@@ -29,6 +29,8 @@ build/bin/llama-hybrid-check ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf ~/
 python3 tools/hybrid/test_prefill.py --binary build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-a-r3-261030/http
 python3 tools/hybrid/test_prefill.py --binary build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-a-r3-261030/slow --regression slow-readers
 python3 tools/hybrid/test_prefill.py --binary build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-a-r3-261030/max --regression max-delta
+python3 tools/hybrid/test_prefill.py --binary build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-a-r6-261030/pending --regression pending
+python3 tools/hybrid/test_prefill.py --binary build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-a-r6-261030/errors --regression errors
 python3 tools/hybrid/test_recurrent_append.py --library build/bin/libllama.so --malformed
 ```
 
@@ -36,7 +38,7 @@ The node binds to `127.0.0.1`. Health and metrics are public; session routes req
 
 `GET /v1/sessions/{id}/snapshot` returns the upstream slot-file format (GGSQ version 4, token IDs, native memory state). Deltas use chunked HTTP/1.1, with the entire envelope prepared before transmission. The RAM store is bounded to 512 MiB and 128 sessions. One CPU context is restored from each session's RAM snapshot for its next extend.
 
-Binary responses (deltas and snapshots) hold a permit until transmission completes or the connection closes. At most two are unfinished per client and three globally; four HTTP workers leave one available for admission and control requests. Excess binary requests return `429` with `Retry-After: 1`, before inference or session mutation. A retry uses the same boundary and tokens. Shadow requests do not consume a stream permit. Each connection serves one HTTP/1.1 request and then closes, so idle keepalive connections do not retain workers. These are the section-5 bounds approved in spec v0.3.3. Slow request headers and broader transport denial of service are outside this regression's claim.
+Every authenticated session request takes a permit before entering the model scheduler, including shadow extends, snapshots, list, info, create and delete. Session routes retain the model lease so DELETE cannot invalidate a running extend. Health and metrics bypass the lease; metrics read atomic counters. A response owns its permit through queuing, inference and transmission, including JSON errors and shadow acknowledgements. Disconnected queued requests leave the scheduler without changing session state; a disconnect during inference may still leave an accepted append committed. At most two permits are held per client and three globally; four HTTP workers leave one available for admission and control requests. Excess requests return `429` with `Retry-After: 1` before waiting, inference or session mutation. The existing error body remains `{"error":"binary response limit"}` for compatibility. A retry uses the same boundary and tokens. Each connection serves one HTTP/1.1 request and then closes. These are the section-5 bounds approved in spec v0.3.5. Slow request headers and broader transport denial of service are outside this regression's claim.
 
 ## Native delta contract
 
@@ -61,3 +63,5 @@ Task logs and tool installation live under `.temp/hybrid-a-r1-261030/`. No bench
 Recorded results, negative cases and evidence limits for this run: [hybrid-a-r1-261030-results.md](hybrid-a-r1-261030-results.md). A mode-0600 runtime configuration for three clients is available locally at `.temp/hybrid-a-r1-261030/clients.json`; refer to the file for credentials.
 
 Fix-round findings, controls and build byte accounting: [fixes-r1-261030.md](fixes-r1-261030.md).
+
+Admission-before-waiting fix, pending-request regressions and exact validation commands: [fixes-r2-261030.md](fixes-r2-261030.md).

@@ -1,6 +1,7 @@
 #include "hybrid-state.h"
 #include "hybrid-scheduler.h"
 #include "httplib.h"
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -44,13 +45,13 @@ public:
     }
 };
 
-static void send_binary(httplib::Response & res, std::string wire, std::shared_ptr<void> permit) {
+static void send_binary(httplib::Response & res, std::string wire) {
     res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire)](size_t offset, httplib::DataSink & sink) {
         size_t n = std::min<size_t>(65536, wire.size() - offset);
         if (n && !sink.write(wire.data() + offset, n)) { return false; }
         if (offset + n == wire.size()) { sink.done(); }
         return true;
-    }, [permit = std::move(permit)](bool) mutable { permit.reset(); });
+    });
 }
 
 static int64_t now() {
@@ -120,8 +121,8 @@ int main(int argc, char ** argv) {
         const std::string empty_state = hybrid::save_state(ctx.get());
         std::map<std::string, std::map<std::string, session>> sessions;
         hybrid::request_scheduler scheduler;
-        size_t ram_bytes = 0;
-        uint64_t extends = 0;
+        std::atomic<size_t> ram_bytes{0};
+        std::atomic<uint64_t> extends{0};
         response_budget responses;
         httplib::Server http;
         http.set_payload_max_length(1024 * 1024);
@@ -131,30 +132,38 @@ int main(int argc, char ** argv) {
         http.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
-            auto owner_it = owners.find(req.get_header_value("Authorization"));
-            const std::string client = owner_it == owners.end() ? "" : owner_it->second;
+            if (req.path == "/v1/health") {
+                respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}});
+                return;
+            }
+            if (req.path == "/metrics") {
+                res.set_content("hybrid_extends_total " + std::to_string(extends.load()) + "\nhybrid_ram_bytes " + std::to_string(ram_bytes.load()) + "\n", "text/plain");
+                return;
+            }
+            auto owner = owners.find(req.get_header_value("Authorization"));
+            if (owner == owners.end()) {
+                res.set_header("WWW-Authenticate", "Bearer");
+                respond(res, 401, {{"error", "unauthorized"}});
+                return;
+            }
+            const std::string & client = owner->second;
+            auto permit = responses.acquire(client);
+            if (!permit) {
+                res.set_header("Retry-After", "1");
+                respond(res, 429, {{"error", "binary response limit"}});
+                return;
+            }
+            // Response ownership covers queued work and every response type, including errors.
+            res.user_data.set("hybrid_permit", std::move(permit));
             const std::string session_id = req.path.size() >= 45 ? req.path.substr(13, 32) : "";
             bool critical = true;
             if (req.method == "POST" && req.path.find("/extend") != std::string::npos) {
                 try { critical = hybrid::parse_json(req.body).value("return_delta", true); }
                 catch (const std::exception &) { /* Invalid requests are rejected below. */ }
             }
-            auto admission = scheduler.enter(client, session_id, critical);
+            auto admission = scheduler.enter(client, session_id, critical, req.is_connection_closed);
+            if (!admission) { return; }
             try {
-                if (req.path == "/v1/health") {
-                    respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}});
-                    return;
-                }
-                if (req.path == "/metrics") {
-                    res.set_content("hybrid_extends_total " + std::to_string(extends) + "\nhybrid_ram_bytes " + std::to_string(ram_bytes) + "\n", "text/plain");
-                    return;
-                }
-                auto owner = owners.find(req.get_header_value("Authorization"));
-                if (owner == owners.end()) {
-                    res.set_header("WWW-Authenticate", "Bearer");
-                    respond(res, 401, {{"error", "unauthorized"}});
-                    return;
-                }
                 auto & space = sessions[owner->second];
                 const std::string base = "/v1/sessions";
                 if (req.path == base) {
@@ -195,12 +204,7 @@ int main(int argc, char ** argv) {
                 } else if (req.method == "GET" && action.empty()) {
                     respond(res, 200, info(s, model_hash));
                 } else if (req.method == "GET" && action == "snapshot") {
-                    auto permit = responses.acquire(client);
-                    if (!permit) {
-                        res.set_header("Retry-After", "1");
-                        respond(res, 429, {{"error", "binary response limit"}}); return;
-                    }
-                    send_binary(res, snapshot(s, empty_state), std::move(permit));
+                    send_binary(res, snapshot(s, empty_state));
                 } else if (req.method == "POST" && action == "extend") {
                     json body = hybrid::parse_json(req.body);
                     if (!body.at("n0").is_number_integer() || !body.at("prefix_hash_n0").is_string()) {
@@ -226,14 +230,8 @@ int main(int argc, char ** argv) {
                     std::vector<llama_token> all = s.tokens;
                     all.insert(all.end(), tokens.begin(), tokens.end());
                     const bool return_delta = body.at("return_delta").get<bool>();
-                    std::shared_ptr<void> permit;
                     json header;
                     if (return_delta) {
-                        permit = responses.acquire(client);
-                        if (!permit) {
-                            res.set_header("Retry-After", "1");
-                            respond(res, 429, {{"error", "binary response limit"}}); return;
-                        }
                         header = {{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}};
                         // Use the largest body length so the header budget is checked before inference.
                         hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
@@ -256,7 +254,7 @@ int main(int argc, char ** argv) {
                     s.last_used = now();
                     ++extends;
                     if (!wire.empty()) {
-                        send_binary(res, std::move(wire), std::move(permit));
+                        send_binary(res, std::move(wire));
                     } else {
                         respond(res, 202, {{"n", s.tokens.size()}, {"prefix_hash", hybrid::prefix_hash(s.tokens)}});
                     }
