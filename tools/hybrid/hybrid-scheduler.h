@@ -13,10 +13,9 @@ struct request_ticket {
     bool critical;
 };
 
-// Only the oldest request for a session is eligible. Across sessions, prefer critical work and rotate clients.
+// Rotate clients first to prevent starvation. Within a client, prefer critical work without bypassing session FIFO.
 inline request_ticket * next_request(const std::vector<request_ticket *> & queue, const std::string & last_client) {
     std::vector<request_ticket *> eligible;
-    bool critical = false;
     for (size_t i = 0; i < queue.size(); ++i) {
         bool first = true;
         for (size_t j = 0; j < i; ++j) {
@@ -24,17 +23,21 @@ inline request_ticket * next_request(const std::vector<request_ticket *> & queue
         }
         if (first) {
             eligible.push_back(queue[i]);
-            critical = critical || queue[i]->critical;
         }
     }
     request_ticket * after = nullptr;
     request_ticket * wrap = nullptr;
     for (auto * ticket : eligible) {
-        if (ticket->critical != critical) { continue; }
         if (!wrap || ticket->client < wrap->client) { wrap = ticket; }
         if (ticket->client > last_client && (!after || ticket->client < after->client)) { after = ticket; }
     }
-    return after ? after : wrap;
+    auto * selected = after ? after : wrap;
+    if (selected) {
+        for (auto * ticket : eligible) {
+            if (ticket->client == selected->client && ticket->critical && !selected->critical) { selected = ticket; }
+        }
+    }
+    return selected;
 }
 
 class request_scheduler {

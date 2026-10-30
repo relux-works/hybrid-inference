@@ -23,16 +23,19 @@ static json header(const std::string & hash, size_t n0, size_t n1, const std::ve
 }
 
 static void scheduler_tests() {
-    // A later critical append cannot pass the same session's shadow; other sessions prefer critical work and rotate clients.
+    // A later critical append cannot pass its session shadow; clients rotate even when one has only shadow work.
     hybrid::request_ticket a_shadow{"a", "one", false};
     hybrid::request_ticket a_later{"a", "one", true};
     hybrid::request_ticket b_critical{"b", "two", true};
     require(hybrid::next_request({&a_shadow, &a_later}, "") == &a_shadow, "session FIFO bypass");
-    require(hybrid::next_request({&a_shadow, &a_later, &b_critical}, "") == &b_critical, "critical priority lost");
+    require(hybrid::next_request({&a_shadow, &a_later, &b_critical}, "a") == &b_critical, "critical priority lost");
     hybrid::request_ticket a{"a", "one", true};
     hybrid::request_ticket a_other{"a", "other", true};
     hybrid::request_ticket b{"b", "one", true};
     hybrid::request_ticket c{"c", "one", true};
+    hybrid::request_ticket b_shadow{"b", "one", false};
+    require(hybrid::next_request({&a, &a_other, &b_shadow}, "a") == &b_shadow, "shadow client starved by critical client");
+    require(hybrid::next_request({&a_shadow, &a_other}, "") == &a_other, "within-client critical priority lost");
     require(hybrid::next_request({&a, &a_other, &b, &c}, "a") == &b, "client b starved");
     require(hybrid::next_request({&a, &a_other, &b, &c}, "b") == &c, "client c starved");
     require(hybrid::next_request({&a, &a_other, &b, &c}, "c") == &a, "round-robin wrap lost");
