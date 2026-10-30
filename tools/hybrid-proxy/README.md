@@ -7,6 +7,7 @@ This directory contains the Python client side of the hybrid prefill/decode prot
 The example contains public fixture credentials, not deployment credentials. Start these three commands in separate terminals:
 
 ```sh
+mkdir -p .temp/hybrid-b-r1-261030/slots
 python3 tools/hybrid-proxy/stub_server.py --role prefill --port 8081 --database .temp/hybrid-b-r1-261030/stub.sqlite3
 python3 tools/hybrid-proxy/stub_server.py --role decode --port 8080 --slot-path .temp/hybrid-b-r1-261030/slots
 python3 tools/hybrid-proxy/proxy.py --config tools/hybrid-proxy/config.example.json --database .temp/hybrid-b-r1-261030/client.sqlite3 --port 8082
@@ -54,6 +55,8 @@ After engine builds are admitted, build only `llama-server` and `llama-hybrid-ch
 ```sh
 build/bin/llama-hybrid-check-append ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf ~/Werkstatt/hybrid-models/golden/prompt-512 ~/Werkstatt/hybrid-models/golden/prompt-2048 ~/Werkstatt/hybrid-models/golden/prompt-8192
 python3 tools/hybrid-proxy/test_decode.py --binary build/bin/llama-server --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --golden ~/Werkstatt/hybrid-models/golden/prompt-512 --artifacts .temp/hybrid-b-r1-261030/native-http
+# Add A's existing prefill binary to exercise the complete real proxy path too:
+python3 tools/hybrid-proxy/test_decode.py --binary build/bin/llama-server --prefill-binary /home/agent/Werkstatt/hybrid-a/llama.cpp/build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --golden ~/Werkstatt/hybrid-models/golden/prompt-512 --artifacts .temp/hybrid-b-r1-261030/real-e2e
 ```
 
-The C++ checker compares incremental append with plain local prefill and A's 64-token golden sequence. The HTTP checker independently checks the actual slot routes, native save bytes after rejection, cross-slot import from A's one-stream source, cache reuse, and 64-token equality with a plain local slot (EOS masked consistently on both HTTP paths). Native layout probes are bounded to the supplied Qwen35 fixtures. These commands are not passing evidence until `RESULTS.md` records their exit status.
+The C++ checker compares incremental append with plain local prefill and A's 64-token golden sequence. The HTTP checker independently checks the actual slot routes, native save bytes after rejection, cross-slot import from A's one-stream source, cache reuse, and 64-token equality with a plain local slot (EOS masked consistently on both HTTP paths). With `--prefill-binary`, it also checks the full real proxy path, 64 generated chat tokens against a plain local request, streaming forks, foreign-client 404, offline continuation and replay after losing the server RAM store. Native layout probes are bounded to the supplied Qwen35 fixtures. These commands are not passing evidence until `RESULTS.md` records their exit status.

@@ -1,5 +1,8 @@
 """Explicit opt-in native slot/CPU equivalence check; requires a built patched server."""
 import argparse
+import http.server
+import os
+import threading
 import hashlib
 import json
 from pathlib import Path
@@ -8,7 +11,7 @@ import struct
 import subprocess
 import time
 
-from proxy import HTTPError, Node
+from proxy import Handler, HTTPError, Node, Proxy
 from store import prefix_hash
 from stub_server import xxh128
 
@@ -104,10 +107,117 @@ def run(node, golden, slots):
     print(f"PASS HTTP incremental import + held token: 64/64 greedy tokens at depth {len(tokens)}", flush=True)
 
 
+def run_proxy(decode, binary, model, golden, directory, slots):
+    metadata = json.loads(Path(str(golden) + ".tokens.json").read_text())
+    credentials = directory / "prefill-fixture.json"
+    credentials.write_text(json.dumps({"a": "fixture-prefill-a-0001", "b": "fixture-prefill-b-0001"}))
+    os.chmod(credentials, 0o600)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    log = open(directory / "prefill.log", "wb")
+    command = [binary, model, str(credentials), str(port), "4096"]
+    process = None
+    app = None
+    server = None
+    thread = None
+
+    def start_prefill():
+        nonlocal process
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        with open(directory / "prefill-pids.txt", "a") as record:
+            record.write(str(process.pid) + "\n")
+        deadline = time.monotonic() + 120
+        node = Node(f"http://127.0.0.1:{port}", timeout=120)
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "prefill exited during startup")
+            try:
+                node.request("GET", "/v1/health")
+                return
+            except (OSError, HTTPError):
+                time.sleep(0.1)
+        raise AssertionError("prefill startup timed out")
+
+    def stop_prefill():
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    try:
+        start_prefill()
+        app = Proxy(dict(model_sha256=metadata["model_sha256"], prefill_url=f"http://127.0.0.1:{port}",
+                         decode_url=decode.url, prefill_timeout=120, slots=2, slot_path=str(slots),
+                         clients={"fixture-a": dict(id="a", prefill_token="fixture-prefill-a-0001"),
+                                  "fixture-b": dict(id="b", prefill_token="fixture-prefill-b-0001")},
+                         policy=dict(always=True)), str(directory / "real-proxy.sqlite"))
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.app = app
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = Node(f"http://127.0.0.1:{server.server_port}", "fixture-a", timeout=120)
+        system = "Follow the user request. Keep conversation state consistent. " * 80
+        body = dict(model=Path(model).name, messages=[dict(role="system", content=system),
+                    dict(role="user", content="Count the integers from one to ten.")],
+                    max_tokens=64, temperature=0, seed=0, ignore_eos=True,
+                    chat_template_kwargs=dict(enable_thinking=False))
+        with client.open("POST", "/v1/chat/completions", body) as response:
+            sid = response.headers["X-Hybrid-Session"]
+            imported = json.loads(response.read())
+        require(app.store.get(sid)["offload"], "real proxy did not import an offloaded delta")
+        local = decode.request("POST", "/v1/chat/completions", dict(body, id_slot=1, cache_prompt=False))
+        require(imported["choices"][0]["message"] == local["choices"][0]["message"], "real proxy/plain-local chat mismatch")
+        require(imported["usage"]["completion_tokens"] == local["usage"]["completion_tokens"] == 64,
+                "real proxy chat did not exercise 64 generated tokens")
+        fork = dict(body, messages=[body["messages"][0], dict(role="user", content="Name the primary colors.")],
+                    max_tokens=4, stream=True)
+        with client.open("POST", "/v1/chat/completions", fork) as response:
+            fork_id = response.headers["X-Hybrid-Session"]
+            chunks = response.read()
+        require(fork_id != sid and b"data: [DONE]" in chunks, "real proxy shared-prefix fork/stream failed")
+        foreign = Node(client.url, "fixture-b", timeout=120)
+        try:
+            foreign.request("POST", "/v1/chat/completions", body, {"X-Hybrid-Session": sid})
+        except HTTPError as error:
+            require(error.status == 404, "real proxy foreign client must get 404")
+        else:
+            raise AssertionError("real proxy allowed a foreign session")
+        stop_prefill()
+        offline = dict(body, messages=[dict(role="user", content="Reply with a short greeting.")], max_tokens=4)
+        with client.open("POST", "/v1/chat/completions", offline) as response:
+            offline_id = response.headers["X-Hybrid-Session"]
+            require(bool(json.loads(response.read())["choices"]), "offline real decode failed")
+        require(not app.store.get(offline_id)["offload"], "offline request incorrectly marked offloaded")
+        start_prefill()
+        with app.lock:
+            app.replay()
+            app.replay()
+            for session in app.store.pending():
+                owner = next(c for c in app.clients.values() if c["id"] == session["client"])
+                info = app.remote(owner).request("GET", "/v1/sessions/" + session["remote_id"])
+                require(info["n"] == len(session["tokens"]) and info["prefix_hash"] == prefix_hash(session["tokens"]),
+                        "real reconnect journal lost or duplicated tokens")
+        print("PASS real proxy: imported chat/local equality for 64 tokens, streaming fork, foreign 404, offline and restart replay", flush=True)
+    finally:
+        if server:
+            server.shutdown()
+            server.server_close()
+        if thread:
+            thread.join()
+        if app:
+            app.store.close()
+        stop_prefill()
+        log.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--prefill-binary", help="Also run the real proxy against A's prefill node")
     parser.add_argument("--golden", required=True, help="Golden filename stem, e.g. .../prompt-512")
     parser.add_argument("--artifacts", required=True)
     args = parser.parse_args()
@@ -141,6 +251,8 @@ def main():
             else:
                 raise AssertionError("server startup timed out")
             run(node, Path(args.golden), slots)
+            if args.prefill_binary:
+                run_proxy(node, args.prefill_binary, args.model, Path(args.golden), directory, slots)
         finally:
             if process.poll() is None:
                 process.terminate()

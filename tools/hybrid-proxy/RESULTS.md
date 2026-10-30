@@ -33,3 +33,25 @@ The bounded-retry candidate was rechecked: the same 12-test command exited 0 in 
 Source review follow-up: single-sequence snapshots may contain a different source stream count from the decode node's parallel-slot count. The native reader now accepts one populated source stream for a single-sequence restore while preserving strict counts for full-context/mirrored restores. The HTTP probe restores A's one-stream snapshot into slot 1 of a two-slot server, keeps that neighbor populated during all invalid imports, and checks the neighbor is unchanged. This probe remains unrun under the build hold. The C++ syntax check for the portability candidate exited 0 (`cxx-syntax-04.log`).
 
 The policy now rejects non-finite measurements and uses a body-transfer timer after response headers, excluding prefill latency from its link EWMA. The explicit transfer-timing control plus the prior suite passed: 13 tests, 10.328 seconds, exit 0 (`proxy-tests-05.log`). The previous 12-test measurement candidate also passed (10.388 seconds, `proxy-tests-04.log`). No performance benchmark was run; the timer control uses a deterministic mock clock.
+
+## Shared core CPU evidence from producer A
+
+A reported exit 0 for each of these exact commands at signed source c68df953711db924a972f67d9d1a1e4fe57bd4f4 (which includes the signed cherry-pick of B core 684e35a5b8):
+
+```sh
+build/bin/llama-hybrid-check /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf /home/agent/Werkstatt/hybrid-models/golden 512
+build/bin/llama-hybrid-check /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf /home/agent/Werkstatt/hybrid-models/golden 2048
+build/bin/llama-hybrid-check /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf /home/agent/Werkstatt/hybrid-models/golden 8192
+```
+
+Working directory: `/home/agent/Werkstatt/hybrid-a/llama.cpp`. B read the persisted PASS lines in A's `.temp/hybrid-a-r1-261030/append-{512,2048,8192}-01.log`. Every depth matched 64/64 greedy tokens against independent plain local prefill; valid incremental append equaled the full native export; eight malformed-native probes each preserved the serialized prefix. A's explicit exit-code confirmation is Matrix event `$OtqlAADVXpdM3Mnxg_COK_xxZqpF-TVIMxJtjECBgDg` in #hybrid, topic prototype-go.
+
+This qualifies the shared baseline core on A's exact candidate. It does not qualify B's later SWA rejection/single-sequence portability guards, B's slot HTTP routes, or the full real proxy path. Compared with A c68df953, B's engine source differs only in 11 lines of the KV stream admission guard. The opt-in B tests remain unrun. A's scheduling correction and shared range-end checks are integrated locally; there is no new review verdict or end-to-end acceptance claim.
+
+## Current build admission blocker
+
+The keeper/orchestrator conditionally admitted one B configure/build, only `llama-server` and `llama-hybrid-check-append`, CPU `-j2` under the shared flock. It requires at least 23.0 GiB exact free space before starting and an abort below 22.5 GiB during the build. `df -BG /` rounds up, so it is insufficient for this gate. The exact check `df -B1 --output=avail /` observed 23,824,539,648 available bytes (22.188332 GiB), below admission. No B configure/build was attempted. No files outside B's workbench were removed.
+
+The task-local `.temp/hybrid-b-r1-261030/build_guard.py` records the actual `df -BG` and exact-byte readings, command PID, return code and disk monitor. It runs under the shared CLI flock and stops only recorded child PIDs if the reserve is crossed. Its known-low-space negative control refused `/usr/bin/true` before execution with exit 78 (`admission-control-negative-01.monitor.log`, expected rejection); its zero-threshold positive control ran `/usr/bin/true` with exit 0 (`admission-control-positive-01.monitor.log`). This is admission-control evidence, not an engine build or passing engine test.
+
+CMake 4.4.4 is available read-only at A's existing `.temp/hybrid-a-r1-261030/cmake-tool/cmake/data/bin/cmake`; `--version` exited 0 (`cmake-readiness-01.log`). B installed no dependencies. The expanded source-only syntax check initially exited 1 because the command omitted `-Ivendor/cpp-httplib` for A's prefill source (`cxx-syntax-05.log`); adding that include path made the same nine-source check exit 0 (`cxx-syntax-06.log`). B's real end-to-end probe is now prepared under `test_decode.py --prefill-binary`, but remains unrun.
