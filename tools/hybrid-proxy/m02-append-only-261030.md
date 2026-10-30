@@ -1,5 +1,369 @@
 # M0.2 append-only sessions
 
+## R12: type-aware message identity
+
+Status: **ready for review**, with R1 fixed in signed commit `c5b91be89af5a09ac98fedc75c0ebce67b2b8b4e` on `m02-append-only-sessions`. The later documentation commit is the branch tip. All current qualification gates below passed; expected-red controls retain their real nonzero exits. Independent acceptance and publication are pending. No pushes.
+
+Run `hybrid-b-r12-261030`, 2026-10-30 UTC. A's review was fetched read-only:
+
+```sh
+git fetch /home/agent/Werkstatt/hybrid-a/llama.cpp.git review-m02-of-b-261030:refs/remotes/a/review-m02-of-b-261030
+```
+
+Fetch exit0; accepted input identity `5528b995ff4de5bdd59cb6d2498fab6c26a4e2b9`, report `tools/hybrid/review-m02-of-b-261030.md`. This rework starts from reviewed B head `d4f8a8a3848b99a29146ca71d5baeea3ca77f6ce`. Only `tools/hybrid-proxy` changes. No server, `src/`, codec, prefill-node, A-workbench, dependency or build changes were needed. The current specification has later sections; this task qualifies the unchanged v0.3.7 append-only subsection and the r12 brief, not those later features.
+
+### R1 fix and comparison-site audit
+
+The previous normalizer decoded tool-argument strings, then compared Python dictionaries. Recursive Python equality merges JSON `true` with `1`, `false` with `0`, and integer `1` with floating `1.0`. The native pre-fix witness fails at `one-bool-forward: typed edit silently appended`; A's original six-case test also demonstrates the class. A native token/hash check alone cannot detect disagreement between the messages and the old authoritative IDs.
+
+`journal.py::message_identity` now copies the full message, normalizes valid JSON tool arguments, and returns compact sorted JSON with `ensure_ascii=False, allow_nan=False`. This is a canonical typed encoding for the decoded JSON domain: `true`, `1`, `1.0`, `null` and `"1"` stay different, recursively. Missing keys are not inserted. Unknown/extension message fields participate as well. The old falsey assistant content/reasoning defaults were removed, so null, empty text, zero, false and absence no longer merge. Non-JSON nonfinite values cannot silently enter the comparison.
+
+The one deliberate omission remains narrowly caller-controlled: `matching_messages` omits `reasoning_content` from both canonical values only when the incoming message is an assistant and did not supply that key. Supplied null or conflicting reasoning remains explicit. Tool-argument whitespace, object key order and equivalent Unicode escape spelling remain presentation-only after JSON parsing; invalid argument JSON retains its original text. No shared settings/session schema migration is required; existing message journals are compared with the corrected algorithm when next used.
+
+All seven message-comparison call sites use this one `matching_messages` path:
+
+| Site | Decision protected |
+| --- | --- |
+| `store.py:152` | Completed message-prefix candidate selection. |
+| `store.py:155` | Divergence position for inferred checkpoint/fork selection. |
+| `proxy.py:387` | Pending in-flight admission. |
+| `proxy.py:437` | Queued request's compatibility revalidation after its predecessor commits. |
+| `proxy.py:497` | Matching prefix before restoring client-omitted reasoning into the recorded messages. |
+| `proxy.py:515` | Append versus rewrite decision. |
+| `proxy.py:526` | Exact message divergence for checkpoint planning. |
+
+`journal.py:29-32` performs canonical string comparison; no caller compares message dictionaries directly. Other nearby equality checks compare role markers, render/settings hashes, token IDs or positions, not message JSON values. Render/settings identities already use JSON encoding plus SHA-256. The exact search output is retained in `.temp/hybrid-b-r12-261030/comparison-sites.log`.
+
+### Regressions and native decisions
+
+New file `test_message_identity.py` follows the existing unit-plus-opt-in-native helper pattern. Every cohesive test group has a claim comment. The six unit tests add to all55 prior named tests (retained unchanged), yielding **61 tests**. Pure controls apply the same type pairs inside content parts and other fields, including extension metadata; they test identity semantics rather than claiming those arbitrary field shapes are valid chat API inputs. The durable-store and pending-admission control requires a fork candidate instead of append reuse after an edit.
+
+| Variant | Required identity | Executable regression and observation |
+| --- | --- | --- |
+| `1` / `true`, both directions | Different | `IdentityCases.test_tool_argument_scalar_type_is_a_rewrite`; native rollback at latest user boundary n9; native renderer distinguishes the values. |
+| `0` / `false`, both directions | Different | Same named test; both native directions rollback at n9. |
+| `1` / `1.0`, both directions | Different | Same named test; native rendered tokens differ and both directions rollback at n9. |
+| `null` / missing object key, both directions | Different | Same named test; native rendered tokens differ and both directions rollback at n9. `test_null_and_absent_message_fields_are_not_defaults` also covers top-level key presence, with only the allowed incoming assistant-reasoning exception. |
+| `"1"` / `1`, both directions | Different | Same named test; this template renders the parameter values alike, but identity conservatively preserves JSON types as required; both directions still rollback at n9. |
+| List element, nested object, object/list nested float, both directions | Different | Same named test; all six native directions rollback at n9 with the changed prompt IDs. |
+| Identical history | Equal | `test_same_json_value_control`, `test_content_presentation_and_identical_history_append_identity`; native appends with rollback null, new-only prefill and old IDs unchanged. |
+| Whitespace / object key order | Equal | Same presentation control; native appends. This template can render object keys in a different order, but the brief explicitly treats order as presentation-only. The old authoritative IDs are retained; parsed argument values are identical. No claim that these two full re-renders are byte-identical. |
+| Unicode escape / literal character | Equal | Same presentation control and decoded content-parts control. Native tool rendering/tokenization is identical for escaped and literal e-acute because arguments are parsed before the template renders them. The native positive control requires that equality before allowing the append claim. |
+| Typed changes inside content parts, name/call/reasoning/metadata | Different | `test_content_parts_and_message_fields_keep_json_types`, recursively and in both directions; no direct Python value equality remains. |
+| Edited history with no usable native checkpoint | Conflict | Native `--no-checkpoint-control`: all16 typed edit cases raise `JournalConflict` (the existing handler maps this to409), both durable journals and complete saved native bytes unchanged. All three presentation/identical controls still append. Existing matrix/remote HTTP controls independently exercise actual409 responses. |
+
+The native helper checks16 typed edits and3 append controls on the actual small model, then repeats those19 cases with checkpoints disabled. Each successful typed rewrite must select exactly the latest recorded boundary at/before the edited tool call, include the newly rendered prompt IDs, agree with native slot tokens/hash, and leave its neighbor unchanged. It does not merely assert an arbitrary error or a non-null meter. The initial native probe's assertion that *every* JSON type change renders differently was corrected after observing string/int coercion; the product's strict identity policy was not weakened.
+
+### Known-violation controls
+
+| Control / mutant | What it narrows | Named failing test / gate | Surviving bound |
+| --- | --- | --- | --- |
+| Pre-fix `d4f8a8a384` normalizer | JSON scalar types cannot silently append | `IdentityCases.test_tool_argument_scalar_type_is_a_rewrite`, exit1; `typed-native-before`, exit1 at `one-bool-forward: typed edit silently appended`. | No control survived the new regressions; the old55-test suite alone missed this class. |
+| One-line final-source mutant: decode canonical identity back to a Python object before comparison | The comparison itself must retain scalar types, not only normalization | Same named scalar test, `typed-identity-mutant-final`, exit1 with12 failing subcases. | Killed for bool/int, int/float and nested equivalence classes. String/number and absent/null were already distinct under Python equality; those controls remain product regressions, not claimed mutant kills. |
+| M0.1 old-on / old-off / target-omitted | New user turns and omitted reasoning must reuse exact historical IDs | `test_append_sessions.py --witness`, exit1 each at the intended full re-prefill assertion. | Existing bounded Qwen fixtures only; no arbitrary-template claim. |
+
+The source mutant exists only under the r12 scratch directory; production files were never mutated for this control. No surviving mutant is used to justify acceptance.
+
+### Full M0.2 gate results at c5b91be89a
+
+All tests ran directly as standalone processes through the task-local `run.py`, preserving real exits and redirecting stdout/stderr without tee. Commands are reproduced below. Native helpers use existing B binaries, small CPU contexts, and run serially; the stdlib fixture suite overlaps only with the first native helper. No build or configure ran.
+
+| Gate label | Exit | Result |
+| --- | ---: | --- |
+| `typed-identity-final` | 0 | All six new typed identity/admission tests. |
+| `reviewer-identity-final` | 0 | A's unmodified scalar/presentation tests, copied read-only into r12 scratch. |
+| `typed-native-final` | 0 | 16 typed rewrites at n9 +3 append controls; changed prompt, token/hash and neighbor checks. |
+| `typed-native-no-checkpoint-final` | 0 | 16 conflicts with both journals/native bytes unchanged +3 append controls. |
+| `proxy-suite-final` | 0 | All61 tests, including every prior55 test name. |
+| `server-api` | 0 | Unchanged native prompt-token/stream-ID, parsing, stop/EOG, invalid input and current legacy-path controls. |
+| `matrix-old-on` | 0 | Three-user/tool loops, thinking on: new-only tokens, solo64, rollback/isolation/FIFO. |
+| `matrix-old-off` | 0 | Same old-template conversation, thinking off/inferred. |
+| `matrix-target-returned` | 0 | 27B template on0.8B, reasoning returned. |
+| `matrix-target-omitted` | 0 | 27B template on0.8B, reasoning omitted/inferred. |
+| `matrix-no-checkpoint` | 0 | Actual explicit409/native bytes and inferred fork. |
+| `witness-m01-old-on` | 1 | Expected red for full re-prefill. |
+| `witness-m01-old-off` | 1 | Expected red for full re-prefill. |
+| `witness-m01-target-omitted` | 1 | Expected red for full re-prefill. |
+| `concurrency-native` | 0 | Both solo64/64, two native processing slots, overlap2.307528s and all16 contention audits. |
+| `remote-append` | 0 | Fresh checkpoint replay/retirement404, local1+remote28=new29, no-checkpoint409/inferred isolation. |
+| `e2e-section11` | 0 | Real2clients x2sessions,16 malformed imports byte-atomic, one-token endpoints, portable restore, streaming fork/foreign404/offline/restart replay. |
+| `native-gates` | 0 | Driver requires every intended native exit and all three named witness failures. |
+| `syntax` | 0 | Changed Python compiles. |
+| `diff-whitespace` | 0 | No diff whitespace errors. |
+| `state-dump-hash-and-cleanup` | 0 | Required green/red assertions, source identity, token totals, owned PID readback, dump hash manifest and removal. |
+
+The server API command intentionally has no `--baseline`: r12 does not repeat an independently generated pre-build/post-build legacy byte comparison. Its print after saving a legacy snapshot is not promoted to that claim. The r11 comparison remains unchanged-source evidence with the same binary and server source; its historical details are retained below. The fresh r12 API negatives compare complete native bytes before/after each rejection.
+
+Section11 freshly passed for each of clients a and b: counting same-partition64/64, teacher-forced meanKL8.67437e-15/top1=64/64; colors same-partition64/64, meanKL0.00203662/top1=63/64. Whole-prompt free-running colors still diverges first at38, with38/64 equal IDs; this is informational, not relabelled exact. The numeric checker's KL-only and top1-only controls reject their known violations. Compact metric lines survive dump removal in `qualification-summary.json`.
+
+| Six-request prompt-prefill total | M0.1 observed | Fixed M0.2 observed | Independent new-input count |
+| --- | ---: | ---: | ---: |
+| Old template, thinking on | 1530 | 524 | 524 |
+| Old template, thinking off | 2102 | 536 | 536 |
+| Target template, omitted reasoning | 3264 | 562 | 562 |
+| Target template, returned reasoning | not requested | 562 | 562 |
+
+Each fixed conversation additionally meters six final sampled-token evaluations separately, as in r11. None is hidden inside the new-input count. All five candidate matrix cases passed; all three old-proxy witnesses retained exit1. The same reasoning-budget16 fixture and supplied templates were used, with no assertion relaxation for the product failure.
+
+### Binary identity, disk custody and limits
+
+Runtime source is signed `c5b91be89a`; only the identity normalizer and new test file changed in that commit. Server, core, prefill and checker sources/binaries remain unchanged. The recorded hashes match r11:
+
+| Existing object | SHA-256 |
+| --- | --- |
+| `build/bin/llama-server` | `acdf3fc833c655cc788e049fbe846e925fd68479a4384e5234644acb97a69a7c` |
+| `build/bin/libllama-server-impl.so` | `d567ac3b58a6f7556aaf24e79e518cb3e69d8d8b80ff64e28e029f9b4ffad81d` |
+| `build/bin/libllama.so` | `1ad5d26ba8388d05ca87d8872dd6dcbc104694c24b38dff93ee7ae44844c8865` |
+| `build/bin/llama-hybrid-prefill` | `5af5b1901d918b9db7eb6d5b94fb79d238f625ee3cb51b660f4c64f40de80240` |
+| `build/bin/llama-hybrid-check-distributions` | `ce6de8ea0b6d2fd37511f903adea0b66d9037c9fccb27878a6e1326f61fa4814` |
+
+All new native state files, SQLite journals, full runtime artifacts and fixture `TMPDIR` were placed below the single directory `.temp/hybrid-b-r12-261030/dumps/`. The initial free-space observation was28,714,078,208 bytes. After accumulating closed matrix fixtures an observation was24,481,476,608; no build ran, and only closed owned artifacts were reclaimed. `prune-closed-dumps` hashed29 completed binary files, flushed their hash records, then removed4,469,381,956 bytes. It checks all recorded fixture PIDs absent before selecting those files. No live fixture, foreign directory or r10/r11 artifact was removed.
+
+After all gates, `state-dump-hash-and-cleanup` combined those earlier hashes with every remaining artifact's SHA-256 and byte count: **314 files / 6,454,381,344 content bytes**. Manifest `.temp/hybrid-b-r12-261030/state-dump-manifest.json`, SHA-256 `2fe4f7c9ef2c6f90662a0c3f73a2af0e811380a54f12c6d9483e3fb35fea16bb`. The entire owned dump directory was then removed and absence verified. Short qualification metrics, command/source identities, per-process resource/cleanup metadata, red logs and hashes remain outside it. Ordinary in-request rollback files and synthetic fixture temporaries already removed by their owners were not retained as dumps. No original state dump is claimed to remain available for inspection; rerun the committed helpers to regenerate it under a fresh scratch directory.
+
+All **21 recorded native server/prefill PIDs are absent** on readback, recorded in `cleanup-pids.json`. Processes were stopped by their recorded PIDs in fixture `finally` blocks. Maximum recorded native-server VmHWM was2,041,116KiB; driver VmHWM531,588KiB. These are per-process observations, not an aggregate benchmark. No extra model, GPU, Metal, target weights, large-context or network-rate qualification ran.
+
+The r11 functional/platform limits remain. The brief contains no surface table; that is an explicit coverage-map brief gap, not universal coverage. No requested row was silently placed out of contract. All55 preexisting named tests remain and pass; self-review applied scope, security, general and tests checklists. A/orchestrator re-review is pending.
+
+`ty` and `editorconfig-checker` remain absent: readiness exits127 each. The first direct `ty` launch through the ephemeral wrapper exited1 with FileNotFoundError before it could write a ledger row; the later `env ty --version` command records the executable's absence as127. No type/style-tool pass or installation is claimed. Syntax and local format/diff checks ran. Initial iterations retain their real failures: `typed-identity-before` had scalar/default failures and invalid-shape/setup errors; `typed-identity-after` had an empty-clients fixture setup error, fixed before the clean focused run; `typed-native-after` asserted an overstrong rendering property for string/int, corrected as explained above. The clean pre-fix scalar and native witnesses, plus the final one-line mutant, establish the intended red independently of those setup issues.
+
+### R12 exact commands and real exits
+
+All commands ran from `/home/agent/Werkstatt/hybrid-b/llama.cpp`. Logs and the exact process ledger are `.temp/hybrid-b-r12-261030/LABEL.log` and `gates.jsonl`. Artifact paths below are historical qualification paths: their contents were hashed and removed per the keeper's rule. Create a fresh dump directory/TMPDIR before re-running, and preserve its hashes before your cleanup. `full_gates.py` sequences the individually listed native commands and enforces the expected-red reason. For the old-source controls, modules were extracted with `git show d4f8a8a384:tools/hybrid-proxy/NAME.py` (proxy/store/journal/policy/concurrency) or `git show edb31a7e:tools/hybrid-proxy/NAME.py` (proxy/store/policy/concurrency); no workbench was switched or modified. The narrow mutant changes only canonical return string to its decoded Python object in the r12 scratch copy.
+
+`typed-identity-before`; 2026-10-30T17:58:30Z; exit **1**; log `typed-identity-before.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest discover -s tools/hybrid-proxy -p test_message_identity.py -v
+```
+
+`typed-native-before`; 2026-10-30T17:58:45Z; exit **1**; log `typed-native-before.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_message_identity.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-b-r12-261030/dumps/typed-native-before --proxy-source .temp/hybrid-b-r12-261030/before
+```
+
+`typed-identity-after`; 2026-10-30T17:58:59Z; exit **1**; log `typed-identity-after.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest discover -s tools/hybrid-proxy -p test_message_identity.py -v
+```
+
+`typed-identity-after-02`; 2026-10-30T17:59:26Z; exit **0**; log `typed-identity-after-02.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest discover -s tools/hybrid-proxy -p test_message_identity.py -v
+```
+
+`typed-native-after`; 2026-10-30T17:59:26Z; exit **1**; log `typed-native-after.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_message_identity.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-b-r12-261030/dumps/typed-native-after
+```
+
+`reviewer-identity`; 2026-10-30T18:00:11Z; exit **0**; log `reviewer-identity.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 .temp/hybrid-b-r12-261030/test_reviewer_identity.py
+```
+
+`typed-identity-mutant`; 2026-10-30T18:00:11Z; exit **1**; log `typed-identity-mutant.log`.
+
+```sh
+env PYTHONPATH=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/mutant:/home/agent/Werkstatt/hybrid-b/llama.cpp/tools/hybrid-proxy TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest test_message_identity.IdentityCases.test_tool_argument_scalar_type_is_a_rewrite -v
+```
+
+`typed-native-after-02`; 2026-10-30T18:00:32Z; exit **0**; log `typed-native-after-02.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_message_identity.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-b-r12-261030/dumps/typed-native-after-02
+```
+
+`typed-native-no-checkpoint`; 2026-10-30T18:01:22Z; exit **0**; log `typed-native-no-checkpoint.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_message_identity.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-b-r12-261030/dumps/typed-native-no-checkpoint --no-checkpoint-control
+```
+
+`proxy-suite`; 2026-10-30T18:00:34Z; exit **0**; log `proxy-suite.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest discover -s tools/hybrid-proxy -p 'test_*.py' -v
+```
+
+`typed-identity-final`; 2026-10-30T18:02:10Z; exit **0**; log `typed-identity-final.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest discover -s tools/hybrid-proxy -p test_message_identity.py -v
+```
+
+`syntax`; 2026-10-30T18:02:35Z; exit **0**; log `syntax.log`.
+
+```sh
+python3 -m py_compile tools/hybrid-proxy/journal.py tools/hybrid-proxy/test_message_identity.py
+```
+
+`typed-identity-before-final`; 2026-10-30T18:03:28Z; exit **1**; log `typed-identity-before-final.log`.
+
+```sh
+env PYTHONPATH=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/before:/home/agent/Werkstatt/hybrid-b/llama.cpp/tools/hybrid-proxy TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest test_message_identity.IdentityCases.test_tool_argument_scalar_type_is_a_rewrite -v
+```
+
+`typed-native-final`; 2026-10-30T18:03:07Z; exit **0**; log `typed-native-final.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_message_identity.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/typed-native-final
+```
+
+`typed-native-no-checkpoint-final`; 2026-10-30T18:03:29Z; exit **0**; log `typed-native-no-checkpoint-final.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_message_identity.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/typed-native-no-checkpoint-final --no-checkpoint-control
+```
+
+`server-api`; 2026-10-30T18:03:44Z; exit **0**; log `server-api.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_api.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/server-api
+```
+
+`typed-identity-mutant-final`; 2026-10-30T18:04:22Z; exit **1**; log `typed-identity-mutant-final.log`.
+
+```sh
+env PYTHONPATH=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/mutant:/home/agent/Werkstatt/hybrid-b/llama.cpp/tools/hybrid-proxy TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest test_message_identity.IdentityCases.test_tool_argument_scalar_type_is_a_rewrite -v
+```
+
+`proxy-suite-final`; 2026-10-30T18:03:08Z; exit **0**; log `proxy-suite-final.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 -m unittest discover -s tools/hybrid-proxy -p 'test_*.py' -v
+```
+
+`matrix-old-on`; 2026-10-30T18:04:14Z; exit **0**; log `matrix-old-on.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/matrix-old-on --thinking on
+```
+
+`matrix-old-off`; 2026-10-30T18:04:48Z; exit **0**; log `matrix-old-off.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/matrix-old-off --thinking off --inferred
+```
+
+`matrix-target-returned`; 2026-10-30T18:05:20Z; exit **0**; log `matrix-target-returned.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/matrix-target-returned --template /home/agent/lanes/hybrid/.temp/research/qwen3.8-27b-chat_template.jinja --thinking on
+```
+
+`reviewer-identity-final`; 2026-10-30T18:06:10Z; exit **0**; log `reviewer-identity-final.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 .temp/hybrid-b-r12-261030/test_reviewer_identity.py
+```
+
+`matrix-target-omitted`; 2026-10-30T18:05:56Z; exit **0**; log `matrix-target-omitted.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/matrix-target-omitted --template /home/agent/lanes/hybrid/.temp/research/qwen3.8-27b-chat_template.jinja --thinking on --omit-reasoning --inferred
+```
+
+`matrix-no-checkpoint`; 2026-10-30T18:06:32Z; exit **0**; log `matrix-no-checkpoint.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/matrix-no-checkpoint --thinking off --no-checkpoint-control
+```
+
+`witness-m01-old-on`; 2026-10-30T18:06:40Z; exit **1**; log `witness-m01-old-on.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/witness-m01-old-on --thinking on --proxy-source /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/m01-proxy --witness
+```
+
+`witness-m01-old-off`; 2026-10-30T18:06:54Z; exit **1**; log `witness-m01-old-off.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/witness-m01-old-off --thinking off --proxy-source /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/m01-proxy --witness
+```
+
+`prune-closed-dumps`; 2026-10-30T18:07:15Z; exit **0**; log `prune-closed-dumps.log`.
+
+```sh
+python3 .temp/hybrid-b-r12-261030/prune_closed_dumps.py
+```
+
+`witness-m01-target-omitted`; 2026-10-30T18:07:08Z; exit **1**; log `witness-m01-target-omitted.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_append_sessions.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/witness-m01-target-omitted --template /home/agent/lanes/hybrid/.temp/research/qwen3.8-27b-chat_template.jinja --thinking on --omit-reasoning --proxy-source /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/m01-proxy --witness
+```
+
+`concurrency-native`; 2026-10-30T18:07:27Z; exit **0**; log `concurrency-native.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_concurrency_native.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/concurrency-native
+```
+
+`remote-append`; 2026-10-30T18:07:41Z; exit **0**; log `remote-append.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_remote_append.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --prefill-binary build/bin/llama-hybrid-prefill --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/remote-append
+```
+
+`ty-readiness-02`; 2026-10-30T18:09:00Z; exit **127**; log `ty-readiness-02.log`.
+
+```sh
+env ty --version
+```
+
+`e2e-section11`; 2026-10-30T18:07:52Z; exit **0**; log `e2e-section11.log`.
+
+```sh
+env TMPDIR=/home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/tmp python3 tools/hybrid-proxy/test_decode.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --prefill-binary build/bin/llama-hybrid-prefill --golden /home/agent/Werkstatt/hybrid-models/golden/prompt-512 --artifacts /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r12-261030/dumps/e2e-section11
+```
+
+`native-gates`; 2026-10-30T18:03:07Z; exit **0**; log `native-gates.log`.
+
+```sh
+python3 .temp/hybrid-b-r12-261030/full_gates.py
+```
+
+`editorconfig-readiness`; 2026-10-30T18:09:05Z; exit **127**; log `editorconfig-readiness.log`.
+
+```sh
+env editorconfig-checker --version
+```
+
+`state-dump-hash-and-cleanup`; 2026-10-30T18:09:27Z; exit **0**; log `state-dump-hash-and-cleanup.log`.
+
+```sh
+python3 .temp/hybrid-b-r12-261030/retain_and_clean.py
+```
+
+`diff-whitespace`; 2026-10-30T18:09:28Z; exit **0**; log `diff-whitespace.log`.
+
+```sh
+git diff --check
+```
+
+`report-whitespace`; 2026-10-30T18:12:32Z; exit **0**; log `report-whitespace.log`.
+
+```sh
+git diff --check
+```
+
+`delivery-check`; 2026-10-30T18:13:25Z; exit **0**; log `delivery-check.log`.
+
+```sh
+python3 .temp/hybrid-b-r12-261030/delivery_check.py
+```
+
+## R11 qualification retained as historical evidence
+
+The remainder describes the independently reviewed r11 candidate `d4f8a8a384`, its original build and tests. R12 above supersedes its message-identity behavior and supplies fresh gates. Its artifact locations and source-freeze statements refer to r11 only; those directories were not modified during r12.
+
+
 Status: ready for review. Requested native, proxy and end-to-end gates passed; the three M0.1 witnesses failed for the intended full re-prefill. No push or independent acceptance is claimed.
 
 Run `hybrid-b-r11-261030`, 2026-10-30 UTC, branch `m02-append-only-sessions`. This continues the signed r10 scope report `d079547f8f`; the user explicitly approved the two server extensions and proxy implementation. The base is landed M0.1 main `edb31a7e`. Specification: the lane's v0.3.7 section 4a and the r11 conditions. No `src/`, codec, prefill-node or A-workbench edits, new dependencies, configure steps or pushes.
