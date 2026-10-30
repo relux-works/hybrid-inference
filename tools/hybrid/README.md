@@ -51,3 +51,5 @@ The check restores the prefix into a fresh context, rejects malformed native app
 Current prototype limits: RAM only, no restart recovery, no NVMe encryption/TTL/eviction, no shadow batching. Admitted requests rotate clients first; within each client, eligible critical requests precede shadows while preserving per-session FIFO. Shadow appends are applied synchronously before returning 202. HTTP/2 and per-layer streaming are deferred by the orchestrator. A disconnected response can leave an accepted append committed; retry observes 409 and must resynchronize.
 
 Task logs and tool installation live under `.temp/hybrid-a-r1-261030/`. No benchmark is run on this host.
+
+Recorded results, negative cases and evidence limits for this run: [hybrid-a-r1-261030-results.md](hybrid-a-r1-261030-results.md). A mode-0600 runtime configuration for three clients is available locally at `.temp/hybrid-a-r1-261030/clients.json`; refer to the file for credentials.
