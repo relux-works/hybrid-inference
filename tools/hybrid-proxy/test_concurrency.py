@@ -11,7 +11,7 @@ import urllib.request
 from unittest import mock
 
 import test_proxy as fixtures
-from proxy import HTTPError, SLOT_WAIT_SECONDS
+from proxy import HTTPError, Node, SLOT_WAIT_SECONDS
 from store import prefix_hash
 
 
@@ -178,6 +178,73 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertNotEqual(other, sid)
         self.assertEqual(self.app.store.get(sid)['tokens'], tokens + [901, 902])
         self.assertEqual(self.app.store.get(other)['tokens'], tokens + [99, 901, 902])
+
+    # A faster later tokenizer cannot overtake an earlier turn of the inferred session; another client still runs.
+    def test_inferred_fifo_with_out_of_order_tokenization(self):
+        sid, _ = self.chat([10])
+        first_tokens = [10, 901, 902, 11]
+        second_tokens = first_tokens + [901, 902, 12]
+        entered, release = threading.Event(), threading.Event()
+        second_ready = threading.Event()
+        tokenize = self.app.tokenize
+        def controlled(body):
+            if body['_tokens'] == first_tokens:
+                entered.set()
+                self.assertTrue(release.wait(10))
+            result = tokenize(body)
+            if body['_tokens'] == second_tokens:
+                second_ready.set()
+            return result
+        first_gate, release_first = self.block(first_tokens)
+        second_gate, release_second = self.block(second_tokens)
+        self.app.tokenize = controlled
+        first = self.launch(first_tokens, None)
+        try:
+            self.assertTrue(entered.wait(5))
+            second = self.launch(second_tokens, None)
+            self.assertTrue(second_ready.wait(5))
+            with self.app.lock:
+                queue = self.app.admissions['a']
+            with queue.condition:
+                self.assertEqual(len(queue.waiters), 2)
+            self.assertFalse(second_gate.is_set())
+            foreign = Node(self.client.url, 'fixture-b', timeout=60)
+            self.chat([30], client=foreign, sid='other-client')
+            release.set()
+            self.assertTrue(first_gate.wait(5))
+            self.assertFalse(second_gate.is_set())
+            release_first.set()
+            self.assertTrue(second_gate.wait(5))
+            release_second.set()
+            self.assertEqual(first.result(timeout=5)[0], sid)
+            self.assertEqual(second.result(timeout=5)[0], sid)
+            self.assertEqual(self.app.store.get(sid)['tokens'], second_tokens + [901, 902])
+        finally:
+            release.set()
+
+    # Failed classification removes its admission ticket, so later valid work cannot remain blocked behind it.
+    def test_failed_tokenizer_releases_admission(self):
+        entered, release = threading.Event(), threading.Event()
+        tokenize = self.app.tokenize
+        def controlled(body):
+            if body['_tokens'] == [10]:
+                entered.set()
+                self.assertTrue(release.wait(10))
+                raise ValueError('injected invalid template')
+            return tokenize(body)
+        self.app.tokenize = controlled
+        first = self.launch([10], None)
+        try:
+            self.assertTrue(entered.wait(5))
+            second = self.launch([20], None)
+            release.set()
+            with self.assertRaises(HTTPError) as error:
+                first.result(timeout=5)
+            self.assertEqual(error.exception.status, 400)
+            sid, _ = second.result(timeout=5)
+            self.assertEqual(self.app.store.get(sid)['tokens'], [20, 901, 902])
+        finally:
+            release.set()
 
     # LRU eviction skips the pinned slot and preserves its tokens; an idle neighbor can be parked.
     def test_eviction_skips_pinned_slot(self):

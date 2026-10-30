@@ -97,6 +97,7 @@ class Proxy:
         self.pinned = set()
         self.quarantined = set()
         self.queues = {}
+        self.admissions = {}
         self.link_rate = self.policy.link_rate
         self.stop = threading.Event()
 
@@ -354,34 +355,42 @@ class Proxy:
     def prepare(self, client, body, explicit):
         if body.get("n", 1) != 1:
             raise ValueError("only one completion per request is supported")
-        if explicit:
-            with self.lock:
+        with self.lock:
+            if explicit:
                 try:
                     existing = self.store.get(explicit)
                 except KeyError:
                     existing = None
                 if existing and existing["client"] != client["id"]:
                     raise KeyError("session not found")
-                ticket = self.reserve(explicit)
-            # Reserve explicit IDs before any HTTP, so a slow tokenizer cannot invert their arrival order.
-            with ticket:
-                tokens = self.tokenize(body)
-                session = self.store.select(client["id"], tokens, explicit)
-                with self.slot_lease(session):
-                    yield self.prepare_session(client, body, session, tokens)
-            return
-        tokens = self.tokenize(body)
+            admission = self.admissions.setdefault(client["id"], SessionQueue()).reserve()
+        try:
+            tokens = self.tokenize(body)
+        except BaseException:
+            admission.__exit__(None, None, None)
+            raise
+        # HTTP classification runs concurrently; retire its metadata in arrival order before session admission.
+        with admission:
+            with self.lock:
+                if explicit and existing:
+                    session = existing
+                else:
+                    session = self.store.select(client["id"], tokens, explicit)
+                ticket = self.reserve(session["id"])
         while True:
+            with ticket:
+                if explicit:
+                    session = self.store.select(client["id"], tokens, explicit)
+                else:
+                    session = self.store.get(session["id"])
+                if explicit or tokens[:len(session["tokens"])] == session["tokens"]:
+                    with self.slot_lease(session):
+                        yield self.prepare_session(client, body, session, tokens)
+                    return
+            # A predecessor completed while queued; resolve its fork against the fresh journal.
             with self.lock:
                 session = self.store.select(client["id"], tokens)
                 ticket = self.reserve(session["id"])
-            with ticket:
-                session = self.store.get(session["id"])
-                if tokens[:len(session["tokens"])] != session["tokens"]:
-                    continue  # A predecessor completed while queued; resolve the fork against its fresh journal.
-                with self.slot_lease(session):
-                    yield self.prepare_session(client, body, session, tokens)
-                return
 
     def prepare_session(self, client, body, session, tokens):
         slot = session["slot"]

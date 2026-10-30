@@ -125,8 +125,8 @@ def main():
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         client = Node(f'http://127.0.0.1:{server.server_port}', 'fixture-native', timeout=120)
-        questions = ['Count the integers from one to one hundred, separated by commas.',
-                     'Count the integers from one hundred to two hundred, separated by commas.']
+        questions = ['Write integers 1 through 100 as decimal digits, separated by a comma and a space. Begin exactly: 1, 2, 3,',
+                     'Write integers 100 through 200 as decimal digits, separated by a comma and a space. Begin exactly: 100, 101, 102,']
 
         def chat(index, barrier=None):
             body = dict(messages=[dict(role='system', content='Follow the request exactly. ' * 16),
