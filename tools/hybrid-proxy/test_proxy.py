@@ -3,9 +3,11 @@ import hashlib
 import io
 from unittest import mock
 import http.server
+import http.client
 import json
 from pathlib import Path
 import struct
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -60,6 +62,16 @@ class TransferTests(unittest.TestCase):
         with mock.patch.object(node, "open", return_value=io.BytesIO(b"")):
             self.assertEqual(node.request("GET", "/empty", binary=True), b"")
         self.assertIsNone(node.last_transfer_rate)
+
+    # A truncated HTTP body is a reconnectable transport error, including during recovery GET.
+    def test_truncated_http_body_is_transport_error(self):
+        node = Node("http://127.0.0.1")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = http.client.IncompleteRead(b"", 10)
+        with mock.patch.object(node, "open", return_value=response):
+            with self.assertRaisesRegex(OSError, "connection interrupted"):
+                node.request("GET", "/snapshot", binary=True)
 
 
 class MappingTests(unittest.TestCase):
@@ -200,6 +212,141 @@ class HTTPTests(unittest.TestCase):
         continued, _ = self.chat(ahead + [66], sid=sid)
         self.assertEqual(continued, sid)
         self.assertEqual(self.app.store.get(sid)["tokens"], ahead + [66, 901, 902])
+
+    # An incompatible remote prefix must be rejected before decoder save/restore or journal changes.
+    def test_resync_incompatible_prefix_is_atomic(self):
+        sid, _ = self.chat([1, 2, 3])
+        self.app.replay()
+        self.app.replay()
+        session = self.app.store.get(sid)
+        before = self.decode.app.slots[session["slot"]][:]
+        with self.prefill.app.db:
+            self.prefill.app.db.execute("UPDATE sessions SET tokens=? WHERE id=?",
+                                        (json.dumps([8, 8, 8]), session["remote_id"]))
+        with mock.patch.object(self.app.decode, "request", wraps=self.app.decode.request) as decoder:
+            with self.assertRaises(HTTPError) as error:
+                self.app.resync(session, self.config["clients"]["fixture-a"], before + [4])
+            self.assertEqual(error.exception.status, 409)
+            decoder.assert_not_called()
+        self.assertEqual(self.decode.app.slots[session["slot"]], before)
+        self.assertEqual(self.app.store.get(sid), session)
+
+    # A foreign model is incompatible even when its token prefix happens to match the journal.
+    def test_resync_incompatible_model_is_atomic(self):
+        sid, _ = self.chat([21, 22, 23])
+        self.app.replay()
+        self.app.replay()
+        session = self.app.store.get(sid)
+        before = self.decode.app.slots[session["slot"]][:]
+        with mock.patch.object(self.prefill.app, "model", "f" * 64), mock.patch.object(self.app.decode, "request", wraps=self.app.decode.request) as decoder:
+            with self.assertRaises(HTTPError) as error:
+                self.app.resync(session, self.config["clients"]["fixture-a"], before + [4])
+            self.assertEqual(error.exception.status, 409)
+            decoder.assert_not_called()
+        self.assertEqual(self.decode.app.slots[session["slot"]], before)
+        self.assertEqual(self.app.store.get(sid), session)
+
+    # A changing snapshot or failed SQLite commit rolls the decoder back; the durable prefix stays old.
+    def test_resync_snapshot_and_journal_failures_roll_back(self):
+        for failure in ("snapshot", "journal"):
+            with self.subTest(failure=failure):
+                sid, _ = self.chat([31, 32, len(self.app.store.pending())])
+                self.app.replay()
+                self.app.replay()
+                session = self.app.store.get(sid)
+                before = self.decode.app.slots[session["slot"]][:]
+                ahead = before + [55]
+                with self.prefill.app.db:
+                    self.prefill.app.db.execute("UPDATE sessions SET tokens=? WHERE id=?",
+                                                (json.dumps(ahead), session["remote_id"]))
+                original = self.prefill.app.handle
+                def changed_snapshot(method, path, query, body, client):
+                    if failure == "snapshot" and path.endswith("/snapshot"):
+                        return 200, json.dumps(dict(model_sha256=MODEL, tokens=[8, 8, 8])).encode()
+                    return original(method, path, query, body, client)
+                if failure == "journal":
+                    self.app.store.db.execute("CREATE TEMP TRIGGER fail_commit BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END")
+                try:
+                    with mock.patch.object(self.prefill.app, "handle", side_effect=changed_snapshot):
+                        with self.assertRaises(HTTPError if failure == "snapshot" else sqlite3.IntegrityError) as error:
+                            self.app.resync(session, self.config["clients"]["fixture-a"], ahead + [66])
+                        if failure == "snapshot":
+                            self.assertEqual(error.exception.status, 409)
+                finally:
+                    if failure == "journal":
+                        self.app.store.db.execute("DROP TRIGGER fail_commit")
+                self.assertEqual(self.decode.app.slots[session["slot"]], before)
+                self.assertEqual(self.app.store.get(sid), session)
+
+    # Loss during either recovery branch must complete locally, then replay each token once on reconnect.
+    def test_recovery_get_outage_completes_locally_and_replays(self):
+        original = Node.open
+        for branch in ("divergence", "409"):
+            for outage in (OSError("recovery connection lost"), HTTPError(503), http.client.IncompleteRead(b"", 10)):
+                with self.subTest(branch=branch, outage=type(outage).__name__):
+                    sid, _ = self.chat([41, 42, len(self.app.store.pending())])
+                    self.app.replay()
+                    self.app.replay()
+                    session = self.app.store.get(sid)
+                    ahead = session["tokens"] + ([55] if branch == "divergence" else [])
+                    with self.prefill.app.db:
+                        self.prefill.app.db.execute("UPDATE sessions SET tokens=? WHERE id=?",
+                                                    (json.dumps(ahead), session["remote_id"]))
+                    self.prefill.app.conflict_once = branch == "409"
+                    calls = []
+                    def fail_recovery(node, method, path, data=None, headers=None):
+                        if node.url == self.url(self.prefill) and method == "GET" and path.startswith("/v1/sessions/"):
+                            calls.append(path)
+                            if len(calls) == 2:
+                                raise outage
+                        return original(node, method, path, data, headers)
+                    prompt = ahead + [66, 67]
+                    with mock.patch.object(Node, "open", new=fail_recovery):
+                        continued, _ = self.chat(prompt, sid=sid)
+                    self.assertEqual(continued, sid)
+                    self.assertEqual(len(calls), 2)
+                    local = self.app.store.get(sid)
+                    self.assertFalse(local["offload"])
+                    self.assertEqual(local["tokens"], prompt + [901, 902])
+                    self.app.replay()
+                    self.app.replay()
+                    remote = self.app.remote(self.config["clients"]["fixture-a"]).request("GET", "/v1/sessions/" + local["remote_id"])
+                    self.assertEqual(remote["tokens"], local["tokens"])
+
+    # Queued 202 shadows are not applied yet; FIFO drains before a critical extend and rejects stale duplicates.
+    def test_delayed_202_shadows_critical_drain_without_token_loss(self):
+        sid, _ = self.chat([10, 11, 12])
+        queued, applied = [], []
+        original = self.prefill.app.handle
+        def delayed(method, path, query, body, client):
+            if path.endswith("/extend"):
+                if not body["return_delta"]:
+                    queued.append((method, path, query, dict(body), client))
+                    return 202, None
+                for item in queued:
+                    applied.append(original(*item)[0])
+                queued.clear()
+            return original(method, path, query, body, client)
+        with mock.patch.object(self.prefill.app, "handle", side_effect=delayed):
+            self.app.replay()
+            self.app.replay()
+            self.app.replay()
+            self.assertEqual(len(queued), 3)
+            self.assertEqual(queued[0][3]["n0"], queued[1][3]["n0"])
+            old = self.app.store.get(sid)
+            continued, _ = self.chat(old["tokens"] + [13, 14], sid=sid)
+            self.assertEqual(continued, sid)
+            self.assertTrue(self.app.store.get(sid)["offload"])
+        self.assertEqual(applied[0], 202)
+        self.assertTrue(all(status == 409 for status in applied[1:]))
+        self.assertFalse(queued)
+        self.app.replay()
+        self.app.replay()
+        local = self.app.store.get(sid)
+        remote = self.app.remote(self.config["clients"]["fixture-a"]).request("GET", "/v1/sessions/" + local["remote_id"])
+        self.assertEqual(local["tokens"], old["tokens"] + [13, 14, 901, 902])
+        self.assertEqual(remote["tokens"], local["tokens"])
+        self.assertEqual(self.app.store.get(sid)["remote_n"], len(local["tokens"]))
 
     # A RAM-only server restart may lose the session ID; the journal recreates its full state once.
     def test_server_session_loss_recreates_and_replays(self):

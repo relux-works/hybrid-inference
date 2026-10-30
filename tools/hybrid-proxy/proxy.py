@@ -1,6 +1,7 @@
 """Hybrid client proxy. Credentials are read from a JSON file, never CLI arguments."""
 import argparse
 import http.server
+import http.client
 import json
 import logging
 import os
@@ -45,15 +46,18 @@ class Node:
                 raise HTTPError(error.code, error.read(MAX_JSON)) from None
 
     def request(self, method, path, data=None, headers=None, binary=False):
-        with self.open(method, path, data, headers) as response:
-            limit = MAX_DELTA if binary else MAX_JSON
-            started = time.monotonic()
-            body = response.read(limit + 1)
-            elapsed = max(time.monotonic() - started, 1e-6)
-            self.last_transfer_rate = len(body) / elapsed if body else None
-            if len(body) > limit:
-                raise ValueError("upstream body too large")
-            return body if binary else (json.loads(body) if body else None)
+        try:
+            with self.open(method, path, data, headers) as response:
+                limit = MAX_DELTA if binary else MAX_JSON
+                started = time.monotonic()
+                body = response.read(limit + 1)
+                elapsed = max(time.monotonic() - started, 1e-6)
+                self.last_transfer_rate = len(body) / elapsed if body else None
+                if len(body) > limit:
+                    raise ValueError("upstream body too large")
+                return body if binary else (json.loads(body) if body else None)
+        except http.client.HTTPException as error:
+            raise OSError("upstream HTTP connection interrupted") from error
 
 
 class Proxy:
@@ -123,32 +127,55 @@ class Proxy:
         info = node.request("GET", path)
         LOG.warning("resync session=%s local_hash=%s remote_hash=%s", session["id"],
                     prefix_hash(session["tokens"]), info.get("prefix_hash"))
+        if info["model_sha256"] != self.model:
+            raise HTTPError(409)
         if (0 <= info["n"] <= len(session["tokens"])
                 and info["prefix_hash"] == prefix_hash(session["tokens"][:info["n"]])):
             self.sync(session, client)
             return
-        if info["model_sha256"] != self.model:
+        n = info["n"]
+        if not 0 <= n <= len(prompt) or info["prefix_hash"] != prefix_hash(prompt[:n]):
             raise HTTPError(409)
         snapshot = node.request("GET", path + "/snapshot", binary=True)
         filename = session["id"] + "-resync.bin"
+        backup = session["id"] + "-resync-backup.bin"
         temporary = self.slot_path / (filename + ".tmp")
+        slot = f"/slots/{session['slot']}"
+        saved = False
         try:
             with open(temporary, "wb") as output:
                 output.write(snapshot)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, self.slot_path / filename)
-            self.decode.request("POST", f"/slots/{session['slot']}?action=restore", {"filename": filename})
+            self.decode.request("POST", slot + "?action=save", {"filename": backup})
+            saved = True
+            self.decode.request("POST", slot + "?action=restore", {"filename": filename})
+            actual = self.decode.request("GET", slot + "/info")
+            if (actual["n"] != n or actual["prefix_hash"] != info["prefix_hash"]
+                    or actual["tokens"] != prompt[:n]):
+                raise HTTPError(409)
+            updated = dict(session, tokens=actual["tokens"], remote_n=n)
+            self.store.save(updated)
+            session.update(updated)
+            saved = False
+        except Exception:
+            if saved:
+                self.decode.request("POST", slot + "?action=restore", {"filename": backup})
+            raise
         finally:
             temporary.unlink(missing_ok=True)
             (self.slot_path / filename).unlink(missing_ok=True)
-        actual = self.decode.request("GET", f"/slots/{session['slot']}/info")
-        if (actual["n"] != info["n"] or actual["prefix_hash"] != info["prefix_hash"]
-                or actual["tokens"] != prompt[:actual["n"]]):
-            raise HTTPError(409)
-        session["tokens"] = actual["tokens"]
-        session["remote_n"] = actual["n"]
-        self.store.save(session)
+            (self.slot_path / backup).unlink(missing_ok=True)
+
+    def recover(self, session, client, prompt):
+        try:
+            self.resync(session, client, prompt)
+        except OSError:
+            pass
+        except HTTPError as error:
+            if error.status not in (404, 408, 429, 500, 502, 503, 504):
+                raise
 
     def replay(self):
         for session in self.store.pending():
@@ -246,16 +273,13 @@ class Proxy:
             if error.status == 409:
                 LOG.warning("409 resync session=%s", session["id"])
                 # GET validates the acknowledged prefix; replay uses its exact boundary.
-                try:
-                    self.resync(session, client, tokens)
-                except OSError:
-                    pass
+                self.recover(session, client, tokens)
             elif error.status not in (404, 408, 429, 500, 502, 503, 504):
                 raise
             session["offload"] = False
         except ValueError:
             if session["remote_id"]:
-                self.resync(session, client, tokens)
+                self.recover(session, client, tokens)
             session["offload"] = False
         except OSError:
             session["offload"] = False
