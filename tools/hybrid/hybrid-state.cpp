@@ -77,15 +77,30 @@ static std::string checksums(const std::string & body) {
     return out;
 }
 
-std::string encode_delta(json header, const std::string & state) {
+static size_t header_budget(const json & header) {
+    require(header.at("n0").is_number_integer() && header.at("n1").is_number_integer(), "invalid positions");
+    int64_t n0 = header.at("n0").get<int64_t>();
+    int64_t n1 = header.at("n1").get<int64_t>();
+    require(n0 >= 0 && n1 > n0 && n1 <= INT32_MAX, "invalid positions");
+    // Nonnegative int32 IDs need at most ten digits and one separator each.
+    return std::min<uint64_t>(max_delta_header_bytes, 4096 + 11 * uint64_t(n1 - n0));
+}
+
+std::string encode_delta_header(json header, size_t state_bytes) {
     header["magic"] = "HYBD";
     header["version"] = 1;
     header["body_format"] = "llama-native-seq-v1";
     header["kv_type"] = "q8_0";
     header["state_dtype"] = "f32";
-    header["sections"] = json::array({{{"name", "llama_seq_state"}, {"offset", 0}, {"bytes", state.size()}}});
+    header["sections"] = json::array({{{"name", "llama_seq_state"}, {"offset", 0}, {"bytes", state_bytes}}});
     const std::string text = header.dump();
-    require(text.size() <= 65536 && !state.empty() && state.size() <= 512 * 1024 * 1024, "invalid delta size");
+    require(text.size() <= header_budget(header), "delta header exceeds range budget");
+    require(state_bytes > 0 && state_bytes <= max_delta_body_bytes, "invalid delta size");
+    return text;
+}
+
+std::string encode_delta(json header, const std::string & state) {
+    const std::string text = encode_delta_header(std::move(header), state.size());
     uint32_t n = text.size();
     std::string out;
     for (int i = 0; i < 4; ++i) { out += (char) (n >> (i * 8)); }
@@ -96,7 +111,7 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     require(wire.size() >= 4, "truncated delta length");
     uint32_t size = 0;
     for (int i = 0; i < 4; ++i) { size |= (uint32_t) (unsigned char) wire[i] << (8 * i); }
-    require(size <= 65536 && size <= wire.size() - 4, "invalid delta header length");
+    require(size <= max_delta_header_bytes && size <= wire.size() - 4, "invalid delta header length");
     json h = parse_json(wire.substr(4, size));
     require(h.is_object() && h.at("magic") == "HYBD" && h.at("version").is_number_integer() && h.at("version") == 1, "unsupported delta version");
     require(h.at("body_format") == "llama-native-seq-v1" && h.at("kv_type") == "q8_0" && h.at("state_dtype") == "f32", "unsupported delta layout");
@@ -104,6 +119,7 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     require(h.at("session_id").is_string() && !h.at("session_id").get<std::string>().empty(), "invalid session id");
     require(h.at("n0").is_number_integer() && h.at("n1").is_number_integer(), "invalid positions");
     require(n0 >= 0 && h.at("n0").get<int64_t>() == n0 && h.at("n1").get<int64_t>() > n0 && h.at("n1").get<int64_t>() <= INT32_MAX, "position gap or overlap");
+    require(size <= header_budget(h), "delta header exceeds range budget");
     auto hash = h.at("prefix_hash_n1").get<std::string>();
     require(hash.size() == 64 && hash.find_first_not_of("0123456789abcdef") == std::string::npos, "invalid prefix hash");
     const auto & tokens = h.at("tokens");
@@ -119,7 +135,7 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     const auto & section = sections[0];
     require(section.at("name") == "llama_seq_state" && section.at("offset") == 0 && section.at("bytes").is_number_unsigned(), "invalid section layout");
     uint64_t bytes = section.at("bytes").get<uint64_t>();
-    require(bytes > 0 && bytes <= 512 * 1024 * 1024 && wire.size() - 4 - size == bytes + 48, "truncated or trailing delta bytes");
+    require(bytes > 0 && bytes <= max_delta_body_bytes && wire.size() - 4 - size == bytes + 48, "truncated or trailing delta bytes");
     std::string state = wire.substr(4 + size, bytes);
     require(wire.substr(4 + size + bytes) == checksums(state), "delta checksum mismatch");
     return {std::move(h), std::move(state)};

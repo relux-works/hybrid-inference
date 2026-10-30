@@ -1,5 +1,6 @@
 #include "common.h"
 #include "http.h"
+#include "hybrid-state.h"
 #include "server-http.h"
 #include "server-common.h"
 #include "ui.h"
@@ -216,6 +217,9 @@ bool server_http_context::init_listener(const common_params & params) {
     // set timeouts and change hostname and port
     srv->set_read_timeout (params.timeout_read);
     srv->set_write_timeout(params.timeout_write);
+    if (params.endpoint_slots && !params.slot_save_path.empty()) {
+        srv->set_payload_max_length(hybrid::max_delta_body_bytes + hybrid::max_delta_header_bytes + 52);
+    }
     srv->set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
         if (reuse_port) {

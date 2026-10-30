@@ -13,6 +13,9 @@ json parse_json(const std::string & text);
 std::string prefix_hash(const std::vector<llama_token> & tokens);
 std::string file_hash(const std::string & path);
 std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1);
+constexpr size_t max_delta_header_bytes = 1024 * 1024;
+constexpr size_t max_delta_body_bytes = 512 * 1024 * 1024;
+std::string encode_delta_header(json header, size_t state_bytes);
 std::string encode_delta(json header, const std::string & state);
 struct delta {
     json header;

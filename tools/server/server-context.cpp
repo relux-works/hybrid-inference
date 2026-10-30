@@ -1631,6 +1631,17 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
+        if (params_base.endpoint_slots && !params_base.slot_save_path.empty()) {
+            const int64_t started = ggml_time_us();
+            try {
+                hybrid_model_hash = hybrid::file_hash(params_base.model.path);
+            } catch (const std::exception & error) {
+                SRV_ERR("hybrid model hash failed: %s\n", error.what());
+                return false;
+            }
+            SRV_INF("hybrid model SHA-256 ready in %.2f ms\n", (ggml_time_us() - started) / 1000.0);
+        }
+
         // propagate new defaults back to caller
         params = params_base;
 
@@ -3239,7 +3250,7 @@ private:
                         }
                         if (task.type == SERVER_TASK_TYPE_SLOT_IMPORT_DELTA) {
                             if (hybrid_model_hash.empty()) {
-                                hybrid_model_hash = hybrid::file_hash(params_base.model.path);
+                                throw std::runtime_error("Hybrid model hash was not initialized at startup");
                             }
                             auto delta = hybrid::read_delta(task.slot_action.delta, hybrid_model_hash, n);
                             if (delta.header.at("session_id") != task.slot_action.session_id) {
@@ -6842,7 +6853,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
         res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
-    if (!info && (req.body.empty() || req.body.size() > 512u * 1024 * 1024 + 65536 + 52)) {
+    if (!info && (req.body.empty() || req.body.size() > hybrid::max_delta_body_bytes + hybrid::max_delta_header_bytes + 52)) {
         res->error(format_error_response("Invalid delta size", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
