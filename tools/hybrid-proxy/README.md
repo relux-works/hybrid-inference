@@ -2,6 +2,18 @@
 
 This directory contains the Python client side of the hybrid prefill/decode prototype. Run commands from the repository root. Python 3.10+ and its standard library are sufficient for the proxy. The synthetic stub additionally calls the already installed `libxxhash` through `ctypes`; it does not install a Python package. The real delta reader is shared with producer A in `tools/hybrid`.
 
+## M0.2 API scope check
+
+Append-only message sessions are blocked pending authorization for a llama-server API change. The runtime remains M0.1. See [m02-append-only-261030.md](m02-append-only-261030.md) for the native controls, checkpoint findings and proposed extension.
+
+`probe_append_api.py` starts and stops one existing CPU server by PID. It checks exact token input on raw completion versus chat, generated-ID visibility, tool-stream logprobs rejection and native checkpoint reuse. It uses only the small model and writes its command, identities, server PID, results and cleanup evidence below `--artifacts`. It does not build or test the M0.2 feature.
+
+```sh
+python3 tools/hybrid-proxy/probe_append_api.py --binary build/bin/llama-server --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/append-api
+```
+
+Add `--template /home/agent/lanes/hybrid/.temp/research/qwen3.8-27b-chat_template.jinja` to exercise the target template on the same small model. Add `--require-chat-token-input` for the expected-red prerequisite check: the current chat route ignores the supplied token array and the command exits 1. This is a diagnostic for the current API, not a general template or append-equivalence gate.
+
 ## Run the synthetic path
 
 The example contains public fixture credentials, not deployment credentials. Start these three commands in separate terminals:
