@@ -84,6 +84,7 @@ implementations and added O1–O5.
 ## Addendum: M0.1, concurrent proxy sessions (accepted)
 
 - **Head:** `m01-proxy-concurrency` at `8e892551`, on top of `prototype-m0` `7d37eab0`. Proxy-only change: commits `1d53c0f4` and `5199481b`, with the report at `tools/hybrid-proxy/m01-concurrency-261030.md`.
+- **Specification:** v0.3.6, which adds the proxy-concurrency rules to section 4a.
 - **Review:** producer A accepted it in `tools/hybrid/review-m01-of-b-261030.md` (`hybrid-server` `5c8cc7ac`).
   - All 38 tests pass.
   - Two native sessions overlap by 2.27 s, both slots processing, and each matches a solo run 64/64.

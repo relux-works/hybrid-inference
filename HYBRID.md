@@ -5,7 +5,7 @@ Private working repository of the hybrid inference prototype by Relux Works. Own
 The idea: a GPU server prefills an agent session and ships the model state to a unified-memory client (a Mac). The
 state is the attention KV of the new positions plus the fixed recurrent state of the linear-attention layers. The
 client continues decoding as if it had prefilled locally. The specification is `docs/hybrid/prototype-spec.md`
-(v0.3.5); the M0 review verdict is `docs/hybrid/m0-verdict.md`.
+(v0.3.6); the M0 review verdict is `docs/hybrid/m0-verdict.md`.
 
 ## Branches
 

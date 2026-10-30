@@ -1,6 +1,6 @@
 # Hybrid prefill/decode prototype: technical specification
 
-Version 0.3.5, 2026-10-30. Owner: Ivan Oparin (Relux Works). Author: agents1 hybrid lane.
+Version 0.3.6, 2026-10-30. Owner: Ivan Oparin (Relux Works). Author: agents1 hybrid lane.
 Status: approved for development by Ivan on 2026-10-30. Section 12 gives the work split and
 section 14 the decisions, including what is still open. v0.3 adds several clients with several
 sessions each (section 4a).
@@ -97,6 +97,12 @@ Added in v0.3 at Ivan's request: the prototype serves several clients, each with
      slot save to local SSD, and restores it on its next request.
    - A parked session still continues by delta from the server: the proxy restores it, then
      imports the delta.
+- **Proxy concurrency** (v0.3.6, after review finding O4).
+   - The proxy decodes different sessions at the same time, one session per slot.
+   - A session's own requests are serialized by that session's lock, in arrival order.
+   - Shared state is locked only for short critical sections, never while streaming. Shared state means the slot table, the store and the link-rate estimate.
+   - A slot is pinned while its session has a request in progress, and eviction never takes a pinned slot.
+   - When every slot is pinned, a new session waits up to 30 s for a slot, then gets `503` with `Retry-After`.
 - **Prefill node scheduling.**
    - Each session has its own lock and FIFO, because extends are append-only.
    - Across sessions, latency-critical extends go first, round-robin by client so one client
