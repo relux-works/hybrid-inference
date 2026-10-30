@@ -1,10 +1,12 @@
 #include "hybrid-state.h"
 #include "hybrid-scheduler.h"
 #include "httplib.h"
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <random>
 
 using hybrid::json;
@@ -14,6 +16,43 @@ struct session {
     std::string state;
     int64_t last_used = 0;
 };
+
+class response_budget {
+    std::mutex mutex;
+    size_t active = 0;
+    std::map<std::string, size_t> clients;
+
+    struct lease {
+        response_budget & owner;
+        std::string client;
+        lease(response_budget & owner, const std::string & client) : owner(owner), client(client) {}
+        ~lease() {
+            std::lock_guard<std::mutex> lock(owner.mutex);
+            --owner.active;
+            --owner.clients.at(client);
+        }
+    };
+
+public:
+    std::shared_ptr<void> acquire(const std::string & client) {
+        std::lock_guard<std::mutex> lock(mutex);
+        // Reserve one of the four HTTP workers for admission and control requests.
+        if (active >= 3 || clients[client] >= 2) { return {}; }
+        auto permit = std::make_shared<lease>(*this, client);
+        ++active;
+        ++clients[client];
+        return permit;
+    }
+};
+
+static void send_binary(httplib::Response & res, std::string wire) {
+    res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire)](size_t offset, httplib::DataSink & sink) {
+        size_t n = std::min<size_t>(65536, wire.size() - offset);
+        if (n && !sink.write(wire.data() + offset, n)) { return false; }
+        if (offset + n == wire.size()) { sink.done(); }
+        return true;
+    });
+}
 
 static int64_t now() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -82,39 +121,49 @@ int main(int argc, char ** argv) {
         const std::string empty_state = hybrid::save_state(ctx.get());
         std::map<std::string, std::map<std::string, session>> sessions;
         hybrid::request_scheduler scheduler;
-        size_t ram_bytes = 0;
-        uint64_t extends = 0;
+        std::atomic<size_t> ram_bytes{0};
+        std::atomic<uint64_t> extends{0};
+        response_budget responses;
         httplib::Server http;
         http.set_payload_max_length(1024 * 1024);
         http.set_read_timeout(30, 0);
         http.set_write_timeout(3600, 0);
+        http.set_keep_alive_max_count(1);
         http.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
-            auto owner_it = owners.find(req.get_header_value("Authorization"));
-            const std::string client = owner_it == owners.end() ? "" : owner_it->second;
+            if (req.path == "/v1/health") {
+                respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}});
+                return;
+            }
+            if (req.path == "/metrics") {
+                res.set_content("hybrid_extends_total " + std::to_string(extends.load()) + "\nhybrid_ram_bytes " + std::to_string(ram_bytes.load()) + "\n", "text/plain");
+                return;
+            }
+            auto owner = owners.find(req.get_header_value("Authorization"));
+            if (owner == owners.end()) {
+                res.set_header("WWW-Authenticate", "Bearer");
+                respond(res, 401, {{"error", "unauthorized"}});
+                return;
+            }
+            const std::string & client = owner->second;
+            auto permit = responses.acquire(client);
+            if (!permit) {
+                res.set_header("Retry-After", "1");
+                respond(res, 429, {{"error", "binary response limit"}});
+                return;
+            }
+            // Response ownership covers queued work and every response type, including errors.
+            res.user_data.set("hybrid_permit", std::move(permit));
             const std::string session_id = req.path.size() >= 45 ? req.path.substr(13, 32) : "";
             bool critical = true;
             if (req.method == "POST" && req.path.find("/extend") != std::string::npos) {
                 try { critical = hybrid::parse_json(req.body).value("return_delta", true); }
                 catch (const std::exception &) { /* Invalid requests are rejected below. */ }
             }
-            auto admission = scheduler.enter(client, session_id, critical);
+            auto admission = scheduler.enter(client, session_id, critical, req.is_connection_closed);
+            if (!admission) { return; }
             try {
-                if (req.path == "/v1/health") {
-                    respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}});
-                    return;
-                }
-                if (req.path == "/metrics") {
-                    res.set_content("hybrid_extends_total " + std::to_string(extends) + "\nhybrid_ram_bytes " + std::to_string(ram_bytes) + "\n", "text/plain");
-                    return;
-                }
-                auto owner = owners.find(req.get_header_value("Authorization"));
-                if (owner == owners.end()) {
-                    res.set_header("WWW-Authenticate", "Bearer");
-                    respond(res, 401, {{"error", "unauthorized"}});
-                    return;
-                }
                 auto & space = sessions[owner->second];
                 const std::string base = "/v1/sessions";
                 if (req.path == base) {
@@ -155,7 +204,7 @@ int main(int argc, char ** argv) {
                 } else if (req.method == "GET" && action.empty()) {
                     respond(res, 200, info(s, model_hash));
                 } else if (req.method == "GET" && action == "snapshot") {
-                    res.set_content(snapshot(s, empty_state), "application/octet-stream");
+                    send_binary(res, snapshot(s, empty_state));
                 } else if (req.method == "POST" && action == "extend") {
                     json body = hybrid::parse_json(req.body);
                     if (!body.at("n0").is_number_integer() || !body.at("prefix_hash_n0").is_string()) {
@@ -178,13 +227,20 @@ int main(int argc, char ** argv) {
                         tokens.push_back(token.get<llama_token>());
                     }
                     const size_t n0 = s.tokens.size();
-                    hybrid::load_state(ctx.get(), s.state);
-                    hybrid::prefill(ctx.get(), tokens, n0);
                     std::vector<llama_token> all = s.tokens;
                     all.insert(all.end(), tokens.begin(), tokens.end());
+                    const bool return_delta = body.at("return_delta").get<bool>();
+                    json header;
+                    if (return_delta) {
+                        header = {{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}};
+                        // Use the largest body length so the header budget is checked before inference.
+                        hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
+                    }
+                    hybrid::load_state(ctx.get(), s.state);
+                    hybrid::prefill(ctx.get(), tokens, n0);
                     std::string wire;
-                    if (body.at("return_delta").get<bool>()) {
-                        wire = hybrid::encode_delta({{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}}, hybrid::export_range(ctx.get(), n0, all.size()));
+                    if (return_delta) {
+                        wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size()));
                     }
                     std::string state = hybrid::save_state(ctx.get());
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);
@@ -198,12 +254,7 @@ int main(int argc, char ** argv) {
                     s.last_used = now();
                     ++extends;
                     if (!wire.empty()) {
-                        res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire)](size_t offset, httplib::DataSink & sink) {
-                            size_t n = std::min<size_t>(65536, wire.size() - offset);
-                            if (n && !sink.write(wire.data() + offset, n)) { return false; }
-                            if (offset + n == wire.size()) { sink.done(); }
-                            return true;
-                        });
+                        send_binary(res, std::move(wire));
                     } else {
                         respond(res, 202, {{"n", s.tokens.size()}, {"prefix_hash", hybrid::prefix_hash(s.tokens)}});
                     }

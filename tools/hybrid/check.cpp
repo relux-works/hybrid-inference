@@ -86,6 +86,30 @@ static void codec_tests() {
     auto wrong_prefix = h;
     wrong_prefix["prefix_hash_n1"] = std::string(64, '0');
     rejects("prefix-hash", hybrid::encode_delta(wrong_prefix, "abc"), hash, 0, "prefix hash mismatch");
+    // The maximum node range fits even with ten-digit int32 IDs; both readers and writers enforce the range budget.
+    std::vector<llama_token> maximum_tokens(16384, INT32_MAX);
+    auto maximum = header(hash, 0, maximum_tokens.size(), maximum_tokens);
+    auto maximum_text = hybrid::encode_delta_header(maximum, hybrid::max_delta_body_bytes);
+    require(maximum_text.size() > 65536 && maximum_text.size() <= 4096 + 11 * 16384, "maximum header budget");
+    auto maximum_delta = hybrid::read_delta(hybrid::encode_delta(maximum, "abc"), hash, 0);
+    require(maximum_delta.state == "abc" && maximum_delta.header.at("tokens").get<std::vector<llama_token>>() == maximum_tokens, "maximum header round trip");
+    auto padded = h;
+    padded["padding"] = std::string(4096, 'x');
+    bool rejected = false;
+    try { hybrid::encode_delta_header(padded, hybrid::max_delta_body_bytes); }
+    catch (const std::exception & e) { rejected = std::string(e.what()) == "delta header exceeds range budget"; }
+    require(rejected, "writer header budget not enforced");
+    padded = hybrid::parse_json(wire.substr(4, length));
+    padded["padding"] = std::string(4096, 'x');
+    const auto padded_text = padded.dump();
+    std::string padded_wire;
+    for (int i = 0; i < 4; ++i) { padded_wire += (char) (padded_text.size() >> (8 * i)); }
+    padded_wire += padded_text + wire.substr(4 + length);
+    rejects("reader-range-header-budget", padded_wire, hash, 0, "delta header exceeds range budget");
+    std::string oversized_length;
+    for (int i = 0; i < 4; ++i) { oversized_length += (char) ((1048577u >> (8 * i)) & 255); }
+    rejects("reader-absolute-header-budget", oversized_length, hash, 0, "invalid delta header length");
+    std::cout << "PASS test_header_budget_int32_max_16384: " << maximum_text.size() << " bytes with largest body metadata; writer/reader over-budget rejection\n";
     std::cout << "PASS codec positive and negative controls\n";
 }
 

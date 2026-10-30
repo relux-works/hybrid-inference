@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -44,23 +46,32 @@ class request_scheduler {
 public:
     class lease {
     public:
-        explicit lease(request_scheduler & scheduler) : scheduler(scheduler) {}
+        explicit lease(request_scheduler & scheduler, bool active = true) : scheduler(scheduler), active(active) {}
         lease(const lease &) = delete;
+        explicit operator bool() const { return active; }
         ~lease() {
+            if (!active) { return; }
             std::lock_guard<std::mutex> lock(scheduler.mutex);
             scheduler.busy = false;
             scheduler.changed.notify_all();
         }
     private:
         request_scheduler & scheduler;
+        bool active;
     };
 
-    lease enter(const std::string & client, const std::string & session, bool critical) {
+    lease enter(const std::string & client, const std::string & session, bool critical, const std::function<bool()> & disconnected) {
         request_ticket ticket{client, session, critical};
         std::unique_lock<std::mutex> lock(mutex);
         queue.push_back(&ticket);
-        changed.wait(lock, [&] { return !busy && next_request(queue, last_client) == &ticket; });
+        while (!disconnected() && (busy || next_request(queue, last_client) != &ticket)) {
+            changed.wait_for(lock, std::chrono::milliseconds(50));
+        }
         queue.erase(std::find(queue.begin(), queue.end(), &ticket));
+        if (disconnected()) {
+            changed.notify_all();
+            return lease(*this, false);
+        }
         busy = true;
         last_client = client;
         return lease(*this);
