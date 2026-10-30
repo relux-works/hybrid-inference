@@ -10,29 +10,26 @@ class JournalConflict(ValueError):
     pass
 
 
-def message_identity(message):
-    result = {key: copy.deepcopy(message[key]) for key in
-              ("role", "content", "reasoning_content", "tool_calls", "tool_call_id", "name") if key in message}
-    if result.get("role") == "assistant":
-        result["content"] = result.get("content") or ""
-        result["reasoning_content"] = result.get("reasoning_content") or ""
-    for call in result.get("tool_calls", []):
-        function = call.get("function", {})
-        if isinstance(function.get("arguments"), str):
+def message_identity(message, omit_reasoning=False):
+    result = copy.deepcopy(message)
+    if omit_reasoning:
+        result.pop("reasoning_content", None)
+    calls = result.get("tool_calls")
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if isinstance(function, dict) and isinstance(function.get("arguments"), str):
             try:
                 function["arguments"] = json.loads(function["arguments"])
             except ValueError:
                 pass
-    return result
+    # JSON encoding preserves scalar types and absent keys through nested lists/objects; Python equality does not.
+    return json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def matching_messages(recorded, incoming):
     for index, (old, new) in enumerate(zip(recorded, incoming)):
-        a, b = message_identity(old), message_identity(new)
-        if b.get("role") == "assistant" and "reasoning_content" not in new:
-            a.pop("reasoning_content", None)
-            b.pop("reasoning_content", None)
-        if a != b:
+        omit_reasoning = new.get("role") == "assistant" and "reasoning_content" not in new
+        if message_identity(old, omit_reasoning) != message_identity(new, omit_reasoning):
             return index
     return min(len(recorded), len(incoming))
 
