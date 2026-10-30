@@ -1,6 +1,6 @@
 # Hybrid prefill/decode prototype: technical specification
 
-Version 0.3.2, 2026-10-30. Owner: Ivan Oparin (Relux Works). Author: agents1 hybrid lane.
+Version 0.3.5, 2026-10-30. Owner: Ivan Oparin (Relux Works). Author: agents1 hybrid lane.
 Status: approved for development by Ivan on 2026-10-30. Section 12 gives the work split and
 section 14 the decisions, including what is still open. v0.3 adds several clients with several
 sessions each (section 4a).
@@ -129,6 +129,14 @@ Rules:
 - Shadow extends of the same session are applied in order and may be batched: one prefill for
    several queued deltas.
 - A latency-critical `extend` first drains the session's shadow queue, then prefills the new tokens.
+- **Admission** (v0.3.5, after cross-review findings F1 and F1-R2). A request that waits for the model is
+   admitted before it waits. This covers every `extend` and `snapshot`, and any other route that takes the
+   model lease. A permit lasts from admission until the response is complete or the client disconnects, so it
+   covers time spent queued, prefilling and streaming. The server holds at most 2 permits per client and 3 in
+   total, with 4 HTTP workers, so one worker always stays free. A request over either limit gets `429` with
+   `Retry-After: 1` at once, before it waits, runs inference or changes a session. Health and metrics never take
+   the model lease. Counting only responses that are already streaming is not enough: requests queued for the
+   model also hold HTTP workers (finding F1-R2).
 
 ## 6. State-delta format
 
@@ -152,6 +160,10 @@ Wire encoding of version 1 (fixed on 2026-10-30, agreed with both producers):
    bytes, then the raw 32-byte SHA-256 of the whole body.
 - **prefix_hash_n.** SHA-256 over token ids [0, n) as little-endian int32. The proxy's 256-token block
    hashes use the same function.
+- **Header budget** (v0.3.3, after cross-review finding F2). The JSON header may be at most
+   min(1,048,576, 4,096 + 11 × (n1 − n0)) bytes. That covers worst-case int32 token ids up to 16,384 tokens per
+   delta. Both sides validate the range first and the header size second. The server checks the budget before it
+   runs inference. Readers accept envelopes up to the 1 MiB cap.
 - Version 1 has no compression. M4 adds an optional zstd per section and lower-precision dtypes.
 
 ## 7. Flows
@@ -239,13 +251,21 @@ statistics (`agent_session_stats.py` output) and a link model, and prints the pr
 ## 11. Tests and acceptance
 
 The equivalence tests compare the decode after a state-delta import of [0, n−1) followed by a local
-evaluation of token n−1 (section 7.3) with the decode after local
-prefill of the same tokens:
-- same backend: greedy tokens identical for 64 tokens on at least 95% of test prompts;
-- CUDA server with Metal client: identical for 64 tokens on at least 90%, mean KL at most 0.01
-   nats/token over the first 64 positions. Batching and backends are not bit-deterministic, so these
-   thresholds are to be calibrated in M0;
-- prompts: 50 synthetic and real agent prompts at 4k, 32k and 128k depth.
+evaluation of token n−1 (section 7.3) with a local decode of the same tokens. There are two references,
+because floating-point results depend on how the prompt is split into batches. Finding of 2026-10-30, on CPU:
+the hybrid path matched a local path with the same split (421 tokens, then the held token) 64/64. A whole-prompt
+local prefill of the same 422 tokens diverged at generated token 39.
+- **Same-partition reference** (exactness of the transfer): locally prefill [0, n−1), evaluate token n−1 alone,
+   then decode. On the same backend, greedy tokens must be identical for 64 tokens on every test prompt. A
+   mismatch here is a transfer defect.
+- **Whole-prompt reference** (numerical closeness): a plain local prefill of [0, n). Compare distributions, not
+   free-running text. Use teacher forcing: run both paths over the same 64 continuation tokens and compare the
+   next-token distributions at every position. Mean KL must be at most 0.01 nats/token, and greedy-top-1
+   agreement at least 95% of positions. Also report the first index where free-running greedy decoding diverges;
+   it is information, not a pass/fail gate.
+- CUDA server with Metal client: the same two references, with thresholds calibrated in M1, because backends
+   are not bit-identical either.
+- Prompts: 50 synthetic and real agent prompts at 4k, 32k and 128k depth.
 
 Negative tests:
 - each must fail with a clear error and leave the slot unchanged:
