@@ -32,7 +32,9 @@ def main():
     base = f"http://127.0.0.1:{args.port}"
 
     def request(method, path, client="a", body=None, expected=200):
-        headers = {"Authorization": "Bearer " + clients[client], "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if client is not None:
+            headers["Authorization"] = "Bearer " + clients[client]
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
         try:
@@ -60,6 +62,7 @@ def main():
         else:
             raise AssertionError("prefill startup timed out")
         model_hash = health["model_sha256"]
+        request("GET", "/v1/sessions", client=None, expected=401)
         # Each rejection preserves the session list or existing session count, hash and snapshot bytes.
         request("POST", "/v1/sessions", body={"model_sha256": "0" * 64}, expected=400)
         assert request("GET", "/v1/sessions") == []
@@ -79,6 +82,7 @@ def main():
         state_before = request("GET", path + "/snapshot")
         assert struct.unpack_from("<III", state_before)[1:] == (4, 2)
         assert struct.unpack_from("<ii", state_before, 12) == (100, 101)
+        assert state_before[20:] == native[8:]
         for n0 in (0, 1, 3, -1):
             invalid = dict(append, n0=n0)
             response = request("POST", path + "/extend", body=invalid, expected=409)
@@ -95,22 +99,28 @@ def main():
         print("PASS wrong model, gap/overlap, prefix mismatch, token bounds, foreign read/extend/snapshot/delete; rejection leaves count/hash/snapshot unchanged")
 
         # Three clients each retain four independent sessions through interleaved offload and shadow appends.
-        def exercise(pair):
-            client, index = pair
-            other = request("POST", "/v1/sessions", client, {"model_sha256": model_hash})["session_id"]
+        cases = [(client, index, request("POST", "/v1/sessions", client, {"model_sha256": model_hash})["session_id"])
+                 for index in range(4) for client in clients]
+        assert all(len(request("GET", "/v1/sessions", client)) >= 4 for client in clients)
+
+        def exercise(case):
+            client, index, other = case
             endpoint = "/v1/sessions/" + other
             tokens = [110 + index, 120 + index]
             request("POST", endpoint + "/extend", client, {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": tokens, "return_delta": True})
             request("POST", endpoint + "/extend", client, {"n0": 2, "prefix_hash_n0": prefix(tokens), "tokens": [130 + index], "return_delta": False}, 202)
             final = request("GET", endpoint, client)
             assert final["n"] == 3 and final["prefix_hash"] == prefix(tokens + [130 + index])
-            request("DELETE", endpoint, client, expected=204)
             return other
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            ids = list(pool.map(exercise, [(client, index) for client in clients for index in range(4)]))
+            ids = list(pool.map(exercise, cases))
         assert len(set(ids)) == 12
+        for client, _, other in cases:
+            request("DELETE", "/v1/sessions/" + other, client, expected=204)
         request("DELETE", path, expected=204)
         request("GET", path, expected=404)
+        assert all(request("GET", "/v1/sessions", client) == [] for client in clients)
+        assert b"hybrid_ram_bytes 0\n" in request("GET", "/metrics")
         print("PASS 3 clients x 4 sessions, interleaved offload/shadow, distinct IDs, expected prefix hashes, deletion")
     finally:
         process.terminate()
