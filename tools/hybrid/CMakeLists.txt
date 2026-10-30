@@ -1,4 +1,5 @@
 add_library(hybrid-state STATIC hybrid-state.cpp)
+set_target_properties(hybrid-state PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(hybrid-state PUBLIC llama vendor::hash vendor::nlohmann)
 target_include_directories(hybrid-state PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(hybrid-state PUBLIC cxx_std_17)
@@ -12,3 +13,9 @@ target_link_libraries(llama-hybrid-check PRIVATE hybrid-state)
 
 add_executable(llama-hybrid-check-append check-append.cpp)
 target_link_libraries(llama-hybrid-check-append PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-check-guards check-guards.cpp)
+target_link_libraries(llama-hybrid-check-guards PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-check-distributions check-distributions.cpp)
+target_link_libraries(llama-hybrid-check-distributions PRIVATE hybrid-state)
