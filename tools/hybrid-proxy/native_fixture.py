@@ -35,6 +35,8 @@ def native_server(binary, model, root, template=None, checkpoints=32):
         command += ["--chat-template-file", str(template)]
     (root / "identity.json").write_text(json.dumps(dict(command=command,
         binary_sha256=hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+        libraries={name: hashlib.sha256((Path(binary).resolve().parent / name).read_bytes()).hexdigest()
+                   for name in ("libllama.so", "libllama-server-impl.so") if (Path(binary).resolve().parent / name).exists()},
         template_sha256=hashlib.sha256(Path(template).read_bytes()).hexdigest() if template else None), indent=2))
     with (root / "server.log").open("wb") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)

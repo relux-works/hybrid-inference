@@ -141,7 +141,7 @@ class ConcurrencyTests(unittest.TestCase):
         first.result(timeout=5)
         with self.assertRaises(HTTPError) as error:
             stale.result(timeout=5)
-        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.status, 409)
         self.assertEqual(self.app.store.get('fifo')['tokens'], [10, 901, 902])
 
     # Inferred requests serialize once identified; they reload the predecessor's completed journal before continuing.

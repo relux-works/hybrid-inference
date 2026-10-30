@@ -1,5 +1,7 @@
 """Hybrid client proxy. Credentials are read from a JSON file, never CLI arguments."""
 import argparse
+import copy
+import hashlib
 from contextlib import contextmanager
 import http.server
 import http.client
@@ -15,6 +17,7 @@ import urllib.request
 
 from policy import Policy
 from concurrency import SessionQueue
+from journal import Capture, JournalConflict, Renderer, matching_messages, settings_identity
 from store import Store, prefix_hash
 
 LOG = logging.getLogger("hybrid")
@@ -100,6 +103,7 @@ class Proxy:
         self.admissions = {}
         self.link_rate = self.policy.link_rate
         self.stop = threading.Event()
+        self.renderer = Renderer(self.decode)
 
     def client(self, authorization):
         value = self.clients.get(authorization.removeprefix("Bearer ")) if authorization.startswith("Bearer ") else None
@@ -148,11 +152,30 @@ class Proxy:
             LOG.error("divergence session=%s local_hash=%s remote_hash=%s", session["id"],
                       prefix_hash(session["tokens"]), info.get("prefix_hash"))
             raise ValueError("server prefix diverged; explicit snapshot recovery required")
+        acknowledged = max(0, n - session["remote_n"])
+        if acknowledged:
+            session["_remote_replayed"] = session.get("_remote_replayed", 0) + acknowledged
+            LOG.info("remote_applied session=%s n0=%d n1=%d kind=shadow", session["id"], session["remote_n"], n)
         session["remote_n"] = n
         self.store.save(session)
         if n < len(session["tokens"]):
             node.request("POST", path + "/extend", {"n0": n, "prefix_hash_n0": prefix_hash(session["tokens"][:n]),
                          "tokens": session["tokens"][n:], "return_delta": False})
+        journal = session.get("journal")
+        if journal:
+            retired = journal.get("retired_remote_ids", [])
+            for sid in retired[:1]:
+                if sid == session["remote_id"]:
+                    continue
+                try:
+                    node.request("DELETE", "/v1/sessions/" + urllib.parse.quote(sid, safe=""))
+                except HTTPError as error:
+                    if error.status != 404:
+                        continue
+                except OSError:
+                    continue
+                journal["retired_remote_ids"] = [value for value in retired if value != sid]
+                self.store.save(session)
         return path
 
     def resync(self, session, client, prompt):
@@ -329,7 +352,8 @@ class Proxy:
 
     def acquire_slot(self, session):
         # Called only while the slot lease is pinned and the native slot is idle.
-        rollback_pending = (self.slot_path / (session["id"] + "-resync-backup.bin")).exists()
+        rollback_pending = any((self.slot_path / (session["id"] + suffix)).exists()
+                               for suffix in ("-resync-backup.bin", "-rewrite-backup.bin"))
         slot = session["slot"]
         if rollback_pending:
             self.decode.request("POST", f"/slots/{slot}?action=erase", {})
@@ -337,7 +361,7 @@ class Proxy:
             return slot
         if not self.verified(session["id"]):
             info = self.decode.request("GET", f"/slots/{slot}/info")
-            if (info["n"] >= len(session["tokens"])
+            if (not (session.get("_message_mode") or session.get("journal")) and info["n"] >= len(session["tokens"])
                     and info.get("tokens", [])[:len(session["tokens"])] == session["tokens"]
                     and prefix_hash(info.get("tokens", [])) == info["prefix_hash"]):
                 session["tokens"] = info["tokens"]
@@ -355,6 +379,10 @@ class Proxy:
     def prepare(self, client, body, explicit):
         if body.get("n", 1) != 1:
             raise ValueError("only one completion per request is supported")
+        if "prompt_tokens" in body:
+            raise ValueError("prompt_tokens is managed by the proxy")
+        messages = body.get("messages")
+        message_mode = isinstance(messages, list) and bool(messages)
         with self.lock:
             if explicit:
                 try:
@@ -366,41 +394,207 @@ class Proxy:
             admission = self.admissions.setdefault(client["id"], SessionQueue()).reserve()
         try:
             tokens = self.tokenize(body)
+            template = self.renderer.template_identity() if message_mode else None
+            identity = settings_identity(body, template) if message_mode else None
         except BaseException:
             admission.__exit__(None, None, None)
             raise
         # HTTP classification runs concurrently; retire its metadata in arrival order before session admission.
         with admission:
             with self.lock:
-                if explicit and existing:
+                if message_mode:
+                    session = self.store.select_messages(client["id"], messages, identity, tokens, explicit)
+                elif explicit and existing:
                     session = existing
                 else:
                     session = self.store.select(client["id"], tokens, explicit)
                 ticket = self.reserve(session["id"])
+                fork_parent = session.get("_fork", False)
+        forked = False
         while True:
             with ticket:
-                if explicit:
+                if message_mode:
+                    session = self.store.get(session["id"], client["id"])
+                    journal = session.get("journal")
+                    compatible = (not journal or journal["identity"] == identity and
+                                  matching_messages(journal["messages"], messages) == len(journal["messages"]))
+                    if fork_parent and not compatible:
+                        with self.slot_lease(session):
+                            child = self.store.select(client["id"], [])
+                            self.decode.request("POST", f"/slots/{session['slot']}?action=save",
+                                                {"filename": child["id"] + ".bin"})
+                            child.update(tokens=list(session["tokens"]), journal=copy.deepcopy(journal))
+                            with self.lock:
+                                next_ticket = self.reserve(child["id"])
+                                try:
+                                    self.store.save(child)
+                                except BaseException:
+                                    next_ticket.__exit__(None, None, None)
+                                    raise
+                        next_session = child
+                    elif explicit or compatible or forked:
+                        session["_message_mode"] = True
+                        with self.slot_lease(session):
+                            try:
+                                with self.prepare_messages(client, body, session, tokens, identity, template):
+                                    yield self.prepare_session(client, body, session, session["_prompt"])
+                            except JournalConflict:
+                                if not forked or session.get("_prepared"):
+                                    raise
+                                # The copied native checkpoint was evicted or incompatible. Only the child may reset.
+                                self.decode.request("POST", f"/slots/{session['slot']}?action=erase", {})
+                                session.update(tokens=[], journal=None, remote_id=None, remote_n=0)
+                                self.store.save(session)
+                                with self.prepare_messages(client, body, session, tokens, identity, template):
+                                    yield self.prepare_session(client, body, session, session["_prompt"])
+                        return
+                elif explicit:
                     session = self.store.select(client["id"], tokens, explicit)
                 else:
                     session = self.store.get(session["id"])
-                if explicit or tokens[:len(session["tokens"])] == session["tokens"]:
+                if not message_mode and (explicit or tokens[:len(session["tokens"])] == session["tokens"]):
                     with self.slot_lease(session):
                         yield self.prepare_session(client, body, session, tokens)
                     return
             # A predecessor completed while queued; resolve its fork against the fresh journal.
+            if message_mode and fork_parent and not compatible:
+                session, ticket = next_session, next_ticket
+                fork_parent, forked = False, True
+                continue
             with self.lock:
-                session = self.store.select(client["id"], tokens)
+                session = (self.store.select_messages(client["id"], messages, identity, tokens) if message_mode else
+                           self.store.select(client["id"], tokens))
                 ticket = self.reserve(session["id"])
+                fork_parent = session.get("_fork", False)
+
+    @contextmanager
+    def prepare_messages(self, client, body, session, full_tokens, identity, template):
+        session["_prepared"] = False
+        journal = session.get("journal")
+        text = self.renderer.render(body)
+        if self.renderer.encode(text, initial=True) != full_tokens:
+            raise JournalConflict("template changed during request admission")
+        old = copy.deepcopy(session)
+        recorded_messages = copy.deepcopy(body["messages"])
+        if journal:
+            matched = matching_messages(journal["messages"], recorded_messages)
+            for index in range(matched):
+                if (recorded_messages[index].get("role") == "assistant" and
+                        "reasoning_content" not in recorded_messages[index] and
+                        "reasoning_content" in journal["messages"][index]):
+                    recorded_messages[index]["reasoning_content"] = journal["messages"][index]["reasoning_content"]
+        backup = None
+        rollback_n = None
+        probe_evaluated = 0
+        try:
+            if not journal:
+                prompt = full_tokens
+                boundaries = self.renderer.user_boundaries(body, text, full_tokens)
+                checkpoints = []
+                segment_start = 0
+                message_start, token_base, anchor_base = 0, 0, 0
+            elif (journal["identity"] == identity and
+                  matching_messages(journal["messages"], body["messages"]) == len(journal["messages"])):
+                segment_start = len(session["tokens"])
+                prompt, boundaries, _, tail = self.renderer.append(body, text, full_tokens,
+                    len(journal["messages"]), session["tokens"])
+                checkpoints = copy.deepcopy(journal.get("checkpoints", []))
+                message_start = len(journal["messages"])
+                token_base, anchor_base = len(full_tokens) - len(tail), len(prompt) - len(tail)
+            else:
+                if journal["identity"] != identity:
+                    raise JournalConflict("template or rendering settings changed")
+                matched = matching_messages(journal["messages"], body["messages"])
+                usable = [cp for cp in journal.get("checkpoints", []) if cp["message_index"] <= matched]
+                if not usable:
+                    raise JournalConflict("history rewrite has no user-boundary checkpoint")
+                cp = max(usable, key=lambda item: item["message_index"])
+                rollback_n = cp["n"]
+                prefix = session["tokens"][:rollback_n]
+                if prefix_hash(prefix) != cp["prefix_hash"]:
+                    raise JournalConflict("checkpoint prefix does not match journal")
+                index = cp["message_index"]
+                message_start = index
+                if index and body["messages"][index - 1].get("role") == "assistant":
+                    _, mapped, closing, tail = self.renderer.append(body, text, full_tokens, index, [])
+                    prompt = prefix + tail[closing:]
+                    boundaries = [dict(message_index=b["message_index"], n=rollback_n + b["n"] - closing)
+                                  for b in mapped]
+                    token_base, anchor_base = len(full_tokens) - len(tail), rollback_n - closing
+                else:
+                    boundaries = self.renderer.user_boundaries(body, text, full_tokens)
+                    found = next((b for b in boundaries if b["message_index"] == index), None)
+                    if not found or full_tokens[:found["n"]] != prefix:
+                        raise JournalConflict("rewritten prefix cannot retain the checkpoint")
+                    prompt = full_tokens
+                    token_base, anchor_base = 0, 0
+                header = self.renderer.encode("<|im_start|>user\n")
+                trial = prompt[:rollback_n + len(header)]
+                if trial[rollback_n:] != header:
+                    raise JournalConflict("checkpoint is not at a user boundary")
+                backup = session["id"] + "-rewrite-backup.bin"
+                self.decode.request("POST", f"/slots/{session['slot']}?action=save", {"filename": backup})
+                result = self.decode.request("POST", "/v1/chat/completions", dict(body,
+                    prompt_tokens=trial, id_slot=session["slot"], n_predict=0, stream=False,
+                    cache_prompt=True, return_tokens=True, verbose=True))
+                probe_evaluated = result["timings"]["prompt_n"]
+                if result["timings"]["cache_n"] != rollback_n:
+                    raise JournalConflict("native user-boundary checkpoint is no longer available")
+                actual = self.decode.request("GET", f"/slots/{session['slot']}/info")
+                if actual["tokens"] != trial or actual["prefix_hash"] != prefix_hash(trial):
+                    raise JournalConflict("native checkpoint trial changed the token prefix")
+                session["tokens"] = trial
+                session["remote_id"], session["remote_n"] = None, 0
+                checkpoints = [cp for cp in usable if cp["n"] <= rollback_n]
+                segment_start = rollback_n
+            layout, generation_start = self.renderer.layout(body, text, full_tokens, start=message_start,
+                                                            token_base=token_base, anchor_base=anchor_base)
+            session["_prompt"] = prompt
+            session["_capture"] = Capture()
+            session["_turn"] = dict(identity=identity, template=template, messages=recorded_messages,
+                boundaries=boundaries, checkpoints=checkpoints, start=segment_start,
+                rollback_n=rollback_n, probe_evaluated=probe_evaluated, message_start=message_start,
+                layout=layout, generation_start=generation_start,
+                settings=hashlib.sha256(json.dumps({key: value for key, value in body.items() if key != "messages"},
+                    sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                retired_remote=old["remote_id"] if rollback_n is not None else None)
+            session["_prepared"] = True
+            yield
+        except BaseException:
+            if backup:
+                try:
+                    self.decode.request("POST", f"/slots/{session['slot']}?action=restore", {"filename": backup})
+                    self.store.save(old)
+                    self.verified(session["id"], True)
+                except (OSError, HTTPError, ValueError):
+                    self.verified(session["id"], False)
+                    self.store.set_slot(session["id"], None)
+                    # Both names mark the decoder untrusted; keep the original file if the rename fails.
+                    try:
+                        marker = self.slot_path / (session["id"] + "-resync-backup.bin")
+                        os.replace(self.slot_path / backup, marker)
+                    except OSError:
+                        LOG.error("rewrite backup retained session=%s", session["id"])
+                    backup = None
+                    raise RollbackError() from None
+            raise
+        finally:
+            if backup:
+                (self.slot_path / backup).unlink(missing_ok=True)
 
     def prepare_session(self, client, body, session, tokens):
         slot = session["slot"]
         info = self.decode.request("GET", f"/slots/{slot}/info")
         local_n = info["n"]
         if local_n > len(tokens) or info["prefix_hash"] != prefix_hash(tokens[:local_n]):
+            if "_turn" in session:
+                raise JournalConflict("slot does not extend the message journal")
             self.decode.request("POST", f"/slots/{slot}?action=erase", {})
             local_n = 0
         # Imported memory has no logits. Decode the final prompt token locally.
         target = tokens[:-1]
+        session["_remote_applied"] = 0
+        session["_remote_replayed"] = 0
         with self.lock:
             link_rate = self.link_rate
         decision = self.policy.choose(max(0, len(target) - local_n), local_n,
@@ -432,6 +626,10 @@ class Proxy:
                 session["offload"] = True
                 session["tokens"] = target
                 session["remote_n"] = len(target)
+                session["_remote_applied"] = len(target) - local_n
+                LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], local_n, len(target))
+                if "_turn" in session:
+                    session["_turn"]["checkpoints"] = []  # Native import clears the slot's checkpoints.
                 self.store.save(session)
         except HTTPError as error:
             if error.status == 409:
@@ -450,6 +648,8 @@ class Proxy:
         session["tokens"] = tokens
         self.store.save(session)
         request = dict(body, id_slot=slot, cache_prompt=True)
+        if "_turn" in session:
+            request.update(prompt_tokens=tokens, return_tokens=True, verbose=True)
         return session, tokens, request
 
     def finish(self, session, prompt):
@@ -458,9 +658,76 @@ class Proxy:
         if (len(evaluated) != info["n"] or evaluated[:len(prompt)] != prompt
                 or prefix_hash(evaluated) != info["prefix_hash"]):
             raise ValueError("decode token journal does not match slot")
+        if "_turn" in session:
+            turn, capture = session["_turn"], session["_capture"]
+            native = capture.native
+            if not native or not isinstance(native.get("tokens"), list):
+                raise JournalConflict("decoder did not return the complete sampled IDs")
+            complete = prompt + native["tokens"]
+            if evaluated != complete[:len(evaluated)] or len(complete) - len(evaluated) not in (0, 1):
+                raise JournalConflict("sampled and evaluated token boundaries differ")
+            generated_evaluated = 0
+            if len(evaluated) < len(complete):
+                # Evaluate the last sampled token as generation reconciliation, before the next prompt begins.
+                tail = self.decode.request("POST", "/completion", dict(prompt=complete, n_predict=0,
+                    id_slot=session["slot"], cache_prompt=True))
+                generated_evaluated = tail["timings"]["prompt_n"]
+                info = self.decode.request("GET", f"/slots/{session['slot']}/info")
+                evaluated = info["tokens"]
+                if evaluated != complete or info["prefix_hash"] != prefix_hash(complete):
+                    raise JournalConflict("generated-token reconciliation changed the prefix")
+            timings = native.get("timings") or capture.timings or {}
+            local = timings["prompt_n"] + turn["probe_evaluated"]
+            remote = session["_remote_applied"]
+            checkpoints = turn["checkpoints"]
+            if not remote:
+                cached = turn["rollback_n"] if turn["rollback_n"] is not None else timings["cache_n"]
+                for boundary in turn["boundaries"]:
+                    if boundary["n"] >= cached and boundary["n"] > 0:
+                        cp = dict(boundary, prefix_hash=prefix_hash(prompt[:boundary["n"]]))
+                        if cp not in checkpoints:
+                            checkpoints.append(cp)
+            meter = dict(local_evaluated=local, remote_applied=remote,
+                generated_evaluated=generated_evaluated, new_tokens=len(prompt) - turn["start"],
+                remote_replay_acknowledged=session.get("_remote_replayed", 0),
+                rollback_n=turn["rollback_n"], prefilled=local + remote)
+            previous = session.get("journal") or {}
+            retired = list(previous.get("retired_remote_ids", []))
+            if turn["retired_remote"] and turn["retired_remote"] != session["remote_id"]:
+                if turn["retired_remote"] not in retired:
+                    retired.append(turn["retired_remote"])
+            segments = [s for s in previous.get("segments", []) if s["end"] <= turn["start"]]
+            segments += [dict(kind="incoming", start=turn["start"], end=len(prompt),
+                             message_indices=list(range(turn["message_start"], len(turn["messages"])))),
+                         dict(kind="generated", start=len(prompt), end=len(complete),
+                             message_indices=[len(turn["messages"])], sampled_ids=native["tokens"])]
+            layout = [row for row in previous.get("message_boundaries", []) if row["message_index"] < turn["message_start"]]
+            if layout and turn["layout"]:
+                layout[-1]["end"] = turn["layout"][0]["start"]
+            layout += turn["layout"]
+            messages = turn["messages"]
+            if messages[-1]["role"] == "assistant":
+                for key in ("content", "reasoning_content"):
+                    messages[-1][key] = (messages[-1].get(key) or "") + (capture.message.get(key) or "")
+                layout[-1]["end"] = dict(n=len(complete), byte_offset=0)
+                segments[-1]["message_indices"] = [len(messages) - 1]
+            else:
+                layout.append(dict(message_index=len(messages), role="assistant", start=turn["generation_start"],
+                                   end=dict(n=len(complete), byte_offset=0)))
+                messages = messages + [capture.message]
+            session["journal"] = dict(identity=turn["identity"], template=turn["template"],
+                settings_sha256=turn["settings"], messages=messages, message_boundaries=layout,
+                segments=segments, checkpoints=checkpoints, retired_remote_ids=retired,
+                evaluated_boundary=len(evaluated), sampled_boundary=len(complete),
+                last_meter=meter, meters=previous.get("meters", []) + [meter])
+            LOG.info("prefill session=%s local=%d remote=%d generated=%d new=%d rollback=%s", session["id"],
+                     local, remote, generated_evaluated, meter["new_tokens"], turn["rollback_n"])
         session["tokens"] = evaluated
+        session["_commit"] = True
         self.store.save(session)
         (self.slot_path / (session["id"] + "-resync-backup.bin")).unlink(missing_ok=True)
+        if "_turn" not in session or session["_turn"]["rollback_n"] is None:
+            (self.slot_path / (session["id"] + "-rewrite-backup.bin")).unlink(missing_ok=True)
         # Replay is asynchronous; the durable suffix beyond remote_n is the journal.
 
 
@@ -509,6 +776,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         for line in upstream:
                             if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                                 chunk = json.loads(line[6:])
+                                if "_capture" in session:
+                                    session["_capture"].feed(chunk)
                                 chunk.pop("__verbose", None)
                                 line = b"data: " + json.dumps(chunk).encode() + b"\n"
                             if not disconnected:
@@ -521,6 +790,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     self.close_connection = True
                     else:
                         data = json.loads(upstream.read(MAX_JSON))
+                        if "_capture" in session:
+                            session["_capture"].feed(data)
                         data.pop("__verbose", None)
                         app.finish(session, prompt)
                         self.send_response(200)
@@ -534,7 +805,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 app.finish(session, prompt)
         except (HTTPError, KeyError, ValueError, OSError) as error:
             if not started:
-                status = error.status if isinstance(error, HTTPError) else 404 if isinstance(error, KeyError) else 400
+                status = (error.status if isinstance(error, HTTPError) else 404 if isinstance(error, KeyError) else
+                          409 if isinstance(error, JournalConflict) else 400)
                 self.json_response(status, {"error": {"message": str(error), "type": "hybrid_error"}})
             else:
                 LOG.error("stream interrupted: %s", type(error).__name__)

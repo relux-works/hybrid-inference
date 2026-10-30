@@ -39,7 +39,8 @@ def main():
     command = [str(Path(args.binary).resolve()), '-m', args.model, '--host', '127.0.0.1', '--port', str(port),
                '-ngl', '0', '-t', '2', '-tb', '2', '-c', '8192', '-b', '256', '-ub', '256', '-np', '2',
                '-ctk', 'q8_0', '-ctv', 'q8_0', '-fa', 'on', '--slots', '--no-context-shift', '--cache-ram', '0',
-               '--no-cache-idle-slots', '--ctx-checkpoints', '0', '--slot-save-path', str(slots) + '/']
+               '--no-cache-idle-slots', '--ctx-checkpoints', '32', '--checkpoint-min-step', '0',
+               '--slot-save-path', str(slots) + '/']
     log = (root / 'server.log').open('wb')
     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
     (root / 'server.pid').write_text(str(process.pid) + '\n')
@@ -112,7 +113,7 @@ def main():
             # The lease is still pinned: no eviction can invalidate this per-request token/hash assertion.
             info = decode.request('GET', f"/slots/{session['slot']}/info")
             generated = next(r['tokens'] for r in reversed(records) if r['slot'] == session['slot'])
-            require(info['tokens'] == prompt + generated[:-1], 'native request lost or duplicated evaluated tokens')
+            require(info['tokens'] == prompt + generated, 'native request lost or duplicated reconciled tokens')
             require(info['tokens'] == app.store.get(session['id'])['tokens'] and
                     info['prefix_hash'] == prefix_hash(info['tokens']), 'native slot/journal mismatch')
             with app.lock:
@@ -202,15 +203,12 @@ def main():
                     if line.startswith(b'data: ') and line != b'data: [DONE]':
                         for choice in json.loads(line[6:]).get('choices', []):
                             content.append(choice.get('delta', {}).get('content') or '')
-                # This GGUF removes historical reasoning tags when a new user turn arrives. Assistant continuations
-                # keep its token history append-only, so this tests native restore rather than an unrelated fork.
-                if messages[-1]['role'] == 'assistant':
-                    messages[-1]['content'] += ''.join(content)
-                else:
-                    messages.append(dict(role='assistant', content=''.join(content)))
+                # M0.2 keeps the native IDs across ordinary user turns; no assistant-continuation workaround is needed.
+                messages.append(dict(role='assistant', content=''.join(content)))
+                messages.append(dict(role='user', content='Continue counting decimal integers.'))
             return sid
 
-        # Four native conversations contend for two slots, each with an initial request and two assistant continuations.
+        # Four native conversations contend for two slots, each with three ordinary user turns.
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             sessions = list(pool.map(conversation, range(4)))
         require(len(checked) == 16, 'missing per-request native journal checks')

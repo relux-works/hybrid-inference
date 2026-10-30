@@ -8,6 +8,8 @@ import time
 import threading
 import uuid
 
+from journal import JournalConflict, matching_messages
+
 
 def prefix_hash(tokens):
     digest = hashlib.sha256()
@@ -51,6 +53,8 @@ class Store:
                 slot INTEGER, used REAL NOT NULL, offload INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS unique_slot ON sessions(slot);
         """)
+        if "journal" not in {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN journal TEXT")
         row = self.db.execute("SELECT model FROM meta").fetchone()
         if row and row[0] != model:
             self.db.close()
@@ -73,17 +77,21 @@ class Store:
         row = dict(row)
         row["tokens"] = json.loads(row["tokens"])
         row["hashes"] = json.loads(row["hashes"])
+        row["journal"] = json.loads(row["journal"]) if row["journal"] else None
         return row
 
     @locked
     def save(self, session):
+        if "_turn" in session and not session.get("_commit"):
+            return  # Keep the last completed token/message pair durable until generation is reconciled.
         tokens = session["tokens"]
         prefix_hash(tokens)
         with self.db:
             self.db.execute("""UPDATE sessions SET tokens=?,hashes=?,remote_id=?,remote_n=?,
-                used=?,offload=? WHERE id=?""", (
+                used=?,offload=?,journal=? WHERE id=?""", (
                 json.dumps(tokens), json.dumps(block_hashes(tokens)), session["remote_id"],
-                session["remote_n"], time.time(), int(session["offload"]), session["id"]))
+                session["remote_n"], time.time(), int(session["offload"]),
+                json.dumps(session.get("journal")) if session.get("journal") else None, session["id"]))
 
     @locked
     def set_slot(self, sid, slot):
@@ -100,7 +108,7 @@ class Store:
             if row:
                 session = self.get(explicit, client)
                 if tokens[:len(session["tokens"])] != session["tokens"]:
-                    raise ValueError("explicit session history is not append-only")
+                    raise JournalConflict("explicit session history is not append-only")
                 return session
         else:
             hashes = block_hashes(tokens)
@@ -125,6 +133,36 @@ class Store:
             self.db.execute("INSERT INTO sessions(id,client,tokens,hashes,used) VALUES(?,?,'[]','[]',?)",
                             (sid, client, time.time()))
         return self.get(sid)
+
+    @locked
+    def select_messages(self, client, messages, identity, tokens, explicit=None):
+        if explicit:
+            try:
+                return self.get(explicit, client)
+            except KeyError:
+                if self.db.execute("SELECT 1 FROM sessions WHERE id=?", (explicit,)).fetchone():
+                    raise
+                return self.select(client, [], explicit)
+        candidates = []
+        forks = []
+        for row in self.db.execute("SELECT id FROM sessions WHERE client=? ORDER BY used DESC", (client,)):
+            session = self.get(row["id"])
+            journal = session["journal"]
+            if (journal and journal["identity"] == identity and
+                    matching_messages(journal["messages"], messages) == len(journal["messages"])):
+                candidates.append((len(journal["messages"]), session))
+            elif journal and journal["identity"] == identity:
+                matched = matching_messages(journal["messages"], messages)
+                if matched and any(cp["message_index"] <= matched for cp in journal.get("checkpoints", [])):
+                    session["_fork"] = True
+                    forks.append((matched, session))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+        if forks:
+            return max(forks, key=lambda item: item[0])[1]
+        # An inferred divergence is a fork. An explicit ID authorizes checkpoint rollback of that session.
+        session = self.select(client, tokens)
+        return self.select(client, []) if session.get("journal") else session
 
     @locked
     def occupant(self, slot):
