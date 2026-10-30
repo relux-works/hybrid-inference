@@ -1,13 +1,11 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
-#include "hash/hash.h"
 #include "hash/xxhash/xxhash.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
 }
 #include <algorithm>
 #include <fstream>
-#include <limits>
 #include <stdexcept>
 
 namespace hybrid {
@@ -100,7 +98,7 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     for (int i = 0; i < 4; ++i) { size |= (uint32_t) (unsigned char) wire[i] << (8 * i); }
     require(size <= 65536 && size <= wire.size() - 4, "invalid delta header length");
     json h = parse_json(wire.substr(4, size));
-    require(h.is_object() && h.at("magic") == "HYBD" && h.at("version") == 1, "unsupported delta version");
+    require(h.is_object() && h.at("magic") == "HYBD" && h.at("version").is_number_integer() && h.at("version") == 1, "unsupported delta version");
     require(h.at("body_format") == "llama-native-seq-v1" && h.at("kv_type") == "q8_0" && h.at("state_dtype") == "f32", "unsupported delta layout");
     require(h.at("model_sha256").is_string() && h.at("model_sha256") == model_sha256, "model hash mismatch");
     require(h.at("session_id").is_string() && !h.at("session_id").get<std::string>().empty(), "invalid session id");

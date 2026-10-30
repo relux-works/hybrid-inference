@@ -98,6 +98,59 @@ static std::vector<llama_token> prompt_tokens(llama_model * model, size_t n) {
     return out;
 }
 
+static uint32_t read_u32(const std::string & data, size_t offset) {
+    require(offset <= data.size() && data.size() - offset >= 4, "native fixture offset");
+    uint32_t n = 0;
+    for (int i = 0; i < 4; ++i) { n |= (uint32_t) (unsigned char) data[offset + i] << (8 * i); }
+    return n;
+}
+
+static void put_u32(std::string & data, size_t offset, uint32_t n) {
+    require(offset <= data.size() && data.size() - offset >= 4, "native fixture offset");
+    for (int i = 0; i < 4; ++i) { data[offset + i] = (char) (n >> (8 * i)); }
+}
+
+static void append_negative_tests(llama_context * ctx, const std::string & raw, llama_pos n0, llama_pos n1) {
+    // Invalid boundaries and native metadata must reject with byte-identical serialized prefix state, including after partial restore work.
+    const auto before = hybrid::save_state(ctx);
+    auto reject = [&](const char * name, const std::string & input, llama_pos start, llama_pos end) {
+        require(llama_state_seq_set_data_append(ctx, reinterpret_cast<const uint8_t *>(input.data()), input.size(), 0, start, end) == 0, name);
+        require(hybrid::save_state(ctx) == before, "rejected append changed prefix state");
+        std::cout << "PASS " << name << " with unchanged prefix state\n";
+    };
+    reject("raw-gap", raw, n0 + 1, n1);
+    reject("raw-overlap", raw, n0 - 1, n1);
+    reject("raw-end-mismatch", raw, n0, n1 + 1);
+    reject("raw-truncated", raw.substr(0, raw.size() - 1), n0, n1);
+    auto corrupt = raw;
+    corrupt[0] ^= 1;
+    reject("raw-magic", corrupt, n0, n1);
+    corrupt = raw;
+    put_u32(corrupt, 8, 0);
+    reject("raw-stream-layout", corrupt, n0, n1);
+    corrupt = raw;
+    put_u32(corrupt, 16, n0 + 1);
+    reject("raw-position-gap", corrupt, n0, n1);
+
+    // These fixture controls locate the pinned native attention header for ordinary or M-RoPE cell metadata.
+    const uint32_t cells = read_u32(raw, 12);
+    require(cells == (uint32_t) (n1 - n0), "range cell count mismatch");
+    size_t stride = 0;
+    for (size_t candidate : {12, 24}) {
+        bool matches = true;
+        for (uint32_t i = 0; i < cells; ++i) {
+            matches = matches && read_u32(raw, 16 + i * candidate) == (uint32_t) (n0 + i);
+            matches = matches && read_u32(raw, 20 + i * candidate) == 1;
+        }
+        if (matches) { stride = candidate; }
+    }
+    require(stride != 0, "unsupported native fixture cell metadata");
+    const size_t layer_offset = 16 + cells * stride + 4;
+    corrupt = raw;
+    put_u32(corrupt, layer_offset, read_u32(raw, layer_offset) + 1);
+    reject("raw-layer-layout", corrupt, n0, n1);
+}
+
 static void run_model(const std::string & model_path, const std::string & directory, size_t depth) {
     require(depth >= 256 && depth <= 8192, "depth must be 256-8192");
     const auto hash = hybrid::file_hash(model_path);
@@ -123,9 +176,12 @@ static void run_model(const std::string & model_path, const std::string & direct
     auto parsed = hybrid::read_delta(wire, hash, n0);
     require(parsed.state == raw, "delta changed range bytes");
     require(raw.size() < hybrid::save_state(source.get()).size(), "range export did not reduce attention data");
-    // A fresh context restores the full range, evaluates the held final prompt token, then matches 64 local-prefill greedy tokens.
     auto full_raw = hybrid::export_range(source.get(), 0, n1);
-    hybrid::load_state(restored.get(), full_raw);
+    hybrid::load_state(restored.get(), prefix);
+    append_negative_tests(restored.get(), parsed.state, n0, n1);
+    require(llama_state_seq_set_data_append(restored.get(), reinterpret_cast<const uint8_t *>(parsed.state.data()), parsed.state.size(), 0, n0, n1) == parsed.state.size(), "incremental append failed");
+    require(hybrid::save_state(restored.get()) == full_raw, "appended state differs from full source state");
+    // A prefix plus range append and held final token matches 64 tokens from an independent plain local prefill.
     hybrid::prefill(restored.get(), {tokens.back()}, n1);
     hybrid::load_state(source.get(), {});
     hybrid::prefill(source.get(), tokens, 0);
@@ -147,7 +203,7 @@ static void run_model(const std::string & model_path, const std::string & direct
         write(stem + ".full.delta", full_wire);
         write(stem + ".tokens.json", json({{"model_sha256", hash}, {"n0", n0}, {"n1", n1}, {"tokens", tokens}, {"held_token", tokens.back()}, {"greedy_64", generated}, {"prefix_hash_n0", hybrid::prefix_hash({tokens.begin(), tokens.begin() + n0})}, {"prefix_hash_n1", hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1})}}).dump(2) + "\n");
     }
-    std::cout << "PASS depth=" << depth << " n0=" << n0 << " n1=" << n1 << " range_bytes=" << raw.size() << " full_bytes=" << full_raw.size() << " greedy=64/64 (full-range restore; incremental append awaits B)\n";
+    std::cout << "PASS depth=" << depth << " n0=" << n0 << " n1=" << n1 << " range_bytes=" << raw.size() << " full_bytes=" << full_raw.size() << " greedy=64/64 (incremental range append vs independent local prefill)\n";
 }
 
 int main(int argc, char ** argv) {
@@ -161,9 +217,9 @@ int main(int argc, char ** argv) {
         }
         llama_backend_init();
         if (argc == 4) {
-            run_model(argv[1], argv[2], std::stoul(argv[3]));
+            run_model(argv[1], std::string(argv[2]) == "-" ? "" : argv[2], std::stoul(argv[3]));
         } else {
-            for (size_t depth : {512, 2048, 8192}) { run_model(argv[1], argv[2], depth); }
+            for (size_t depth : {512, 2048, 8192}) { run_model(argv[1], std::string(argv[2]) == "-" ? "" : argv[2], depth); }
         }
         return 0;
     } catch (const std::exception & e) {

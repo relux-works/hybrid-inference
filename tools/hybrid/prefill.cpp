@@ -5,7 +5,6 @@
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <random>
 
 using hybrid::json;
