@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include <nlohmann/json.hpp>
+#include <memory>
 #include <string>
 #include <vector>
 

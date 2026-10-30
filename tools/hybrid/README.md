@@ -22,6 +22,8 @@ Create a mode-0600 JSON credentials file mapping client IDs to distinct bearer t
 ```sh
 build/bin/llama-hybrid-prefill ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf .temp/clients.json 8091 8448
 build/bin/llama-hybrid-check --codec
+# Incremental append equivalence, without rewriting large fixtures:
+build/bin/llama-hybrid-check ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf -
 build/bin/llama-hybrid-check ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf ~/Werkstatt/hybrid-models/golden
 python3 tools/hybrid/test_prefill.py --binary build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-a-r1-261030/http
 ```
@@ -44,8 +46,8 @@ The caller implements one-token holdback: send all appended prompt tokens except
 
 `llama-hybrid-check MODEL DIR [DEPTH]` writes deterministic fixtures for prompt lengths 512, 2048 and 8192, or the specified single depth. Each prompt repeats the tokenizer output of the literal prompt in `check.cpp`; the exact IDs and 64 greedy outputs are recorded in `prompt-N.tokens.json`. `n0=N-129`, `n1=N-1`; the final prompt token is held back. Files are `prompt-N.prefix.state` (raw sequence at n0), `prompt-N.delta` (128-token range), `prompt-N.full.delta` (range 0..n1), and the token manifest.
 
-The initial producer-A check restores the full-range native state into a fresh context, evaluates the held token in both contexts and compares 64 greedy tokens. It also checks stale/empty/negative range rejection and unchanged source state. Incremental append equivalence requires producer B's append importer and is reported separately until that importer is integrated. Codec checks are independent of model inference; HTTP tests verify snapshot equality after rejected requests and 3 x 4 session isolation, without claiming decode equivalence for each concurrent session.
+The check restores the prefix into a fresh context, rejects malformed native appends with an unchanged prefix, then appends the range and requires its native state to equal a full source export. After evaluating the held token, it compares 64 greedy tokens against an independent plain local prefill. It also checks stale/empty/negative range rejection and unchanged source state. The append importer is producer B's signed core change, integrated locally. `GOLDEN_DIR=-` suppresses artifact writes. Codec checks are independent of model inference; HTTP tests verify snapshot equality after rejected requests and 3 x 4 session isolation, without claiming decode equivalence for each concurrent session.
 
-Current prototype limits: RAM only, no restart recovery, no NVMe encryption/TTL/eviction, no cross-client priority scheduler or shadow batching. Shadow appends are applied synchronously before returning 202. HTTP/2 and per-layer streaming are deferred by the orchestrator. A disconnected response can leave an accepted append committed; retry observes 409 and must resynchronize.
+Current prototype limits: RAM only, no restart recovery, no NVMe encryption/TTL/eviction, no shadow batching. Admitted requests use per-session FIFO and client round robin, with eligible critical requests ahead of shadows. Shadow appends are applied synchronously before returning 202. HTTP/2 and per-layer streaming are deferred by the orchestrator. A disconnected response can leave an accepted append committed; retry observes 409 and must resynchronize.
 
 Task logs and tool installation live under `.temp/hybrid-a-r1-261030/`. No benchmark is run on this host.
