@@ -132,3 +132,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+### Hybrid prefill prototype tools
+
+The local CPU prefill node, shared state-delta codec, correctness checker, and HTTP isolation tests are documented in [tools/hybrid/README.md](tools/hybrid/README.md), including exact CMake, flock, Python and run commands. Binaries go to `build/bin/`; logs and task-local tools go to `.temp/`; golden state fixtures go to `~/Werkstatt/hybrid-models/golden/`.

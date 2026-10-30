@@ -1,4 +1,5 @@
 #include "llama-memory.h"
+#include <stdexcept>
 
 #include "llama-ext.h"
 #include "llama-io.h"
@@ -141,4 +142,8 @@ std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t
     mem->state_write(writer);
 
     return std::vector<ggml_backend_buffer_t>(writer.buffers.begin(), writer.buffers.end());
+}
+
+void llama_memory_i::state_write_range(llama_io_write_i &, llama_seq_id, llama_pos, llama_pos, llama_state_seq_flags) const {
+    throw std::runtime_error("range export is not supported by this memory type");
 }

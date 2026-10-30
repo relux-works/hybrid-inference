@@ -4,6 +4,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <stdexcept>
+
 //
 // llama_memory_hybrid
 //
@@ -190,6 +192,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
+    mem_recr->state_write(io, seq_id, flags);
+}
+
+void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    if (p1 != seq_pos_max(seq_id) + 1) {
+        throw std::runtime_error("range endpoint must equal the current recurrent state position");
+    }
+    mem_attn->state_write_range(io, seq_id, p0, p1, flags);
     mem_recr->state_write(io, seq_id, flags);
 }
 
