@@ -1,4 +1,4 @@
-"""Opt-in native API controls for the M0.2 scope decision; never builds a server."""
+"""Opt-in native capability probe for the M0.2 chat bridge; never builds a server."""
 import argparse
 import hashlib
 import json
@@ -82,8 +82,10 @@ def main():
             info = node.request("GET", "/slots/0/info")
             require(info["tokens"] == expected and info["prefix_hash"] == prefix_hash(expected),
                     "chat prompt precedence changed; reassess the scope decision")
-            result["chat_honored_token_input"] = info["tokens"] == authoritative
-            result["chat_prompt_control"] = dict(supplied=authoritative, evaluated=info, response=response)
+            result["legacy_prompt_control"] = dict(supplied=authoritative, evaluated=info, response=response)
+            # The explicit new field can be detected on both the original and extended server.
+            node.request("POST", "/v1/chat/completions", dict(body, prompt_tokens=authoritative))
+            result["chat_honored_token_input"] = node.request("GET", "/slots/0/info")["tokens"] == authoritative
 
             # Positive: nonstream chat exposes all sampled IDs in __verbose when return_tokens is enabled.
             response = node.request("POST", "/v1/chat/completions", dict(body, n_predict=8, ignore_eos=True))
@@ -93,7 +95,7 @@ def main():
             require(info["tokens"] == expected + sampled[:-1], "slot sampled/evaluated boundary changed")
             result["nonstream_sampled_ids"] = sampled
 
-            # Negative: verbose streaming omits sampled IDs; slot info excludes the final sampled token.
+            # Slot info excludes the final sampled token; the new opt-in final vector closes that gap.
             chunks = []
             with node.open("POST", "/v1/chat/completions", dict(body, id_slot=1, stream=True,
                                                                   n_predict=8, ignore_eos=True)) as stream:
@@ -101,8 +103,9 @@ def main():
                     if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                         chunks.append(json.loads(line[6:]))
             verbose = [chunk["__verbose"] for chunk in chunks if "__verbose" in chunk]
-            require(verbose and not any(item.get("tokens") for item in verbose),
-                    "stream verbose now carries IDs; reassess the scope decision")
+            require(bool(verbose), "verbose final stream result missing")
+            stream_ids = verbose[-1].get("tokens", [])
+            require(not stream_ids or len(stream_ids) == 8, "incomplete final sampled vector")
             info = node.request("GET", "/slots/1/info")
             require(len(info["tokens"]) == len(expected) + 7, "expected seven evaluated generated tokens")
             result["stream_chunks"] = chunks
@@ -144,11 +147,11 @@ def main():
             (root / "results.json").write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(dict(raw_token_input=result["raw_token_input"],
                 chat_honored_token_input=result["chat_honored_token_input"], nonstream_ids=len(sampled),
-                streaming_verbose_ids=0, tool_stream_logprobs_status=400,
+                streaming_verbose_ids=len(stream_ids), tool_stream_logprobs_status=400,
                 checkpoint_cached_tokens=after["timings"]["cache_n"])), flush=True)
             if args.require_chat_token_input:
-                require(result["chat_honored_token_input"],
-                        "M0.2 prerequisite: chat must evaluate authoritative token IDs while retaining its chat session")
+                require(result["chat_honored_token_input"] and len(stream_ids) == 8,
+                        "M0.2 requires authoritative chat token input and complete final streamed IDs")
         finally:
             if process.poll() is None:
                 process.terminate()

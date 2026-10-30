@@ -1442,6 +1442,10 @@ Given a ChatML-formatted json description in `messages`, it returns the predicte
 
 See [OpenAI Chat Completions API documentation](https://platform.openai.com/docs/api-reference/chat). llama.cpp `/completion`-specific features such as `mirostat` are also supported.
 
+`prompt_tokens`: Optional token ID array for clients that maintain an exact token journal. The server evaluates this array as the prompt while `messages`, tools and settings still define native output parsing, grammar and message spans. The array must be nonempty, contain only integer IDs in the model vocabulary, and have at most the slot context length. Invalid arrays return 400 before task submission. The existing completion capacity guard still reserves one token, including for `n_predict=0`, so the usable prompt limit is `n_ctx-1`. This extension is for text input.
+
+`return_tokens` together with `verbose`: For chat streams with both flags set to `true`, the final `__verbose.tokens` contains the complete sampled token ID vector. It includes stop/EOG tokens and tokens whose text was buffered or suppressed. Other streams retain their existing output shape. Nonstream chat already returns sampled IDs in the verbose data with these flags.
+
 The `response_format` parameter supports both plain JSON output (e.g. `{"type": "json_object"}`) and schema-constrained JSON (e.g. `{"type": "json_object", "schema": {"type": "string", "minLength": 10, "maxLength": 100}}` or `{"type": "json_schema", "schema": {"properties": { "name": { "title": "Name",  "type": "string" }, "date": { "title": "Date",  "type": "string" }, "participants": { "items": {"type: "string" }, "title": "Participants",  "type": "string" } } } }`), similar to other OpenAI-inspired API providers.
 
 `chat_template_kwargs`: Allows sending additional parameters to the json templating system. For example: `{"enable_thinking": false}`

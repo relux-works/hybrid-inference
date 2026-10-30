@@ -1,23 +1,13 @@
-# Qualification limits after review fixes
+# Qualification limits
 
-## M0.2 scope decision
+- M0.2 implementation is ready for producer/orchestrator review; no acceptance or push is claimed. See [m02-append-only-261030.md](m02-append-only-261030.md). The earlier server scope blocker was explicitly approved in run r11.
+- Native qualification uses Qwen3.5-0.8B-Q4_0 only, including the supplied Qwen3.8-27B template on those small weights. No target-model weights, GPU, Metal or network-hardware qualification ran. Same-partition greedy64 and whole-prompt teacher-forced KL/top1 have separate meanings; free-running whole-prompt divergence remains informational.
+- Incremental rendering validates Qwen/ChatML message frames and token pieces against the active template. Other framing, multimodal inputs, multiple choices and same-history assistant continuation without a new message are unsupported; explicit reuse returns409 when no supported transition exists. Anthropic Messages is not implemented.
+- Checkpoint positions are candidates validated on use. Configure native checkpoints with `--ctx-checkpoints 32 --checkpoint-min-step 0`. Imported state clears native checkpoints. An explicit unavailable-checkpoint rewrite returns409 with restored native bytes; inferred edits fork. Local slot loss can require recovery prefill, and its actual count is logged.
+- A's prefill node has no historical restore/fork API. The proxy creates a fresh remote session and replays the chosen prefix; this can cost remote full-prefix work. Applied critical ranges and replay acknowledgements are logged separately. A future client-scoped checkpoint restore/fork contract needs A/orchestrator agreement.
+- Explicit rewrites and checkpoint-backed inferred forks use existing full slot files for rare rollback/copy operations. Ordinary appends do not save a whole-slot backup. Large-depth disk/memory costs for these rare operations remain unqualified.
+- A downstream disconnect drains the upstream completion before releasing the slot. Immediate cancellation and cross-process slot ownership are not added. SQLite atomically commits the token/message pair; the decoder and SQLite are separate processes, so process-crash transactions across them remain unqualified. Uncommitted native extensions are discarded and rebuilt from durable tokens rather than adopted into completed message history.
+- Session metadata, request queues, parked files and journals retain the existing unbounded session-table policy. TTL/metadata eviction, maximum concurrent state-transfer memory and O5 double-failure core recovery remain future work.
+- Upstream type/style executables were absent on this host in r10; no dependencies were installed. The r11 report distinguishes executed syntax/format checks from unrun hosted checks.
 
-- M0.2 implementation is paused at the user's explicit server-change boundary. Existing chat requests always use the re-rendered prompt, while raw completion cannot retain the server's chat parser, tool grammar and message-boundary handling. Native controls verify both paths; this is not a claim that a separate proxy implementation of those systems is impossible.
-- Proposed authorization: let the chat route accept an authoritative token array while retaining its `common_chat_session`, and retain sampled IDs in the final verbose stream result when `return_tokens` is enabled. No engine or prefill-node edit is proposed. New-message suffix rendering still needs its own exactness gate before implementation can be accepted.
-- Native user-boundary checkpoints work when enabled, but the current proxy erases a mismatching slot before the native checkpoint path can run. The documented M0.1 launch disables checkpoints. Remote historical restore/fork remains an absent API; the allowed remote fallback is a fresh session.
-- See [m02-append-only-261030.md](m02-append-only-261030.md). The requested M0.2 conversation gates, M0.1 conversation witnesses and prefilled-token totals remain unrun; only API diagnostics and the unchanged 38-test regression suite ran.
-
-- Spec v0.3.4 section11 resolves the CPU batch-partition equivalence criterion: exact same-partition greedy64 plus teacher-forced whole-prompt KL/top1 bounds. Free-running whole-prompt text can differ; retain its divergence index in evidence.
-- CUDA-to-Metal distribution thresholds still need M1 calibration. This run qualifies only CPU on Qwen3.5-0.8B-Q4_0.
-- Performance on real client/server hardware and the larger prompt matrix remain outside this run. The second fix round measures only the three explicitly requested small-model append costs.
-- Anthropic Messages and SWA import are not implemented.
-- A and the lane orchestrator still need to review this signed fix candidate.
-
-See [fixes-r2-261030.md](fixes-r2-261030.md) for current evidence and exact commands. Rollback-outage state-machine coverage is synthetic; native process-crash atomicity across the decoder and SQLite remains unqualified.
-
-## M0.1 concurrency qualification
-
-- M0.1 implements per-session FIFO, pinned slot leases and independent replay; A and the orchestrator still need to review the candidate. See [m01-concurrency-261030.md](m01-concurrency-261030.md).
-- The supplied Qwen35 GGUF removes earlier reasoning tags when a new user turn is rendered. Explicit reuse requires an append-only token history; native contention uses assistant continuations to retain it. General multi-user-turn explicit reuse is not qualified by this change. Inferred mapping continues to fork when rendered prefixes change.
-- A downstream disconnect drains the bounded upstream request before releasing its slot. Immediate cancellation, process-crash transactions across SQLite/native memory, and cross-process ownership of the same slot pool are not added here.
-- Session queues and journal retention follow the existing unbounded session table; TTL/metadata eviction remains future store work. CUDA/Metal, large-model/depth, maximum concurrent state-transfer memory and O5 double-failure recovery remain outside this proxy-only scope.
+Historical evidence remains in [fixes-r2-261030.md](fixes-r2-261030.md) and [m01-concurrency-261030.md](m01-concurrency-261030.md).
