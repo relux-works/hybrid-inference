@@ -5,11 +5,124 @@ import hashlib
 import json
 import pathlib
 import secrets
+import socket
 import struct
 import subprocess
 import time
 import urllib.error
 import urllib.request
+
+
+def prefix(tokens):
+    return hashlib.sha256(b"".join(struct.pack("<i", token) for token in tokens)).hexdigest()
+
+
+def test_slow_readers_do_not_starve_critical(request, clients, port, model_hash):
+    # Four stalled X requests cannot keep Y from completing within 5 s; excess streams reject before mutation.
+    def create(client):
+        sid = request("POST", "/v1/sessions", client, {"model_sha256": model_hash})["session_id"]
+        return "/v1/sessions/" + sid
+
+    paths = [create("a") for _ in range(4)]
+    other, third = create("b"), create("c")
+    empty_snapshot = request("GET", paths[0] + "/snapshot")
+    held = []
+
+    def stall(path, client, method="POST"):
+        data = b"" if method == "GET" else json.dumps({"n0": 0, "prefix_hash_n0": prefix([]), "tokens": [100], "return_delta": True}).encode()
+        sock = socket.socket()
+        held.append(sock)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        sock.settimeout(5)
+        sock.connect(("127.0.0.1", port))
+        headers = (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {clients[client]}\r\n"
+                   f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode()
+        sock.sendall(headers + data)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(1)
+            assert chunk, "response closed before headers"
+            response += chunk
+        return int(response.split(b" ", 2)[1])
+
+    def release():
+        for sock in held:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        held.clear()
+
+    try:
+        statuses = [stall(path + "/extend", "a") for path in paths]
+        append = {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": [101], "return_delta": True}
+        start = time.monotonic()
+        wire = request("POST", other + "/extend", "b", append, timeout=5)
+        elapsed = time.monotonic() - start
+        assert elapsed < 5 and wire[:4], "critical Y did not complete within 5 s"
+        assert request("GET", other, "b", timeout=5)["n"] == 1
+        assert statuses == [200, 200, 429, 429], statuses
+        for path, status in zip(paths, statuses):
+            assert request("GET", path, timeout=5)["n"] == (1 if status == 200 else 0)
+        # Three global streams still leave an HTTP worker for control requests and bounded rejection.
+        other_snapshot = request("GET", other + "/snapshot", "b")
+        assert stall(third + "/extend", "c") == 200
+        before = request("GET", other, "b", timeout=5)
+        blocked = dict(append, n0=1, prefix_hash_n0=prefix([101]))
+        request("POST", other + "/extend", "b", blocked, expected=429, timeout=5)
+        assert request("GET", other, "b", timeout=5) == before
+        assert request("GET", "/v1/health", timeout=5)["status"] == "ok"
+        request("GET", paths[0] + "/snapshot", "b", expected=404, timeout=5)
+        release()
+        assert request("GET", other + "/snapshot", "b", retry_overload=True) == other_snapshot
+        for path in paths[2:]:
+            assert request("GET", path + "/snapshot", retry_overload=True) == empty_snapshot
+        # Disconnection and normal completion both release permits; snapshots share the same budget.
+        assert stall(paths[0] + "/snapshot", "a", "GET") == 200
+        assert stall(paths[1] + "/snapshot", "a", "GET") == 200
+        request("GET", paths[2] + "/snapshot", expected=429, timeout=5)
+        request("POST", paths[2] + "/extend", body=append, expected=429, timeout=5)
+        assert request("GET", paths[2], timeout=5)["n"] == 0
+        request("POST", other + "/extend", "b", blocked, timeout=5)
+        assert request("GET", other, "b")["n"] == 2
+        release()
+        assert request("GET", paths[2] + "/snapshot", retry_overload=True) == empty_snapshot
+        wire = request("POST", paths[2] + "/extend", body=append, retry_overload=True)
+        assert wire[:4] and request("GET", paths[2])["n"] == 1
+        for _ in range(3):
+            assert request("GET", paths[3] + "/snapshot", retry_overload=True) == empty_snapshot
+        print(f"PASS test_slow_readers_do_not_starve_critical: four X attempts {statuses}; Y completed within 5 s")
+        print("PASS test_stream_budget_lifetime: global admission reserve, snapshot limits, 429 unchanged state, disconnect/completion release")
+    finally:
+        release()
+
+
+def test_max_delta_header_16384(request, model_hash):
+    # The largest supported HTTP range carries all 16384 six-digit token IDs; over-capacity rejects without writes.
+    sid = request("POST", "/v1/sessions", body={"model_sha256": model_hash})["session_id"]
+    path = "/v1/sessions/" + sid
+    before = request("GET", path)
+    snapshot = request("GET", path + "/snapshot")
+    tokens = [100000] * 16384
+    append = {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": tokens, "return_delta": True}
+    request("POST", path + "/extend", body=dict(append, tokens=tokens + [100000]), expected=400)
+    assert request("GET", path) == before and request("GET", path + "/snapshot") == snapshot
+    wire = request("POST", path + "/extend", body=append, timeout=900)
+    length = struct.unpack_from("<I", wire)[0]
+    assert 65536 < length <= 4096 + 11 * 16384
+    header = json.loads(wire[4:4 + length])
+    assert header["n0"] == 0 and header["n1"] == 16384 and header["tokens"] == tokens
+    assert header["prefix_hash_n1"] == prefix(tokens)
+    native = wire[4 + length:-48]
+    assert header["sections"] == [{"name": "llama_seq_state", "offset": 0, "bytes": len(native)}]
+    assert wire[-32:] == hashlib.sha256(native).digest()
+    saved = request("GET", path + "/snapshot")
+    assert struct.unpack_from("<III", saved)[1:] == (4, 16384)
+    assert list(struct.unpack_from("<16384i", saved, 12)) == tokens
+    assert saved[12 + 4 * 16384:] == native[8:]
+    assert request("GET", path)["n"] == 16384
+    print(f"PASS test_max_delta_header_16384: {length}-byte header, exact tokens/hash/native snapshot; 16385 rejected with unchanged empty snapshot")
 
 
 def main():
@@ -18,6 +131,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--artifacts", required=True)
     parser.add_argument("--port", type=int, default=18091)
+    parser.add_argument("--regression", choices=("slow-readers", "max-delta"))
     args = parser.parse_args()
     artifacts = pathlib.Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
@@ -27,28 +141,34 @@ def main():
     credentials.chmod(0o600)
     credentials.write_text(json.dumps(clients))
     log = (artifacts / "prefill-node-01.log").open("wb")
-    process = subprocess.Popen([args.binary, args.model, str(credentials), str(args.port), "512"], stdout=log, stderr=log)
+    process = subprocess.Popen([args.binary, args.model, str(credentials), str(args.port), "16384" if args.regression == "max-delta" else "512"], stdout=log, stderr=log)
     (artifacts / "prefill.pid").write_text(str(process.pid) + "\n")
     base = f"http://127.0.0.1:{args.port}"
 
-    def request(method, path, client="a", body=None, expected=200):
+    def request(method, path, client="a", body=None, expected=200, timeout=180, retry_overload=False):
         headers = {"Content-Type": "application/json"}
         if client is not None:
             headers["Authorization"] = "Bearer " + clients[client]
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=180) as response:
-                status, payload, response_headers = response.status, response.read(), response.headers
-        except urllib.error.HTTPError as error:
-            status, payload, response_headers = error.code, error.read(), error.headers
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    status, payload, response_headers = response.status, response.read(), response.headers
+            except urllib.error.HTTPError as error:
+                status, payload, response_headers = error.code, error.read(), error.headers
+            if status != 429 or not retry_overload or time.monotonic() >= deadline:
+                break
+            assert response_headers.get("Retry-After") == "1"
+            time.sleep(0.05)
         assert status == expected, (method, path, status, expected, payload[:120])
+        if status == 429:
+            assert response_headers.get("Retry-After") == "1"
+            assert json.loads(payload) == {"error": "binary response limit"}
         if "application/json" in response_headers.get("Content-Type", ""):
             return json.loads(payload)
         return payload
-
-    def prefix(tokens):
-        return hashlib.sha256(b"".join(struct.pack("<i", token) for token in tokens)).hexdigest()
 
     try:
         for _ in range(600):
@@ -62,6 +182,12 @@ def main():
         else:
             raise AssertionError("prefill startup timed out")
         model_hash = health["model_sha256"]
+        if args.regression == "slow-readers":
+            test_slow_readers_do_not_starve_critical(request, clients, args.port, model_hash)
+            return
+        if args.regression == "max-delta":
+            test_max_delta_header_16384(request, model_hash)
+            return
         request("GET", "/v1/sessions", client=None, expected=401)
         # Each rejection preserves the session list or existing session count, hash and snapshot bytes.
         request("POST", "/v1/sessions", body={"model_sha256": "0" * 64}, expected=400)
@@ -107,7 +233,7 @@ def main():
             client, index, other = case
             endpoint = "/v1/sessions/" + other
             tokens = [110 + index, 120 + index]
-            request("POST", endpoint + "/extend", client, {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": tokens, "return_delta": True})
+            request("POST", endpoint + "/extend", client, {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": tokens, "return_delta": True}, retry_overload=True)
             request("POST", endpoint + "/extend", client, {"n0": 2, "prefix_hash_n0": prefix(tokens), "tokens": [130 + index], "return_delta": False}, 202)
             final = request("GET", endpoint, client)
             assert final["n"] == 3 and final["prefix_hash"] == prefix(tokens + [130 + index])

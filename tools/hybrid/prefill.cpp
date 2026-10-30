@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <random>
 
 using hybrid::json;
@@ -14,6 +15,43 @@ struct session {
     std::string state;
     int64_t last_used = 0;
 };
+
+class response_budget {
+    std::mutex mutex;
+    size_t active = 0;
+    std::map<std::string, size_t> clients;
+
+    struct lease {
+        response_budget & owner;
+        std::string client;
+        lease(response_budget & owner, const std::string & client) : owner(owner), client(client) {}
+        ~lease() {
+            std::lock_guard<std::mutex> lock(owner.mutex);
+            --owner.active;
+            --owner.clients.at(client);
+        }
+    };
+
+public:
+    std::shared_ptr<void> acquire(const std::string & client) {
+        std::lock_guard<std::mutex> lock(mutex);
+        // Reserve one of the four HTTP workers for admission and control requests.
+        if (active >= 3 || clients[client] >= 2) { return {}; }
+        auto permit = std::make_shared<lease>(*this, client);
+        ++active;
+        ++clients[client];
+        return permit;
+    }
+};
+
+static void send_binary(httplib::Response & res, std::string wire, std::shared_ptr<void> permit) {
+    res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire)](size_t offset, httplib::DataSink & sink) {
+        size_t n = std::min<size_t>(65536, wire.size() - offset);
+        if (n && !sink.write(wire.data() + offset, n)) { return false; }
+        if (offset + n == wire.size()) { sink.done(); }
+        return true;
+    }, [permit = std::move(permit)](bool) mutable { permit.reset(); });
+}
 
 static int64_t now() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -84,10 +122,12 @@ int main(int argc, char ** argv) {
         hybrid::request_scheduler scheduler;
         size_t ram_bytes = 0;
         uint64_t extends = 0;
+        response_budget responses;
         httplib::Server http;
         http.set_payload_max_length(1024 * 1024);
         http.set_read_timeout(30, 0);
         http.set_write_timeout(3600, 0);
+        http.set_keep_alive_max_count(1);
         http.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
@@ -155,7 +195,12 @@ int main(int argc, char ** argv) {
                 } else if (req.method == "GET" && action.empty()) {
                     respond(res, 200, info(s, model_hash));
                 } else if (req.method == "GET" && action == "snapshot") {
-                    res.set_content(snapshot(s, empty_state), "application/octet-stream");
+                    auto permit = responses.acquire(client);
+                    if (!permit) {
+                        res.set_header("Retry-After", "1");
+                        respond(res, 429, {{"error", "binary response limit"}}); return;
+                    }
+                    send_binary(res, snapshot(s, empty_state), std::move(permit));
                 } else if (req.method == "POST" && action == "extend") {
                     json body = hybrid::parse_json(req.body);
                     if (!body.at("n0").is_number_integer() || !body.at("prefix_hash_n0").is_string()) {
@@ -178,13 +223,26 @@ int main(int argc, char ** argv) {
                         tokens.push_back(token.get<llama_token>());
                     }
                     const size_t n0 = s.tokens.size();
-                    hybrid::load_state(ctx.get(), s.state);
-                    hybrid::prefill(ctx.get(), tokens, n0);
                     std::vector<llama_token> all = s.tokens;
                     all.insert(all.end(), tokens.begin(), tokens.end());
+                    const bool return_delta = body.at("return_delta").get<bool>();
+                    std::shared_ptr<void> permit;
+                    json header;
+                    if (return_delta) {
+                        permit = responses.acquire(client);
+                        if (!permit) {
+                            res.set_header("Retry-After", "1");
+                            respond(res, 429, {{"error", "binary response limit"}}); return;
+                        }
+                        header = {{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}};
+                        // Use the largest body length so the header budget is checked before inference.
+                        hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
+                    }
+                    hybrid::load_state(ctx.get(), s.state);
+                    hybrid::prefill(ctx.get(), tokens, n0);
                     std::string wire;
-                    if (body.at("return_delta").get<bool>()) {
-                        wire = hybrid::encode_delta({{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}}, hybrid::export_range(ctx.get(), n0, all.size()));
+                    if (return_delta) {
+                        wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size()));
                     }
                     std::string state = hybrid::save_state(ctx.get());
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);
@@ -198,12 +256,7 @@ int main(int argc, char ** argv) {
                     s.last_used = now();
                     ++extends;
                     if (!wire.empty()) {
-                        res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire)](size_t offset, httplib::DataSink & sink) {
-                            size_t n = std::min<size_t>(65536, wire.size() - offset);
-                            if (n && !sink.write(wire.data() + offset, n)) { return false; }
-                            if (offset + n == wire.size()) { sink.done(); }
-                            return true;
-                        });
+                        send_binary(res, std::move(wire), std::move(permit));
                     } else {
                         respond(res, 202, {{"n", s.tokens.size()}, {"prefix_hash", hybrid::prefix_hash(s.tokens)}});
                     }
