@@ -1,4 +1,5 @@
 #include "hybrid-state.h"
+#include "hybrid-scheduler.h"
 #include "llama-ext.h"
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,24 @@ static void write(const std::string & path, const std::string & data) {
 
 static json header(const std::string & hash, size_t n0, size_t n1, const std::vector<llama_token> & tokens) {
     return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"tokens", std::vector<llama_token>(tokens.begin() + n0, tokens.begin() + n1)}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
+}
+
+static void scheduler_tests() {
+    // A later critical append cannot pass the same session's shadow; other sessions prefer critical work and rotate clients.
+    hybrid::request_ticket a_shadow{"a", "one", false};
+    hybrid::request_ticket a_later{"a", "one", true};
+    hybrid::request_ticket b_critical{"b", "two", true};
+    require(hybrid::next_request({&a_shadow, &a_later}, "") == &a_shadow, "session FIFO bypass");
+    require(hybrid::next_request({&a_shadow, &a_later, &b_critical}, "") == &b_critical, "critical priority lost");
+    hybrid::request_ticket a{"a", "one", true};
+    hybrid::request_ticket a_other{"a", "other", true};
+    hybrid::request_ticket b{"b", "one", true};
+    hybrid::request_ticket c{"c", "one", true};
+    require(hybrid::next_request({&a, &a_other, &b, &c}, "a") == &b, "client b starved");
+    require(hybrid::next_request({&a, &a_other, &b, &c}, "b") == &c, "client c starved");
+    require(hybrid::next_request({&a, &a_other, &b, &c}, "c") == &a, "round-robin wrap lost");
+    require(hybrid::next_request({}, "c") == nullptr, "empty scheduler queue");
+    std::cout << "PASS scheduler FIFO, critical priority and client round robin\n";
 }
 
 static void codec_tests() {
@@ -133,6 +152,7 @@ static void run_model(const std::string & model_path, const std::string & direct
 
 int main(int argc, char ** argv) {
     try {
+        scheduler_tests();
         codec_tests();
         if (argc == 2 && std::string(argv[1]) == "--codec") { return 0; }
         if (argc < 3 || argc > 4) {

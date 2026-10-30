@@ -196,7 +196,7 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
-    if (p1 != seq_pos_max(seq_id) + 1) {
+    if (p1 != mem_attn->seq_pos_max(seq_id) + 1 || p1 != mem_recr->seq_pos_max(seq_id) + 1) {
         throw std::runtime_error("range endpoint must equal the current recurrent state position");
     }
     mem_attn->state_write_range(io, seq_id, p0, p1, flags);

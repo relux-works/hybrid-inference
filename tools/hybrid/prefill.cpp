@@ -1,4 +1,5 @@
 #include "hybrid-state.h"
+#include "hybrid-scheduler.h"
 #include "httplib.h"
 #include <chrono>
 #include <fstream>
@@ -81,7 +82,7 @@ int main(int argc, char ** argv) {
         auto ctx = hybrid::make_context(model.get(), n_ctx);
         const std::string empty_state = hybrid::save_state(ctx.get());
         std::map<std::string, std::map<std::string, session>> sessions;
-        std::mutex mutex;
+        hybrid::request_scheduler scheduler;
         size_t ram_bytes = 0;
         uint64_t extends = 0;
         httplib::Server http;
@@ -91,7 +92,15 @@ int main(int argc, char ** argv) {
         http.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
-            std::lock_guard<std::mutex> lock(mutex);
+            auto owner_it = owners.find(req.get_header_value("Authorization"));
+            const std::string client = owner_it == owners.end() ? "" : owner_it->second;
+            const std::string session_id = req.path.size() >= 45 ? req.path.substr(13, 32) : "";
+            bool critical = true;
+            if (req.method == "POST" && req.path.find("/extend") != std::string::npos) {
+                try { critical = hybrid::parse_json(req.body).value("return_delta", true); }
+                catch (const std::exception &) { /* Invalid requests are rejected below. */ }
+            }
+            auto admission = scheduler.enter(client, session_id, critical);
             try {
                 if (req.path == "/v1/health") {
                     respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}});
