@@ -1,6 +1,7 @@
 """Per-turn cost model. Rates are tokens/s and bytes/s; times are seconds."""
 import argparse
 import json
+import math
 from dataclasses import dataclass
 
 
@@ -18,21 +19,25 @@ class Policy:
     always: bool = False
 
     def __post_init__(self):
-        if (not self.local_rates or any(d < 0 or r <= 0 for d, r in self.local_rates)
+        values = [self.server_rate, self.link_rate, self.fixed, self.kv_bytes, self.state_bytes,
+                  self.eta, self.margin, self.hysteresis]
+        values.extend(v for row in self.local_rates for v in row)
+        if (not all(math.isfinite(v) for v in values)
+                or not self.local_rates or any(d < 0 or r <= 0 for d, r in self.local_rates)
                 or min(self.server_rate, self.link_rate, self.eta) <= 0
                 or min(self.fixed, self.kv_bytes, self.state_bytes, self.hysteresis) < 0
                 or not 0 <= self.margin < 1 or self.eta > 1):
             raise ValueError("invalid policy rates or bounds")
 
     def choose(self, delta, depth, previous=False, link_rate=None, server_factor=1.0):
-        if delta < 0 or depth < 0 or server_factor <= 0:
+        if not all(math.isfinite(v) for v in (delta, depth, server_factor)) or delta < 0 or depth < 0 or server_factor <= 0:
             raise ValueError("invalid turn size or server factor")
         rate = sorted(self.local_rates)[0][1]
         for at, value in sorted(self.local_rates):
             if depth >= at:
                 rate = value
         link = self.link_rate if link_rate is None else link_rate
-        if link <= 0:
+        if not math.isfinite(link) or link <= 0:
             raise ValueError("invalid measured link rate")
         local = delta / rate
         remote = self.fixed + delta * server_factor / self.server_rate

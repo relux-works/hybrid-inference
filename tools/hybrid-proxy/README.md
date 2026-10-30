@@ -22,7 +22,7 @@ The stub has a clearly labelled synthetic token body. It cannot be imported by t
 
 ## Run with the engine
 
-Set `model_sha256` to the SHA-256 of the one shared GGUF. Point `prefill_url` at A's prefill node and `decode_url` at the patched llama-server. Replace the fixture credentials in a private configuration file, and restrict its permissions. Increase `prefill_timeout` to cover real CPU prefill during correctness runs (for example, 120 seconds); its default of 0.5 seconds bounds waits when using an unavailable development server. `slot_path` must be the same local directory passed to llama-server as `--slot-save-path`, and `slots` must match its `--parallel` value. Keep context shifting and speculative decoding disabled for this prototype. Text chat and upstream chat tool parsing are forwarded; multimodal inputs and multiple choices are not supported. Anthropic Messages is not implemented.
+Set `model_sha256` to the SHA-256 of the one shared GGUF. Point `prefill_url` at A's prefill node and `decode_url` at the patched llama-server. Replace the fixture credentials in a private configuration file, and restrict its permissions. Increase `prefill_timeout` to cover real CPU prefill during correctness runs (for example, 120 seconds); its default of 0.5 seconds bounds waits when using an unavailable development server. `slot_path` must be the same local directory passed to llama-server as `--slot-save-path`, and `slots` must match its `--parallel` value. Keep context shifting, speculative decoding, automatic idle-slot caching, and RAM prompt caching disabled for this prototype (`--no-context-shift --no-cache-idle-slots --cache-ram 0 --ctx-checkpoints 0`). Text chat and upstream chat tool parsing are forwarded; multimodal inputs and multiple choices are not supported. Anthropic Messages is not implemented.
 
 The decode node must expose `GET /slots/{id}/info` with `n`, `prefix_hash`, and `tokens`, and binary `POST /slots/{id}?action=import_delta`. The import uses A's shared checked reader. The proxy offloads all but the final prompt token, then submits the original chat request locally. That last token produces the client's exact logits; memory serialization alone does not carry logits.
 
@@ -32,7 +32,7 @@ A 409 logs both hashes. A behind server receives journal replay; an ahead server
 
 ## Policy and trace replay
 
-The policy uses a depth-indexed local prefill table, server rate, link EWMA, fixed overhead, KV bytes/token, recurrent-state bytes, efficiency, margin and hysteresis. The defaults are estimates from the specification; configure measured rates for the target Mac and server. Transfer EWMA includes request/server time and is a conservative effective throughput, not a physical link measurement. `policy.always=true` forces an offload attempt when there are new transferable tokens; offline requests still run locally.
+The policy uses a depth-indexed local prefill table, server rate, link EWMA, fixed overhead, KV bytes/token, recurrent-state bytes, efficiency, margin and hysteresis. The defaults are estimates from the specification; configure measured rates for the target Mac and server. Transfer EWMA measures body bytes after response headers arrive, excluding server prefill time; it is application-level throughput, not a physical link measurement. `policy.always=true` forces an offload attempt when there are new transferable tokens; offline requests still run locally.
 
 ```sh
 python3 tools/hybrid-proxy/policy.py .temp/turns.jsonl --config .temp/policy.json

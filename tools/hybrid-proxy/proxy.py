@@ -28,6 +28,7 @@ class HTTPError(Exception):
 class Node:
     def __init__(self, url, token="", timeout=1.0):
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+        self.last_transfer_rate = None
 
     def open(self, method, path, data=None, headers=None):
         headers = dict(headers or {})
@@ -46,7 +47,10 @@ class Node:
     def request(self, method, path, data=None, headers=None, binary=False):
         with self.open(method, path, data, headers) as response:
             limit = MAX_DELTA if binary else MAX_JSON
+            started = time.monotonic()
             body = response.read(limit + 1)
+            elapsed = max(time.monotonic() - started, 1e-6)
+            self.last_transfer_rate = len(body) / elapsed if body else None
             if len(body) > limit:
                 raise ValueError("upstream body too large")
             return body if binary else (json.loads(body) if body else None)
@@ -219,12 +223,12 @@ class Proxy:
                     raise ValueError("server is ahead of local slot; local re-prefill required")
                 if session["remote_n"] < local_n:
                     self.sync(session, client)
-                started = time.monotonic()
-                delta = self.remote(client).request("POST", path + "/extend", {
+                remote = self.remote(client)
+                delta = remote.request("POST", path + "/extend", {
                     "n0": local_n, "prefix_hash_n0": prefix_hash(tokens[:local_n]),
                     "tokens": target[local_n:], "return_delta": True}, binary=True)
-                elapsed = max(time.monotonic() - started, 1e-6)
-                self.link_rate = 0.8 * self.link_rate + 0.2 * len(delta) / elapsed
+                if remote.last_transfer_rate:
+                    self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
                 session["tokens"] = target
                 self.store.save(session)
                 self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,

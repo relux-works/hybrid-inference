@@ -39,6 +39,14 @@ def run(node, golden, slots):
     prefix = Path(str(golden) + ".prefix.state").read_bytes()
     first = dict(header, n0=0, n1=n0, tokens=tokens[:n0], prefix_hash_n1=prefix_hash(tokens[:n0]))
     node.request("POST", "/slots/0?action=import_delta", envelope(first, prefix), headers)
+    # A's one-stream slot snapshot must restore into another slot of a two-stream decode node.
+    slot_file = struct.pack("<III", 0x67677371, 4, n0)
+    slot_file += b"".join(struct.pack("<i", token) for token in tokens[:n0]) + prefix[8:]
+    (slots / "source-prefix.bin").write_bytes(slot_file)
+    node.request("POST", "/slots/1?action=restore", {"filename": "source-prefix.bin"})
+    restored = node.request("GET", "/slots/1/info")
+    require(restored["tokens"] == tokens[:n0], "one-stream snapshot restore into parallel slot failed")
+    print("PASS HTTP source snapshot restore into parallel slot", flush=True)
     before = node.request("GET", "/slots/0/info")
     require(before == dict(n=n0, prefix_hash=prefix_hash(tokens[:n0]), tokens=tokens[:n0]), "prefix import info mismatch")
     node.request("POST", "/slots/0?action=save", {"filename": "before.bin"})
@@ -76,6 +84,7 @@ def run(node, golden, slots):
         else:
             raise AssertionError(f"{name}: invalid delta accepted")
         require(node.request("GET", "/slots/0/info") == before, f"{name}: slot info changed")
+        require(node.request("GET", "/slots/1/info") == restored, f"{name}: another slot changed")
         node.request("POST", "/slots/0?action=save", {"filename": "after.bin"})
         require((slots / "after.bin").read_bytes() == before_bytes, f"{name}: native slot bytes changed")
         print(f"PASS HTTP {name}: 400, slot unchanged", flush=True)
@@ -84,6 +93,7 @@ def run(node, golden, slots):
     require(info["n"] == n1 and info["tokens"] == tokens[:n1], "valid delta info mismatch")
     require(info["prefix_hash"] == metadata["prefix_hash_n1"], "valid delta hash mismatch")
     # Slot 0 imports a real prefix+delta; slot 1 prefills locally on the same CPU backend.
+    node.request("POST", "/slots/1?action=erase", {})
     request = dict(prompt=tokens, n_predict=64, temperature=0, seed=0, cache_prompt=True,
                    return_tokens=True, ignore_eos=True)
     imported = node.request("POST", "/completion", dict(request, id_slot=0))
@@ -114,7 +124,8 @@ def main():
         command = [args.binary, "-m", args.model, "--host", "127.0.0.1", "--port", str(port),
                    "-ngl", "0", "-t", "2", "-tb", "2", "-c", "8192", "-b", "256", "-ub", "256",
                    "-np", "2", "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on", "--slots",
-                   "--no-context-shift", "--slot-save-path", str(slots) + "/"]
+                   "--no-context-shift", "--cache-ram", "0", "--no-cache-idle-slots",
+                   "--ctx-checkpoints", "0", "--slot-save-path", str(slots) + "/"]
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
         (directory / "pid.txt").write_text(str(process.pid) + "\n")
         try:

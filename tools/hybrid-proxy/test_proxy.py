@@ -1,5 +1,7 @@
 """Bounded synthetic HTTP contract tests. These do not prove engine equivalence."""
 import hashlib
+import io
+from unittest import mock
 import http.server
 import json
 from pathlib import Path
@@ -27,6 +29,10 @@ class PolicyTests(unittest.TestCase):
             policy.choose(-1, 0)
         with self.assertRaises(ValueError):
             Policy(local_rates=((0, 0),))
+        with self.assertRaises(ValueError):
+            Policy(link_rate=float("nan"))
+        with self.assertRaises(ValueError):
+            policy.choose(1, 0, link_rate=float("inf"))
 
     def test_hysteresis_and_depth(self):
         policy = Policy(local_rates=((0, 100), (1000, 10)), server_rate=1000,
@@ -34,6 +40,26 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(policy.choose(100, 0, previous=False)["offload"])
         self.assertTrue(policy.choose(100, 0, previous=True)["offload"])
         self.assertTrue(policy.choose(100, 1000)["offload"])
+
+
+class TransferTests(unittest.TestCase):
+    # Server response headers arrive before the body timer starts; empty responses do not update rate.
+    def test_body_transfer_measurement(self):
+        node = Node("http://127.0.0.1")
+        calls = []
+        def opened(*args, **kwargs):
+            calls.append("headers")
+            return io.BytesIO(b"1234")
+        def clock():
+            self.assertIn("headers", calls)
+            calls.append("clock")
+            return 100 if calls.count("clock") == 1 else 102
+        with mock.patch.object(node, "open", side_effect=opened), mock.patch("proxy.time.monotonic", side_effect=clock):
+            self.assertEqual(node.request("GET", "/delta", binary=True), b"1234")
+        self.assertEqual(node.last_transfer_rate, 2)
+        with mock.patch.object(node, "open", return_value=io.BytesIO(b"")):
+            self.assertEqual(node.request("GET", "/empty", binary=True), b"")
+        self.assertIsNone(node.last_transfer_rate)
 
 
 class MappingTests(unittest.TestCase):
