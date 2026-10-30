@@ -2158,6 +2158,7 @@ const slot_info_vec_t *   sinfos_in) {
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     const bool append = flags & LLAMA_STATE_SEQ_FLAGS_APPEND;
+    const bool validate = flags & LLAMA_STATE_SEQ_FLAGS_VALIDATE;
     if ((!append && n_stream_cur != n_stream) || (append && (seq_id < 0 || n_stream_cur == 0 || n_stream_cur > n_seq_max))) {
         throw std::runtime_error("n_stream mismatch");
     }
@@ -2191,7 +2192,7 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append, validate);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2200,7 +2201,9 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (!res) {
-            state_clear(seq_id, strm, sinfo);
+            if (!validate) {
+                state_clear(seq_id, strm, sinfo);
+            }
             throw std::runtime_error("failed to restore kv cache");
         }
 
@@ -2344,7 +2347,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append, bool validate) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2356,7 +2359,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         const int64_t next_pos = (int64_t) seq_pos_max(dest_seq_id) + 1;
-        if (!append) {
+        if (!append && !validate) {
             seq_rm(dest_seq_id, -1, -1);
         }
 
@@ -2413,6 +2416,17 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.pos[i]      = pos;
             ubatch.n_seq_id[i] = n_seq_id;
             ubatch.seq_id[i]   = &dest_seq_id;
+        }
+
+        if (validate) {
+            // The tensor parser needs a bounded layout, but must not allocate cache cells.
+            sinfo.resize(1);
+            sinfo.s0 = sinfo.s1 = strm;
+            sinfo.strm[0] = strm;
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                sinfo.idxs[0].push_back(i);
+            }
+            return true;
         }
 
         if (sinfo_in) {

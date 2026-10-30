@@ -860,10 +860,22 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
-
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
+
+    if (flags & LLAMA_STATE_SEQ_FLAGS_VALIDATE) {
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || cell_count != 1) {
+            throw std::runtime_error("append requires one recurrent cell for one sequence");
+        }
+        llama_pos pos;
+        uint32_t n_seq_id;
+        io.read(&pos, sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+        if (pos < 0 || n_seq_id != 0 || !state_read_data(io, cell_count)) {
+            throw std::runtime_error("invalid recurrent sequence state");
+        }
+        return;
+    }
 
     bool res = true;
 
@@ -1007,8 +1019,8 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
     if (dest_seq_id != -1) {
         // single sequence
-        if (cell_count > size) {
-            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+        if (cell_count > 1 || cell_count > size || dest_seq_id < 0 || (uint32_t) dest_seq_id >= n_seq_max) {
+            LLAMA_LOG_ERROR("%s: invalid single-sequence recurrent cell count or sequence\n", __func__);
             return false;
         }
 

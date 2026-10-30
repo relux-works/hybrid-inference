@@ -17,6 +17,7 @@ class llama_io_read_i;
 
 // Internal host-state append mode. Use the transactional API in llama-ext.h.
 #define LLAMA_STATE_SEQ_FLAGS_APPEND 4
+#define LLAMA_STATE_SEQ_FLAGS_VALIDATE 8
 
 struct llama_memory_params {
     // kv cache

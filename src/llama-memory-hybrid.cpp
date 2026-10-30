@@ -208,12 +208,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     try {
         mem_recr->state_read(io, seq_id, flags);
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_APPEND) && mem_attn->seq_pos_max(seq_id) != mem_recr->seq_pos_max(seq_id)) {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_APPEND) && !(flags & LLAMA_STATE_SEQ_FLAGS_VALIDATE) && mem_attn->seq_pos_max(seq_id) != mem_recr->seq_pos_max(seq_id)) {
             throw std::runtime_error("append attention and recurrent positions differ");
         }
     } catch (...) {
         // a failed restore leaves the sequence empty in both caches
-        mem_attn->state_clear(seq_id);
+        if (!(flags & LLAMA_STATE_SEQ_FLAGS_VALIDATE)) {
+            mem_attn->state_clear(seq_id);
+        }
 
         throw;
     }
