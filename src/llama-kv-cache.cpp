@@ -2161,7 +2161,9 @@ const slot_info_vec_t *   sinfos_in) {
     if (append && swa_type != LLAMA_SWA_TYPE_NONE) {
         throw std::runtime_error("append of sliding-window state is unsupported");
     }
-    if ((!append && n_stream_cur != n_stream) || (append && (seq_id < 0 || n_stream_cur == 0 || n_stream_cur > n_seq_max))) {
+    // A sequence has one populated stream, independent of source and destination parallelism.
+    const bool single_sequence = seq_id >= 0 && !sinfos_in && !sinfos_out;
+    if ((!single_sequence && n_stream_cur != n_stream) || n_stream_cur == 0 || n_stream_cur > LLAMA_MAX_SEQ || (append && seq_id < 0)) {
         throw std::runtime_error("n_stream mismatch");
     }
 
@@ -2184,8 +2186,8 @@ const slot_info_vec_t *   sinfos_in) {
             continue;
         }
 
-        if (append && appended) {
-            throw std::runtime_error("append state must contain one sequence");
+        if (single_sequence && appended) {
+            throw std::runtime_error("single-sequence state must contain one populated stream");
         }
         appended = true;
 
