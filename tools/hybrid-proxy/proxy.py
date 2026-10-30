@@ -1,5 +1,6 @@
 """Hybrid client proxy. Credentials are read from a JSON file, never CLI arguments."""
 import argparse
+from contextlib import contextmanager
 import http.server
 import http.client
 import json
@@ -13,11 +14,13 @@ import urllib.parse
 import urllib.request
 
 from policy import Policy
+from concurrency import SessionQueue
 from store import Store, prefix_hash
 
 LOG = logging.getLogger("hybrid")
 MAX_JSON = 8 * 1024 * 1024
 MAX_DELTA = 512 * 1024 * 1024
+SLOT_WAIT_SECONDS = 30
 
 
 class HTTPError(Exception):
@@ -30,6 +33,12 @@ class RollbackError(HTTPError):
     def __init__(self):
         super().__init__(503)
         self.args = ("decoder rollback failed; backup retained; slot requires local prefill",)
+
+
+class SlotUnavailable(HTTPError):
+    def __init__(self):
+        super().__init__(503)
+        self.args = ("no decode slot available; retry later",)
 
 
 class Node:
@@ -83,7 +92,11 @@ class Proxy:
         self.slots = config.get("slots", 1)
         if self.slots < 1:
             raise ValueError("slots must be positive")
-        self.lock = threading.RLock()
+        self.lock = self.store.lock
+        self.slot_available = threading.Condition(self.lock)
+        self.pinned = set()
+        self.quarantined = set()
+        self.queues = {}
         self.link_rate = self.policy.link_rate
         self.stop = threading.Event()
 
@@ -95,6 +108,20 @@ class Proxy:
 
     def remote(self, client):
         return Node(self.prefill, client["prefill_token"], self.timeout)
+
+    def reserve(self, sid, skip_busy=False):
+        with self.lock:
+            queue = self.queues.setdefault(sid, SessionQueue())
+            return queue.reserve(skip_busy)
+
+    def verified(self, sid, value=None):
+        with self.lock:
+            if value is not None:
+                if value:
+                    self.store.verified.add(sid)
+                else:
+                    self.store.verified.discard(sid)
+            return sid in self.store.verified
 
     def sync(self, session, client, recreate=True):
         """202 is an acknowledgement of queuing, never proof that tokens were applied."""
@@ -172,7 +199,7 @@ class Proxy:
                     self.decode.request("POST", slot + "?action=restore", {"filename": backup})
                 except Exception as error:
                     keep_backup = True
-                    self.store.verified.discard(session["id"])
+                    self.verified(session["id"], False)
                     raise RollbackError() from error
             raise
         finally:
@@ -197,67 +224,167 @@ class Proxy:
                 raise
 
     def replay(self):
-        for session in self.store.pending():
-            client = next((c for c in self.clients.values() if c["id"] == session["client"]), None)
+        for pending in self.store.pending():
+            client = next((c for c in self.clients.values() if c["id"] == pending["client"]), None)
             if client:
+                ticket = self.reserve(pending["id"], skip_busy=True)
+                if ticket is None:
+                    continue
                 try:
-                    self.sync(session, client)
+                    with ticket:
+                        self.sync(self.store.get(pending["id"]), client)
                 except (OSError, HTTPError, ValueError):
                     pass
 
     def replay_loop(self):
         while not self.stop.wait(1):
-            with self.lock:
-                self.replay()
+            self.replay()
+
+    def wait_idle(self, slot):
+        deadline = time.monotonic() + SLOT_WAIT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SlotUnavailable()
+            node = Node(self.decode.url, self.decode.token, min(self.decode.timeout, remaining))
+            states = node.request("GET", "/slots")
+            if any(s["id"] == slot and not s["is_processing"] for s in states):
+                return
+            time.sleep(min(0.05, remaining))
+
+    def refresh_quarantined(self, deadline):
+        with self.lock:
+            if not self.quarantined:
+                return
+        node = Node(self.decode.url, self.decode.token, min(1.0, max(0.001, deadline - time.monotonic())))
+        try:
+            states = node.request("GET", "/slots")
+        except (OSError, HTTPError, ValueError):
+            return
+        with self.slot_available:
+            for state in states:
+                if not state["is_processing"]:
+                    self.quarantined.discard(state["id"])
+            self.slot_available.notify_all()
+
+    @contextmanager
+    def slot_lease(self, session):
+        deadline = time.monotonic() + SLOT_WAIT_SECONDS
+        while True:
+            self.refresh_quarantined(deadline)
+            with self.slot_available:
+                # Another session can park this inactive binding while its owner is replaying or queued.
+                session["slot"] = self.store.get(session["id"])["slot"]
+                slot = session["slot"]
+                occupants = [self.store.occupant(i) for i in range(self.slots)]
+                candidates = [i for i in range(self.slots) if i not in self.pinned and i not in self.quarantined]
+                if slot is not None:
+                    candidates = [slot] if slot in candidates else []
+                if candidates:
+                    slot = min(candidates, key=lambda i: occupants[i]["used"] if occupants[i] else -1)
+                    old = occupants[slot]
+                    self.pinned.add(slot)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SlotUnavailable()
+                self.slot_available.wait(min(remaining, 0.1))
+        checked_idle = False
+        try:
+            self.wait_idle(slot)
+            checked_idle = True
+            if session["slot"] is None:
+                if old:
+                    self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": old["id"] + ".bin"})
+                    self.store.set_slot(old["id"], None)
+                self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+                rollback = (self.slot_path / (session["id"] + "-resync-backup.bin")).exists()
+                if session["tokens"] and not rollback:
+                    try:
+                        self.decode.request("POST", f"/slots/{slot}?action=restore", {"filename": session["id"] + ".bin"})
+                    except HTTPError:
+                        pass  # Durable tokens allow local prefill when a parked file is missing.
+                session["slot"] = slot
+                self.store.set_slot(session["id"], slot)
+            self.acquire_slot(session)
+            yield slot
+        except BaseException:
+            self.verified(session["id"], False)
+            raise
+        finally:
+            idle = False
+            try:
+                if checked_idle:
+                    self.wait_idle(slot)
+                    idle = True
+            except (HTTPError, OSError, ValueError):
+                LOG.warning("slot idle status unavailable slot=%s; quarantined", slot)
+            with self.slot_available:
+                self.pinned.remove(slot)
+                if not idle:
+                    self.quarantined.add(slot)
+                    self.verified(session["id"], False)
+                self.slot_available.notify_all()
 
     def acquire_slot(self, session):
-        # A retained rollback backup is a durable marker: never adopt this slot's unverified state.
+        # Called only while the slot lease is pinned and the native slot is idle.
         rollback_pending = (self.slot_path / (session["id"] + "-resync-backup.bin")).exists()
-        if session["slot"] is not None:
-            slot = session["slot"]
-            if rollback_pending:
-                self.decode.request("POST", f"/slots/{slot}?action=erase", {})
-                self.store.verified.add(session["id"])
-                return slot
-            if session["id"] not in self.store.verified:
-                info = self.decode.request("GET", f"/slots/{slot}/info")
-                if (info["n"] >= len(session["tokens"])
-                        and info.get("tokens", [])[:len(session["tokens"])] == session["tokens"]
-                        and prefix_hash(info.get("tokens", [])) == info["prefix_hash"]):
-                    session["tokens"] = info["tokens"]
-                    self.store.save(session)
-                if info["n"] != len(session["tokens"]) or info["prefix_hash"] != prefix_hash(session["tokens"]):
-                    self.decode.request("POST", f"/slots/{slot}?action=erase", {})
-                    # The durable tokens remain the source for a full local re-prefill.
-                self.store.verified.add(session["id"])
+        slot = session["slot"]
+        if rollback_pending:
+            self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+            self.verified(session["id"], True)
             return slot
-        occupants = [self.store.occupant(i) for i in range(self.slots)]
-        free = next((i for i, item in enumerate(occupants) if item is None), None)
-        if free is None:
-            old = min(occupants, key=lambda row: row["used"])
-            free = old["slot"]
-            self.decode.request("POST", f"/slots/{free}?action=save", {"filename": old["id"] + ".bin"})
-            old["slot"] = None
-            self.store.save(old)
-        self.decode.request("POST", f"/slots/{free}?action=erase", {})
-        # Restore a parked sequence when there is a saved file. First-use sessions have none.
-        if session["tokens"] and not rollback_pending:
-            try:
-                self.decode.request("POST", f"/slots/{free}?action=restore", {"filename": session["id"] + ".bin"})
-            except HTTPError:
-                pass  # Tokens permit a correct local re-prefill if a saved file was lost.
-        session["slot"] = free
-        self.store.save(session)
-        self.store.verified.add(session["id"])
-        return free
+        if not self.verified(session["id"]):
+            info = self.decode.request("GET", f"/slots/{slot}/info")
+            if (info["n"] >= len(session["tokens"])
+                    and info.get("tokens", [])[:len(session["tokens"])] == session["tokens"]
+                    and prefix_hash(info.get("tokens", [])) == info["prefix_hash"]):
+                session["tokens"] = info["tokens"]
+                self.store.save(session)
+            if info["n"] != len(session["tokens"]) or info["prefix_hash"] != prefix_hash(session["tokens"]):
+                self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+            self.verified(session["id"], True)
+        return slot
 
+    def tokenize(self, body):
+        prompt = self.decode.request("POST", "/apply-template", body)["prompt"]
+        return self.decode.request("POST", "/tokenize", {"content": prompt, "add_special": True})["tokens"]
+
+    @contextmanager
     def prepare(self, client, body, explicit):
         if body.get("n", 1) != 1:
             raise ValueError("only one completion per request is supported")
-        prompt = self.decode.request("POST", "/apply-template", body)["prompt"]
-        tokens = self.decode.request("POST", "/tokenize", {"content": prompt, "add_special": True})["tokens"]
-        session = self.store.select(client["id"], tokens, explicit)
-        slot = self.acquire_slot(session)
+        if explicit:
+            with self.lock:
+                try:
+                    existing = self.store.get(explicit)
+                except KeyError:
+                    existing = None
+                if existing and existing["client"] != client["id"]:
+                    raise KeyError("session not found")
+                ticket = self.reserve(explicit)
+            # Reserve explicit IDs before any HTTP, so a slow tokenizer cannot invert their arrival order.
+            with ticket:
+                tokens = self.tokenize(body)
+                session = self.store.select(client["id"], tokens, explicit)
+                with self.slot_lease(session):
+                    yield self.prepare_session(client, body, session, tokens)
+            return
+        tokens = self.tokenize(body)
+        while True:
+            with self.lock:
+                session = self.store.select(client["id"], tokens)
+                ticket = self.reserve(session["id"])
+            with ticket:
+                session = self.store.get(session["id"])
+                if tokens[:len(session["tokens"])] != session["tokens"]:
+                    continue  # A predecessor completed while queued; resolve the fork against its fresh journal.
+                with self.slot_lease(session):
+                    yield self.prepare_session(client, body, session, tokens)
+                return
+
+    def prepare_session(self, client, body, session, tokens):
+        slot = session["slot"]
         info = self.decode.request("GET", f"/slots/{slot}/info")
         local_n = info["n"]
         if local_n > len(tokens) or info["prefix_hash"] != prefix_hash(tokens[:local_n]):
@@ -265,8 +392,10 @@ class Proxy:
             local_n = 0
         # Imported memory has no logits. Decode the final prompt token locally.
         target = tokens[:-1]
+        with self.lock:
+            link_rate = self.link_rate
         decision = self.policy.choose(max(0, len(target) - local_n), local_n,
-                                      bool(session["offload"]), self.link_rate)
+                                      bool(session["offload"]), link_rate)
         try:
             path = self.sync(session, client)
             if decision["offload"] and len(target) > local_n:
@@ -280,7 +409,8 @@ class Proxy:
                     "n0": local_n, "prefix_hash_n0": prefix_hash(tokens[:local_n]),
                     "tokens": target[local_n:], "return_delta": True}, binary=True)
                 if remote.last_transfer_rate:
-                    self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
+                    with self.lock:
+                        self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
                 session["tokens"] = target
                 self.store.save(session)
                 self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
@@ -336,6 +466,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if status == 503:
+            self.send_header("Retry-After", "1")
         self.end_headers()
         self.wfile.write(body)
 
@@ -355,8 +487,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             explicit = self.headers.get("X-Hybrid-Session")
             if explicit and (len(explicit) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in explicit)):
                 raise ValueError("invalid session id")
-            with app.lock:
-                session, prompt, request = app.prepare(client, body, explicit)
+            with app.prepare(client, body, explicit) as (session, prompt, request):
                 with app.decode.open("POST", "/v1/chat/completions", request) as upstream:
                     if body.get("stream"):
                         self.send_response(200)
@@ -365,13 +496,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.send_header("Cache-Control", "no-cache")
                         self.end_headers()
                         started = True
+                        disconnected = False
                         for line in upstream:
                             if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                                 chunk = json.loads(line[6:])
                                 chunk.pop("__verbose", None)
                                 line = b"data: " + json.dumps(chunk).encode() + b"\n"
-                            self.wfile.write(line)
-                            self.wfile.flush()
+                            if not disconnected:
+                                try:
+                                    self.wfile.write(line)
+                                    self.wfile.flush()
+                                except OSError:
+                                    # Drain the upstream before releasing its slot; finish records all evaluated tokens.
+                                    disconnected = True
+                                    self.close_connection = True
                     else:
                         data = json.loads(upstream.read(MAX_JSON))
                         data.pop("__verbose", None)

@@ -1,9 +1,11 @@
 """Persistent token journal and client-scoped session mapping."""
 import hashlib
+from functools import wraps
 import json
 import sqlite3
 import struct
 import time
+import threading
 import uuid
 
 
@@ -26,8 +28,17 @@ def block_hashes(tokens):
     return result
 
 
+def locked(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class Store:
     def __init__(self, path, model):
+        self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -38,6 +49,7 @@ class Store:
                 id TEXT PRIMARY KEY, client TEXT NOT NULL, tokens TEXT NOT NULL,
                 hashes TEXT NOT NULL, remote_id TEXT, remote_n INTEGER NOT NULL DEFAULT 0,
                 slot INTEGER, used REAL NOT NULL, offload INTEGER NOT NULL DEFAULT 0);
+            CREATE UNIQUE INDEX IF NOT EXISTS unique_slot ON sessions(slot);
         """)
         row = self.db.execute("SELECT model FROM meta").fetchone()
         if row and row[0] != model:
@@ -49,9 +61,11 @@ class Store:
         # Runtime slots must be revalidated or restored after every proxy restart.
         self.verified = set()
 
+    @locked
     def close(self):
         self.db.close()
 
+    @locked
     def get(self, sid, client=None):
         row = self.db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
         if not row or (client is not None and row["client"] != client):
@@ -61,15 +75,24 @@ class Store:
         row["hashes"] = json.loads(row["hashes"])
         return row
 
+    @locked
     def save(self, session):
         tokens = session["tokens"]
         prefix_hash(tokens)
         with self.db:
             self.db.execute("""UPDATE sessions SET tokens=?,hashes=?,remote_id=?,remote_n=?,
-                slot=?,used=?,offload=? WHERE id=?""", (
+                used=?,offload=? WHERE id=?""", (
                 json.dumps(tokens), json.dumps(block_hashes(tokens)), session["remote_id"],
-                session["remote_n"], session["slot"], time.time(), int(session["offload"]), session["id"]))
+                session["remote_n"], time.time(), int(session["offload"]), session["id"]))
 
+    @locked
+    def set_slot(self, sid, slot):
+        # Replay may save an older session copy while an inactive slot is parked; it must not restore that binding.
+        with self.db:
+            self.db.execute("UPDATE sessions SET slot=? WHERE id=?", (slot, sid))
+        self.verified.discard(sid)
+
+    @locked
     def select(self, client, tokens, explicit=None):
         prefix_hash(tokens)
         if explicit:
@@ -103,9 +126,11 @@ class Store:
                             (sid, client, time.time()))
         return self.get(sid)
 
+    @locked
     def occupant(self, slot):
         row = self.db.execute("SELECT id FROM sessions WHERE slot=?", (slot,)).fetchone()
         return self.get(row[0]) if row else None
 
+    @locked
     def pending(self):
         return [self.get(row[0]) for row in self.db.execute("SELECT id FROM sessions")]

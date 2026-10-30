@@ -294,15 +294,16 @@ def run_proxy(decode, binary, model, golden, directory, slots, checker):
             offline_id = response.headers["X-Hybrid-Session"]
             require(bool(json.loads(response.read())["choices"]), "offline real decode failed")
         require(not app.store.get(offline_id)["offload"], "offline request incorrectly marked offloaded")
+        with app.reserve(offline_id):
+            pass
         start_prefill()
-        with app.lock:
-            app.replay()
-            app.replay()
-            for session in app.store.pending():
-                owner = next(c for c in app.clients.values() if c["id"] == session["client"])
-                info = app.remote(owner).request("GET", "/v1/sessions/" + session["remote_id"])
-                require(info["n"] == len(session["tokens"]) and info["prefix_hash"] == prefix_hash(session["tokens"]),
-                        "real reconnect journal lost or duplicated tokens")
+        app.replay()
+        app.replay()
+        for session in app.store.pending():
+            owner = next(c for c in app.clients.values() if c["id"] == session["client"])
+            info = app.remote(owner).request("GET", "/v1/sessions/" + session["remote_id"])
+            require(info["n"] == len(session["tokens"]) and info["prefix_hash"] == prefix_hash(session["tokens"]),
+                    "real reconnect journal lost or duplicated tokens")
         print("PASS real proxy: 2 clients x 2 sessions mapped, streaming fork, foreign 404, offline and restart replay", flush=True)
         # Spec v0.3.4 keeps whole-prompt free-running divergence informational; exactness and KL use independent local contexts.
         fixtures = sorted(str(path) for path in directory.glob("conversation-*.tokens.json"))

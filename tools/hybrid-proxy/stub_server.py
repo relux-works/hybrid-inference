@@ -72,7 +72,7 @@ class State:
         self.lock = threading.RLock()
         self.db = sqlite3.connect(database, check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, client TEXT, tokens TEXT)")
-        self.slots = {}
+        self.slots = {i: [] for i in range(2)}
         self.saved = {}
         self.available = True
         self.conflict_once = False
@@ -140,6 +140,8 @@ class State:
             return 200, {"prompt": [ord(c) for c in text]}
         if path == "/tokenize":
             return 200, {"tokens": body["content"]}
+        if path == "/slots":
+            return 200, [dict(id=slot, is_processing=False) for slot in self.slots]
         if path.startswith("/slots/"):
             parts = path.split("/")
             slot = int(parts[2])

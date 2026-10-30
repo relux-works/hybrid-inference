@@ -157,7 +157,11 @@ class HTTPTests(unittest.TestCase):
         client = client or self.client
         with client.open("POST", "/v1/chat/completions", dict(messages=[], _tokens=tokens, stream=stream),
                          {"X-Hybrid-Session": sid} if sid else {}) as response:
-            return response.headers["X-Hybrid-Session"], response.read()
+            sid, data = response.headers["X-Hybrid-Session"], response.read()
+        # Content-Length can finish before the handler releases its lease; manual replay controls need that boundary.
+        with self.app.reserve(sid):
+            pass
+        return sid, data
 
     # Streaming uses the actual HTTP route and imported prefix; forks and client IDs stay separate.
     def test_stream_forks_foreign_404_and_restart(self):
