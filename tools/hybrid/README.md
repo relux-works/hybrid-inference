@@ -76,6 +76,7 @@ build/bin/llama-hybrid-check-distributions ~/Werkstatt/hybrid-models/Qwen3.5-0.8
 build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --capacity ~/Werkstatt/hybrid-models/golden/prompt-512
 build/bin/llama-hybrid-check-codec
 # Prepare fixtures for the bounded append cost/RSS control; no shared fixtures are rewritten.
+mkdir -p .temp/append-cost
 build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --prepare ~/Werkstatt/hybrid-models/golden .temp/append-cost
 build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --measure .temp/append-cost/cost-512 512
 ```
