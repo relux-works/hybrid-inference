@@ -12,7 +12,8 @@ client continues decoding as if it had prefilled locally. The specification is `
 | Branch | What |
 |---|---|
 | `main` | Pinned upstream base `e0f142d5` (llama.cpp, 2026-10-29), this README, the specification and the M0 prototype once merged |
-| `prototype-m0` | Integration of both producer branches; the pull request into `main` |
+| `prototype-m0` | Integration of both producer branches (M0) |
+| `m01-proxy-concurrency` | M0 plus concurrent proxy sessions (M0.1); the pull request into `main` |
 | `hybrid-server` | Producer A: range export, native delta codec, prefill node with per-client sessions, admission and a fair scheduler |
 | `hybrid-client` | Producer B: append import with range rollback, slot import and info endpoints, client proxy with session mapping and a journal |
 
@@ -45,9 +46,16 @@ cross-review between the two producers; the reports are in `tools/hybrid/*.md` a
   - Slow readers and queued requests cannot occupy every worker.
   - A permit is released about 0.1 s after its response completes, or after a queued client disconnects. Right at the global limit a client can therefore get a brief `429`; the proxy treats it as retryable or completes locally.
 
+- **Concurrent sessions in the proxy (M0.1).**
+  - Different sessions decode at the same time, one per slot; one session's requests run in arrival order.
+  - A slot stays pinned while its session is busy. When every slot is pinned, a new session waits up to 30 s, then gets `503`.
+  - 38 proxy tests pass. Two native sessions overlap their decoding and each matches a solo run 64/64.
+
 Not yet done:
-- concurrent decoding through one proxy: the proxy holds one lock for a whole request, the decode stream included,
-  so the sessions of one client decode one at a time even with several decode slots (next task, M0.1);
+- a chat template that rewrites history: some reasoning-model templates re-serialize earlier reasoning when a new user
+  turn arrives, so the token prefix changes. The proxy then forks or rejects the session and prefills again from
+  position 0. At depth that is very expensive, so M1 needs history-preserving templates or recovery from a checkpoint
+  before the divergence;
 - CUDA server with a Metal client, and Qwen3.8-27B at 32k–128k depth over the 50-prompt matrix;
 - the NVMe session store and asynchronous shadow batching;
 - a failed recurrent restore after a failed append, a double failure: the slot is then inconsistent and needs a resync.

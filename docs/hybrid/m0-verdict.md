@@ -48,7 +48,7 @@ implementations and added O1–O5.
 | O2 | Shared core: internal flags shared the public flag space | minor | fixed, round 2 |
 | O3 | `llama-server`: model hashed on the first import, in the main loop | minor | fixed, round 2 |
 | T1 | Tests: A's pending-request test cancels two waiters and checks one release | minor | open; B's per-route probe covers it |
-| O4 | Proxy: one lock covers each whole request, the decode stream included (`tools/hybrid-proxy/proxy.py`), so one client decodes one session at a time | major for M1, not a correctness defect | open: M0.1 |
+| O4 | Proxy: one lock covers each whole request, the decode stream included (`tools/hybrid-proxy/proxy.py`), so one client decodes one session at a time | major for M1, not a correctness defect | fixed in M0.1 (see below) |
 | O5 | Shared core and server: if the recurrent restore after a failed append itself fails, the slot keeps its tokens with emptied memory | minor, double failure | open: known limitation |
 
 ## Integration check (orchestrator)
@@ -80,3 +80,19 @@ implementations and added O1–O5.
    - Measure delta size, import time and time to first token at depth.
    - Each delta carries the recurrent state, which the engine keeps in f32: 156.9 MB per delta for 27B, measured on an M3 Max.
 3. **Recurrent state as bf16 on the wire.** This halves the fixed part of every delta. Accept it only if the equivalence checks of section 11 still hold.
+
+## Addendum: M0.1, concurrent proxy sessions (accepted)
+
+- **Head:** `m01-proxy-concurrency` at `8e892551`, on top of `prototype-m0` `7d37eab0`. Proxy-only change: commits `1d53c0f4` and `5199481b`, with the report at `tools/hybrid-proxy/m01-concurrency-261030.md`.
+- **Review:** producer A accepted it in `tools/hybrid/review-m01-of-b-261030.md` (`hybrid-server` `5c8cc7ac`).
+  - All 38 tests pass.
+  - Two native sessions overlap by 2.27 s, both slots processing, and each matches a solo run 64/64.
+  - 16 native journal audits are exact.
+  - The M0 witness fails on its serialization assertion.
+  - The 503 with every slot pinned arrives at 30.0 s.
+  - An out-of-order tokenizer control passes.
+- **Orchestrator check of the lock design.**
+  - One short shared lock covers the table and the store.
+  - Per-session FIFO tickets order a session's requests, and a slot lease pins the slot.
+  - While streaming, only the session ticket and the slot lease are held.
+- **New finding O6, for M1, not a blocker.** The test model's chat template re-serializes earlier reasoning on a new user turn, so the token prefix changes. An inferred session then forks from position 0, and an explicit one is rejected unchanged. Real agent traffic needs history-preserving templates, or recovery from a checkpoint before the divergence; see `HYBRID.md`.
