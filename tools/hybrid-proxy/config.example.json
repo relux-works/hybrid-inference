@@ -1,0 +1,16 @@
+{
+  "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "prefill_url": "http://127.0.0.1:8081",
+  "decode_url": "http://127.0.0.1:8080",
+  "decode_token": "decode-fixture",
+  "slot_path": ".temp/hybrid-b-r1-261030/slots",
+  "slots": 2,
+  "clients": {
+    "fixture-a": {"id": "a", "prefill_token": "remote-a"},
+    "fixture-b": {"id": "b", "prefill_token": "remote-b"}
+  },
+  "policy": {
+    "local_rates": [[0, 100], [4096, 60]],
+    "always": true
+  }
+}

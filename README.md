@@ -102,6 +102,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [cli](tools/cli/README.md)
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
+- [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay and test commands; artifacts in `.temp/hybrid-b-r1-261030/`
 - [GBNF grammars](grammars/README.md)
 
 #### Development

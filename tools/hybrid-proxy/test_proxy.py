@@ -1,0 +1,247 @@
+"""Bounded synthetic HTTP contract tests. These do not prove engine equivalence."""
+import hashlib
+import http.server
+import json
+from pathlib import Path
+import struct
+import tempfile
+import threading
+import unittest
+
+from policy import Policy
+from proxy import Handler, HTTPError, Node, Proxy
+from store import Store, prefix_hash
+from stub_server import MODEL, decode_delta, encode_delta, make_server
+
+
+class PolicyTests(unittest.TestCase):
+    # These controls check cost ordering, a hysteresis band, and invalid inputs.
+    def test_cost_and_override(self):
+        policy = Policy()
+        self.assertFalse(policy.choose(1, 0)["offload"])
+        self.assertTrue(policy.choose(8000, 0)["offload"])
+        self.assertFalse(policy.choose(8000, 0, link_rate=10_000)["offload"])
+        self.assertTrue(Policy(always=True).choose(1, 0)["offload"])
+        self.assertFalse(Policy(always=True).choose(0, 0)["offload"])
+        with self.assertRaises(ValueError):
+            policy.choose(-1, 0)
+        with self.assertRaises(ValueError):
+            Policy(local_rates=((0, 0),))
+
+    def test_hysteresis_and_depth(self):
+        policy = Policy(local_rates=((0, 100), (1000, 10)), server_rate=1000,
+                        fixed=0.8, kv_bytes=0, state_bytes=0)
+        self.assertFalse(policy.choose(100, 0, previous=False)["offload"])
+        self.assertTrue(policy.choose(100, 0, previous=True)["offload"])
+        self.assertTrue(policy.choose(100, 1000)["offload"])
+
+
+class MappingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.temp.name) / "sessions.sqlite")
+        self.store = Store(self.path, MODEL)
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    # Exact tokens after the matching 256-token block prevent cross-fork reuse.
+    def test_shared_system_prompt_forks_and_restart(self):
+        system = list(range(600))
+        first = self.store.select("a", system + [700])
+        first["tokens"] = system + [700, 701]
+        self.store.save(first)
+        second = self.store.select("a", system + [800])
+        self.assertNotEqual(first["id"], second["id"])
+        second["tokens"] = system + [800, 801]
+        self.store.save(second)
+        self.assertEqual(self.store.select("a", first["tokens"] + [999])["id"], first["id"])
+        self.store.close()
+        self.store = Store(self.path, MODEL)
+        self.assertEqual(self.store.select("a", second["tokens"] + [999])["id"], second["id"])
+        self.assertEqual(len(self.store.get(first["id"])["hashes"]), 2)
+        with self.assertRaises(KeyError):
+            self.store.select("foreign", system, first["id"])
+        with self.assertRaises(ValueError):
+            self.store.select("a", system + [555], first["id"])
+
+    # Explicit IDs have precedence, but cannot adopt another client's session.
+    def test_explicit_and_short_prefix(self):
+        first = self.store.select("a", [1, 2], "named-session")
+        first["tokens"] = [1, 2]
+        self.store.save(first)
+        self.assertEqual(self.store.select("a", [1, 2, 3])["id"], first["id"])
+        self.assertEqual(self.store.select("a", [1, 2, 4], "named-session")["id"], first["id"])
+        self.assertNotEqual(self.store.select("b", [1, 2, 3])["id"], first["id"])
+
+
+class HTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.servers, self.threads = [], []
+        self.prefill = self.start(make_server("prefill", database=str(Path(self.temp.name) / "prefill.sqlite")))
+        self.decode = self.start(make_server("decode", slot_path=self.temp.name))
+        self.config = dict(model_sha256=MODEL, prefill_url=self.url(self.prefill), decode_url=self.url(self.decode),
+                           decode_token="decode-fixture", slot_path=self.temp.name, slots=2, prefill_timeout=0.5,
+                           clients={f"fixture-{c}": dict(id=c, prefill_token=f"remote-{c}") for c in "abc"},
+                           policy=dict(always=True))
+        self.app = Proxy(self.config, str(Path(self.temp.name) / "proxy.sqlite"))
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.app = self.app
+        self.proxy = self.start(server)
+        self.client = Node(self.url(self.proxy), "fixture-a")
+
+    def start(self, server):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.servers.append(server)
+        self.threads.append(thread)
+        return server
+
+    @staticmethod
+    def url(server):
+        return "http://127.0.0.1:" + str(server.server_port)
+
+    def tearDown(self):
+        for server in reversed(self.servers):
+            server.shutdown()
+            server.server_close()
+            if hasattr(server, "app") and hasattr(server.app, "close"):
+                server.app.close()
+        for thread in self.threads:
+            thread.join()
+        self.app.store.close()
+        self.temp.cleanup()
+
+    def chat(self, tokens, client=None, sid=None, stream=False):
+        client = client or self.client
+        with client.open("POST", "/v1/chat/completions", dict(messages=[], _tokens=tokens, stream=stream),
+                         {"X-Hybrid-Session": sid} if sid else {}) as response:
+            return response.headers["X-Hybrid-Session"], response.read()
+
+    # Streaming uses the actual HTTP route and imported prefix; forks and client IDs stay separate.
+    def test_stream_forks_foreign_404_and_restart(self):
+        base = list(range(600))
+        sid, body = self.chat(base + [700], stream=True)
+        self.assertIn(b"data: [DONE]", body)
+        self.assertIn(b'"content": "s"', body)
+        first = self.app.store.get(sid)
+        self.assertEqual(first["tokens"], base + [700, 901, 902])
+        sid2, _ = self.chat(base + [800])
+        self.assertNotEqual(sid, sid2)
+        with self.assertRaises(HTTPError) as error:
+            self.chat(first["tokens"] + [4], Node(self.url(self.proxy), "fixture-b"), sid)
+        self.assertEqual(error.exception.status, 404)
+        self.app.replay()
+        self.app.store.close()
+        self.app.store = Store(str(Path(self.temp.name) / "proxy.sqlite"), MODEL)
+        continued, _ = self.chat(first["tokens"] + [4])
+        self.assertEqual(continued, sid)
+        self.assertGreaterEqual(self.decode.app.imports, 2)
+
+    # Offline completions remain usable; lost acknowledgements and restart replay do not duplicate tokens.
+    def test_offline_journal_and_lost_ack_replay(self):
+        self.prefill.app.available = False
+        sid, _ = self.chat([10, 11, 12])
+        local = self.app.store.get(sid)
+        self.assertEqual(local["tokens"], [10, 11, 12, 901, 902])
+        self.assertIsNone(local["remote_id"])
+        self.app.store.close()
+        self.app.store = Store(str(Path(self.temp.name) / "proxy.sqlite"), MODEL)
+        self.prefill.app.available = True
+        self.prefill.app.lose_ack_once = True
+        self.app.replay()
+        self.app.replay()
+        self.app.replay()
+        local = self.app.store.get(sid)
+        remote = self.app.remote(self.config["clients"]["fixture-a"]).request("GET", "/v1/sessions/" + local["remote_id"])
+        self.assertEqual(remote["tokens"], local["tokens"])
+        self.assertEqual(local["remote_n"], len(local["tokens"]))
+
+    # 409 behind replays the durable suffix; ahead restores a verified server snapshot.
+    def test_409_and_snapshot_resync(self):
+        sid, _ = self.chat([1, 2, 3])
+        session = self.app.store.get(sid)
+        self.prefill.app.conflict_once = True
+        continued, _ = self.chat(session["tokens"] + [4], sid=sid)
+        self.assertEqual(continued, sid)
+        session = self.app.store.get(sid)
+        self.app.replay()
+        ahead = session["tokens"] + [55]
+        with self.prefill.app.db:
+            self.prefill.app.db.execute("UPDATE sessions SET tokens=? WHERE id=?", (json.dumps(ahead), session["remote_id"]))
+        continued, _ = self.chat(ahead + [66], sid=sid)
+        self.assertEqual(continued, sid)
+        self.assertEqual(self.app.store.get(sid)["tokens"], ahead + [66, 901, 902])
+
+    # All four server session operations hide foreign IDs and leave the victim unchanged.
+    def test_prefill_namespace(self):
+        a, b = Node(self.url(self.prefill), "a"), Node(self.url(self.prefill), "b")
+        sid = a.request("POST", "/v1/sessions", {"model_sha256": MODEL})["session_id"]
+        path = "/v1/sessions/" + sid
+        before = a.request("GET", path)
+        for method, suffix, data in [("GET", "", None), ("POST", "/extend", {}),
+                                     ("GET", "/snapshot", None), ("DELETE", "", None)]:
+            with self.subTest(method=method, suffix=suffix), self.assertRaises(HTTPError) as error:
+                b.request(method, path + suffix, data)
+            self.assertEqual(error.exception.status, 404)
+        self.assertEqual(a.request("GET", path)["tokens"], before["tokens"])
+        self.assertEqual(b.request("GET", "/v1/sessions"), [])
+
+    # Three clients with four sessions each exercise parking and exact per-session journals.
+    def test_three_clients_four_sessions_interleaved(self):
+        records = []
+        for c in "abc":
+            client = Node(self.url(self.proxy), "fixture-" + c)
+            for index in range(4):
+                prompt = [ord(c), index, 77]
+                sid, _ = self.chat(prompt, client)
+                records.append((client, sid, prompt + [901, 902]))
+        self.app.replay()
+        self.app.policy = Policy(always=False, local_rates=((0, 1e9),))
+        for client, sid, old in records:
+            continued, _ = self.chat(old + [88], client, sid)
+            self.assertEqual(continued, sid)
+            self.assertEqual(self.app.store.get(sid)["tokens"], old + [88, 901, 902])
+        self.app.replay()
+        self.app.replay()
+        for client, sid, _ in records:
+            session = self.app.store.get(sid)
+            config = self.app.client("Bearer " + client.token)
+            remote = self.app.remote(config).request("GET", "/v1/sessions/" + session["remote_id"])
+            self.assertEqual(remote["tokens"], session["tokens"])
+        self.assertEqual(len({sid for _, sid, _ in records}), 12)
+
+    # Synthetic corruption tests prove the fixture rejects each class atomically, not native KV imports.
+    def test_synthetic_delta_negative_cases(self):
+        node = Node(self.url(self.decode), "decode-fixture")
+        node.request("POST", "/slots/0?action=import_delta", encode_delta(MODEL, "s", [], [1, 2]))
+        before = node.request("GET", "/slots/0/info")
+        good = encode_delta(MODEL, "s", [1, 2], [3])
+        def header_change(key, value):
+            size, = struct.unpack("<I", good[:4])
+            header = json.loads(good[4:4 + size])
+            header[key] = value
+            raw = json.dumps(header).encode()
+            return struct.pack("<I", len(raw)) + raw + good[4 + size:]
+        cases = {
+            "wrong_model": header_change("model_sha256", "f" * 64),
+            "gap": header_change("n0", 3), "overlap": header_change("n0", 1),
+            "truncated": good[:-1], "checksum": good[:-1] + bytes([good[-1] ^ 1]),
+            "section_checksum": good[:-48] + bytes([good[-48] ^ 1]) + good[-47:],
+            "prefix": header_change("prefix_hash_n1", "f" * 64),
+            "layout": header_change("sections", []),
+        }
+        for name, delta in cases.items():
+            with self.subTest(name=name), self.assertRaises(HTTPError) as error:
+                node.request("POST", "/slots/0?action=import_delta", delta)
+            self.assertEqual(error.exception.status, 400)
+            after = node.request("GET", "/slots/0/info")
+            self.assertEqual((after["tokens"], after["prefix_hash"]), (before["tokens"], before["prefix_hash"]))
+        node.request("POST", "/slots/0?action=import_delta", good)
+        self.assertEqual(node.request("GET", "/slots/0/info")["tokens"], [1, 2, 3])
+
+
+if __name__ == "__main__":
+    unittest.main()
