@@ -2997,7 +2997,7 @@ private:
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len, bool validate = false) : ptr(p), base_ptr(p), buf_size(len), validate(validate) {}
 
     ~llama_io_read_host() {
         if (rinfos.empty()) {
@@ -3039,7 +3039,9 @@ public:
         }
 
         // save for later during destruction
-        rinfos.push_back({tensor, (size_t) (ptr - base_ptr), size, offset});
+        if (!validate) {
+            rinfos.push_back({tensor, (size_t) (ptr - base_ptr), size, offset});
+        }
 
         ptr += size;
         size_read += size;
@@ -3067,6 +3069,7 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+    bool validate;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -3526,6 +3529,25 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
     if (!memory || !src || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max ||
             n0 < 0 || n1 <= n0 || (int64_t) memory->seq_pos_max(seq_id) + 1 != n0) {
         LLAMA_LOG_ERROR("%s: invalid append boundary or sequence\n", __func__);
+        return 0;
+    }
+
+    // Parse the complete host record before changing metadata or scheduling tensor writes.
+    try {
+        llama_io_read_host validation(src, size, true);
+        uint32_t magic;
+        llama_seq_id source_seq;
+        validation.read(&magic, sizeof(magic));
+        validation.read(&source_seq, sizeof(source_seq));
+        if (magic != io_magic || source_seq < 0 || source_seq >= LLAMA_MAX_SEQ) {
+            throw std::runtime_error("invalid sequence state header");
+        }
+        state_seq_read_data(validation, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE);
+        if (validation.n_bytes() != size) {
+            throw std::runtime_error("append has trailing bytes");
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: rejected append: %s\n", __func__, err.what());
         return 0;
     }
 
