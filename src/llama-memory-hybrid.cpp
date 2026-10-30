@@ -212,8 +212,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
             throw std::runtime_error("append attention and recurrent positions differ");
         }
     } catch (...) {
-        // a failed restore leaves the sequence empty in both caches
-        if (!(flags & LLAMA_STATE_SEQ_FLAGS_VALIDATE)) {
+        // Append rollback belongs to the caller, which retains the attention prefix.
+        if (!(flags & (LLAMA_STATE_SEQ_FLAGS_VALIDATE | LLAMA_STATE_SEQ_FLAGS_APPEND))) {
             mem_attn->state_clear(seq_id);
         }
 

@@ -3551,8 +3551,10 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         return 0;
     }
 
-    std::vector<uint8_t> backup(state_seq_get_size(seq_id, 0));
-    if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), 0) != backup.size()) {
+    // Non-SWA attention needs only suffix removal; back up the recurrent state that append replaces.
+    const auto backup_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> backup(state_seq_get_size(seq_id, backup_flags));
+    if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size()) {
         return 0;
     }
 
@@ -3573,8 +3575,9 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
     } catch (const std::exception & err) {
         io.discard();
         LLAMA_LOG_ERROR("%s: rejected append: %s\n", __func__, err.what());
-        memory->seq_rm(seq_id, -1, -1);
-        if (state_seq_set_data(seq_id, backup.data(), backup.size(), 0) != backup.size()) {
+        // Restore the old recurrent position before removing the failed attention suffix.
+        if (state_seq_set_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size() ||
+                !memory->seq_rm(seq_id, n0, -1)) {
             throw std::runtime_error("failed to restore sequence after rejected append");
         }
         return 0;

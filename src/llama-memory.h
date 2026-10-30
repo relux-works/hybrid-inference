@@ -16,8 +16,11 @@ class llama_io_write_i;
 class llama_io_read_i;
 
 // Internal host-state append mode. Use the transactional API in llama-ext.h.
-#define LLAMA_STATE_SEQ_FLAGS_APPEND 4
-#define LLAMA_STATE_SEQ_FLAGS_VALIDATE 8
+#define LLAMA_STATE_SEQ_FLAGS_APPEND (1u << 30)
+#define LLAMA_STATE_SEQ_FLAGS_VALIDATE (1u << 31)
+static_assert(((LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE) &
+               (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) == 0,
+              "internal state flags must not overlap public state flags");
 
 struct llama_memory_params {
     // kv cache

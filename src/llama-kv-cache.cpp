@@ -2206,7 +2206,8 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (!res) {
-            if (!validate) {
+            // The append transaction removes its suffix; clearing here would destroy the retained prefix.
+            if (!validate && !append) {
                 state_clear(seq_id, strm, sinfo);
             }
             throw std::runtime_error("failed to restore kv cache");
