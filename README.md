@@ -1,3 +1,6 @@
+> **Fork notice.** This repository is a fork of llama.cpp with a proof of concept of hybrid prefill/decode
+> inference: see [HYBRID.md](HYBRID.md). Everything below is the upstream llama.cpp README.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

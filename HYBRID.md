@@ -1,23 +1,19 @@
-# Hybrid prefill/decode prototype (llama.cpp fork)
+# Hybrid prefill/decode: proof of concept (llama.cpp fork)
 
-Private working repository of the hybrid inference prototype by Relux Works. Owner: Ivan Oparin.
+Proof of concept of hybrid inference by Relux Works: Swarm Inference, https://inference.swarma.si. The paper that
+describes the scheme and its economics is https://github.com/relux-works/hybrid-inference-paper.
 
 The idea: a GPU server prefills an agent session and ships the model state to a unified-memory client (a Mac). The
 state is the attention KV of the new positions plus the fixed recurrent state of the linear-attention layers. The
-client continues decoding as if it had prefilled locally. The specification is `docs/hybrid/prototype-spec.md`
-(v0.3.6); the M0 review verdict is `docs/hybrid/m0-verdict.md`.
+client continues decoding as if it had prefilled locally. The specification is `docs/hybrid/prototype-spec.md`;
+the M0 review verdict is `docs/hybrid/m0-verdict.md`.
+
+This is research code, not a production service. What has and has not been verified is listed under Status.
 
 ## Branches
 
-| Branch | What |
-|---|---|
-| `main` | Pinned upstream base `e0f142d5` (llama.cpp, 2026-10-29), this README, the specification and the M0 prototype once merged |
-| `prototype-m0` | Integration of both producer branches (M0) |
-| `m01-proxy-concurrency` | M0 plus concurrent proxy sessions (M0.1); the pull request into `main` |
-| `hybrid-server` | Producer A: range export, native delta codec, prefill node with per-client sessions, admission and a fair scheduler |
-| `hybrid-client` | Producer B: append import with range rollback, slot import and info endpoints, client proxy with session mapping and a journal |
-
-Feature branches land in `main` through pull requests after review.
+`main` is the pinned upstream base `e0f142d5` (llama.cpp, 2026-10-29) plus the prototype: M0 and M0.1 from pull
+request #1, and M0.2, append-only sessions, from pull request #2. Other branches are historical producer branches.
 
 ## Components
 
@@ -28,7 +24,7 @@ Feature branches land in `main` through pull requests after review.
 | `tools/server/` (small patch) | `llama-server` endpoints to import a delta into a slot and to read slot state |
 | `tools/hybrid-proxy/` | Client proxy: maps conversations to server sessions, decides when to offload, keeps a journal for recovery and replay |
 
-## Status (2026-10-30)
+## Status (2026-10-30, after M0.2)
 
 Verified on CPU, same backend, with Qwen3.5-0.8B (arch `qwen35`, the layout of Qwen3.8-27B). Three rounds of
 cross-review between the two producers; the reports are in `tools/hybrid/*.md` and `tools/hybrid-proxy/*.md`.
@@ -51,11 +47,16 @@ cross-review between the two producers; the reports are in `tools/hybrid/*.md` a
   - A slot stays pinned while its session is busy. When every slot is pinned, a new session waits up to 30 s, then gets `503`.
   - 38 proxy tests pass. Two native sessions overlap their decoding and each matches a solo run 64/64.
 
+- **Append-only sessions (M0.2).**
+  - The proxy keeps a journal of the exact token IDs in each slot and appends only new messages; a rewrite of the
+    history rolls back to the latest checkpoint at a user-message boundary instead of position 0. An explicit
+    session whose rewrite cannot be appended or rolled back gets `409`.
+  - Prefilled tokens over a three-turn agent conversation drop from 1530 to 524 (thinking on), from 2102 to 536
+    (thinking off) and from 3264 to 562 (client omits reasoning).
+  - Message identity compares a canonical typed JSON encoding, so `1` and `true` in tool arguments differ.
+  - 61 proxy tests pass. Report: `tools/hybrid-proxy/m02-append-only-261030.md`.
+
 Not yet done:
-- a chat template that rewrites history: some reasoning-model templates re-serialize earlier reasoning when a new user
-  turn arrives, so the token prefix changes. The proxy then forks or rejects the session and prefills again from
-  position 0. At depth that is very expensive, so M1 needs history-preserving templates or recovery from a checkpoint
-  before the divergence;
 - CUDA server with a Metal client, and Qwen3.8-27B at 32k–128k depth over the 50-prompt matrix;
 - the NVMe session store and asynchronous shadow batching;
 - a failed recurrent restore after a failed append, a double failure: the slot is then inconsistent and needs a resync.
@@ -63,6 +64,5 @@ Not yet done:
 ## Rules
 
 - Commits are signed.
-- Builds on the shared agent host are CPU only.
 - This repository does not track upstream automatically. GitHub Actions stay disabled: the tree carries upstream
   workflows that are not meant to run here.

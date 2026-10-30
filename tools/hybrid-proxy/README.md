@@ -62,7 +62,7 @@ The policy uses a depth-indexed local prefill table, server rate, link EWMA, fix
 python3 tools/hybrid-proxy/policy.py .temp/turns.jsonl --config .temp/policy.json
 ```
 
-The trace contains JSON objects with `delta`, `depth`, and optional `server_factor`; the config contains `Policy` fields. Output is JSONL with the selected path and both predicted times. No benchmarks are run on agents1.
+The trace contains JSON objects with `delta`, `depth`, and optional `server_factor`; the config contains `Policy` fields. Output is JSONL with the selected path and both predicted times. The tool runs no benchmarks.
 
 ## Tests and artifacts
 
@@ -104,7 +104,6 @@ build/bin/llama-hybrid-check-distributions ~/Werkstatt/hybrid-models/Qwen3.5-0.8
 | CMake and C++ compiler | CPU engine and the four named targets, under the shared flock | `build/`; monitor/build logs under `.temp/` |
 | Native checkers | Append, recurrent rejection, SWA guard and distribution commands above | stdout/stderr logs under `.temp/` |
 | Git | Scoped signed local commits (`git commit -S`), no pushes | Local feature-branch history |
-| a2a | `a2a post '#hybrid' --topic prototype-go --kind notice --to agents1_hybrid_orch TEXT` | Lane notice; local command logs under `.temp/` |
 
 ## Second fix round controls
 
