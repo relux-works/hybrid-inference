@@ -29,7 +29,7 @@ The decode node must expose `GET /slots/{id}/info` with `n`, `prefix_hash`, and 
 
 SQLite stores each client's token journal, block hashes, remote acknowledgement position, slot, and last-use time. This contains conversation data; keep the database and slot directory private. Shadow replay runs in a background thread, and also precedes a critical extend. A 202 only acknowledges queuing; GET establishes the applied boundary. After a lost acknowledgement or restart, the boundary and hash determine the remaining suffix, preventing duplicate application. If a RAM-only server lost the session, the proxy creates a replacement remote session and replays the complete durable history. If the server is unavailable, the request uses local prefill. After a restart, the proxy checks slot state and the remote prefix before reuse. Slot eviction saves the least recently used session and restores it on demand; missing parked files fall back to local prefill from durable tokens.
 
-A 409 logs both hashes. A behind server receives journal replay; an ahead server is recovered through its snapshot and the local slot restore action. The restored prefix must match the incoming history. An incompatible restored history returns 409 for investigation. Turns currently serialize through one proxy lock, including slot operations. This bounds resource usage and preserves per-session ordering; parallel decode scheduling is future work.
+A 409 logs both hashes. A behind server receives journal replay; an ahead server is recovered through its snapshot and the local slot restore action. The restored prefix must match the incoming history. Incompatible model/prefix metadata returns 409 before restore. A snapshot mismatch or journal failure restores the prior decoder snapshot. Recovery GET transport errors and retryable HTTP failures continue locally, then replay on reconnect. Turns currently serialize through one proxy lock, including slot operations. This bounds resource usage and preserves per-session ordering; parallel decode scheduling is future work.
 
 ## Policy and trace replay
 
@@ -50,7 +50,7 @@ python3 -m py_compile tools/hybrid-proxy/*.py
 
 The tests use ephemeral localhost ports and temporary SQLite/slot fixtures. They cover policy decisions, explicit and inferred mapping, shared-prefix forks, restart persistence, streaming, offline/lost-ack replay, 409/snapshot recovery, foreign-client 404s on all prefill session operations, 3 clients x 4 interleaved sessions, and atomic synthetic corruption rejection. See `RESULTS.md` for exact run evidence and engine limitations. Runtime databases, slots, diagnostics and test logs belong under `.temp/hybrid-b-r1-261030/`.
 
-After engine builds are admitted, build only `llama-server` and `llama-hybrid-check-append` under the shared flock, with CPU-only settings and `-j2`. Do not start a build while the orchestrator's disk hold is active.
+Build the four named correctness targets listed below under the shared flock, with CPU-only settings and `-j2`. Check exact free bytes and retain the 25 GiB start/abort floor. Do not start a build while the orchestrator's disk hold is active.
 
 ```sh
 build/bin/llama-hybrid-check-append ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf ~/Werkstatt/hybrid-models/golden/prompt-512 ~/Werkstatt/hybrid-models/golden/prompt-2048 ~/Werkstatt/hybrid-models/golden/prompt-8192
@@ -59,4 +59,26 @@ python3 tools/hybrid-proxy/test_decode.py --binary build/bin/llama-server --mode
 python3 tools/hybrid-proxy/test_decode.py --binary build/bin/llama-server --prefill-binary /home/agent/Werkstatt/hybrid-a/llama.cpp/build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --golden ~/Werkstatt/hybrid-models/golden/prompt-512 --artifacts .temp/hybrid-b-r1-261030/real-e2e
 ```
 
-The C++ checker compares incremental append with plain local prefill and A's 64-token golden sequence. The HTTP checker independently checks the actual slot routes, native save bytes after rejection, cross-slot import from A's one-stream source, cache reuse, and 64-token equality with a plain local slot (EOS masked consistently on both HTTP paths). With `--prefill-binary`, it also checks the full real proxy path, 64 generated chat tokens against a plain local request, streaming forks, foreign-client 404, offline continuation and replay after losing the server RAM store. Native layout probes are bounded to the supplied Qwen35 fixtures. These commands are not passing evidence until `RESULTS.md` records their exit status.
+The C++ checker compares incremental append with plain local prefill and A's 64-token golden sequence. The HTTP checker independently checks the actual slot routes, both slots' native save bytes after rejection, cross-slot import from A's one-stream source, actual cache reuse, and 64-token equality for the golden prompt (EOS masked consistently on both HTTP paths). With `--prefill-binary`, it also checks the full real proxy path for two clients with two sessions each, captures actual imported deltas, checks both numerical references described below, and exercises streaming forks, foreign-client 404, offline continuation and replay after losing the server RAM store. Native layout probes are bounded to the supplied Qwen35 fixtures. These commands are not passing evidence until `RESULTS.md` records their exit status.
+
+## Review fix round and numerical checks
+
+See [fixes-r1-261030.md](fixes-r1-261030.md) for the current signed fix, exact commands, build evidence and finite coverage. Historical build-hold notes in RESULTS.md are superseded by that round.
+
+Build targets for the real path now include `llama-server`, `llama-hybrid-check-append`, `llama-hybrid-check-guards` and `llama-hybrid-check-distributions`. All builds use CPU `-j2`, the shared flock and the exact 25 GiB free-space guard. The end-to-end harness uses two proxy slots and a third independent local-reference slot, and stops its servers by PID.
+
+Spec v0.3.4 section 11 distinguishes exact 64-token same-partition equivalence from whole-prompt numerical closeness. The numerical checker imports each actual delta and compares it with two independent token-only local contexts. It teacher-forces the same 64 tokens into imported and whole-prompt contexts, requiring mean KL <=0.01 nats/token and top1 agreement >=95%. Free-running whole-prompt divergence is retained as information. The real harness automatically calls the numerical checker beside `--binary`, or at `--distribution-checker`.
+
+```sh
+python3 tools/hybrid/test_recurrent_append.py --library build/bin/libllama.so --malformed
+build/bin/llama-hybrid-check-guards ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf ~/Werkstatt/hybrid-models/golden/prompt-512
+build/bin/llama-hybrid-check-distributions ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf ~/Werkstatt/hybrid-models/golden/prompt-512.tokens.json ~/Werkstatt/hybrid-models/golden/prompt-2048.tokens.json ~/Werkstatt/hybrid-models/golden/prompt-8192.tokens.json
+```
+
+| Tool | Purpose and entry point | Artifacts |
+|---|---|---|
+| Python standard library | Proxy/stub CLIs and unittest commands above | SQLite, slots and logs under `.temp/` |
+| CMake and C++ compiler | CPU engine and the four named targets, under the shared flock | `build/`; monitor/build logs under `.temp/` |
+| Native checkers | Append, recurrent rejection, SWA guard and distribution commands above | stdout/stderr logs under `.temp/` |
+| Git | Scoped signed local commits (`git commit -S`), no pushes | Local `hybrid-client` history |
+| a2a | `a2a post '#hybrid' --topic prototype-go --kind notice --to agents1_hybrid_orch TEXT` | Lane notice; local command logs under `.temp/` |

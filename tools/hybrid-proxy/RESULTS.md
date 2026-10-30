@@ -48,10 +48,16 @@ Working directory: `/home/agent/Werkstatt/hybrid-a/llama.cpp`. B read the persis
 
 This qualifies the shared baseline core on A's exact candidate. It does not qualify B's later SWA rejection/single-sequence portability guards, B's slot HTTP routes, or the full real proxy path. Compared with A c68df953, B's engine source differs only in 11 lines of the KV stream admission guard. The opt-in B tests remain unrun. A's scheduling correction and shared range-end checks are integrated locally; there is no new review verdict or end-to-end acceptance claim.
 
-## Current build admission blocker
+## Historical r1 build admission blocker (superseded by r4)
 
 The keeper/orchestrator conditionally admitted one B configure/build, only `llama-server` and `llama-hybrid-check-append`, CPU `-j2` under the shared flock. It requires at least 23.0 GiB exact free space before starting and an abort below 22.5 GiB during the build. `df -BG /` rounds up, so it is insufficient for this gate. The exact check `df -B1 --output=avail /` observed 23,824,539,648 available bytes (22.188332 GiB), below admission. No B configure/build was attempted. No files outside B's workbench were removed.
 
 The task-local `.temp/hybrid-b-r1-261030/build_guard.py` records the actual `df -BG` and exact-byte readings, command PID, return code and disk monitor. It runs under the shared CLI flock and stops only recorded child PIDs if the reserve is crossed. Its known-low-space negative control refused `/usr/bin/true` before execution with exit 78 (`admission-control-negative-01.monitor.log`, expected rejection); its zero-threshold positive control ran `/usr/bin/true` with exit 0 (`admission-control-positive-01.monitor.log`). This is admission-control evidence, not an engine build or passing engine test.
 
 CMake 4.4.4 is available read-only at A's existing `.temp/hybrid-a-r1-261030/cmake-tool/cmake/data/bin/cmake`; `--version` exited 0 (`cmake-readiness-01.log`). B installed no dependencies. The expanded source-only syntax check initially exited 1 because the command omitted `-Ivendor/cpp-httplib` for A's prefill source (`cxx-syntax-05.log`); adding that include path made the same nine-source check exit 0 (`cxx-syntax-06.log`). B's real end-to-end probe is now prepared under `test_decode.py --prefill-binary`, but remains unrun.
+
+## Review fix round r4, 2026-10-30
+
+Builds were admitted after disk reclamation, using CPU -j2 under the shared flock and a 25 GiB exact start/abort floor. See [fixes-r1-261030.md](fixes-r1-261030.md) for the review findings, signed core fix, commands and current evidence. R1-R4 and delayed-202 regressions pass; the 19-test proxy suite exits 0. Native append at all three golden depths, portable restore, actual HTTP routes, neighbor native-byte preservation and all SWA rejection guards now have B runtime evidence.
+
+The first real whole-prompt free-running comparison discovered a numerical batch-partition difference on the primary-colors conversation at generated token39. The orchestrator documented the two-reference acceptance rule in spec v0.3.4 section11. The original failing run remains preserved. The added native checker uses actual imported state and two independent local contexts, requires exact64 same-partition greedy tokens, and checks teacher-forced whole-prompt KL/top1 bounds. Current round metrics and limitations are recorded in the fix report.
