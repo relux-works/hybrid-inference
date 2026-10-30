@@ -18,7 +18,7 @@ static void write(const std::string & path, const std::string & data) {
 }
 
 static json header(const std::string & hash, size_t n0, size_t n1, const std::vector<llama_token> & tokens) {
-    return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
+    return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"tokens", std::vector<llama_token>(tokens.begin() + n0, tokens.begin() + n1)}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
 }
 
 static void codec_tests() {
@@ -56,6 +56,14 @@ static void codec_tests() {
     for (int i = 0; i < 4; ++i) { bad += (char) (text.size() >> (8 * i)); }
     bad += text + wire.substr(4 + length);
     rejects("layout", bad, hash, 0, "unsupported delta layout");
+    auto wrong_tokens = h;
+    wrong_tokens["tokens"] = json::array();
+    rejects("token-count", hybrid::encode_delta(wrong_tokens, "abc"), hash, 0, "token count mismatch");
+    wrong_tokens["tokens"] = json::array({-1});
+    rejects("negative-token", hybrid::encode_delta(wrong_tokens, "abc"), hash, 0, "invalid delta token");
+    auto wrong_prefix = h;
+    wrong_prefix["prefix_hash_n1"] = std::string(64, '0');
+    rejects("prefix-hash", hybrid::encode_delta(wrong_prefix, "abc"), hash, 0, "prefix hash mismatch");
     std::cout << "PASS codec positive and negative controls\n";
 }
 
@@ -100,7 +108,8 @@ static void run_model(const std::string & model_path, const std::string & direct
     auto full_raw = hybrid::export_range(source.get(), 0, n1);
     hybrid::load_state(restored.get(), full_raw);
     hybrid::prefill(restored.get(), {tokens.back()}, n1);
-    hybrid::prefill(source.get(), {tokens.back()}, n1);
+    hybrid::load_state(source.get(), {});
+    hybrid::prefill(source.get(), tokens, 0);
     std::vector<llama_token> generated;
     for (size_t i = 0; i < 64; ++i) {
         auto local = hybrid::greedy(source.get(), model.get());

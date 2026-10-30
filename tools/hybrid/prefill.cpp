@@ -176,7 +176,7 @@ int main(int argc, char ** argv) {
                     all.insert(all.end(), tokens.begin(), tokens.end());
                     std::string wire;
                     if (body.at("return_delta").get<bool>()) {
-                        wire = hybrid::encode_delta({{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"prefix_hash_n1", hybrid::prefix_hash(all)}}, hybrid::export_range(ctx.get(), n0, all.size()));
+                        wire = hybrid::encode_delta({{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}}, hybrid::export_range(ctx.get(), n0, all.size()));
                     }
                     std::string state = hybrid::save_state(ctx.get());
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);

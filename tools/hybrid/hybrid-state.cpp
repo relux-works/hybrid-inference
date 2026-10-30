@@ -108,6 +108,14 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     require(n0 >= 0 && h.at("n0").get<int64_t>() == n0 && h.at("n1").get<int64_t>() > n0 && h.at("n1").get<int64_t>() <= INT32_MAX, "position gap or overlap");
     auto hash = h.at("prefix_hash_n1").get<std::string>();
     require(hash.size() == 64 && hash.find_first_not_of("0123456789abcdef") == std::string::npos, "invalid prefix hash");
+    const auto & tokens = h.at("tokens");
+    require(tokens.is_array() && tokens.size() == (uint64_t) (h.at("n1").get<int64_t>() - n0), "delta token count mismatch");
+    for (const auto & token : tokens) {
+        require(token.is_number_integer() && token.get<int64_t>() >= 0 && token.get<int64_t>() <= INT32_MAX, "invalid delta token");
+    }
+    if (n0 == 0) {
+        require(prefix_hash(tokens.get<std::vector<llama_token>>()) == hash, "delta prefix hash mismatch");
+    }
     const auto & sections = h.at("sections");
     require(sections.is_array() && sections.size() == 1, "unsupported section layout");
     const auto & section = sections[0];
