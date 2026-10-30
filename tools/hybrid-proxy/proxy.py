@@ -17,7 +17,7 @@ import urllib.request
 
 from policy import Policy
 from concurrency import SessionQueue
-from journal import Capture, JournalConflict, Renderer, matching_messages, settings_identity
+from journal import Capture, JournalConflict, Renderer, matching_messages, segment_range, settings_identity
 from store import Store, prefix_hash
 
 LOG = logging.getLogger("hybrid")
@@ -492,10 +492,12 @@ class Proxy:
                 boundaries = self.renderer.user_boundaries(body, text, full_tokens)
                 checkpoints = []
                 segment_start = 0
+                replay_end = 0
                 message_start, token_base, anchor_base = 0, 0, 0
             elif (journal["identity"] == identity and
                   matching_messages(journal["messages"], body["messages"]) == len(journal["messages"])):
                 segment_start = len(session["tokens"])
+                replay_end = segment_start
                 prompt, boundaries, _, tail = self.renderer.append(body, text, full_tokens,
                     len(journal["messages"]), session["tokens"])
                 checkpoints = copy.deepcopy(journal.get("checkpoints", []))
@@ -515,7 +517,18 @@ class Proxy:
                     raise JournalConflict("checkpoint prefix does not match journal")
                 index = cp["message_index"]
                 message_start = index
-                if index and body["messages"][index - 1].get("role") == "assistant":
+                anchors = [segment for segment in journal.get("segments", []) if segment["kind"] == "generated"
+                           and segment["end"] >= rollback_n and segment["message_indices"]
+                           and max(segment["message_indices"]) < matched]
+                replay_end = rollback_n
+                if anchors:
+                    anchor = max(anchors, key=lambda segment: segment["end"])
+                    replay_end = anchor["end"]
+                    message_start = max(anchor["message_indices"]) + 1
+                    prompt, boundaries, _, tail = self.renderer.append(body, text, full_tokens,
+                        message_start, session["tokens"][:replay_end])
+                    token_base, anchor_base = len(full_tokens) - len(tail), len(prompt) - len(tail)
+                elif index and body["messages"][index - 1].get("role") == "assistant":
                     _, mapped, closing, tail = self.renderer.append(body, text, full_tokens, index, [])
                     prompt = prefix + tail[closing:]
                     boundaries = [dict(message_index=b["message_index"], n=rollback_n + b["n"] - closing)
@@ -554,6 +567,7 @@ class Proxy:
             session["_turn"] = dict(identity=identity, template=template, messages=recorded_messages,
                 boundaries=boundaries, checkpoints=checkpoints, start=segment_start,
                 rollback_n=rollback_n, probe_evaluated=probe_evaluated, message_start=message_start,
+                replay_end=replay_end,
                 layout=layout, generation_start=generation_start,
                 settings=hashlib.sha256(json.dumps({key: value for key, value in body.items() if key != "messages"},
                     sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
@@ -688,7 +702,8 @@ class Proxy:
                         if cp not in checkpoints:
                             checkpoints.append(cp)
             meter = dict(local_evaluated=local, remote_applied=remote,
-                generated_evaluated=generated_evaluated, new_tokens=len(prompt) - turn["start"],
+                generated_evaluated=generated_evaluated, new_tokens=len(prompt) - turn["replay_end"],
+                replayed_prefix=turn["replay_end"] - turn["start"],
                 remote_replay_acknowledged=session.get("_remote_replayed", 0),
                 rollback_n=turn["rollback_n"], prefilled=local + remote)
             previous = session.get("journal") or {}
@@ -696,8 +711,10 @@ class Proxy:
             if turn["retired_remote"] and turn["retired_remote"] != session["remote_id"]:
                 if turn["retired_remote"] not in retired:
                     retired.append(turn["retired_remote"])
-            segments = [s for s in previous.get("segments", []) if s["end"] <= turn["start"]]
-            segments += [dict(kind="incoming", start=turn["start"], end=len(prompt),
+            segments = segment_range(previous.get("segments", []), 0, turn["start"])
+            if turn["replay_end"] > turn["start"]:
+                segments += segment_range(previous.get("segments", []), turn["start"], turn["replay_end"], replayed=True)
+            segments += [dict(kind="incoming", start=turn["replay_end"], end=len(prompt),
                              message_indices=list(range(turn["message_start"], len(turn["messages"])))),
                          dict(kind="generated", start=len(prompt), end=len(complete),
                              message_indices=[len(turn["messages"])], sampled_ids=native["tokens"])]

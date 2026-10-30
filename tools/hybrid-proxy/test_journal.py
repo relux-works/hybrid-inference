@@ -8,10 +8,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from journal import Capture, JournalConflict, Renderer, matching_messages, settings_identity
+from journal import Capture, JournalConflict, Renderer, matching_messages, segment_range, settings_identity
 from store import Store
 import test_proxy as fixtures
-from proxy import HTTPError, RollbackError
+from proxy import HTTPError, Node, RollbackError
 
 
 class TemplateNode:
@@ -144,6 +144,17 @@ class JournalTests(unittest.TestCase):
         with self.assertRaises(JournalConflict):
             capture.feed(dict(choices=[dict(delta=dict(tool_calls=[dict(index=1000000)]))]))
 
+    # A checkpoint can split an input segment; clipping/replay preserves coverage and the original sampled IDs.
+    def test_segment_checkpoint_clipping_has_no_gap_or_duplicate(self):
+        original = [dict(kind="incoming", start=0, end=10, message_indices=[0, 1]),
+                    dict(kind="generated", start=10, end=14, message_indices=[2], sampled_ids=[21, 22, 23, 24])]
+        prefix = segment_range(original, 0, 7)
+        replay = segment_range(original, 7, 13, replayed=True)
+        self.assertEqual([(s["start"], s["end"]) for s in prefix + replay], [(0, 7), (7, 10), (10, 13)])
+        self.assertEqual(replay[-1]["sampled_ids"], [21, 22, 23])
+        self.assertTrue(all(s["replayed"] for s in replay))
+        self.assertEqual(original[-1]["sampled_ids"], [21, 22, 23, 24])
+
     # An existing SQLite database migrates without losing its journal, and remains client scoped after reopening.
     def test_store_migration_message_mapping_fork_and_foreign(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +261,36 @@ class JournalHTTPTests(unittest.TestCase):
         with self.app.reserve(sid), self.app.slot_lease(fresh):
             self.assertEqual(self.app.decode.request("GET", f"/slots/{fresh['slot']}/info")["n"], 0)
         self.assertTrue(backup.exists())
+
+    # A failed retirement DELETE is retried without losing the current session or its acknowledged prefix.
+    def test_retired_remote_delete_outage_preserves_retry_and_current_prefix(self):
+        sid, _ = self.chat([10])
+        self.app.replay()
+        self.app.replay()
+        session = self.app.store.get(sid)
+        owner = self.app.clients["fixture-a"]
+        remote = self.app.remote(owner)
+        old = remote.request("POST", "/v1/sessions", dict(model_sha256=self.app.model))["session_id"]
+        session["journal"] = dict(messages=[], retired_remote_ids=[old])
+        self.app.store.save(session)
+        before = remote.request("GET", "/v1/sessions/" + session["remote_id"])
+        request = Node.request
+
+        def interrupted(node, method, path, *args, **kwargs):
+            if method == "DELETE" and path.endswith(old):
+                raise OSError("injected retirement outage")
+            return request(node, method, path, *args, **kwargs)
+        with mock.patch.object(Node, "request", new=interrupted):
+            with self.app.reserve(sid):
+                self.app.sync(session, owner)
+        self.assertEqual(self.app.store.get(sid)["journal"]["retired_remote_ids"], [old])
+        self.app.replay()
+        self.assertEqual(self.app.store.get(sid)["journal"]["retired_remote_ids"], [])
+        with self.assertRaises(HTTPError) as error:
+            remote.request("GET", "/v1/sessions/" + old)
+        self.assertEqual(error.exception.status, 404)
+        after = remote.request("GET", "/v1/sessions/" + session["remote_id"])
+        self.assertEqual((after["n"], after["prefix_hash"]), (before["n"], before["prefix_hash"]))
 
 
 if __name__ == "__main__":

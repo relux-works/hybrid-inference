@@ -265,6 +265,10 @@ def main():
                     changed[divergence]["content"] = "Edited earlier user: count decimal integers from 10."
                 cp = max((cp for cp in old["journal"]["checkpoints"] if cp["message_index"] <= divergence),
                          key=lambda cp: cp["message_index"])
+                if args.omit_reasoning:
+                    for item in changed:
+                        if item["role"] == "assistant":
+                            item.pop("reasoning_content", None)
                 changed.append(dict(role="user", content="Continue counting decimal integers from 1 to 100."))
                 rewrite = dict(common, messages=changed, tool_choice="none", max_tokens=64, ignore_eos=True)
                 reused, _ = chat(client, rewrite, sid)
@@ -273,9 +277,24 @@ def main():
                         mutation + ": did not use the latest user boundary before divergence")
                 require(updated["tokens"][:cp["n"]] == old["tokens"][:cp["n"]] and cp["n"] > 0,
                         mutation + ": checkpoint prefix changed or fell back to0")
+                if mutation == "drop-tool":
+                    # The unchanged tool call before the deleted output retains its exact generated IDs and reasoning.
+                    before_edit = next(record for record in records if record["phase"] == "turn-2-tool")
+                    anchor_ids = before_edit["prompt"] + before_edit["native"]["tokens"]
+                    actual_prompt = native_records[-1]["request"]["prompt_tokens"]
+                    require(actual_prompt[:len(anchor_ids)] == anchor_ids,
+                            "compaction re-tokenized the unchanged generated prefix after the checkpoint")
                 info = decode.request("GET", f"/slots/{updated['slot']}/info")
                 require(info["tokens"] == updated["tokens"] and info["prefix_hash"] == prefix_hash(updated["tokens"]),
                         mutation + ": final token/hash mismatch")
+                cursor = 0
+                for segment in updated["journal"]["segments"]:
+                    require(segment["start"] == cursor, mutation + ": segment coverage has a gap or duplicate")
+                    cursor = segment["end"]
+                    if "sampled_ids" in segment:
+                        require(updated["tokens"][segment["start"]:cursor] == segment["sampled_ids"],
+                                mutation + ": original sampled IDs were lost from segment replay")
+                require(cursor == len(updated["tokens"]), mutation + ": segment journal omitted a suffix")
                 require(decode.request("GET", f"/slots/{neighbor['slot']}/info") == neighbor_info and
                         app.store.get(other)["journal"] == neighbor["journal"], mutation + ": leaked into neighbor")
                 (root / (mutation + ".json")).write_text(json.dumps(dict(checkpoint=cp,

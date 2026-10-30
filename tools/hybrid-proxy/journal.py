@@ -44,6 +44,22 @@ def settings_identity(body, template):
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def segment_range(segments, n0, n1, replayed=False):
+    result = []
+    for segment in segments:
+        start, end = max(n0, segment["start"]), min(n1, segment["end"])
+        if start >= end:
+            continue
+        value = copy.deepcopy(segment)
+        value.update(start=start, end=end)
+        if "sampled_ids" in value:
+            value["sampled_ids"] = value["sampled_ids"][start - segment["start"]:end - segment["start"]]
+        if replayed:
+            value["replayed"] = True
+        result.append(value)
+    return result
+
+
 class Renderer:
     def __init__(self, node):
         self.node = node
