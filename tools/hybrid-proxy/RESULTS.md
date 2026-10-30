@@ -17,3 +17,15 @@ These tests use a synthetic decode node. They do not prove native-memory atomici
 Python 3.14.4; SQLite 3.46.1; installed system libxxhash.so.0 for the fixture checksum. No Python dependencies installed. CMake was absent on PATH at startup. No engine build or configure has run in B's checkout: the orchestrator explicitly held B builds and then all new builds/configures for disk headroom. A's golden directory was initially empty. Native append, server import and CPU equivalence evidence will be recorded separately after integration and build admission.
 
 There is no brief surface table or landing property suite. This is a first-build private prototype under the explicit no-review-gate exception. Cross-review and orchestrator review remain future gates; no upstream submission or push is authorized.
+
+## Source integration and additional probes
+
+A's signed reader/range commits 30b992f3a9 and d8fe1bcddc were fetched locally and integrated by signed merge 76a230f647. B core append is signed commit 684e35a5b8 (source-only when committed). The C++ API uses explicit n0/n1, requires a contiguous attention suffix, replaces recurrent state, checks both hybrid endpoints, and restores a serialized destination backup on failure. Sliding-window append is explicitly unsupported so failed allocation cannot evict another session's masked cells.
+
+`c++ -std=c++17 -Iinclude -Iggml/include -Isrc -Icommon -Ivendor -Ivendor/nlohmann -Itools/mtmd -Itools/hybrid -Itools/server -fsyntax-only src/llama-context.cpp src/llama-kv-cache.cpp src/llama-memory-hybrid.cpp tools/server/server-context.cpp tools/server/server.cpp tools/hybrid/check-append.cpp` exited 0. Log: `.temp/hybrid-b-r1-261030/cxx-syntax-03.log`. The first syntax check exited 1 because a new server field was placed in the slot instead of the context implementation; the field was moved, and subsequent checks passed. No compilation/link/runtime success is inferred from syntax-only success.
+
+Two further synthetic HTTP tests exercise authentication/unsafe-ID rejection and full journal replay after the prefill server loses all RAM sessions. The updated 12-test suite passed in 10.548 seconds (exit 0, `.temp/hybrid-b-r1-261030/proxy-tests-02.log`). A subsequent bounded retry guard prevents unbounded recursion when a faulty server repeatedly creates IDs that cannot be read.
+
+Native test sources now include `llama-hybrid-check-append` (golden prefix+delta append, fresh-slot rollback, malformed native stream/layout/recurrent endpoint, 64-token local/golden equivalence) and opt-in `tools/hybrid-proxy/test_decode.py` (real slot HTTP rejection, saved-state byte preservation, two-slot cache reuse and 64-token local equivalence). They remain unrun until binary build admission. No pre-existing reviewer tests were removed. This run adds engine/server changes outside the proxy as explicitly required by brief scope 2; it is not a rework.
+
+The bounded-retry candidate was rechecked: the same 12-test command exited 0 in 10.328 seconds (`.temp/hybrid-b-r1-261030/proxy-tests-03.log`); Python compile and diff checks exited 0 (`pycompile-05.log`, `diff-check-02.log`).

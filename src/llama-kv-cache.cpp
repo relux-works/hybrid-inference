@@ -2158,6 +2158,9 @@ const slot_info_vec_t *   sinfos_in) {
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     const bool append = flags & LLAMA_STATE_SEQ_FLAGS_APPEND;
+    if (append && swa_type != LLAMA_SWA_TYPE_NONE) {
+        throw std::runtime_error("append of sliding-window state is unsupported");
+    }
     if ((!append && n_stream_cur != n_stream) || (append && (seq_id < 0 || n_stream_cur == 0 || n_stream_cur > n_seq_max))) {
         throw std::runtime_error("n_stream mismatch");
     }

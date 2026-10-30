@@ -56,8 +56,9 @@ class Proxy:
     def __init__(self, config, database):
         self.model = config["model_sha256"]
         self.clients = config["clients"]  # incoming bearer -> {id, prefill_token}
-        if not self.clients or len({c["id"] for c in self.clients.values()}) != len(self.clients):
-            raise ValueError("configure one incoming credential per unique client id")
+        if (not self.clients or len({c["id"] for c in self.clients.values()}) != len(self.clients)
+                or len({c["prefill_token"] for c in self.clients.values()}) != len(self.clients)):
+            raise ValueError("configure distinct client IDs and prefill credentials")
         self.slot_path = Path(config["slot_path"]).resolve()
         self.slot_path.mkdir(parents=True, exist_ok=True)
         self.prefill = config["prefill_url"]
@@ -81,7 +82,7 @@ class Proxy:
     def remote(self, client):
         return Node(self.prefill, client["prefill_token"], self.timeout)
 
-    def sync(self, session, client):
+    def sync(self, session, client, recreate=True):
         """202 is an acknowledgement of queuing, never proof that tokens were applied."""
         node = self.remote(client)
         if not session["remote_id"]:
@@ -89,7 +90,16 @@ class Proxy:
             session["remote_n"] = 0
             self.store.save(session)
         path = "/v1/sessions/" + urllib.parse.quote(session["remote_id"], safe="")
-        info = node.request("GET", path)
+        try:
+            info = node.request("GET", path)
+        except HTTPError as error:
+            if error.status != 404 or not recreate:
+                raise
+            # A RAM-only prefill node can lose sessions on restart. Recreate and replay all durable tokens.
+            session["remote_id"] = None
+            session["remote_n"] = 0
+            self.store.save(session)
+            return self.sync(session, client, recreate=False)
         n = info["n"]
         if (info["model_sha256"] != self.model or n < 0 or n > len(session["tokens"])
                 or info["prefix_hash"] != prefix_hash(session["tokens"][:n])):
@@ -286,6 +296,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 0 < size <= MAX_JSON:
                 raise ValueError("invalid request size")
             body = json.loads(self.rfile.read(size))
+            if not isinstance(body, dict):
+                raise ValueError("request must be a JSON object")
             explicit = self.headers.get("X-Hybrid-Session")
             if explicit and (len(explicit) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in explicit)):
                 raise ValueError("invalid session id")

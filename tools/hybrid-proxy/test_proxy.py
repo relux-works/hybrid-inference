@@ -175,6 +175,32 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(continued, sid)
         self.assertEqual(self.app.store.get(sid)["tokens"], ahead + [66, 901, 902])
 
+    # A RAM-only server restart may lose the session ID; the journal recreates its full state once.
+    def test_server_session_loss_recreates_and_replays(self):
+        sid, _ = self.chat([10, 20, 30])
+        self.app.replay()
+        self.app.replay()
+        old = self.app.store.get(sid)
+        with self.prefill.app.db:
+            self.prefill.app.db.execute("DELETE FROM sessions")
+        self.app.replay()
+        self.app.replay()
+        recovered = self.app.store.get(sid)
+        self.assertNotEqual(old["remote_id"], recovered["remote_id"])
+        node = self.app.remote(self.config["clients"]["fixture-a"])
+        info = node.request("GET", "/v1/sessions/" + recovered["remote_id"])
+        self.assertEqual(info["tokens"], old["tokens"])
+        self.assertEqual(recovered["remote_n"], len(old["tokens"]))
+
+    # Bad or missing authorization and unsafe IDs cannot allocate sessions or reach the decoder.
+    def test_auth_and_session_id_validation(self):
+        for client, sid, status in [(Node(self.url(self.proxy)), None, 401),
+                                    (self.client, "../bad", 400)]:
+            with self.assertRaises(HTTPError) as error:
+                self.chat([1, 2], client, sid)
+            self.assertEqual(error.exception.status, status)
+        self.assertEqual(self.app.store.pending(), [])
+
     # All four server session operations hide foreign IDs and leave the victim unchanged.
     def test_prefill_namespace(self):
         a, b = Node(self.url(self.prefill), "a"), Node(self.url(self.prefill), "b")

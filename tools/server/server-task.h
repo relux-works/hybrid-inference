@@ -26,6 +26,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_GET,
+    SERVER_TASK_TYPE_SLOT_INFO,
+    SERVER_TASK_TYPE_SLOT_IMPORT_DELTA,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -196,6 +198,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::string delta;
+        std::string session_id;
     };
     slot_action slot_action;
 

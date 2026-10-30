@@ -16,6 +16,8 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-ext.h"
+#include "hybrid-state.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -25,6 +27,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cctype>
 #include <cinttypes>
 #include <deque>
 #include <exception>
@@ -1074,6 +1077,7 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+    std::string hybrid_model_hash;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1208,6 +1212,7 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        hybrid_model_hash.clear();
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -3210,6 +3215,67 @@ private:
                     res->n_idle_slots = n_idle_slots;
 
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_INFO:
+            case SERVER_TASK_TYPE_SLOT_IMPORT_DELTA:
+                {
+                    server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
+                    if (!slot) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        send_error(task, "Slot is busy", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    try {
+                        if (slot->prompt.tokens.has_mtmd || ctx_dft || spec) {
+                            throw std::runtime_error("Hybrid state transfer requires text-only, non-speculative slots");
+                        }
+                        auto tokens = slot->prompt.tokens.get_tokens();
+                        const int64_t n = (int64_t) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) + 1;
+                        if (n < 0 || (size_t) n != tokens.size()) {
+                            throw std::runtime_error("Slot token and memory positions differ; context shifting is unsupported");
+                        }
+                        if (task.type == SERVER_TASK_TYPE_SLOT_IMPORT_DELTA) {
+                            if (hybrid_model_hash.empty()) {
+                                hybrid_model_hash = hybrid::file_hash(params_base.model.path);
+                            }
+                            auto delta = hybrid::read_delta(task.slot_action.delta, hybrid_model_hash, n);
+                            if (delta.header.at("session_id") != task.slot_action.session_id) {
+                                throw std::runtime_error("Delta session mismatch");
+                            }
+                            auto suffix = delta.header.at("tokens").get<llama_tokens>();
+                            const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+                            for (auto token : suffix) {
+                                if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
+                                    throw std::runtime_error("Delta token outside vocabulary");
+                                }
+                            }
+                            if (tokens.size() > (size_t) slot->n_ctx || suffix.size() > (size_t) slot->n_ctx - tokens.size()) {
+                                throw std::runtime_error("Delta exceeds slot context");
+                            }
+                            tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+                            if (hybrid::prefix_hash(tokens) != delta.header.at("prefix_hash_n1")) {
+                                throw std::runtime_error("Delta prefix hash mismatch");
+                            }
+                            // Allocate token bookkeeping before mutating memory.
+                            server_tokens imported(tokens, false);
+                            if (llama_state_seq_set_data_append(ctx_tgt,
+                                    reinterpret_cast<const uint8_t *>(delta.state.data()), delta.state.size(),
+                                    slot->id, n, delta.header.at("n1").get<llama_pos>()) != delta.state.size()) {
+                                throw std::runtime_error("Native delta append rejected; slot preserved");
+                            }
+                            slot->prompt.clear();
+                            slot->prompt.tokens = std::move(imported);
+                        }
+                        auto res = std::make_unique<server_task_result_slots>();
+                        res->id = task.id;
+                        res->slots_data = {{"n", tokens.size()}, {"prefix_hash", hybrid::prefix_hash(tokens)}, {"tokens", tokens}};
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & err) {
+                        send_error(task, err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    }
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
@@ -5831,7 +5897,14 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_slot_info = [this](const server_http_req & req) {
+        return handle_slot_delta(req, true);
+    };
+
     this->post_slots = [this](const server_http_req & req) {
+        if (req.get_param("action") == "import_delta") {
+            return handle_slot_delta(req, false);
+        }
         auto res = create_response();
         if (params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
@@ -6749,6 +6822,57 @@ void server_routes::init_routes() {
         res->ok(result->to_json());
         return res;
     };
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const server_http_req & req, bool info) {
+    auto res = create_response();
+    if (!params.endpoint_slots || (!info && params.slot_save_path.empty())) {
+        res->error(format_error_response("Hybrid slots require --slots and --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
+    int id_slot;
+    try {
+        const auto text = req.get_param("id_slot");
+        size_t used = 0;
+        id_slot = std::stoi(text, &used);
+        if (id_slot < 0 || used != text.size()) {
+            throw std::invalid_argument("Invalid slot ID");
+        }
+    } catch (const std::exception &) {
+        res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (!info && (req.body.empty() || req.body.size() > 512u * 1024 * 1024 + 65536 + 52)) {
+        res->error(format_error_response("Invalid delta size", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    server_task task(info ? SERVER_TASK_TYPE_SLOT_INFO : SERVER_TASK_TYPE_SLOT_IMPORT_DELTA);
+    task.id = res->rd.get_new_id();
+    task.slot_action.id_slot = id_slot;
+    if (!info) {
+        task.slot_action.delta = req.body;
+        for (const auto & header : req.headers) {
+            std::string name = header.first;
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (name == "x-hybrid-session") {
+                task.slot_action.session_id = header.second;
+            }
+        }
+        if (task.slot_action.session_id.empty()) {
+            res->error(format_error_response("X-Hybrid-Session is required for delta import", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    }
+    res->rd.post_task(std::move(task));
+    auto result = res->rd.next(req.should_stop);
+    if (result) {
+        if (result->is_error()) {
+            res->error(result->to_json());
+        } else {
+            res->ok(result->to_json());
+        }
+    }
+    return res;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
