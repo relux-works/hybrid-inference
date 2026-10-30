@@ -1,6 +1,7 @@
 """Bounded synthetic HTTP contract tests. These do not prove engine equivalence."""
 import hashlib
 import io
+from contextlib import nullcontext
 from unittest import mock
 import http.server
 import http.client
@@ -13,7 +14,7 @@ import threading
 import unittest
 
 from policy import Policy
-from proxy import Handler, HTTPError, Node, Proxy
+from proxy import Handler, HTTPError, Node, Proxy, RollbackError
 from store import Store, prefix_hash
 from stub_server import MODEL, decode_delta, encode_delta, make_server
 
@@ -178,6 +179,26 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(continued, sid)
         self.assertGreaterEqual(self.decode.app.imports, 2)
 
+    # Retain A's C9 control: a critical HTTP 429 must complete locally and replay every token once.
+    def test_429_critical_falls_back_locally_and_replays(self):
+        original = self.prefill.app.handle
+        calls = []
+        def limited(method, path, query, body, client):
+            if path.endswith('/extend') and body['return_delta']:
+                calls.append(path)
+                return 429, {'error': 'binary response limit'}
+            return original(method, path, query, body, client)
+        with mock.patch.object(self.prefill.app, 'handle', side_effect=limited):
+            sid, _ = self.chat([71, 72, 73])
+        self.assertEqual(len(calls), 1)
+        local = self.app.store.get(sid)
+        self.assertFalse(local['offload'])
+        self.assertEqual(local['tokens'], [71, 72, 73, 901, 902])
+        self.app.replay()
+        self.app.replay()
+        remote = self.app.remote(self.config['clients']['fixture-a']).request('GET', '/v1/sessions/' + local['remote_id'])
+        self.assertEqual(remote['tokens'], local['tokens'])
+
     # Offline completions remain usable; lost acknowledgements and restart replay do not duplicate tokens.
     def test_offline_journal_and_lost_ack_replay(self):
         self.prefill.app.available = False
@@ -277,6 +298,52 @@ class HTTPTests(unittest.TestCase):
                         self.app.store.db.execute("DROP TRIGGER fail_commit")
                 self.assertEqual(self.decode.app.slots[session["slot"]], before)
                 self.assertEqual(self.app.store.get(sid), session)
+
+    # C12: rollback outages must escape recovery, retain the backup and force local prefill after restart.
+    def test_recovery_rollback_failure_retains_backup_and_resets_slot(self):
+        sid, _ = self.chat([31, 32, 33])
+        self.app.replay()
+        self.app.replay()
+        session = self.app.store.get(sid)
+        before = session["tokens"][:]
+        ahead = before + [55]
+        with self.prefill.app.db:
+            self.prefill.app.db.execute("UPDATE sessions SET tokens=? WHERE id=?",
+                                        (json.dumps(ahead), session["remote_id"]))
+        original_remote, original_decode = self.prefill.app.handle, self.app.decode.request
+        def inconsistent(method, path, query, body, client):
+            if path.endswith("/snapshot"):
+                return 200, json.dumps(dict(model_sha256=MODEL, tokens=[8, 8, 8])).encode()
+            return original_remote(method, path, query, body, client)
+        def rollback_outage(method, path, data=None, headers=None):
+            if "action=restore" in path and data["filename"].endswith("-resync-backup.bin"):
+                raise OSError("injected rollback connection loss")
+            return original_decode(method, path, data, headers)
+        for cleanup_outage in (False, True):
+            self.decode.app.slots[session["slot"]] = before[:]
+            self.app.store.verified.add(sid)
+            cleanup = mock.patch.object(Path, "unlink", side_effect=OSError("injected cleanup failure")) if cleanup_outage else nullcontext()
+            with self.subTest(cleanup_outage=cleanup_outage), cleanup, \
+                    mock.patch.object(self.prefill.app, "handle", side_effect=inconsistent), \
+                    mock.patch.object(self.app.decode, "request", side_effect=rollback_outage):
+                with self.assertRaisesRegex(RollbackError, "rollback failed"):
+                    self.app.recover(session, self.config["clients"]["fixture-a"], ahead + [66])
+        backup = Path(self.temp.name) / (sid + "-resync-backup.bin")
+        self.assertEqual(json.loads(backup.read_text())["tokens"], before)
+        self.assertEqual(self.app.store.get(sid)["tokens"], before)
+        self.assertNotIn(sid, self.app.store.verified)
+        self.assertEqual(self.decode.app.slots[session["slot"]], [8, 8, 8])
+        # A dirty slot may even look like a compatible extension. Restart must still erase it before reuse.
+        self.decode.app.slots[session["slot"]] = ahead[:]
+        self.app.store.close()
+        self.app.store = Store(str(Path(self.temp.name) / "proxy.sqlite"), MODEL)
+        self.prefill.app.available = False
+        with mock.patch.object(self.app.decode, "request", wraps=original_decode) as decoder:
+            self.chat(before + [66], sid=sid)
+            self.assertTrue(any("action=erase" in call.args[1] for call in decoder.call_args_list))
+        self.assertFalse(backup.exists())
+        self.assertEqual(self.app.store.get(sid)["tokens"], before + [66, 901, 902])
+        self.assertEqual(self.decode.app.slots[session["slot"]], before + [66, 901, 902])
 
     # Loss during either recovery branch must complete locally, then replay each token once on reconnect.
     def test_recovery_get_outage_completes_locally_and_replays(self):

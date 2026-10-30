@@ -26,6 +26,12 @@ class HTTPError(Exception):
         super().__init__(f"upstream HTTP {status}")
 
 
+class RollbackError(HTTPError):
+    def __init__(self):
+        super().__init__(503)
+        self.args = ("decoder rollback failed; backup retained; slot requires local prefill",)
+
+
 class Node:
     def __init__(self, url, token="", timeout=1.0):
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
@@ -142,6 +148,7 @@ class Proxy:
         temporary = self.slot_path / (filename + ".tmp")
         slot = f"/slots/{session['slot']}"
         saved = False
+        keep_backup = False
         try:
             with open(temporary, "wb") as output:
                 output.write(snapshot)
@@ -161,16 +168,28 @@ class Proxy:
             saved = False
         except Exception:
             if saved:
-                self.decode.request("POST", slot + "?action=restore", {"filename": backup})
+                try:
+                    self.decode.request("POST", slot + "?action=restore", {"filename": backup})
+                except Exception as error:
+                    keep_backup = True
+                    self.store.verified.discard(session["id"])
+                    raise RollbackError() from error
             raise
         finally:
-            temporary.unlink(missing_ok=True)
-            (self.slot_path / filename).unlink(missing_ok=True)
-            (self.slot_path / backup).unlink(missing_ok=True)
+            cleanup = [temporary, self.slot_path / filename]
+            if not keep_backup:
+                cleanup.append(self.slot_path / backup)
+            for path in cleanup:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    LOG.warning("resync cleanup failed session=%s", session["id"])
 
     def recover(self, session, client, prompt):
         try:
             self.resync(session, client, prompt)
+        except RollbackError:
+            raise
         except OSError:
             pass
         except HTTPError as error:
@@ -192,8 +211,14 @@ class Proxy:
                 self.replay()
 
     def acquire_slot(self, session):
+        # A retained rollback backup is a durable marker: never adopt this slot's unverified state.
+        rollback_pending = (self.slot_path / (session["id"] + "-resync-backup.bin")).exists()
         if session["slot"] is not None:
             slot = session["slot"]
+            if rollback_pending:
+                self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+                self.store.verified.add(session["id"])
+                return slot
             if session["id"] not in self.store.verified:
                 info = self.decode.request("GET", f"/slots/{slot}/info")
                 if (info["n"] >= len(session["tokens"])
@@ -216,7 +241,7 @@ class Proxy:
             self.store.save(old)
         self.decode.request("POST", f"/slots/{free}?action=erase", {})
         # Restore a parked sequence when there is a saved file. First-use sessions have none.
-        if session["tokens"]:
+        if session["tokens"] and not rollback_pending:
             try:
                 self.decode.request("POST", f"/slots/{free}?action=restore", {"filename": session["id"] + ".bin"})
             except HTTPError:
@@ -296,6 +321,7 @@ class Proxy:
             raise ValueError("decode token journal does not match slot")
         session["tokens"] = evaluated
         self.store.save(session)
+        (self.slot_path / (session["id"] + "-resync-backup.bin")).unlink(missing_ok=True)
         # Replay is asynchronous; the durable suffix beyond remote_n is the journal.
 
 

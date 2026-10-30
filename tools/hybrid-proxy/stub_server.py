@@ -151,6 +151,7 @@ class State:
                 self.slots[slot] = []
             elif action == "save":
                 self.saved[body["filename"]] = tokens[:]
+                (self.slot_path / body["filename"]).write_text(json.dumps(dict(model_sha256=self.model, tokens=tokens)))
             elif action == "restore":
                 if body["filename"] in self.saved:
                     self.slots[slot] = self.saved[body["filename"]][:]
