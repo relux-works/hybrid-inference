@@ -5,7 +5,7 @@ Private working repository of the hybrid inference prototype by Relux Works. Own
 The idea: a GPU server prefills an agent session and ships the model state to a unified-memory client (a Mac). The
 state is the attention KV of the new positions plus the fixed recurrent state of the linear-attention layers. The
 client continues decoding as if it had prefilled locally. The specification is `docs/hybrid/prototype-spec.md`
-(v0.3.5).
+(v0.3.5); the M0 review verdict is `docs/hybrid/m0-verdict.md`.
 
 ## Branches
 
@@ -46,6 +46,8 @@ cross-review between the two producers; the reports are in `tools/hybrid/*.md` a
   - A permit is released about 0.1 s after its response completes, or after a queued client disconnects. Right at the global limit a client can therefore get a brief `429`; the proxy treats it as retryable or completes locally.
 
 Not yet done:
+- concurrent decoding through one proxy: the proxy holds one lock for a whole request, the decode stream included,
+  so the sessions of one client decode one at a time even with several decode slots (next task, M0.1);
 - CUDA server with a Metal client, and Qwen3.8-27B at 32k–128k depth over the 50-prompt matrix;
 - the NVMe session store and asynchronous shadow batching;
 - a failed recurrent restore after a failed append, a double failure: the slot is then inconsistent and needs a resync.
