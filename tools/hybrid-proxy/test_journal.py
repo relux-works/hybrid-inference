@@ -203,6 +203,33 @@ class JournalHTTPTests(unittest.TestCase):
     url = staticmethod(fixtures.HTTPTests.url)
     chat = fixtures.HTTPTests.chat
 
+    # The documented stub path accepts real message shapes and the new bridge; this proves protocol state, not inference.
+    def test_synthetic_message_stream_and_append_keep_exact_journals(self):
+        body = dict(messages=[dict(role="user", content="first")], stream=True)
+        with self.client.open("POST", "/v1/chat/completions", body) as response:
+            sid = response.headers["X-Hybrid-Session"]
+            self.assertIn(b"data: [DONE]", response.read())
+        with self.app.reserve(sid):
+            pass
+        old = self.app.store.get(sid)
+        follow = dict(messages=old["journal"]["messages"] + [dict(role="user", content="second")])
+        with self.client.open("POST", "/v1/chat/completions", follow, {"X-Hybrid-Session": sid}) as response:
+            self.assertEqual(response.headers["X-Hybrid-Session"], sid)
+            self.assertEqual(json.loads(response.read())["choices"][0]["message"]["content"], "stub")
+        with self.app.reserve(sid):
+            pass
+        new = self.app.store.get(sid)
+        self.assertEqual(new["tokens"][:len(old["tokens"])], old["tokens"])
+        self.assertEqual(new["journal"]["last_meter"]["prefilled"], new["journal"]["last_meter"]["new_tokens"])
+        slot = new["slot"]
+        before = self.app.decode.request("GET", f"/slots/{slot}/info")
+        for invalid in ([], "bad", [2**31]):
+            with self.assertRaises(HTTPError) as error:
+                self.app.decode.request("POST", "/v1/chat/completions", dict(body, id_slot=slot, prompt_tokens=invalid))
+            self.assertEqual(error.exception.status, 400)
+        after = self.app.decode.request("GET", f"/slots/{slot}/info")
+        self.assertEqual((after["tokens"], after["prefix_hash"]), (before["tokens"], before["prefix_hash"]))
+
     # Inferred follow-ups can queue after stream DONE but before the first durable message commit.
     def test_inflight_message_admission_keeps_session_and_prefers_longer_completed_history(self):
         session = self.app.store.select("a", [], "inflight")

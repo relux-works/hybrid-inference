@@ -136,10 +136,27 @@ class State:
         if path == "/apply-template":
             if "_tokens" in body:
                 return 200, {"prompt": body["_tokens"]}
-            text = "".join(m["role"] + ":" + m["content"] + "\n" for m in body["messages"])
-            return 200, {"prompt": [ord(c) for c in text]}
+            text = "".join("<|im_start|>" + m["role"] + "\n" + (m.get("content") or "") + "<|im_end|>\n"
+                           for m in body["messages"])
+            if body.get("add_generation_prompt", True):
+                text += "<|im_start|>assistant\n"
+            return 200, {"prompt": text}
+        if path == "/props":
+            return 200, {"chat_template": "synthetic ChatML fixture; no recurrent checkpoints"}
         if path == "/tokenize":
-            return 200, {"tokens": body["content"]}
+            if isinstance(body["content"], list):
+                return 200, {"tokens": body["content"]}
+            text, pieces = body["content"], []
+            while text:
+                for marker, token in (("<|im_start|>", 2147480001), ("<|im_end|>", 2147480002)):
+                    if text.startswith(marker):
+                        piece = marker
+                        break
+                else:
+                    piece, token = text[0], ord(text[0])
+                pieces.append(dict(id=token, piece=piece))
+                text = text[len(piece):]
+            return 200, {"tokens": pieces if body.get("with_pieces") else [piece["id"] for piece in pieces]}
         if path == "/slots":
             return 200, [dict(id=slot, is_processing=False) for slot in self.slots]
         if path.startswith("/slots/"):
@@ -171,16 +188,35 @@ class State:
             else:
                 return 400, {"error": "action"}
             return 200, self.info(self.slots[slot])
-        if path == "/v1/chat/completions":
-            prompt = self.handle("POST", "/apply-template", {}, body, client)[1]["prompt"]
+        if path in ("/v1/chat/completions", "/completion"):
+            if path == "/completion":
+                prompt = body["prompt"]
+            else:
+                rendered = self.handle("POST", "/apply-template", {}, body, client)[1]["prompt"]
+                prompt = body.get("prompt_tokens", self.handle("POST", "/tokenize", {}, {"content": rendered}, client)[1]["tokens"])
+            if ("prompt_tokens" in body or path == "/completion") and (not isinstance(prompt, list) or not prompt or len(prompt) > 8192 or
+                    any(type(token) is not int or not 0 <= token < 2**31 for token in prompt)):
+                return 400, {"error": "prompt_tokens"}
+            if path == "/completion" and body.get("n_predict") != 0:
+                return 400, {"error": "synthetic raw completion supports prefill only"}
+            previous = self.slots[body["id_slot"]]
+            cached = len(previous) if prompt[:len(previous)] == previous else 0
+            if body.get("n_predict", body.get("max_tokens")) == 0:
+                self.slots[body["id_slot"]] = prompt
+                return 200, {"tokens": [], "timings": {"cache_n": cached, "prompt_n": len(prompt) - cached}}
             # The last sampled token has not been evaluated, like llama-server.
             generated = [901, 902, 903]
             self.slots[body["id_slot"]] = prompt + generated[:-1]
             response = dict(id="chatcmpl-stub", object="chat.completion", model="stub",
                             choices=[dict(index=0, message=dict(role="assistant", content="stub"), finish_reason="stop")])
+            native = dict(tokens=generated, timings=dict(cache_n=cached, prompt_n=len(prompt) - cached))
+            if body.get("verbose") and body.get("return_tokens"):
+                response["__verbose"] = native
             if body.get("stream"):
                 chunks = [dict(id="chatcmpl-stub", object="chat.completion.chunk",
                                choices=[dict(index=0, delta=dict(content=part), finish_reason=None)]) for part in ("s", "tub")]
+                if body.get("verbose") and body.get("return_tokens"):
+                    chunks.append(dict(choices=[], __verbose=native))
                 return 200, b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks) + b"data: [DONE]\n\n"
             return 200, response
         return 404, {}
