@@ -326,8 +326,9 @@ class HTTPTests(unittest.TestCase):
             with self.subTest(cleanup_outage=cleanup_outage), cleanup, \
                     mock.patch.object(self.prefill.app, "handle", side_effect=inconsistent), \
                     mock.patch.object(self.app.decode, "request", side_effect=rollback_outage):
-                with self.assertRaisesRegex(RollbackError, "rollback failed"):
+                with self.assertRaisesRegex(RollbackError, "rollback failed") as error:
                     self.app.recover(session, self.config["clients"]["fixture-a"], ahead + [66])
+                self.assertEqual(error.exception.status, 503)
         backup = Path(self.temp.name) / (sid + "-resync-backup.bin")
         self.assertEqual(json.loads(backup.read_text())["tokens"], before)
         self.assertEqual(self.app.store.get(sid)["tokens"], before)

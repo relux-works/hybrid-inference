@@ -63,7 +63,7 @@ The C++ checker compares incremental append with plain local prefill and A's 64-
 
 ## Review fix round and numerical checks
 
-See [fixes-r1-261030.md](fixes-r1-261030.md) for the current signed fix, exact commands, build evidence and finite coverage. Historical build-hold notes in RESULTS.md are superseded by that round.
+See [fixes-r2-261030.md](fixes-r2-261030.md) for the current signed fix, exact commands, build evidence and finite coverage, and [fixes-r1-261030.md](fixes-r1-261030.md) for the prior round. Historical build-hold notes in RESULTS.md are superseded by those rounds.
 
 Build targets for the real path now include `llama-server`, `llama-hybrid-check-append`, `llama-hybrid-check-guards` and `llama-hybrid-check-distributions`. All builds use CPU `-j2`, the shared flock and the exact 25 GiB free-space guard. The end-to-end harness uses two proxy slots and a third independent local-reference slot, and stops its servers by PID.
 
@@ -82,3 +82,17 @@ build/bin/llama-hybrid-check-distributions ~/Werkstatt/hybrid-models/Qwen3.5-0.8
 | Native checkers | Append, recurrent rejection, SWA guard and distribution commands above | stdout/stderr logs under `.temp/` |
 | Git | Scoped signed local commits (`git commit -S`), no pushes | Local `hybrid-client` history |
 | a2a | `a2a post '#hybrid' --topic prototype-go --kind notice --to agents1_hybrid_orch TEXT` | Lane notice; local command logs under `.temp/` |
+
+## Second fix round controls
+
+Build the additional targets `llama-hybrid-check-client` and `llama-hybrid-check-codec` under the same lock and disk guard. The codec controls retain A80013538's valid maximum int32-token header and intended budget failures. The capacity control fills a 512-cell unified KV cache so the valid append fails after validation, then checks both sequences' native bytes and a successful retry after freeing cells.
+
+```sh
+build/bin/llama-hybrid-check-codec
+build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --capacity ~/Werkstatt/hybrid-models/golden/prompt-512
+python3 tools/hybrid-proxy/test_header_budget.py --binary build/bin/llama-server --prefill-binary /home/agent/Werkstatt/hybrid-a/llama.cpp/build/bin/llama-hybrid-prefill --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/hybrid-b-r6-261030/header-http
+```
+
+The HTTP header control generates one real 16,384-token state with A's existing binary, checks both header-budget rejections against saved native slot bytes, then imports the valid maximum. It stops both servers by recorded PID. The client checker also supplies the requested bounded append-cost measurement: `--prepare GOLDEN_DIR OUTPUT_DIR` creates three fixed-suffix fixtures, then `--measure STEM N0` measures one append in a fresh process and verifies source equality outside the timing interval. Exact before/after commands, RSS methodology and limits are in the round-2 report. All outputs go under `.temp/`.
+
+If snapshot rollback fails, the proxy returns HTTP 503 and retains `SESSION-resync-backup.bin` in the configured slot directory. This file also marks that binding untrusted across a proxy restart. The next request erases the dirty slot and supplies tokens for a full prefill; the marker is removed after the decoder's evaluated tokens and the durable journal agree. Ordinary prefill-node outages still complete locally and replay on reconnect.

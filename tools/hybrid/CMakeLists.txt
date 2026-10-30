@@ -19,3 +19,9 @@ target_link_libraries(llama-hybrid-check-guards PRIVATE hybrid-state)
 
 add_executable(llama-hybrid-check-distributions check-distributions.cpp)
 target_link_libraries(llama-hybrid-check-distributions PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-check-client check-client.cpp)
+target_link_libraries(llama-hybrid-check-client PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-check-codec check-codec.cpp)
+target_link_libraries(llama-hybrid-check-codec PRIVATE hybrid-state)

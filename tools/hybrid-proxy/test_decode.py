@@ -69,6 +69,8 @@ def run(node, golden, slots):
     candidates["truncated"] = wire[:-1]
     candidates["section-checksum"] = wire[:-48] + bytes([wire[-48] ^ 1]) + wire[-47:]
     candidates["body-checksum"] = wire[:-1] + bytes([wire[-1] ^ 1])
+    candidates["range-header-budget"] = envelope(dict(header, padding="x" * (4096 + 11 * (n1 - n0))), state)
+    candidates["absolute-header-budget"] = struct.pack("<I", 1048577)
     # Recompute valid envelope checksums so this malformed native state reaches rollback.
     candidates["native-truncated"] = envelope(header, state[:-1])
     raw = bytearray(state)
