@@ -2433,6 +2433,10 @@ private:
         if (slot.task->params.stream) {
             res->content     = {};
             res->tokens      = llama_tokens{};
+            if (slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CHAT &&
+                    slot.task->params.return_tokens && slot.task->params.verbose) {
+                res->tokens = std::move(slot.generated_tokens);
+            }
         } else {
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
@@ -6085,6 +6089,19 @@ void server_routes::init_routes() {
             meta->chat_params,
             files,
             session);
+        if (body.contains("prompt_tokens")) {
+            const auto & tokens = body.at("prompt_tokens");
+            if (!tokens.is_array() || tokens.empty() || tokens.size() > (size_t) meta->slot_n_ctx) {
+                throw std::invalid_argument("prompt_tokens must be a nonempty array within the slot context");
+            }
+            const auto n_vocab = (uint64_t) llama_vocab_n_tokens(ctx_server.vocab);
+            for (const auto & token : tokens) {
+                if (!token.is_number_integer() || token.get<uint64_t>() >= n_vocab) {
+                    throw std::invalid_argument("prompt_tokens contains an invalid vocabulary ID");
+                }
+            }
+            body_parsed["prompt"] = tokens;
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
