@@ -2048,6 +2048,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    state_write_range(io, seq_id, -1, -1, flags);
+}
+
+void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2075,6 +2079,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && (p0 < 0 || cells.pos_get(i) >= p0);
+            add_cell = add_cell && (p1 < 0 || cells.pos_get(i) <  p1);
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {

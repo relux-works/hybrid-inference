@@ -3467,6 +3467,29 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+size_t llama_context::state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
+    try {
+        if (!memory || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max || p0 < 0 || p1 <= p0 ||
+            p1 != memory->seq_pos_max(seq_id) + 1 || flags != 0) {
+            throw std::runtime_error("invalid range export arguments");
+        }
+        synchronize();
+        std::unique_ptr<llama_io_write_i> io;
+        if (dst) {
+            io = std::make_unique<llama_io_write_host>(dst, size);
+        } else {
+            io = std::make_unique<llama_io_write_dummy>(false);
+        }
+        io->write(&io_magic, sizeof(io_magic));
+        io->write(&seq_id, sizeof(seq_id));
+        memory->state_write_range(*io, seq_id, p0, p1, flags);
+        return io->n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -4826,4 +4849,8 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+size_t llama_state_seq_get_data_range(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
+    return ctx->state_seq_get_data_range(seq_id, dst, size, p0, p1, flags);
 }

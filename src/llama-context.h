@@ -160,6 +160,8 @@ struct llama_context {
     size_t state_get_data(      uint8_t * dst, size_t size);
     size_t state_set_data(const uint8_t * src, size_t size);
 
+    size_t state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_pos p0, llama_pos p1, llama_state_seq_flags flags);
+
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);

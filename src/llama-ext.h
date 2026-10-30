@@ -196,3 +196,10 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+// Export native sequence state with attention positions [p0, p1) and current recurrent state.
+// p1 must equal the current sequence endpoint. Only flags == 0 is supported.
+// With dst == nullptr, return the required size. Return 0 on failure.
+LLAMA_API size_t llama_state_seq_get_data_range(
+        llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id,
+        llama_pos p0, llama_pos p1, llama_state_seq_flags flags);
