@@ -3499,6 +3499,43 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 }
 
+size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_pos n0, llama_pos n1) {
+    if (!memory || !src || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max ||
+            n0 < 0 || n1 <= n0 || (int64_t) memory->seq_pos_max(seq_id) + 1 != n0) {
+        LLAMA_LOG_ERROR("%s: invalid append boundary or sequence\n", __func__);
+        return 0;
+    }
+
+    std::vector<uint8_t> backup(state_seq_get_size(seq_id, 0));
+    if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), 0) != backup.size()) {
+        return 0;
+    }
+
+    llama_io_read_host io(src, size);
+    try {
+        uint32_t magic;
+        llama_seq_id source_seq;
+        io.read(&magic, sizeof(magic));
+        io.read(&source_seq, sizeof(source_seq));
+        if (magic != io_magic) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND);
+        if (io.n_bytes() != size || memory->seq_pos_max(seq_id) != n1 - 1) {
+            throw std::runtime_error("append length does not match the declared range");
+        }
+        return size;
+    } catch (const std::exception & err) {
+        io.discard();
+        LLAMA_LOG_ERROR("%s: rejected append: %s\n", __func__, err.what());
+        memory->seq_rm(seq_id, -1, -1);
+        if (state_seq_set_data(seq_id, backup.data(), backup.size(), 0) != backup.size()) {
+            throw std::runtime_error("failed to restore sequence after rejected append");
+        }
+        return 0;
+    }
+}
+
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -4640,6 +4677,11 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_set_data_append(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_pos n0, llama_pos n1) {
+    ctx->synchronize();
+    return ctx->state_seq_set_data_append(seq_id, src, size, n0, n1);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

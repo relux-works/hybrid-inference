@@ -2151,7 +2151,8 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    const bool append = flags & LLAMA_STATE_SEQ_FLAGS_APPEND;
+    if ((!append && n_stream_cur != n_stream) || (append && (seq_id < 0 || n_stream_cur == 0 || n_stream_cur > n_seq_max))) {
         throw std::runtime_error("n_stream mismatch");
     }
 
@@ -2161,7 +2162,8 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    bool appended = false;
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
@@ -2173,12 +2175,17 @@ const slot_info_vec_t *   sinfos_in) {
             continue;
         }
 
+        if (append && appended) {
+            throw std::runtime_error("append state must contain one sequence");
+        }
+        appended = true;
+
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2331,7 +2338,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2342,7 +2349,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        const int64_t next_pos = (int64_t) seq_pos_max(dest_seq_id) + 1;
+        if (!append) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2362,6 +2372,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
+
+            if (append && (int64_t) pos != next_pos + i) {
+                LLAMA_LOG_ERROR("%s: append positions must be contiguous at the current sequence end\n", __func__);
+                return false;
+            }
 
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);

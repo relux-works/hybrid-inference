@@ -12,6 +12,13 @@
 #include <string>
 #include <vector>
 
+// Append a native range state; recurrent state is replaced. Returns size on success, 0 on rejection.
+// Positions must cover [n0, n1), with n0 equal to the destination's current length.
+// A rejected import preserves the destination. Only host state is supported.
+LLAMA_API size_t llama_state_seq_set_data_append(
+        llama_context * ctx, const uint8_t * src, size_t size,
+        llama_seq_id seq_id, llama_pos n0, llama_pos n1);
+
 //
 // llama architecture queries
 //
