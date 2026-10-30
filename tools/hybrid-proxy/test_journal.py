@@ -203,6 +203,25 @@ class JournalHTTPTests(unittest.TestCase):
     url = staticmethod(fixtures.HTTPTests.url)
     chat = fixtures.HTTPTests.chat
 
+    # Inferred follow-ups can queue after stream DONE but before the first durable message commit.
+    def test_inflight_message_admission_keeps_session_and_prefers_longer_completed_history(self):
+        session = self.app.store.select("a", [], "inflight")
+        incoming = [dict(role="system", content="shared"), dict(role="user", content="one")]
+        self.app.inflight[session["id"]] = dict(id=session["id"], client="a", identity="render", messages=incoming)
+        follow = incoming + [dict(role="assistant", content="answer"), dict(role="user", content="next")]
+        with self.app.lock:
+            self.assertEqual(self.app.select_messages("a", follow, "render", [999])["id"], session["id"])
+            foreign = self.app.select_messages("b", follow, "render", [999])
+            other = self.app.select_messages("a", [incoming[0], dict(role="user", content="different")], "render", [998])
+        self.assertNotEqual(foreign["id"], session["id"])
+        self.assertNotEqual(other["id"], session["id"])
+        completed = self.app.store.select("a", [], "completed")
+        completed["tokens"] = [1]
+        completed["journal"] = dict(identity="render", messages=follow[:3])
+        self.app.store.save(completed)
+        with self.app.lock:
+            self.assertEqual(self.app.select_messages("a", follow, "render", [999])["id"], "completed")
+
     # A failed journal commit cannot make unknown native generations part of a completed message history.
     def test_unknown_native_extension_is_never_adopted_into_message_journal(self):
         sid, _ = self.chat([10])

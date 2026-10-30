@@ -1,6 +1,7 @@
 """Opt-in three-user/tool-loop append, independent token oracle, rollback and M0.1 witness."""
 import argparse
 import copy
+import concurrent.futures
 import hashlib
 import http.server
 import io
@@ -239,6 +240,50 @@ def main():
                         "M0.1 control failed for a reason other than full prompt re-prefill")
                 raise AssertionError("M0.1 witness: full re-prefill replaced append-only continuation; see conversation.json")
             require(len(set(sessions)) == 1, "append-only message history forked")
+
+            # Hold the first journal commit after stream DONE. An inferred follow-up must queue on that same session.
+            phase = "commit-window-initial"
+            window_body = dict(common, messages=[dict(role="system", content="A separate commit-window conversation."),
+                dict(role="user", content="Count decimal integers from 1.")], tool_choice="none",
+                max_tokens=8, ignore_eos=True, stream=True)
+            entered, release = threading.Event(), threading.Event()
+            finish = app.finish
+
+            def held_finish(session, prompt):
+                if not entered.is_set():
+                    entered.set()
+                    require(release.wait(10), "commit-window control was not released")
+                return finish(session, prompt)
+            app.finish = held_finish
+            try:
+                result = Capture()
+                with client.open("POST", "/v1/chat/completions", window_body) as response:
+                    window_id = response.headers["X-Hybrid-Session"]
+                    for line in response:
+                        if line.strip() == b"data: [DONE]":
+                            break
+                        if line.startswith(b"data: "):
+                            result.feed(json.loads(line[6:]))
+                require(entered.wait(5), "initial stream did not reach its commit window")
+                phase = "commit-window-followup"
+                follow = dict(window_body, stream=False, messages=window_body["messages"] + [result.message,
+                    dict(role="user", content="Continue counting decimal integers.")])
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(chat, client, follow)
+                    try:
+                        queue = app.queues[window_id]
+                        with queue.condition:
+                            require(queue.condition.wait_for(lambda: len(queue.waiters) >= 2, timeout=5),
+                                    "inferred follow-up forked before the initial journal commit")
+                    finally:
+                        release.set()
+                    reused, _ = pending.result(timeout=120)
+                    require(reused == window_id, "inferred commit-window follow-up changed sessions")
+                require(window_id not in app.inflight, "completed admission metadata leaked")
+                print("PASS inferred follow-up after stream DONE: queued FIFO before commit, same session", flush=True)
+            finally:
+                release.set()
+                app.finish = finish
 
             # Another client's live journal and slot must remain isolated during checkpoint rewrites and rejection.
             phase = "neighbor"

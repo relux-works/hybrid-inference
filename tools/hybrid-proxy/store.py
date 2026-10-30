@@ -135,7 +135,7 @@ class Store:
         return self.get(sid)
 
     @locked
-    def select_messages(self, client, messages, identity, tokens, explicit=None):
+    def select_messages(self, client, messages, identity, tokens, explicit=None, create=True):
         if explicit:
             try:
                 return self.get(explicit, client)
@@ -158,6 +158,8 @@ class Store:
                     forks.append((matched, session))
         if candidates:
             return max(candidates, key=lambda item: item[0])[1]
+        if not create:
+            return None
         if forks:
             return max(forks, key=lambda item: item[0])[1]
         # An inferred divergence is a fork. An explicit ID authorizes checkpoint rollback of that session.

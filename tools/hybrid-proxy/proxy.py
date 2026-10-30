@@ -104,6 +104,7 @@ class Proxy:
         self.link_rate = self.policy.link_rate
         self.stop = threading.Event()
         self.renderer = Renderer(self.decode)
+        self.inflight = {}
 
     def client(self, authorization):
         value = self.clients.get(authorization.removeprefix("Bearer ")) if authorization.startswith("Bearer ") else None
@@ -375,6 +376,22 @@ class Proxy:
         prompt = self.decode.request("POST", "/apply-template", body)["prompt"]
         return self.decode.request("POST", "/tokenize", {"content": prompt, "add_special": True})["tokens"]
 
+    def select_messages(self, client, messages, identity, tokens, explicit=None):
+        # Called under the shared metadata lock. Pending history is visible for admission, never durable replay.
+        if explicit:
+            return self.store.select_messages(client, messages, identity, tokens, explicit)
+        completed = self.store.select_messages(client, messages, identity, tokens, create=False)
+        active = [value for value in self.inflight.values() if value["client"] == client and
+                  value["identity"] == identity and len(messages) > len(value["messages"]) and
+                  messages[len(value["messages"])].get("role") == "assistant" and
+                  matching_messages(value["messages"], messages) == len(value["messages"])]
+        pending = max(active, key=lambda value: len(value["messages"])) if active else None
+        if completed and (not pending or len(completed["journal"]["messages"]) >= len(pending["messages"])):
+            return completed
+        if pending:
+            return self.store.get(pending["id"], client)
+        return self.store.select_messages(client, messages, identity, tokens)
+
     @contextmanager
     def prepare(self, client, body, explicit):
         if body.get("n", 1) != 1:
@@ -403,7 +420,7 @@ class Proxy:
         with admission:
             with self.lock:
                 if message_mode:
-                    session = self.store.select_messages(client["id"], messages, identity, tokens, explicit)
+                    session = self.select_messages(client["id"], messages, identity, tokens, explicit)
                 elif explicit and existing:
                     session = existing
                 else:
@@ -462,7 +479,7 @@ class Proxy:
                 fork_parent, forked = False, True
                 continue
             with self.lock:
-                session = (self.store.select_messages(client["id"], messages, identity, tokens) if message_mode else
+                session = (self.select_messages(client["id"], messages, identity, tokens) if message_mode else
                            self.store.select(client["id"], tokens))
                 ticket = self.reserve(session["id"])
                 fork_parent = session.get("_fork", False)
@@ -573,6 +590,9 @@ class Proxy:
                     sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 retired_remote=old["remote_id"] if rollback_n is not None else None)
             session["_prepared"] = True
+            with self.lock:
+                self.inflight[session["id"]] = dict(id=session["id"], client=client["id"], identity=identity,
+                                                    messages=recorded_messages)
             yield
         except BaseException:
             if backup:
@@ -593,6 +613,8 @@ class Proxy:
                     raise RollbackError() from None
             raise
         finally:
+            with self.lock:
+                self.inflight.pop(session["id"], None)
             if backup:
                 (self.slot_path / backup).unlink(missing_ok=True)
 
