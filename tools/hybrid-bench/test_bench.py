@@ -187,6 +187,21 @@ class BenchmarkTests(unittest.TestCase):
                 info = common.read_private(state / 'node-info.json')
                 self.assertEqual(info['sizing']['sessions_held'], 2)
 
+    # Interrupting a checker stops only its recorded child and rethrows so the run can emit exit 130.
+    def test_checker_interrupt_cleanup(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [KeyboardInterrupt(), -15]
+        with mock.patch.object(hybrid_bench, 'start_process', return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                hybrid_bench.run_checker(['fixture'], Path('.'))
+        process.terminate.assert_called_once_with()
+        process.kill.assert_not_called()
+        process.wait.side_effect = None
+        process.returncode = 0
+        with mock.patch.object(hybrid_bench, 'start_process', return_value=process):
+            self.assertEqual(hybrid_bench.run_checker(['fixture'], Path('.')).returncode, 0)
+
     # Seeded schedules reproduce aggregates without reading private conversations; tails are explicitly clamped.
     def test_schedule_and_quantiles(self):
         a = list(schedule(1, measured=True))

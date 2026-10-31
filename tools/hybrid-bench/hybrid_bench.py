@@ -19,7 +19,7 @@ import urllib.error
 import contextlib
 import uuid
 
-from bench_common import (Refusal, http, private_json, read_private, require, sha256, validate_identity)
+from bench_common import (Refusal, http, private_json, read_private, require, sha256, validate_identity, start_process)
 
 # Measurement export v0.10, generated 2026-10-30, stats.json, agents.all.
 # Source SHA-256 binds the copied aggregates; no original conversations are used or read at runtime.
@@ -121,6 +121,22 @@ def link_probe(config):
                 limitation='application-level download including RTT; not physical or upload bandwidth')
 
 
+def run_checker(command, scratch):
+    process = start_process(command, scratch, 'checker')
+    try:
+        process.wait()
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=15)
+        raise
+    return process
+
+
 def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_backend=False):
     token = next(iter(config['clients'].values()))['prefill_token']
     base = config['prefill_url']
@@ -165,9 +181,8 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
                                      deltas=paths, max_ctx=client['context']))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
-        with Path(str(stem) + '.log').open('wb') as log:
-            process = subprocess.run([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
-                '0' if client['backend'] == 'cpu' else '999'], stdout=log, stderr=subprocess.STDOUT)
+        process = run_checker([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
+            '0' if client['backend'] == 'cpu' else '999'], scratch)
         require(result_path.is_file(), 'equivalence checker aborted before producing metrics')
         result = json.loads(result_path.read_text())
         require(process.returncode in (0, 3), 'equivalence checker failed before valid metrics')
@@ -182,8 +197,15 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
     finally:
         request = urllib.request.Request(base + '/v1/sessions/' + remote, method='DELETE',
                                          headers={'Authorization': 'Bearer ' + token})
-        with urllib.request.urlopen(request, timeout=10):
-            pass
+        active_error = sys.exc_info()[1]
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                pass
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                if isinstance(active_error, Refusal):
+                    raise Refusal(str(active_error) + f'; checker release failed (HTTP {error.code})') from None
+                raise
 
 
 def classify_equivalence(result, cross_backend):
@@ -201,8 +223,12 @@ def mode_session(config, client, sid, rows, mode):
             headers={'Authorization': 'Bearer ' + config['client_credential']})
         active_error = sys.exc_info()[0] is not None
         try:
-            with urllib.request.urlopen(request, timeout=30):
-                pass
+            try:
+                with urllib.request.urlopen(request, timeout=30):
+                    pass
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
             rows.append(dict(stage='release', mode=mode, status='released'))
         except Exception as error:
             rows.append(dict(stage='release', mode=mode, status='failed', reason=type(error).__name__))

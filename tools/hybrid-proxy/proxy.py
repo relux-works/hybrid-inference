@@ -309,7 +309,7 @@ class Proxy:
                 try:
                     with ticket:
                         current = self.store.get(pending["id"])
-                        if current.get("benchmark_mode") not in ("local", "closed"):
+                        if (current.get("benchmark_mode") or (current.get("journal") or {}).get("last_meter", {}).get("benchmark_mode")) not in ("local", "closed"):
                             self.sync(current, client)
                 except (OSError, HTTPError, ValueError):
                     pass

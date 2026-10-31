@@ -4,7 +4,8 @@ from unittest import mock
 import unittest
 
 import test_proxy
-from proxy import HTTPError, Proxy
+from proxy import HTTPError, Node, Proxy
+from store import prefix_hash
 
 
 class BenchmarkProxyTests(unittest.TestCase):
@@ -77,7 +78,7 @@ class ChunkAndLifecycleTests(unittest.TestCase):
         current = fixture.app.store.get(second['id'])
         remote = fixture.app.remote(dict(id='a', prefill_token='remote-a')).request('GET', '/v1/sessions/' + current['remote_id'])
         self.assertEqual(remote['n'], len(current['tokens']))
-        self.assertEqual(remote['prefix_hash'], __import__('store').prefix_hash(current['tokens']))
+        self.assertEqual(remote['prefix_hash'], prefix_hash(current['tokens']))
 
     # Default GET remains 501 and ordinary streaming emits exactly one DONE with no benchmark payload.
     def test_default_get_and_stream(self):
@@ -102,11 +103,22 @@ class ChunkAndLifecycleTests(unittest.TestCase):
         sid, _ = fixture.chat([4, 5, 6])
         session = fixture.app.store.get(sid)
         self.assertTrue(session['remote_id'])
+        foreign = Node(fixture.client.url, 'fixture-b')
+        with self.assertRaises(HTTPError) as error:
+            foreign.request('DELETE', '/v1/sessions/' + sid)
+        self.assertEqual(error.exception.status, 404)
+        self.assertTrue(fixture.app.remote(client).request('GET', '/v1/sessions/' + session['remote_id']))
         fixture.client.request('DELETE', '/v1/sessions/' + session['id'])
         with self.assertRaises(HTTPError) as error:
             fixture.app.remote(client).request('GET', '/v1/sessions/' + session['remote_id'])
         self.assertEqual(error.exception.status, 404)
-        with mock.patch.object(fixture.app, 'remote', side_effect=AssertionError('closed replay contacted node')):
+        # Durable local-mode meters retain their replay exclusion after the schema upgrade.
+        legacy = fixture.app.store.get('interrupted')
+        legacy['journal'] = dict(last_meter=dict(benchmark_mode='local'))
+        fixture.app.store.save(legacy)
+        with fixture.app.store.lock, fixture.app.store.db:
+            fixture.app.store.db.execute("UPDATE sessions SET benchmark_mode=NULL WHERE id=?", ('interrupted',))
+        with mock.patch.object(fixture.app, 'remote', side_effect=AssertionError('closed or legacy-local replay contacted node')):
             fixture.app.replay()
 
     # Different model bytes require explicit matching layout admission; mismatches never reach native import.

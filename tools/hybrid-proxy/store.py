@@ -98,7 +98,7 @@ class Store:
     @locked
     def benchmark_mode(self, sid, mode):
         with self.db:
-            self.db.execute("UPDATE sessions SET benchmark_mode=? WHERE id=?", (mode, sid))
+            self.db.execute("UPDATE sessions SET benchmark_mode=? WHERE id=?", (mode or "default", sid))
 
     @locked
     def set_slot(self, sid, slot):
