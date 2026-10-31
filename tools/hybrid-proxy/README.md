@@ -1,5 +1,7 @@
 # Hybrid client proxy prototype
 
+For private deployment, seeded chat benchmarks, opt-in content-free timing traces and real-node equivalence checks, see [the hybrid benchmark guide](../hybrid-bench/README.md). Benchmark switches require explicit operator configuration; ordinary proxy behavior is unchanged.
+
 This directory contains the Python client side of the hybrid prefill/decode prototype. Run commands from the repository root. Python 3.10+ and its standard library are sufficient for the proxy. The synthetic stub additionally calls the already installed `libxxhash` through `ctypes`; it does not install a Python package. The real delta reader is shared with producer A in `tools/hybrid`.
 
 ## M0.2 append-only sessions

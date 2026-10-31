@@ -48,6 +48,9 @@ class Node:
     def __init__(self, url, token="", timeout=1.0):
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
         self.last_transfer_rate = None
+        self.last_transfer_seconds = 0
+        self.last_bytes = 0
+        self.last_prefill_ms = None
 
     def open(self, method, path, data=None, headers=None):
         headers = dict(headers or {})
@@ -71,6 +74,9 @@ class Node:
                 body = response.read(limit + 1)
                 elapsed = max(time.monotonic() - started, 1e-6)
                 self.last_transfer_rate = len(body) / elapsed if body else None
+                self.last_transfer_seconds = elapsed
+                self.last_bytes = len(body)
+                self.last_prefill_ms = getattr(response, "headers", {}).get("X-Hybrid-Prefill-Ms")
                 if len(body) > limit:
                     raise ValueError("upstream body too large")
                 return body if binary else (json.loads(body) if body else None)
@@ -81,6 +87,7 @@ class Node:
 class Proxy:
     def __init__(self, config, database):
         self.model = config["model_sha256"]
+        self.benchmark = config.get("benchmark", False)
         self.clients = config["clients"]  # incoming bearer -> {id, prefill_token}
         if (not self.clients or len({c["id"] for c in self.clients.values()}) != len(self.clients)
                 or len({c["prefill_token"] for c in self.clients.values()}) != len(self.clients)):
@@ -161,7 +168,10 @@ class Proxy:
         self.store.save(session)
         if n < len(session["tokens"]):
             node.request("POST", path + "/extend", {"n0": n, "prefix_hash_n0": prefix_hash(session["tokens"][:n]),
-                         "tokens": session["tokens"][n:], "return_delta": False})
+                         "tokens": session["tokens"][n:], "return_delta": False},
+                         headers={"X-Hybrid-Bench": "1"} if client.get("benchmark_mode") else None)
+            if client.get("benchmark_mode") and node.last_prefill_ms is not None:
+                session["_bench"]["server_shadow_ms"] += float(node.last_prefill_ms)
         journal = session.get("journal")
         if journal:
             retired = journal.get("retired_remote_ids", [])
@@ -257,7 +267,9 @@ class Proxy:
                     continue
                 try:
                     with ticket:
-                        self.sync(self.store.get(pending["id"]), client)
+                        current = self.store.get(pending["id"])
+                        if (current.get("journal") or {}).get("last_meter", {}).get("benchmark_mode") != "local":
+                            self.sync(current, client)
                 except (OSError, HTTPError, ValueError):
                     pass
 
@@ -635,8 +647,17 @@ class Proxy:
             link_rate = self.link_rate
         decision = self.policy.choose(max(0, len(target) - local_n), local_n,
                                       bool(session["offload"]), link_rate)
+        mode = client.get("benchmark_mode")
+        session["_bench"] = dict(mode=mode, path="local", depth_before=local_n,
+            prompt_depth=len(tokens), server_prefill_ms=None, wire_bytes=0,
+            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0)
+        if mode == "offload":
+            decision["offload"] = len(target) > local_n
+        elif mode == "local":
+            decision["offload"] = False
         try:
-            path = self.sync(session, client)
+            remote_started = time.monotonic()
+            path = self.sync(session, client) if mode != "local" else None
             if decision["offload"] and len(target) > local_n:
                 # Flush a queued shadow with a critical extend at the local boundary.
                 if session["remote_n"] > local_n:
@@ -646,15 +667,21 @@ class Proxy:
                 remote = self.remote(client)
                 delta = remote.request("POST", path + "/extend", {
                     "n0": local_n, "prefix_hash_n0": prefix_hash(tokens[:local_n]),
-                    "tokens": target[local_n:], "return_delta": True}, binary=True)
+                    "tokens": target[local_n:], "return_delta": True},
+                    headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
+                session["_bench"].update(wire_bytes=remote.last_bytes,
+                    transfer_ms=remote.last_transfer_seconds * 1000,
+                    server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None)
                 if remote.last_transfer_rate:
                     with self.lock:
                         self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
                 session["tokens"] = target
                 self.store.save(session)
+                import_started = time.monotonic()
                 self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
                                     {"Content-Type": "application/octet-stream",
                                      "X-Hybrid-Session": session["remote_id"]})
+                session["_bench"].update(path="offload", import_ms=(time.monotonic() - import_started) * 1000)
                 actual = self.decode.request("GET", f"/slots/{slot}/info")
                 if actual["n"] != len(target) or actual["prefix_hash"] != prefix_hash(target):
                     self.decode.request("POST", f"/slots/{slot}?action=erase", {})
@@ -681,6 +708,8 @@ class Proxy:
             session["offload"] = False
         except OSError:
             session["offload"] = False
+        session["_bench"]["remote_prepare_ms"] = (time.monotonic() - remote_started) * 1000
+        session["_bench"]["path"] = "offload" if session["_remote_applied"] else "local"
         session["tokens"] = tokens
         self.store.save(session)
         request = dict(body, id_slot=slot, cache_prompt=True)
@@ -728,6 +757,10 @@ class Proxy:
                 replayed_prefix=turn["replay_end"] - turn["start"],
                 remote_replay_acknowledged=session.get("_remote_replayed", 0),
                 rollback_n=turn["rollback_n"], prefilled=local + remote)
+            if session.get("_bench", {}).get("mode"):
+                meter["benchmark_mode"] = session["_bench"]["mode"]
+                session["_bench"].update(meter, depth_after=len(complete), generated_tokens=len(native["tokens"]),
+                    decode_ms=timings.get("predicted_ms"), slot=session["slot"])
             previous = session.get("journal") or {}
             retired = list(previous.get("retired_remote_ids", []))
             if turn["retired_remote"] and turn["retired_remote"] != session["remote_id"]:
@@ -776,6 +809,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # Do not log credentials, request bodies, or token content.
 
+    def do_GET(self):
+        try:
+            self.server.app.client(self.headers.get("Authorization", ""))
+            if self.path != "/health" or not self.server.app.benchmark:
+                raise HTTPError(404)
+            self.json_response(200, {"status": "ok"})
+        except HTTPError as error:
+            self.json_response(error.status, {"error": "unavailable"})
+
     def json_response(self, status, data):
         body = json.dumps(data).encode()
         self.send_response(status)
@@ -799,6 +841,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):
                 raise ValueError("request must be a JSON object")
+            mode = self.headers.get("X-Hybrid-Bench-Mode")
+            if mode:
+                if not app.benchmark or mode not in ("local", "hybrid", "offload"):
+                    raise ValueError("benchmark mode requires benchmark=true and local, hybrid or offload")
+                client = dict(client, benchmark_mode=mode)
             explicit = self.headers.get("X-Hybrid-Session")
             if explicit and (len(explicit) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in explicit)):
                 raise ValueError("invalid session id")
@@ -813,6 +860,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         started = True
                         disconnected = False
                         for line in upstream:
+                            if mode and line.strip() == b"data: [DONE]":
+                                continue
                             if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                                 chunk = json.loads(line[6:])
                                 if "_capture" in session:
@@ -833,6 +882,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             session["_capture"].feed(data)
                         data.pop("__verbose", None)
                         app.finish(session, prompt)
+                        if mode:
+                            data["hybrid_bench"] = session["_bench"]
                         self.send_response(200)
                         output = json.dumps(data).encode()
                         self.send_header("Content-Type", "application/json")
@@ -842,6 +893,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(output)
                         return
                 app.finish(session, prompt)
+                if mode:
+                    self.wfile.write(b"data: " + json.dumps({"hybrid_bench": session["_bench"]}).encode() + b"\n\ndata: [DONE]\n\n")
+                    self.wfile.flush()
         except (HTTPError, KeyError, ValueError, OSError) as error:
             if not started:
                 status = (error.status if isinstance(error, HTTPError) else 404 if isinstance(error, KeyError) else

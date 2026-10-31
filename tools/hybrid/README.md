@@ -1,5 +1,7 @@
 # Hybrid CPU prototype
 
+For opt-in deployment options (`--host`, `--gpu-layers`, `--bench`), private launchers and CPU-qualified benchmark commands, see [the benchmark guide](../hybrid-bench/README.md). CUDA execution remains unqualified until tested on a GPU host. Existing positional arguments and default CPU/loopback behavior are unchanged.
+
 Local prototype on upstream e0f142d5. No upstream submission. Implements the prefill node, native delta codec and client-side correctness tools of the hybrid lane specification with the orchestrator-approved v1 native-state envelope and one-token decode boundary.
 
 ## Tools and commands

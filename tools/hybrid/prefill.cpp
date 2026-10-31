@@ -91,13 +91,24 @@ static std::string snapshot(const session & s, const std::string & empty_state) 
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 3 || argc > 5) {
-        std::cerr << "usage: llama-hybrid-prefill MODEL.gguf CLIENTS.json [PORT=8091] [N_CTX=8448]\n";
+    if (argc < 3) {
+        std::cerr << "usage: llama-hybrid-prefill MODEL.gguf CLIENTS.json [PORT=8091] [N_CTX=8448] [--host ADDRESS] [--gpu-layers N] [--bench]\n";
         return 2;
     }
     try {
         const int port = argc > 3 ? std::stoi(argv[3]) : 8091;
         const int n_ctx = argc > 4 ? std::stoi(argv[4]) : 8448;
+        std::string host = "127.0.0.1";
+        int gpu_layers = 0;
+        bool bench = false;
+        for (int i = 5; i < argc; ++i) {
+            const std::string arg(argv[i]);
+            if (arg == "--bench") { bench = true; }
+            else if (arg == "--host" && i + 1 < argc) { host = argv[++i]; }
+            else if (arg == "--gpu-layers" && i + 1 < argc) { gpu_layers = std::stoi(argv[++i]); }
+            else { throw std::runtime_error("unknown option"); }
+        }
+        if (gpu_layers < 0 || gpu_layers > 999) { throw std::runtime_error("invalid GPU layers"); }
         if (port < 1 || port > 65535 || n_ctx < 256 || n_ctx > 16384) { throw std::runtime_error("invalid port or context size"); }
         std::ifstream credentials(argv[2]);
         std::string text((std::istreambuf_iterator<char>(credentials)), {});
@@ -114,10 +125,19 @@ int main(int argc, char ** argv) {
         const std::string model_hash = hybrid::file_hash(argv[1]);
         llama_backend_init();
         auto mp = llama_model_default_params();
-        mp.n_gpu_layers = 0;
+        mp.n_gpu_layers = gpu_layers;
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], mp));
         if (!model || !llama_model_is_hybrid(model.get())) { throw std::runtime_error("a supported hybrid model is required"); }
-        auto ctx = hybrid::make_context(model.get(), n_ctx);
+        auto cp = llama_context_default_params();
+        cp.n_ctx = n_ctx;
+        cp.n_batch = cp.n_ubatch = 256;
+        cp.n_seq_max = 1;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.offload_kqv = gpu_layers > 0;
+        hybrid::context_ptr ctx(llama_init_from_model(model.get(), cp));
+        if (!ctx) { throw std::runtime_error("cannot create context"); }
         const std::string empty_state = hybrid::save_state(ctx.get());
         std::map<std::string, std::map<std::string, session>> sessions;
         hybrid::request_scheduler scheduler;
@@ -144,6 +164,10 @@ int main(int argc, char ** argv) {
             if (owner == owners.end()) {
                 res.set_header("WWW-Authenticate", "Bearer");
                 respond(res, 401, {{"error", "unauthorized"}});
+                return;
+            }
+            if (bench && req.path == "/v1/bench/link") {
+                res.set_content(std::string(1024 * 1024, 'x'), "application/octet-stream");
                 return;
             }
             const std::string & client = owner->second;
@@ -237,7 +261,12 @@ int main(int argc, char ** argv) {
                         hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
                     }
                     hybrid::load_state(ctx.get(), s.state);
+                    const auto prefill_started = std::chrono::steady_clock::now();
                     hybrid::prefill(ctx.get(), tokens, n0);
+                    if (bench && req.get_header_value("X-Hybrid-Bench") == "1") {
+                        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefill_started).count();
+                        res.set_header("X-Hybrid-Prefill-Ms", std::to_string(ms));
+                    }
                     std::string wire;
                     if (return_delta) {
                         wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size()));
@@ -269,13 +298,14 @@ int main(int argc, char ** argv) {
         };
         http.Get("/v1/health", handler);
         http.Get("/metrics", handler);
+        if (bench) { http.Get("/v1/bench/link", handler); }
         http.Get("/v1/sessions", handler);
         http.Post("/v1/sessions", handler);
         http.Get(R"(/v1/sessions/[a-f0-9]{32}(/snapshot)?)", handler);
         http.Post(R"(/v1/sessions/[a-f0-9]{32}/extend)", handler);
         http.Delete(R"(/v1/sessions/[a-f0-9]{32})", handler);
-        std::cerr << "hybrid prefill listening on 127.0.0.1:" << port << "\n";
-        return http.listen("127.0.0.1", port) ? 0 : 1;
+        std::cerr << "hybrid prefill listening on " << host << ":" << port << "\n";
+        return http.listen(host, port) ? 0 : 1;
     } catch (const std::exception &) {
         std::cerr << "prefill startup failed; check model, client file and arguments\n";
         return 1;
