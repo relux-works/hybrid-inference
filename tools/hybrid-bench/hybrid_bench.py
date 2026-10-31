@@ -142,7 +142,11 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                         dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True), binary=True)
                 except urllib.error.HTTPError as error:
                     if error.code == 503:
-                        raise Refusal('checker node refusal (HTTP 503; possible ram budget)') from None
+                        try:
+                            budget = json.loads(error.read(8192)).get('error') in ('ram budget', 'RAM session budget exceeded')
+                        except (ValueError, AttributeError):
+                            budget = False
+                        raise Refusal('ram budget refusal (HTTP 503)' if budget else 'checker node refusal (HTTP 503)') from None
                     raise
                 delta_path = scratch / ('check-' + str(n0) + '.delta')
                 if config.get('hetero_quant'):
@@ -167,11 +171,12 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         require(result_path.is_file(), 'equivalence checker aborted before producing metrics')
         result = json.loads(result_path.read_text())
         require(process.returncode in (0, 3), 'equivalence checker failed before valid metrics')
-        status, code = classify_equivalence(result, cross_backend)
+        status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False))
         result.update(exit_code=code, checker_exit_code=process.returncode, status=status,
                       check_mode='append_chain' if boundaries is not None else 'fresh',
                       append_endpoints=ends, delta_count=len(paths), cross_backend=cross_backend,
                       cross_backend_thresholds_calibrated=False if cross_backend else None,
+                      hetero_quant_thresholds_calibrated=False if config.get('hetero_quant') else None,
                       reference='same-partition and whole-prompt on client backend; full-vocabulary KL')
         return result
     finally:
@@ -348,7 +353,7 @@ def main():
                                         if r.get('stage') == 'call' and r.get('mode') == 'offload' for c in r.get('chunks', [])
                                         if c['status'] == 'imported' for endpoint in (c['n0'], c['n1'])]
                                     result = equivalence(config, client, tokens, args, check_dir, boundaries,
-                                                         node['backend'] != client['backend'] or config.get('hetero_quant', False))
+                                                         node['backend'] != client['backend'])
                                     rows.append(result)
                                     checks += 1
                                     if result['exit_code']:
