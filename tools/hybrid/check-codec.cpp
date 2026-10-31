@@ -10,8 +10,24 @@ static json header(const std::string & hash, size_t n0, size_t n1, const std::ve
     return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"tokens", std::vector<llama_token>(tokens.begin() + n0, tokens.begin() + n1)}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
 }
 
-static void codec_tests() {
+static void codec_tests(size_t max_ctx) {
     // Round trips accept the valid control; corrupt, truncated and incompatible envelopes are rejected before engine mutation.
+    const json layout = {{"architecture", "qwen35"}, {"layer_count", 24}, {"embedding_size", 1024},
+                         {"heads", 8}, {"kv_heads", 2}, {"recurrent_layout", json::array({true, false})},
+                         {"vocab_sha256", std::string(64, 'a')}};
+    const auto fingerprint = hybrid::layout_fingerprint(layout);
+    json reordered = json::object();
+    for (const auto & field : {"vocab_sha256", "recurrent_layout", "kv_heads", "heads", "embedding_size", "layer_count", "architecture"}) {
+        reordered[field] = layout.at(field);
+    }
+    require(hybrid::layout_fingerprint(reordered) == fingerprint, "layout fingerprint depends on insertion order");
+    for (const auto & field : {"architecture", "layer_count", "embedding_size", "heads", "kv_heads", "recurrent_layout", "vocab_sha256"}) {
+        auto changed = layout;
+        changed[field] = "changed";
+        require(hybrid::layout_fingerprint(changed) != fingerprint, "different layout fingerprint matched");
+    }
+    require(hybrid::layout_fingerprint(layout) == fingerprint, "layout fingerprint unstable");
+    std::cout << "PASS layout fingerprint structural mutation controls\n";
     const std::string hash(64, 'a');
     auto h = header(hash, 0, 1, {1});
     auto wire = hybrid::encode_delta(h, "abc");
@@ -53,13 +69,34 @@ static void codec_tests() {
     auto wrong_prefix = h;
     wrong_prefix["prefix_hash_n1"] = std::string(64, '0');
     rejects("prefix-hash", hybrid::encode_delta(wrong_prefix, "abc"), hash, 0, "prefix hash mismatch");
-    // The maximum node range fits even with ten-digit int32 IDs; both readers and writers enforce the range budget.
-    std::vector<llama_token> maximum_tokens(16384, INT32_MAX);
+    // Worst-case token IDs fit a bounded chunk of the configured context; exact-budget accepts and one-over rejects.
+    const size_t count = std::min<size_t>(max_ctx, (hybrid::max_delta_header_bytes - 4096) / 11 + 1);
+    std::vector<llama_token> maximum_tokens(count, INT32_MAX);
     auto maximum = header(hash, 0, maximum_tokens.size(), maximum_tokens);
     auto maximum_text = hybrid::encode_delta_header(maximum, hybrid::max_delta_body_bytes);
-    require(maximum_text.size() > 65536 && maximum_text.size() <= 4096 + 11 * 16384, "maximum header budget");
+    require(maximum_text.size() <= std::min(hybrid::max_delta_header_bytes, 4096 + 11 * count), "maximum header budget");
     auto maximum_delta = hybrid::read_delta(hybrid::encode_delta(maximum, "abc"), hash, 0);
     require(maximum_delta.state == "abc" && maximum_delta.header.at("tokens").get<std::vector<llama_token>>() == maximum_tokens, "maximum header round trip");
+    const size_t budget = std::min(hybrid::max_delta_header_bytes, 4096 + 11 * count);
+    maximum["padding"] = "";
+    const size_t unpadded = hybrid::encode_delta_header(maximum, 3).size();
+    maximum["padding"] = std::string(budget - unpadded, 'x');
+    auto exact_wire = hybrid::encode_delta(maximum, "abc");
+    require(hybrid::read_delta(exact_wire, hash, 0).header.at("tokens").size() == count, "exact budget rejected");
+    maximum["padding"].get_ref<std::string &>() += 'x';
+    bool one_over_rejected = false;
+    try { hybrid::encode_delta_header(maximum, 3); }
+    catch (const std::exception & e) { one_over_rejected = std::string(e.what()) == "delta header exceeds range budget"; }
+    require(one_over_rejected, "one-over writer accepted");
+    uint32_t exact_size = 0;
+    for (int i = 0; i < 4; ++i) { exact_size |= (uint32_t) (unsigned char) exact_wire[i] << (8 * i); }
+    auto over_header = hybrid::parse_json(exact_wire.substr(4, exact_size));
+    over_header["padding"].get_ref<std::string &>() += 'x';
+    const auto over_text = over_header.dump();
+    std::string over_wire;
+    for (int i = 0; i < 4; ++i) { over_wire += (char) (over_text.size() >> (8 * i)); }
+    over_wire += over_text + exact_wire.substr(4 + exact_size);
+    rejects("one-over-reader", over_wire, hash, 0, budget == hybrid::max_delta_header_bytes ? "invalid delta header length" : "delta header exceeds range budget");
     auto padded = h;
     padded["padding"] = std::string(4096, 'x');
     bool rejected = false;
@@ -76,11 +113,18 @@ static void codec_tests() {
     std::string oversized_length;
     for (int i = 0; i < 4; ++i) { oversized_length += (char) ((1048577u >> (8 * i)) & 255); }
     rejects("reader-absolute-header-budget", oversized_length, hash, 0, "invalid delta header length");
-    std::cout << "PASS test_header_budget_int32_max_16384: " << maximum_text.size() << " bytes with largest body metadata; writer/reader over-budget rejection\n";
+    std::cout << "PASS test_header_budget_int32_max_ctx=" << max_ctx << " chunk=" << count << " exact_budget=" << budget << ": " << maximum_text.size() << " bytes with largest body metadata; writer/reader over-budget rejection\n";
     std::cout << "PASS codec positive and negative controls\n";
 }
 
-int main() {
-    try { codec_tests(); return 0; }
+int main(int argc, char ** argv) {
+    try {
+        size_t max_ctx = 16384;
+        if (argc == 3 && std::string(argv[1]) == "--max-ctx") { max_ctx = std::stoul(argv[2]); }
+        else { require(argc == 1, "usage: llama-hybrid-check-codec [--max-ctx N]"); }
+        require(max_ctx >= 256 && max_ctx <= INT32_MAX - 256, "invalid max-ctx");
+        codec_tests(max_ctx);
+        return 0;
+    }
     catch (const std::exception & error) { std::cerr << "FAIL " << error.what() << '\n'; return 1; }
 }

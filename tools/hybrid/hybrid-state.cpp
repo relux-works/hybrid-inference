@@ -1,5 +1,6 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
+#include "llama-model.h"
 #include "hash/xxhash/xxhash.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
@@ -13,8 +14,8 @@ static void require(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
 }
 
-json parse_json(const std::string & text) {
-    require(text.size() <= 1024 * 1024, "JSON too large");
+json parse_json(const std::string & text, size_t max_bytes) {
+    require(text.size() <= max_bytes, "JSON too large");
     return json::parse(text, [](int depth, json::parse_event_t, json &) {
         require(depth <= 32, "JSON nesting too deep");
         return true;
@@ -29,6 +30,44 @@ static std::string hex(const unsigned char * p, size_t n) {
         out += chars[p[i] & 15];
     }
     return out;
+}
+
+std::string layout_fingerprint(const json & layout) {
+    const nlohmann::json canonical = layout;
+    const auto text = canonical.dump();
+    unsigned char digest[32];
+    sha256_hash(digest, reinterpret_cast<const unsigned char *>(text.data()), text.size());
+    return hex(digest, sizeof(digest));
+}
+
+json model_layout(const llama_model * model) {
+    const auto & hp = model->hparams;
+    const auto & vocab = model->vocab;
+    sha256_t hash;
+    sha256_init(&hash);
+    // Length framing preserves token boundaries and embedded NUL bytes, in token ID order.
+    const int32_t n_tokens = llama_vocab_n_tokens(&vocab);
+    for (llama_token i = 0; i < n_tokens; ++i) {
+        const auto & token = vocab.get_token_data(i);
+        uint64_t size = token.text.size();
+        unsigned char length[8];
+        for (int j = 0; j < 8; ++j) { length[j] = (unsigned char) (size >> (8 * j)); }
+        sha256_update(&hash, length, sizeof(length));
+        sha256_update(&hash, reinterpret_cast<const unsigned char *>(token.text.data()), token.text.size());
+    }
+    unsigned char digest[32];
+    sha256_final(&hash, digest);
+    json layers = json::array();
+    for (uint32_t i = 0; i < hp.n_layer(); ++i) {
+        layers.push_back({{"heads", hp.n_head(i)}, {"kv_heads", hp.n_head_kv(i)},
+                          {"key_dim", hp.n_embd_head_k(i)}, {"value_dim", hp.n_embd_head_v(i)},
+                          {"recurrent", hp.is_recr(i)}});
+    }
+    return {{"version", 1}, {"architecture", model->arch_name()}, {"layer_count", hp.n_layer()},
+            {"embedding_size", hp.n_embd}, {"layers", layers},
+            {"recurrent_layout", {{"conv", hp.ssm_d_conv}, {"inner", hp.ssm_d_inner},
+                                  {"state", hp.ssm_d_state}, {"rank", hp.ssm_dt_rank}, {"groups", hp.ssm_n_group}}},
+            {"vocab_size", vocab.n_tokens()}, {"vocab_sha256", hex(digest, sizeof(digest))}};
 }
 
 std::string file_hash(const std::string & path) {

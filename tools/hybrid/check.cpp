@@ -1,6 +1,7 @@
 #include "hybrid-state.h"
 #include "hybrid-scheduler.h"
 #include "llama-ext.h"
+#include "llama-model.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -43,8 +44,24 @@ static void scheduler_tests() {
     std::cout << "PASS scheduler FIFO, critical priority and client round robin\n";
 }
 
-static void codec_tests() {
+static void codec_tests(size_t max_ctx) {
     // Round trips accept the valid control; corrupt, truncated and incompatible envelopes are rejected before engine mutation.
+    const json layout = {{"architecture", "qwen35"}, {"layer_count", 24}, {"embedding_size", 1024},
+                         {"heads", 8}, {"kv_heads", 2}, {"recurrent_layout", json::array({true, false})},
+                         {"vocab_sha256", std::string(64, 'a')}};
+    const auto fingerprint = hybrid::layout_fingerprint(layout);
+    json reordered = json::object();
+    for (const auto & field : {"vocab_sha256", "recurrent_layout", "kv_heads", "heads", "embedding_size", "layer_count", "architecture"}) {
+        reordered[field] = layout.at(field);
+    }
+    require(hybrid::layout_fingerprint(reordered) == fingerprint, "layout fingerprint depends on insertion order");
+    for (const auto & field : {"architecture", "layer_count", "embedding_size", "heads", "kv_heads", "recurrent_layout", "vocab_sha256"}) {
+        auto changed = layout;
+        changed[field] = "changed";
+        require(hybrid::layout_fingerprint(changed) != fingerprint, "different layout fingerprint matched");
+    }
+    require(hybrid::layout_fingerprint(layout) == fingerprint, "layout fingerprint unstable");
+    std::cout << "PASS layout fingerprint structural mutation controls\n";
     const std::string hash(64, 'a');
     auto h = header(hash, 0, 1, {1});
     auto wire = hybrid::encode_delta(h, "abc");
@@ -86,13 +103,34 @@ static void codec_tests() {
     auto wrong_prefix = h;
     wrong_prefix["prefix_hash_n1"] = std::string(64, '0');
     rejects("prefix-hash", hybrid::encode_delta(wrong_prefix, "abc"), hash, 0, "prefix hash mismatch");
-    // The maximum node range fits even with ten-digit int32 IDs; both readers and writers enforce the range budget.
-    std::vector<llama_token> maximum_tokens(16384, INT32_MAX);
+    // Worst-case token IDs fit a bounded chunk of the configured context; exact-budget accepts and one-over rejects.
+    const size_t count = std::min<size_t>(max_ctx, (hybrid::max_delta_header_bytes - 4096) / 11 + 1);
+    std::vector<llama_token> maximum_tokens(count, INT32_MAX);
     auto maximum = header(hash, 0, maximum_tokens.size(), maximum_tokens);
     auto maximum_text = hybrid::encode_delta_header(maximum, hybrid::max_delta_body_bytes);
-    require(maximum_text.size() > 65536 && maximum_text.size() <= 4096 + 11 * 16384, "maximum header budget");
+    require(maximum_text.size() <= std::min(hybrid::max_delta_header_bytes, 4096 + 11 * count), "maximum header budget");
     auto maximum_delta = hybrid::read_delta(hybrid::encode_delta(maximum, "abc"), hash, 0);
     require(maximum_delta.state == "abc" && maximum_delta.header.at("tokens").get<std::vector<llama_token>>() == maximum_tokens, "maximum header round trip");
+    const size_t budget = std::min(hybrid::max_delta_header_bytes, 4096 + 11 * count);
+    maximum["padding"] = "";
+    const size_t unpadded = hybrid::encode_delta_header(maximum, 3).size();
+    maximum["padding"] = std::string(budget - unpadded, 'x');
+    auto exact_wire = hybrid::encode_delta(maximum, "abc");
+    require(hybrid::read_delta(exact_wire, hash, 0).header.at("tokens").size() == count, "exact budget rejected");
+    maximum["padding"].get_ref<std::string &>() += 'x';
+    bool one_over_rejected = false;
+    try { hybrid::encode_delta_header(maximum, 3); }
+    catch (const std::exception & e) { one_over_rejected = std::string(e.what()) == "delta header exceeds range budget"; }
+    require(one_over_rejected, "one-over writer accepted");
+    uint32_t exact_size = 0;
+    for (int i = 0; i < 4; ++i) { exact_size |= (uint32_t) (unsigned char) exact_wire[i] << (8 * i); }
+    auto over_header = hybrid::parse_json(exact_wire.substr(4, exact_size));
+    over_header["padding"].get_ref<std::string &>() += 'x';
+    const auto over_text = over_header.dump();
+    std::string over_wire;
+    for (int i = 0; i < 4; ++i) { over_wire += (char) (over_text.size() >> (8 * i)); }
+    over_wire += over_text + exact_wire.substr(4 + exact_size);
+    rejects("one-over-reader", over_wire, hash, 0, budget == hybrid::max_delta_header_bytes ? "invalid delta header length" : "delta header exceeds range budget");
     auto padded = h;
     padded["padding"] = std::string(4096, 'x');
     bool rejected = false;
@@ -109,7 +147,7 @@ static void codec_tests() {
     std::string oversized_length;
     for (int i = 0; i < 4; ++i) { oversized_length += (char) ((1048577u >> (8 * i)) & 255); }
     rejects("reader-absolute-header-budget", oversized_length, hash, 0, "invalid delta header length");
-    std::cout << "PASS test_header_budget_int32_max_16384: " << maximum_text.size() << " bytes with largest body metadata; writer/reader over-budget rejection\n";
+    std::cout << "PASS test_header_budget_int32_max_ctx=" << max_ctx << " chunk=" << count << " exact_budget=" << budget << ": " << maximum_text.size() << " bytes with largest body metadata; writer/reader over-budget rejection\n";
     std::cout << "PASS codec positive and negative controls\n";
 }
 
@@ -178,13 +216,23 @@ static void append_negative_tests(llama_context * ctx, const std::string & raw, 
     reject("raw-layer-layout", corrupt, n0, n1);
 }
 
-static void run_model(const std::string & model_path, const std::string & directory, size_t depth) {
-    require(depth >= 256 && depth <= 8192, "depth must be 256-8192");
+static void run_model(const std::string & model_path, const std::string & directory, size_t depth, size_t max_ctx) {
+    require(depth >= 256 && depth + 64 <= max_ctx, "depth exceeds max-ctx continuation capacity");
     const auto hash = hybrid::file_hash(model_path);
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
     hybrid::model_ptr model(llama_model_load_from_file(model_path.c_str(), mp));
     require(bool(model), "model load failed");
+    // The actual model-to-layout projection detects a changed embedding geometry, not just changed JSON input.
+    const auto layout = hybrid::model_layout(model.get());
+    const auto embedding_size = model->hparams.n_embd;
+    model->hparams.n_embd = embedding_size + 1;
+    const auto changed_layout = hybrid::model_layout(model.get());
+    model->hparams.n_embd = embedding_size;
+    require(layout.at("embedding_size") == embedding_size && changed_layout.at("embedding_size") == embedding_size + 1,
+            "model layout projection ignored embedding geometry");
+    require(hybrid::layout_fingerprint(layout) != hybrid::layout_fingerprint(changed_layout), "changed model geometry matched fingerprint");
+    std::cout << "PASS model layout projection: changed embedding geometry differs\n";
     auto source = hybrid::make_context(model.get(), depth + 256);
     auto restored = hybrid::make_context(model.get(), depth + 256);
     const auto tokens = prompt_tokens(model.get(), depth);
@@ -235,18 +283,26 @@ static void run_model(const std::string & model_path, const std::string & direct
 
 int main(int argc, char ** argv) {
     try {
+        size_t max_ctx = 16384;
+        std::vector<std::string> positional;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--max-ctx" && i + 1 < argc) { max_ctx = std::stoul(argv[++i]); }
+            else { positional.push_back(argv[i]); }
+        }
+        require(max_ctx >= 256 && max_ctx <= INT32_MAX - 256, "invalid max-ctx");
         scheduler_tests();
-        codec_tests();
-        if (argc == 2 && std::string(argv[1]) == "--codec") { return 0; }
-        if (argc < 3 || argc > 4) {
-            std::cerr << "usage: llama-hybrid-check --codec | MODEL.gguf GOLDEN_DIR [DEPTH]\n";
+        codec_tests(max_ctx);
+        if (positional.size() == 1 && positional[0] == "--codec") { return 0; }
+        if (positional.size() < 2 || positional.size() > 3) {
+            std::cerr << "usage: llama-hybrid-check --codec | MODEL.gguf GOLDEN_DIR [DEPTH] [--max-ctx N]\n";
             return 2;
         }
         llama_backend_init();
-        if (argc == 4) {
-            run_model(argv[1], std::string(argv[2]) == "-" ? "" : argv[2], std::stoul(argv[3]));
+        const auto directory = positional[1] == "-" ? "" : positional[1];
+        if (positional.size() == 3) {
+            run_model(positional[0], directory, std::stoul(positional[2]), max_ctx);
         } else {
-            for (size_t depth : {512, 2048, 8192}) { run_model(argv[1], std::string(argv[2]) == "-" ? "" : argv[2], depth); }
+            for (size_t depth : {512, 2048, 8192}) { run_model(positional[0], directory, depth, max_ctx); }
         }
         return 0;
     } catch (const std::exception & e) {

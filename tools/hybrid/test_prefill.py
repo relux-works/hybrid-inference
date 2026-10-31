@@ -228,59 +228,54 @@ def test_pending_admission(request, clients, port, model_hash):
 
 
 def test_post_inference_error_release(request, model_hash):
-    # Repeated post-inference RAM rejection releases permits and leaves the rejected session byte-identical.
+    # An impossible state rejects repeatedly without losing neighbors; a smaller valid append releases permits and evicts LRU.
+    retained = request("POST", "/v1/sessions", body={"model_sha256": model_hash})["session_id"]
+    retained = "/v1/sessions/" + retained
     append = {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": [101], "return_delta": False}
-    retained = []
-    for _ in range(32):
-        sid = request("POST", "/v1/sessions", body={"model_sha256": model_hash})["session_id"]
-        path = "/v1/sessions/" + sid
-        result = request("POST", path + "/extend", body=append, expected=(202, 503))
-        if "error" in result:
-            assert result == {"error": "RAM session budget exceeded"}
-            break
-        assert result == {"n": 1, "prefix_hash": prefix([101])}
-        retained.append(path)
-    else:
-        raise AssertionError("RAM error control did not reach the retained-payload limit")
-    before = request("GET", path)
-    snapshot = request("GET", path + "/snapshot")
-    assert before["n"] == 0
-    critical = dict(append, return_delta=True)
-    for _ in range(4):
-        assert request("POST", path + "/extend", body=critical, expected=503) == {"error": "RAM session budget exceeded"}
-        assert request("GET", path) == before
-    assert request("GET", path + "/snapshot") == snapshot
-    request("DELETE", retained.pop(), expected=204)
-    wire = request("POST", path + "/extend", body=critical)
-    assert wire[:4] and request("GET", path)["n"] == 1
-    print("PASS test_post_inference_error_release: repeated 503 preserves empty state and returns permits; freeing RAM admits the same critical request")
-
-
-def test_max_delta_header_16384(request, model_hash):
-    # The largest supported HTTP range carries all 16384 six-digit token IDs; over-capacity rejects without writes.
+    request("POST", retained + "/extend", body=append, expected=202)
+    neighbor = request("GET", retained + "/snapshot")
     sid = request("POST", "/v1/sessions", body={"model_sha256": model_hash})["session_id"]
     path = "/v1/sessions/" + sid
     before = request("GET", path)
     snapshot = request("GET", path + "/snapshot")
-    tokens = [100000] * 16384
+    critical = dict(append, tokens=[101] * 1024, return_delta=True)
+    for _ in range(4):
+        refusal = request("POST", path + "/extend", body=critical, expected=503)
+        assert refusal["error"] == "ram budget" and refusal["need"] > refusal["budget"] == 24 * 1024 * 1024
+        assert request("GET", path) == before
+        assert request("GET", path + "/snapshot") == snapshot
+        assert request("GET", retained + "/snapshot") == neighbor
+    wire = request("POST", path + "/extend", body=dict(append, return_delta=True))
+    assert wire[:4] and request("GET", path)["n"] == 1
+    request("GET", retained, expected=404)
+    print("PASS test_post_inference_error_release: repeated 503 preserves every session and returns permits; smaller valid request evicts oldest idle")
+
+
+def test_max_delta_header_16384(request, model_hash, max_ctx=16384):
+    # The configured maximum HTTP range carries exact token IDs; one token over refuses without writes.
+    sid = request("POST", "/v1/sessions", body={"model_sha256": model_hash})["session_id"]
+    path = "/v1/sessions/" + sid
+    before = request("GET", path)
+    snapshot = request("GET", path + "/snapshot")
+    tokens = [100000] * max_ctx
     append = {"n0": 0, "prefix_hash_n0": prefix([]), "tokens": tokens, "return_delta": True}
     request("POST", path + "/extend", body=dict(append, tokens=tokens + [100000]), expected=400)
     assert request("GET", path) == before and request("GET", path + "/snapshot") == snapshot
     wire = request("POST", path + "/extend", body=append, timeout=900)
     length = struct.unpack_from("<I", wire)[0]
-    assert 65536 < length <= 4096 + 11 * 16384
+    assert 65536 < length <= min(1024 * 1024, 4096 + 11 * max_ctx)
     header = json.loads(wire[4:4 + length])
-    assert header["n0"] == 0 and header["n1"] == 16384 and header["tokens"] == tokens
+    assert header["n0"] == 0 and header["n1"] == max_ctx and header["tokens"] == tokens
     assert header["prefix_hash_n1"] == prefix(tokens)
     native = wire[4 + length:-48]
     assert header["sections"] == [{"name": "llama_seq_state", "offset": 0, "bytes": len(native)}]
     assert wire[-32:] == hashlib.sha256(native).digest()
     saved = request("GET", path + "/snapshot")
-    assert struct.unpack_from("<III", saved)[1:] == (4, 16384)
-    assert list(struct.unpack_from("<16384i", saved, 12)) == tokens
-    assert saved[12 + 4 * 16384:] == native[8:]
-    assert request("GET", path)["n"] == 16384
-    print(f"PASS test_max_delta_header_16384: {length}-byte header, exact tokens/hash/native snapshot; 16385 rejected with unchanged empty snapshot")
+    assert struct.unpack_from("<III", saved)[1:] == (4, max_ctx)
+    assert list(struct.unpack_from(f"<{max_ctx}i", saved, 12)) == tokens
+    assert saved[12 + 4 * max_ctx:] == native[8:]
+    assert request("GET", path)["n"] == max_ctx
+    print(f"PASS test_max_delta_header_16384 max_ctx={max_ctx}: {length}-byte header, exact tokens/hash/native snapshot; {max_ctx + 1} rejected with unchanged empty snapshot")
 
 
 def main():
@@ -289,6 +284,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--artifacts", required=True)
     parser.add_argument("--port", type=int, default=18091)
+    parser.add_argument("--max-ctx", type=int, default=16384)
     parser.add_argument("--regression", choices=("slow-readers", "max-delta", "pending", "errors"))
     args = parser.parse_args()
     artifacts = pathlib.Path(args.artifacts)
@@ -299,7 +295,12 @@ def main():
     credentials.chmod(0o600)
     credentials.write_text(json.dumps(clients))
     log = (artifacts / "prefill-node-01.log").open("wb")
-    process = subprocess.Popen([args.binary, args.model, str(credentials), str(args.port), "16384" if args.regression == "max-delta" else "8192" if args.regression == "pending" else "512"], stdout=log, stderr=log)
+    command = [args.binary, args.model, str(credentials), str(args.port), str(args.max_ctx) if args.regression == "max-delta" else "8192" if args.regression == "pending" else "2048" if args.regression == "errors" else "512"]
+    if args.max_ctx != 16384:
+        command.extend(["--max-ctx", str(args.max_ctx)])
+    if args.regression == "errors":
+        command.extend(["--ram-budget-mib", "24"])
+    process = subprocess.Popen(command, stdout=log, stderr=log)
     (artifacts / "prefill.pid").write_text(str(process.pid) + "\n")
     base = f"http://127.0.0.1:{args.port}"
 
@@ -350,7 +351,7 @@ def main():
             test_post_inference_error_release(request, model_hash)
             return
         if args.regression == "max-delta":
-            test_max_delta_header_16384(request, model_hash)
+            test_max_delta_header_16384(request, model_hash, args.max_ctx)
             return
         request("GET", "/v1/sessions", client=None, expected=401)
         # Each rejection preserves the session list or existing session count, hash and snapshot bytes.
@@ -406,8 +407,8 @@ def main():
             ids = list(pool.map(exercise, cases))
         assert len(set(ids)) == 12
         for client, _, other in cases:
-            request("DELETE", "/v1/sessions/" + other, client, expected=204)
-        request("DELETE", path, expected=204)
+            request("DELETE", "/v1/sessions/" + other, client, expected=204, retry_overload=True)
+        request("DELETE", path, expected=204, retry_overload=True)
         request("GET", path, expected=404)
         assert all(request("GET", "/v1/sessions", client) == [] for client in clients)
         assert b"hybrid_ram_bytes 0\n" in request("GET", "/metrics")

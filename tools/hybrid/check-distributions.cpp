@@ -79,12 +79,13 @@ static std::string read_file(const char * path) {
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 
-static void run(llama_model * model, const hybrid::json & fixture, const char * path) {
+static void run(llama_model * model, const hybrid::json & fixture, const char * path, size_t max_ctx) {
     const auto tokens = fixture.at("tokens").get<std::vector<llama_token>>();
-    const auto continuation = fixture.at("greedy_64").get<std::vector<llama_token>>();
+    const bool observed = fixture.contains("greedy_64");
+    auto continuation = observed ? fixture.at("greedy_64").get<std::vector<llama_token>>() : std::vector<llama_token>(64);
     const bool ignore_eos = fixture.value("ignore_eos", false);
     const auto * vocab = llama_model_get_vocab(model);
-    require(!tokens.empty() && tokens.size() <= 8192 && continuation.size() == 64, "invalid teacher-forcing fixture");
+    require(!tokens.empty() && tokens.size() + 64 <= max_ctx && continuation.size() == 64, "invalid teacher-forcing fixture");
     for (auto token : tokens) { require(token >= 0 && token < llama_vocab_n_tokens(vocab), "invalid prompt token"); }
     for (auto token : continuation) { require(token >= 0 && token < llama_vocab_n_tokens(vocab), "invalid continuation token"); }
     auto imported = hybrid::make_context(model, tokens.size() + 256);
@@ -107,17 +108,25 @@ static void run(llama_model * model, const hybrid::json & fixture, const char * 
     hybrid::prefill(imported.get(), {tokens.back()}, tokens.size() - 1);
     auto split = hybrid::make_context(model, tokens.size() + 256);
     auto whole = hybrid::make_context(model, tokens.size() + 256);
+    auto free_whole = hybrid::make_context(model, tokens.size() + 256);
     hybrid::prefill(split.get(), {tokens.begin(), tokens.end() - 1}, 0);
     hybrid::prefill(split.get(), {tokens.back()}, tokens.size() - 1);
     hybrid::prefill(whole.get(), tokens, 0);
+    // Reuse the whole-prompt state for the informational free-running branch; its first logits come from whole.
+    hybrid::load_state(free_whole.get(), hybrid::save_state(whole.get()));
+    int first_divergence = -1;
     double kl_sum = 0;
     size_t agreed = 0;
     for (size_t i = 0; i < continuation.size(); ++i) {
+        if (!observed) { continuation[i] = sample(imported.get(), vocab, ignore_eos); }
         require(sample(imported.get(), vocab, ignore_eos) == continuation[i], "imported greedy differs from observed continuation");
         require(sample(split.get(), vocab, ignore_eos) == continuation[i], "same-partition greedy mismatch");
         // Both independent contexts receive the exact same observed continuation, even when whole-prefill top1 differs.
         const auto metric = compare(llama_get_logits_ith(imported.get(), -1), llama_get_logits_ith(whole.get(), -1),
                                     llama_vocab_n_tokens(vocab));
+        const auto free_token = sample(i == 0 ? whole.get() : free_whole.get(), vocab, ignore_eos);
+        if (first_divergence < 0 && free_token != continuation[i]) { first_divergence = i; }
+        hybrid::prefill(free_whole.get(), {free_token}, tokens.size() + i);
         kl_sum += metric.kl;
         agreed += metric.top1;
         hybrid::prefill(imported.get(), {continuation[i]}, tokens.size() + i);
@@ -127,14 +136,21 @@ static void run(llama_model * model, const hybrid::json & fixture, const char * 
     const double mean_kl = kl_sum / continuation.size();
     const double agreement = (double) agreed / continuation.size();
     std::cout << "METRICS " << path << " same_partition=64/64 mean_kl=" << mean_kl
-              << " top1=" << agreed << "/64 agreement=" << agreement << '\n';
+              << " free_running_first_divergence=" << first_divergence << " top1=" << agreed << "/64 agreement=" << agreement << '\n';
     require(within_bounds(mean_kl, agreement), "teacher-forced KL/top1 bounds exceeded");
     std::cout << "PASS teacher-forced distribution bounds " << path << '\n';
 }
 
 int main(int argc, char ** argv) {
     try {
-        require(argc >= 3, "usage: llama-hybrid-check-distributions MODEL.gguf TOKENS.json [TOKENS.json ...]");
+        require(argc >= 3, "usage: llama-hybrid-check-distributions MODEL.gguf TOKENS.json [TOKENS.json ...] [--max-ctx N]");
+        size_t max_ctx = 16384;
+        std::vector<std::string> fixtures;
+        for (int i = 2; i < argc; ++i) {
+            if (std::string(argv[i]) == "--max-ctx" && i + 1 < argc) { max_ctx = std::stoul(argv[++i]); }
+            else { fixtures.push_back(argv[i]); }
+        }
+        require(!fixtures.empty() && max_ctx >= 256 && max_ctx <= INT32_MAX - 256, "invalid max-ctx or fixtures");
         controls();
         llama_backend_init();
         auto params = llama_model_default_params();
@@ -142,10 +158,10 @@ int main(int argc, char ** argv) {
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], params));
         require(bool(model), "cannot load model");
         const auto hash = hybrid::file_hash(argv[1]);
-        for (int i = 2; i < argc; ++i) {
-            auto fixture = hybrid::parse_json(read_file(argv[i]));
+        for (const auto & path : fixtures) {
+            auto fixture = hybrid::parse_json(read_file(path.c_str()));
             require(fixture.at("model_sha256") == hash, "teacher fixture model mismatch");
-            run(model.get(), fixture, argv[i]);
+            run(model.get(), fixture, path.c_str(), max_ctx);
         }
         return 0;
     } catch (const std::exception & error) {

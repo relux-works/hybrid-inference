@@ -1,7 +1,9 @@
 #include "hybrid-state.h"
 #include "hybrid-scheduler.h"
 #include "httplib.h"
+#include <algorithm>
 #include <atomic>
+#include <limits>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -15,6 +17,7 @@ struct session {
     std::vector<llama_token> tokens;
     std::string state;
     int64_t last_used = 0;
+    uint64_t recency = 0;
 };
 
 class response_budget {
@@ -92,24 +95,49 @@ static std::string snapshot(const session & s, const std::string & empty_state) 
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        std::cerr << "usage: llama-hybrid-prefill MODEL.gguf CLIENTS.json [PORT=8091] [N_CTX=8448] [--host ADDRESS] [--gpu-layers N] [--bench]\n";
+        std::cerr << "usage: llama-hybrid-prefill MODEL.gguf CLIENTS.json [PORT=8091] [N_CTX=8448] [--host ADDRESS] [--gpu-layers N] [--bench] [--max-ctx N=16384] [--ram-budget-mib N=512] [--max-request-mib N=1]\n";
         return 2;
     }
     try {
-        const int port = argc > 3 ? std::stoi(argv[3]) : 8091;
-        const int n_ctx = argc > 4 ? std::stoi(argv[4]) : 8448;
+        int port = 8091;
+        int n_ctx = 8448;
+        int max_ctx = 16384;
+        size_t ram_budget = 512 * 1024 * 1024;
+        size_t max_request = 1024 * 1024;
         std::string host = "127.0.0.1";
         int gpu_layers = 0;
         bool bench = false;
-        for (int i = 5; i < argc; ++i) {
+        bool context_given = false;
+        bool max_ctx_given = false;
+        auto number = [](const std::string & text, uint64_t maximum) {
+            if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) { throw std::runtime_error("invalid number"); }
+            const auto n = std::stoull(text);
+            if (n > maximum) { throw std::runtime_error("number out of range"); }
+            return n;
+        };
+        int first_option = 3;
+        if (first_option < argc && argv[first_option][0] != '-') { port = number(argv[first_option++], 65535); }
+        if (first_option < argc && argv[first_option][0] != '-') {
+            n_ctx = number(argv[first_option++], INT32_MAX - 256);
+            context_given = true;
+        }
+        for (int i = first_option; i < argc; ++i) {
             const std::string arg(argv[i]);
             if (arg == "--bench") { bench = true; }
             else if (arg == "--host" && i + 1 < argc) { host = argv[++i]; }
-            else if (arg == "--gpu-layers" && i + 1 < argc) { gpu_layers = std::stoi(argv[++i]); }
-            else { throw std::runtime_error("unknown option"); }
+            else if (arg == "--gpu-layers" && i + 1 < argc) { gpu_layers = number(argv[++i], 999); }
+            else if (arg == "--max-ctx" && i + 1 < argc) {
+                max_ctx = number(argv[++i], INT32_MAX - 256);
+                max_ctx_given = true;
+            } else if ((arg == "--ram-budget-mib" || arg == "--max-request-mib") && i + 1 < argc) {
+                const size_t value = number(argv[++i], std::numeric_limits<size_t>::max() / (1024 * 1024));
+                if (value == 0) { throw std::runtime_error("budget must be positive"); }
+                if (arg == "--ram-budget-mib") { ram_budget = value * 1024 * 1024; }
+                else { max_request = value * 1024 * 1024; }
+            } else { throw std::runtime_error("unknown option"); }
         }
-        if (gpu_layers < 0 || gpu_layers > 999) { throw std::runtime_error("invalid GPU layers"); }
-        if (port < 1 || port > 65535 || n_ctx < 256 || n_ctx > 16384) { throw std::runtime_error("invalid port or context size"); }
+        if (max_ctx_given && !context_given) { n_ctx = max_ctx; }
+        if (port < 1 || n_ctx < 256 || n_ctx > max_ctx) { throw std::runtime_error("invalid port or context size"); }
         std::ifstream credentials(argv[2]);
         std::string text((std::istreambuf_iterator<char>(credentials)), {});
         json clients = hybrid::parse_json(text);
@@ -128,6 +156,8 @@ int main(int argc, char ** argv) {
         mp.n_gpu_layers = gpu_layers;
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], mp));
         if (!model || !llama_model_is_hybrid(model.get())) { throw std::runtime_error("a supported hybrid model is required"); }
+        const json layout = hybrid::model_layout(model.get());
+        const std::string fingerprint = hybrid::layout_fingerprint(layout);
         auto cp = llama_context_default_params();
         cp.n_ctx = n_ctx;
         cp.n_batch = cp.n_ubatch = 256;
@@ -139,13 +169,16 @@ int main(int argc, char ** argv) {
         hybrid::context_ptr ctx(llama_init_from_model(model.get(), cp));
         if (!ctx) { throw std::runtime_error("cannot create context"); }
         const std::string empty_state = hybrid::save_state(ctx.get());
-        std::map<std::string, std::map<std::string, session>> sessions;
+        std::map<std::string, std::map<std::string, std::shared_ptr<session>>> sessions;
+        uint64_t recency = 0;
         hybrid::request_scheduler scheduler;
         std::atomic<size_t> ram_bytes{0};
         std::atomic<uint64_t> extends{0};
+        std::atomic<uint64_t> evictions{0};
+        std::atomic<size_t> session_count{0};
         response_budget responses;
         httplib::Server http;
-        http.set_payload_max_length(1024 * 1024);
+        http.set_payload_max_length(max_request);
         http.set_read_timeout(30, 0);
         http.set_write_timeout(3600, 0);
         http.set_keep_alive_max_count(1);
@@ -153,11 +186,22 @@ int main(int argc, char ** argv) {
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
             if (req.path == "/v1/health") {
-                respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}});
+                respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
+                                   {"model_layout", layout}, {"max_ctx", max_ctx}, {"n_ctx", n_ctx},
+                                   {"ram_budget_bytes", ram_budget}, {"ram_bytes", ram_bytes.load()},
+                                   {"sessions", session_count.load()}, {"evictions", evictions.load()},
+                                   {"max_request_bytes", max_request}});
                 return;
             }
             if (req.path == "/metrics") {
-                res.set_content("hybrid_extends_total " + std::to_string(extends.load()) + "\nhybrid_ram_bytes " + std::to_string(ram_bytes.load()) + "\n", "text/plain");
+                res.set_content("hybrid_extends_total " + std::to_string(extends.load()) +
+                                "\nhybrid_ram_bytes " + std::to_string(ram_bytes.load()) +
+                                "\nhybrid_max_ctx " + std::to_string(max_ctx) +
+                                "\nhybrid_ram_budget_bytes " + std::to_string(ram_budget) +
+                                "\nhybrid_sessions " + std::to_string(session_count.load()) +
+                                "\nhybrid_evictions " + std::to_string(evictions.load()) +
+                                "\nhybrid_max_request_bytes " + std::to_string(max_request) +
+                                "\nhybrid_model_info{model_sha256=\"" + model_hash + "\",layout_fingerprint=\"" + fingerprint + "\"} 1\n", "text/plain");
                 return;
             }
             auto owner = owners.find(req.get_header_value("Authorization"));
@@ -182,7 +226,7 @@ int main(int argc, char ** argv) {
             const std::string session_id = req.path.size() >= 45 ? req.path.substr(13, 32) : "";
             bool critical = true;
             if (req.method == "POST" && req.path.find("/extend") != std::string::npos) {
-                try { critical = hybrid::parse_json(req.body).value("return_delta", true); }
+                try { critical = hybrid::parse_json(req.body, max_request).value("return_delta", true); }
                 catch (const std::exception &) { /* Invalid requests are rejected below. */ }
             }
             auto admission = scheduler.enter(client, session_id, critical, req.is_connection_closed);
@@ -194,12 +238,12 @@ int main(int argc, char ** argv) {
                     if (req.method == "GET") {
                         json list = json::array();
                         for (const auto & entry : space) {
-                            const auto & s = entry.second;
+                            const auto & s = *entry.second;
                             list.push_back({{"session_id", entry.first}, {"n", s.tokens.size()}, {"tier", "ram"}, {"last_used", s.last_used}});
                         }
                         respond(res, 200, list);
                     } else {
-                        auto body = hybrid::parse_json(req.body);
+                        auto body = hybrid::parse_json(req.body, max_request);
                         if (body.at("model_sha256") != model_hash) {
                             respond(res, 400, {{"error", "model hash mismatch"}});
                             return;
@@ -209,7 +253,11 @@ int main(int argc, char ** argv) {
                         if (count >= 128) { respond(res, 503, {{"error", "session limit"}}); return; }
                         std::string id;
                         do { id = new_id(); } while (space.count(id));
-                        space[id].last_used = now();
+                        auto created = std::make_shared<session>();
+                        created->last_used = now();
+                        created->recency = ++recency;
+                        space[id] = std::move(created);
+                        ++session_count;
                         respond(res, 200, {{"session_id", id}});
                     }
                     return;
@@ -220,17 +268,22 @@ int main(int argc, char ** argv) {
                 const std::string action = slash == std::string::npos ? "" : rest.substr(slash + 1);
                 auto found = space.find(id);
                 if (found == space.end()) { respond(res, 404, {{"error", "session not found"}}); return; }
-                session & s = found->second;
+                // Pin until the response is destroyed, including a slow binary reader.
+                res.user_data.set("hybrid_session", found->second);
+                session & s = *found->second;
                 if (req.method == "DELETE" && action.empty()) {
                     ram_bytes -= s.state.size() + s.tokens.size() * sizeof(llama_token);
                     space.erase(found);
+                    --session_count;
                     res.status = 204;
                 } else if (req.method == "GET" && action.empty()) {
+                    s.recency = ++recency;
                     respond(res, 200, info(s, model_hash));
                 } else if (req.method == "GET" && action == "snapshot") {
+                    s.recency = ++recency;
                     send_binary(res, snapshot(s, empty_state));
                 } else if (req.method == "POST" && action == "extend") {
-                    json body = hybrid::parse_json(req.body);
+                    json body = hybrid::parse_json(req.body, max_request);
                     if (!body.at("n0").is_number_integer() || !body.at("prefix_hash_n0").is_string()) {
                         respond(res, 400, {{"error", "invalid append boundary"}}); return;
                     }
@@ -274,13 +327,42 @@ int main(int argc, char ** argv) {
                     std::string state = hybrid::save_state(ctx.get());
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);
                     size_t new_bytes = state.size() + all.size() * sizeof(llama_token);
-                    if (ram_bytes - old_bytes + new_bytes > 512 * 1024 * 1024) {
-                        respond(res, 503, {{"error", "RAM session budget exceeded"}}); return;
+                    // Plan before deleting: an impossible admission must preserve every session.
+                    const size_t retained = ram_bytes.load() - old_bytes;
+                    struct victim { std::string client; std::string id; uint64_t recency; size_t bytes; };
+                    std::vector<victim> candidates;
+                    for (const auto & client_space : sessions) {
+                        for (const auto & entry : client_space.second) {
+                            if (entry.second.use_count() != 1) { continue; }
+                            const auto & idle = *entry.second;
+                            candidates.push_back({client_space.first, entry.first, idle.recency,
+                                                  idle.state.size() + idle.tokens.size() * sizeof(llama_token)});
+                        }
                     }
-                    ram_bytes = ram_bytes - old_bytes + new_bytes;
+                    std::sort(candidates.begin(), candidates.end(), [](const victim & a, const victim & b) { return a.recency < b.recency; });
+                    size_t freed = 0;
+                    size_t victims = 0;
+                    if (new_bytes <= ram_budget) {
+                        while (retained - freed > ram_budget - new_bytes && victims < candidates.size()) {
+                            freed += candidates[victims++].bytes;
+                        }
+                    }
+                    if (new_bytes > ram_budget || retained - freed > ram_budget - new_bytes) {
+                        size_t reclaimable = 0;
+                        for (const auto & candidate : candidates) { reclaimable += candidate.bytes; }
+                        respond(res, 503, {{"error", "ram budget"}, {"need", retained - reclaimable + new_bytes}, {"budget", ram_budget}});
+                        return;
+                    }
+                    for (size_t i = 0; i < victims; ++i) {
+                        sessions.at(candidates[i].client).erase(candidates[i].id);
+                    }
+                    evictions += victims;
+                    session_count -= victims;
+                    ram_bytes = retained - freed + new_bytes;
                     s.tokens = std::move(all);
                     s.state = std::move(state);
                     s.last_used = now();
+                    s.recency = ++recency;
                     ++extends;
                     if (!wire.empty()) {
                         send_binary(res, std::move(wire));
