@@ -12,9 +12,12 @@ static void require(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
 }
 
-static std::string read_file(const char * path) {
+static std::string read_file(const char * path, size_t limit = 513 * 1024 * 1024 + 52) {
     std::ifstream source(path, std::ios::binary);
     require(source.good(), "cannot read check input");
+    source.seekg(0, std::ios::end);
+    require(source.tellg() >= 0 && uint64_t(source.tellg()) <= limit, "check input exceeds limit");
+    source.seekg(0);
     return {std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
 }
 
@@ -55,20 +58,18 @@ int main(int argc, char ** argv) {
         // Full-vocabulary KL must detect a changed distribution, including one with unchanged top-1.
         const float p[] = {2, -2}, q[] = {-2, 2}, near[] = {1, 0};
         require(compare(p, p, 2) < 1e-12 && compare(p, q, 2) > .01 && compare(p, near, 2) > .01, "KL control failed");
-        const auto fixture = hybrid::parse_json(read_file(argv[2]));
+        const auto fixture = hybrid::json::parse(read_file(argv[2], 8 * 1024 * 1024), [](int depth, hybrid::json::parse_event_t, hybrid::json &) {
+            require(depth <= 32, "check JSON nesting too deep");
+            return true;
+        });
         const auto tokens = fixture.at("tokens").get<std::vector<llama_token>>();
         const int k = fixture.at("k");
         const int gpu_layers = std::stoi(argv[5]);
-        require(tokens.size() >= 2 && tokens.size() + k + 2 <= 16384 && k > 0 && k <= 256,
+        require(tokens.size() >= 2 && tokens.size() <= 1048576 && tokens.size() + k + 2 <= fixture.value("max_ctx", 16384) && k > 0 && k <= 256,
                 "check depth or continuation exceeds prototype bounds");
         require(gpu_layers >= 0 && gpu_layers <= 999, "invalid GPU layers");
         const auto model_hash = hybrid::file_hash(argv[1]);
         require(model_hash == fixture.at("model_sha256"), "check model mismatch");
-        const auto delta = hybrid::read_delta(read_file(argv[3]), model_hash, 0);
-        require(delta.header.at("n1") == tokens.size() - 1, "check delta endpoint mismatch");
-        require(delta.header.at("tokens").get<std::vector<llama_token>>() ==
-                std::vector<llama_token>(tokens.begin(), tokens.end() - 1), "check delta tokens mismatch");
-        require(delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.end() - 1}), "check prefix mismatch");
         llama_backend_init();
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = gpu_layers;
@@ -81,11 +82,24 @@ int main(int argc, char ** argv) {
         auto split = context(model.get(), ctx, gpu_layers > 0);
         auto whole = context(model.get(), ctx, gpu_layers > 0);
         auto free_whole = context(model.get(), ctx, gpu_layers > 0);
-        require(llama_state_seq_set_data_append(imported.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
-                delta.state.size(), 0, 0, tokens.size() - 1) == delta.state.size(), "check delta import failed");
-        hybrid::prefill(imported.get(), {tokens.back()}, tokens.size() - 1);
-        hybrid::prefill(split.get(), {tokens.begin(), tokens.end() - 1}, 0);
-        hybrid::prefill(split.get(), {tokens.back()}, tokens.size() - 1);
+        int64_t n = 0;
+        const auto paths = fixture.value("deltas", std::vector<std::string>{argv[3]});
+        require(!paths.empty(), "missing check deltas");
+        for (const auto & path : paths) {
+            const auto delta = hybrid::read_delta(read_file(path.c_str()), model_hash, n);
+            const int64_t n1 = delta.header.at("n1");
+            require(n1 <= int64_t(tokens.size() - 1), "check delta endpoint mismatch");
+            require(delta.header.at("tokens").get<std::vector<llama_token>>() ==
+                    std::vector<llama_token>(tokens.begin() + n, tokens.begin() + n1), "check delta tokens mismatch");
+            require(delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "check prefix mismatch");
+            require(llama_state_seq_set_data_append(imported.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
+                    delta.state.size(), 0, n, n1) == delta.state.size(), "check delta import failed");
+            hybrid::prefill(split.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
+            n = n1;
+        }
+        require(n == int64_t(tokens.size() - 1), "incomplete check chain");
+        hybrid::prefill(imported.get(), {tokens.back()}, n);
+        hybrid::prefill(split.get(), {tokens.back()}, n);
         hybrid::prefill(whole.get(), tokens, 0);
         hybrid::prefill(free_whole.get(), tokens, 0);
         double kl_sum = 0;

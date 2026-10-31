@@ -78,6 +78,7 @@ class State:
         self.conflict_once = False
         self.lose_ack_once = False
         self.imports = 0
+        self.layout_fingerprint = "1" * 64
 
     def close(self):
         self.db.close()
@@ -89,6 +90,8 @@ class State:
     def handle(self, method, path, query, body, client):
         if not self.available:
             return 503, {"error": "offline"}
+        if self.role == "prefill" and path == "/v1/health":
+            return 200, dict(model_sha256=self.model, layout_fingerprint=self.layout_fingerprint)
         if self.role == "prefill":
             if path in ("/v1/health", "/metrics"):
                 return 200, {"ok": True}
