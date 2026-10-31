@@ -22,8 +22,13 @@ def build(args, targets, info):
     source = ROOT
     if commit != current:
         source = Path(args.state).expanduser().resolve().parent / ('source-' + commit[:12])
-        require(not source.exists(), 'source worktree already exists; inspect it before retrying')
-        run(['git', '-C', ROOT, 'worktree', 'add', '--detach', source, commit])
+        if source.exists():
+            require(output(['git', '-C', source, 'rev-parse', 'HEAD']) == commit,
+                    'source worktree revision mismatch; inspect it before retrying')
+        else:
+            run(['git', '-C', ROOT, 'worktree', 'add', '--detach', source, commit])
+    require(not output(['git', '-C', source, 'status', '--porcelain', '--untracked-files=no']),
+            'tracked source changes prevent an exact-ref build; commit them or use a clean checkout')
     build_dir = Path(args.build_dir).expanduser().resolve()
     flags = ['-DCMAKE_BUILD_TYPE=Release', '-DGGML_CUDA=' + ('ON' if args.cuda else 'OFF'),
              '-DGGML_METAL=' + ('ON' if info['os'] == 'Darwin' else 'OFF'), '-DLLAMA_CURL=OFF']

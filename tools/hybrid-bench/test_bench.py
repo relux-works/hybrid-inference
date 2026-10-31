@@ -9,10 +9,19 @@ import unittest
 from unittest import mock
 
 import bench_common as common
+import manage
 from hybrid_bench import PROVENANCE, bundle, quantile_sample, schedule, verify_meter
 
 
 class BenchmarkTests(unittest.TestCase):
+    # An exact-ref build refuses tracked changes before CMake or a worktree mutation can run.
+    def test_build_refuses_dirty_source(self):
+        args = argparse.Namespace(ref='HEAD')
+        with mock.patch.object(manage, 'output', side_effect=['a' * 40, 'a' * 40, ' M tools/hybrid/prefill.cpp']), mock.patch.object(manage, 'run') as run:
+            with self.assertRaisesRegex(common.Refusal, 'exact-ref build'):
+                manage.build(args, ['llama-hybrid-prefill'], {})
+            run.assert_not_called()
+
     # A checksum is a prerequisite to publication: wrong local/downloaded bytes leave no cached partial model.
     def test_model_hash_atomicity(self):
         with tempfile.TemporaryDirectory() as directory:
