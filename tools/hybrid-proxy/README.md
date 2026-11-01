@@ -141,3 +141,19 @@ M0.2 replaces the old assistant-continuation workaround with ordinary user turns
 Live node health is checked before sync. Native bytes/checksums and decoder layout validation remain intact. Whole snapshots are not translated; ahead-state recovery uses local continuation. Exact model SHA-256 is required by default. Experimental `--hetero-quant` (`hetero_quant=true` in the proxy) admits a different SHA only after a matching layout fingerprint; the proxy then rewrites the delta envelope SHA, bypassing the native SHA guard. A layout match establishes shapes only, not base-weight identity or numerical equivalence. Quality is unverified and uncalibrated: the r11 CPU Q4_0 node / Q8_0 client measurement gave mean KL 0.0145 nats/token (above the 0.01 reference) and top-1 62/64. The Q8 file was a requantization of Q4 weights, not an independent higher-precision source. Heterogeneous benchmark results remain uncalibrated even when their measured values meet the reference. See the [benchmark guide](../hybrid-bench/README.md) for setup, recorded identities and uncalibrated accuracy checks.
 
 With `benchmark=true`, authenticated `DELETE /v1/sessions/ID` releases that client's current and retired remote sessions and prevents their background recreation. A local-mode marker is persisted before generation, so interruption cannot enable remote replay. Ordinary responses have no benchmark fields and exactly one streaming DONE marker; default GET behavior remains HTTP 501.
+
+## Captured chat-template qualification
+
+The journal probes live message frames for Qwen ChatML, Gemma 4 and Muse Glimmer. It verifies the family against a live user/assistant/user render and, for Gemma and Glimmer, the template source and BOS/EOS properties. Unknown frames reject with 409. Plain token pieces must reproduce every rendered byte. One tokenizer-added BOS is accepted only when its declared single-token ID precedes exactly the plain IDs; its byte width is zero. A visible BOS cannot also be a leading special.
+
+Normal reply boundaries are `<|im_end|>`, `<turn|>` and `<|eot|>`, respectively. Gemma tool replies continue inside a model turn at the sampled `<|tool_response>` opener. Both forms retain a single-token ending check, exact text/token suffix checks and anchor overlap. User checkpoint headers come from the same live message probes.
+
+`fixtures/templates/*.json` are unmodified captures from real decoders at b12094-74f8f4c3a. `FixtureTemplate` in `stub_server.py` supplies text renderers for the captured shapes, default/disabled thinking and assistant continuations. Token replay accepts captured text and aligned captured spans only; it is not a model tokenizer. Renderers are checked against all 96 captured renders before their marker probes serve as test evidence. Tools with root-level definitions, arbitrary multimodal inputs and uncaptured tokenizations are outside this fixture harness.
+
+```sh
+mkdir -p .temp/template-tests/tmp
+TMPDIR="$PWD/.temp/template-tests/tmp" nice -n 10 python3 -B -m unittest discover -s tools/hybrid-proxy -p test_templates.py -v
+TMPDIR="$PWD/.temp/template-tests/tmp" nice -n 10 python3 -B tools/hybrid-proxy/template_controls.py --output .temp/template-tests/controls
+```
+
+The controls output directory must be new. It contains copied-source identities, owned process IDs, exact commands, logs, assertion records and `controls.json`. Identity must survive; setup errors, skipped tests and wrong assertion failures receive no kill credit. Results and finite GPU qualification gaps are in [the r19 report](RESULTS-hybrid-a-r19-templates-261101.md). Gemma drops the bench's unmatched tool response; the workload is unchanged pending the decision recorded in [UNRESOLVED_QUESTIONS.md](../../UNRESOLVED_QUESTIONS.md).
