@@ -210,7 +210,7 @@ def main():
                 raise Refusal(f'node authentication refused (HTTP {error.code})') from None
             if node:
                 plan['benchmark_context'] = min(plan['context'], node['context'])
-        targets = ['llama-hybrid-prefill'] if args.role == 'node' else ['llama-server', 'llama-hybrid-bench-check']
+        targets = ['llama-hybrid-prefill'] if args.role == 'node' else ['llama-server', 'llama-hybrid-bench-check', 'llama-hybrid-score']
         build_dir, record = build(args, targets, info)
         temporary = Path(tempfile.mkdtemp(prefix='.' + state.name + '-', dir=state.parent))
         os.chmod(temporary, 0o700)
