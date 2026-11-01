@@ -223,24 +223,30 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(compile.call_args.args[:2], (source, source / 'build'))
             self.assertTrue((root / 'build.lock').exists())
 
-    # The launcher passes derived limits and exposes the download endpoint only with an explicit opt-in.
+    # Derived budgets and lower operator caps reach the node; the download endpoint still requires opt-in.
     def test_node_limit_command(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = dict(context=65536, max_ctx=65536, ram_budget_mib=4096, max_request_mib=2, sessions_held=2)
             identity = dict(layout_fingerprint='1' * 64, quantization_type='Q8_0')
             record = dict(commit='a' * 40, flags=[], binaries={})
-            for bench_link in (False, True):
-                state = root / str(bench_link)
-                argv = ['manage.py', 'node', '--state', str(state), '--model', 'fixture', '--ram-budget-mib', '560'] + (['--bench-link'] if bench_link else [])
+            for bench_link, cap in ((False, None), (True, None), (False, 560), (True, 560)):
+                state = root / f'{bench_link}-{cap}'
+                argv = ['manage.py', 'node', '--state', str(state), '--model', 'fixture']
+                argv += ['--ram-budget-mib', str(cap)] if cap is not None else []
+                argv += ['--bench-link'] if bench_link else []
                 with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={}), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(root / 'model', 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=dict(plan)), mock.patch.object(manage, 'model_identity', return_value=identity), mock.patch.object(manage, 'build', return_value=(root / 'build', record)), mock.patch.object(manage, 'start_process') as start, mock.patch.object(manage, 'wait_health', return_value=dict(model_sha256='a' * 64, **identity)):
                     self.assertEqual(manage.main(), 0)
                 command = start.call_args.args[0]
-                for flag, value in (('--max-ctx', 65536), ('--ram-budget-mib', 560), ('--max-request-mib', 2)):
+                for flag, value in (('--max-ctx', 65536), ('--ram-budget-mib', 4096 if cap is None else cap), ('--max-request-mib', 2)):
                     self.assertEqual(command[command.index(flag) + 1], value)
                 self.assertEqual('--bench' in command, bench_link)
                 info = common.read_private(state / 'node-info.json')
                 self.assertEqual(info['sizing']['sessions_held'], 2)
+                if cap is None:
+                    self.assertNotIn('derived_ram_budget_mib', info['sizing'])
+                else:
+                    self.assertEqual(info['sizing']['derived_ram_budget_mib'], 4096)
 
     # Operator store caps cannot exceed host admission or apply to the decoder; rejection creates no state/build.
     def test_node_budget_cap_refusal(self):
