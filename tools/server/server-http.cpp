@@ -1,6 +1,7 @@
 #include "common.h"
 #include "http.h"
 #include "hybrid-state.h"
+#include "llama-io.h"
 #include "server-http.h"
 #include "server-common.h"
 #include "ui.h"
@@ -701,7 +702,10 @@ void server_http_context::get(const std::string & path, const server_http_contex
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
-        std::string body = req.body;
+        std::string body = [&req]() {
+            llama_io_timer timer("http_body_copy", req.body.size());
+            return req.body;
+        }();
         std::map<std::string, uploaded_file> files;
 
         if (req.is_multipart_form_data()) {
@@ -731,15 +735,18 @@ void server_http_context::post(const std::string & path, const server_http_conte
             }
         }
 
-        server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
-            get_params(req),
-            get_headers(req),
-            req.path,
-            build_query_string(req),
-            body,
-            std::move(files),
-            req.is_connection_closed
-        });
+        server_http_req_ptr request = [&]() {
+            llama_io_timer timer("http_request_copy");
+            return std::make_unique<server_http_req>(server_http_req{
+                get_params(req),
+                get_headers(req),
+                req.path,
+                build_query_string(req),
+                std::move(body),
+                std::move(files),
+                req.is_connection_closed
+            });
+        }();
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };

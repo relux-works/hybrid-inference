@@ -1,6 +1,7 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
 #include "llama-model.h"
+#include "llama-io.h"
 #include "hash/xxhash/xxhash.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
@@ -157,46 +158,75 @@ static void sha256_update_ni(sha256_t * hash, const unsigned char * data, size_t
 }
 #endif
 
+class sha256_stream {
+public:
+    sha256_stream() {
+        const char * value = std::getenv("HYBRID_HASH_PORTABLE");
+        const bool portable = value && std::strcmp(value, "1") == 0;
+#ifdef __APPLE__
+        accelerated = !portable;
+        if (accelerated) {
+            backend = "commoncrypto";
+            require(CC_SHA256_Init(&apple) == 1, "cannot initialize SHA-256");
+            return;
+        }
+#endif
+#ifdef HYBRID_SHA_NI
+        if (!portable && sha_ni_available()) {
+            update_fn = sha256_update_ni;
+            backend = "sha-ni";
+        }
+#else
+        (void) portable;
+#endif
+        sha256_init(&hash);
+    }
+
+    void update(const void * data, size_t size) {
+#ifdef __APPLE__
+        if (accelerated) {
+            // Callers feed bounded chunks; CommonCrypto takes a 32-bit length.
+            require(size <= UINT32_MAX, "SHA-256 chunk too large");
+            require(CC_SHA256_Update(&apple, data, static_cast<CC_LONG>(size)) == 1, "cannot update SHA-256");
+            return;
+        }
+#endif
+        update_fn(&hash, static_cast<const unsigned char *>(data), size);
+    }
+
+    void finish(unsigned char * digest) {
+#ifdef __APPLE__
+        if (accelerated) {
+            require(CC_SHA256_Final(digest, &apple) == 1, "cannot finalize SHA-256");
+            return;
+        }
+#endif
+        sha256_final(&hash, digest);
+    }
+
+    const char * backend = "portable";
+private:
+    sha256_t hash;
+    decltype(&sha256_update) update_fn = sha256_update;
+#ifdef __APPLE__
+    bool accelerated = false;
+    CC_SHA256_CTX apple;
+#endif
+};
+
 std::string file_hash(const std::string & path, size_t read_bytes, const char ** backend) {
     require(read_bytes > 0 && read_bytes <= 65536, "invalid hash read size");
     std::ifstream file(path, std::ios::binary);
     require(file.good(), "cannot open model");
-    const char * force_portable = std::getenv("HYBRID_HASH_PORTABLE");
-    const bool portable = force_portable && std::strcmp(force_portable, "1") == 0;
+    sha256_stream hash;
+    if (backend) { *backend = hash.backend; }
     char buffer[65536];
-    unsigned char digest[32];
-#ifdef __APPLE__
-    if (!portable) {
-        if (backend) { *backend = "commoncrypto"; }
-        CC_SHA256_CTX hash;
-        require(CC_SHA256_Init(&hash) == 1, "cannot initialize model hash");
-        while (file.read(buffer, read_bytes) || file.gcount()) {
-            require(CC_SHA256_Update(&hash, buffer, static_cast<CC_LONG>(file.gcount())) == 1, "cannot update model hash");
-        }
-        require(file.eof(), "cannot read model");
-        require(CC_SHA256_Final(digest, &hash) == 1, "cannot finalize model hash");
-        return hex(digest, sizeof(digest));
-    }
-#endif
-    auto update = sha256_update;
-    const char * selected = "portable";
-#ifdef HYBRID_SHA_NI
-    if (!portable && sha_ni_available()) {
-        update = sha256_update_ni;
-        selected = "sha-ni";
-    }
-#else
-    (void) portable;
-#endif
-    if (backend) { *backend = selected; }
-    sha256_t hash;
-    sha256_init(&hash);
     while (file.read(buffer, read_bytes) || file.gcount()) {
-        update(&hash, reinterpret_cast<const unsigned char *>(buffer), file.gcount());
+        hash.update(buffer, file.gcount());
     }
     require(file.eof(), "cannot read model");
-    // The vendor finalizer consumes the same state, byte count and partial block.
-    sha256_final(&hash, digest);
+    unsigned char digest[32];
+    hash.finish(digest);
     return hex(digest, sizeof(digest));
 }
 
@@ -221,12 +251,25 @@ std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1) {
     return out;
 }
 
-static std::string checksums(const std::string & body) {
-    XXH128_canonical_t xxh;
-    XXH128_canonicalFromHash(&xxh, XXH3_128bits(body.data(), body.size()));
-    std::string out(reinterpret_cast<const char *>(&xxh), sizeof(xxh));
+static std::string checksums(std::string_view body) {
+    llama_io_timer timer("checksum", body.size());
+    sha256_stream sha;
+    if (timer.enabled) { std::fprintf(stderr, "hybrid_import sha256_backend=%s\n", sha.backend); }
+    const auto delete_xxh = [](XXH3_state_t * p) { XXH3_freeState(p); };
+    std::unique_ptr<XXH3_state_t, decltype(delete_xxh)> xxh(XXH3_createState(), delete_xxh);
+    require(bool(xxh) && XXH3_128bits_reset(xxh.get()) == XXH_OK, "cannot initialize XXH3");
+    // Both digests consume the same cache-resident chunk before moving to the next one.
+    for (size_t offset = 0; offset < body.size();) {
+        const size_t bytes = std::min<size_t>(65536, body.size() - offset);
+        require(XXH3_128bits_update(xxh.get(), body.data() + offset, bytes) == XXH_OK, "cannot update XXH3");
+        sha.update(body.data() + offset, bytes);
+        offset += bytes;
+    }
+    XXH128_canonical_t canonical;
+    XXH128_canonicalFromHash(&canonical, XXH3_128bits_digest(xxh.get()));
+    std::string out(reinterpret_cast<const char *>(&canonical), sizeof(canonical));
     unsigned char digest[32];
-    sha256_hash(digest, reinterpret_cast<const unsigned char *>(body.data()), body.size());
+    sha.finish(digest);
     out.append(reinterpret_cast<const char *>(digest), sizeof(digest));
     return out;
 }
@@ -258,10 +301,15 @@ std::string encode_delta(json header, const std::string & state) {
     uint32_t n = text.size();
     std::string out;
     for (int i = 0; i < 4; ++i) { out += (char) (n >> (i * 8)); }
-    return out + text + state + checksums(state);
+    out.reserve(4 + text.size() + state.size() + 48);
+    out += text;
+    out += state;
+    out += checksums(state);
+    return out;
 }
 
-delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0) {
+delta_view read_delta_view(const std::string & wire, const std::string & model_sha256, int64_t n0) {
+    llama_io_timer timer("codec", wire.size());
     require(wire.size() >= 4, "truncated delta length");
     uint32_t size = 0;
     for (int i = 0; i < 4; ++i) { size |= (uint32_t) (unsigned char) wire[i] << (8 * i); }
@@ -290,9 +338,15 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     require(section.at("name") == "llama_seq_state" && section.at("offset") == 0 && section.at("bytes").is_number_unsigned(), "invalid section layout");
     uint64_t bytes = section.at("bytes").get<uint64_t>();
     require(bytes > 0 && bytes <= max_delta_body_bytes && wire.size() - 4 - size == bytes + 48, "truncated or trailing delta bytes");
-    std::string state = wire.substr(4 + size, bytes);
-    require(wire.substr(4 + size + bytes) == checksums(state), "delta checksum mismatch");
-    return {std::move(h), std::move(state)};
+    const std::string_view state(wire.data() + 4 + size, bytes);
+    require(std::string_view(wire.data() + 4 + size + bytes, 48) == checksums(state), "delta checksum mismatch");
+    return {std::move(h), state};
+}
+
+delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0) {
+    auto view = read_delta_view(wire, model_sha256, n0);
+    llama_io_timer timer("state_copy", view.state.size());
+    return {std::move(view.header), std::string(view.state)};
 }
 
 context_ptr make_context(llama_model * model, uint32_t n_ctx) {

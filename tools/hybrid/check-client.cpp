@@ -1,5 +1,6 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
+#include "hash/hash.h"
 
 #include <chrono>
 #include <fstream>
@@ -121,9 +122,33 @@ static void capacity(llama_model * model, const std::string & stem) {
     std::cout << "PASS capacity positive control after freeing neighbor\n";
 }
 
+static void identity(llama_model * model, const std::string & stem) {
+    // Emit identities for every exported state byte and all logits at 64 teacher-forced positions after fresh and appended imports.
+    const auto meta = hybrid::parse_json(read(stem + ".tokens.json"));
+    const int n0 = meta.at("n0"), n1 = meta.at("n1");
+    const auto tokens = meta.at("tokens").get<std::vector<llama_token>>();
+    for (bool fresh : {true, false}) {
+        auto ctx = hybrid::make_context(model, 9216);
+        if (!fresh) { hybrid::load_state(ctx.get(), read(stem + ".prefix.state")); }
+        const auto delta = hybrid::read_delta(read(stem + (fresh ? ".full.delta" : ".delta")), meta.at("model_sha256"), fresh ? 0 : n0);
+        require(append(ctx.get(), delta.state, fresh ? 0 : n0, n1) == delta.state.size(), "identity import failed");
+        const auto imported = hybrid::save_state(ctx.get());
+        std::string logits;
+        for (int i = 0; i < 64; ++i) {
+            hybrid::prefill(ctx.get(), {tokens.at(i % tokens.size())}, n1 + i);
+            const auto * values = llama_get_logits_ith(ctx.get(), -1);
+            require(values != nullptr, "identity logits missing");
+            logits.append(reinterpret_cast<const char *>(values), llama_vocab_n_tokens(llama_model_get_vocab(model)) * sizeof(float));
+        }
+        std::cout << "IDENTITY " << hybrid::json{{"fresh", fresh}, {"n1", n1}, {"state_bytes", imported.size()},
+            {"state_sha256", hash_sha256_hex(imported.data(), imported.size())},
+            {"logit_bytes", logits.size()}, {"logits_sha256", hash_sha256_hex(logits.data(), logits.size())}}.dump() << '\n';
+    }
+}
+
 int main(int argc, char ** argv) {
     try {
-        require(argc >= 4, "usage: llama-hybrid-check-client MODEL --prepare GOLDEN_DIR OUTPUT_DIR | --measure STEM N0 | --capacity GOLDEN_STEM");
+        require(argc >= 4, "usage: llama-hybrid-check-client MODEL --prepare GOLDEN_DIR OUTPUT_DIR | --measure STEM N0 | --capacity GOLDEN_STEM | --identity GOLDEN_STEM");
         llama_backend_init();
         auto mp = llama_model_default_params(); mp.n_gpu_layers = 0;
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], mp));
@@ -132,6 +157,7 @@ int main(int argc, char ** argv) {
         if (mode == "--prepare" && argc == 5) { prepare(model.get(), argv[3], argv[4]); }
         else if (mode == "--measure" && argc == 5) { measure(model.get(), argv[3], std::stoi(argv[4])); }
         else if (mode == "--capacity" && argc == 4) { capacity(model.get(), argv[3]); }
+        else if (mode == "--identity" && argc == 4) { identity(model.get(), argv[3]); }
         else { throw std::runtime_error("invalid mode or arguments"); }
         return 0;
     } catch (const std::exception & error) {

@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace hybrid {
@@ -24,6 +25,13 @@ struct delta {
     std::string state;
 };
 delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0);
+struct delta_view {
+    json header;
+    std::string_view state;
+};
+// The wire must outlive this view and all tensor writes made from it.
+delta_view read_delta_view(const std::string & wire, const std::string & model_sha256, int64_t n0);
+delta_view read_delta_view(std::string && wire, const std::string & model_sha256, int64_t n0) = delete;
 
 struct model_deleter { void operator()(llama_model * p) const { llama_model_free(p); } };
 struct context_deleter { void operator()(llama_context * p) const { llama_free(p); } };

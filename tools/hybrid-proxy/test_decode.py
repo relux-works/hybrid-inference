@@ -59,6 +59,7 @@ def run(node, golden, slots):
     node.request("POST", "/slots/1?action=save", {"filename": "neighbor-before.bin"})
     neighbor_bytes = (slots / "neighbor-before.bin").read_bytes()
     mutations = {
+        "version": dict(header, version=2),
         "wrong-model": dict(header, model_sha256="f" * 64),
         "gap": dict(header, n0=n0 + 1), "overlap": dict(header, n0=n0 - 1),
         "prefix-hash": dict(header, prefix_hash_n1="f" * 64),
@@ -69,6 +70,7 @@ def run(node, golden, slots):
     candidates["truncated"] = wire[:-1]
     candidates["section-checksum"] = wire[:-48] + bytes([wire[-48] ^ 1]) + wire[-47:]
     candidates["body-checksum"] = wire[:-1] + bytes([wire[-1] ^ 1])
+    candidates["body-corruption"] = wire[:-49] + bytes([wire[-49] ^ 1]) + wire[-48:]
     candidates["range-header-budget"] = envelope(dict(header, padding="x" * (4096 + 11 * (n1 - n0))), state)
     candidates["absolute-header-budget"] = struct.pack("<I", 1048577)
     # Recompute valid envelope checksums so this malformed native state reaches rollback.
@@ -93,7 +95,7 @@ def run(node, golden, slots):
     raw = bytearray(state)
     struct.pack_into("<i", raw, offset + 4, n1)
     candidates["native-recurrent-endpoint"] = envelope(header, raw)
-    # Slot files include KV and recurrent data. Metadata equality alone cannot prove neighbor preservation.
+    # Each refusal returns HTTP 400 and preserves every target/neighbor slot byte; the valid control then imports.
     for name, candidate in candidates.items():
         try:
             node.request("POST", "/slots/0?action=import_delta", candidate, headers)
@@ -113,6 +115,9 @@ def run(node, golden, slots):
     info = node.request("GET", "/slots/0/info")
     require(info["n"] == n1 and info["tokens"] == tokens[:n1], "valid delta info mismatch")
     require(info["prefix_hash"] == metadata["prefix_hash_n1"], "valid delta hash mismatch")
+    # This digest covers the actual HTTP-imported slot file, including tokens, KV rows and recurrent tensors.
+    node.request("POST", "/slots/0?action=save", {"filename": "imported.bin"})
+    print("HTTP_IMPORT_STATE " + hashlib.sha256((slots / "imported.bin").read_bytes()).hexdigest(), flush=True)
     node.request("POST", "/slots/1?action=save", {"filename": "neighbor-after-valid.bin"})
     require((slots / "neighbor-after-valid.bin").read_bytes() == neighbor_bytes, "valid append changed neighbor native bytes")
     # Slot 0 imports a real prefix+delta; slot 1 prefills locally on the same CPU backend.

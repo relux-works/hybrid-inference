@@ -886,6 +886,7 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    llama_io_timer timer("synchronize");
     if (!sched) {
         return;
     }
@@ -3021,6 +3022,9 @@ public:
             data_offsets.push_back(rinfo.data_offset);
         }
 
+        size_t bytes = 0;
+        for (const auto & rinfo : rinfos) { bytes += rinfo.size; }
+        llama_io_timer timer("tensor_write", bytes);
         ggml_backend_tensor_set_n(tensors.data(), base_ptr, offsets.data(), sizes.data(), data_offsets.data(), rinfos.size());
     }
 
@@ -3527,6 +3531,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_pos n0, llama_pos n1) {
+    llama_io_timer timer("native", size);
     if (!memory || !src || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max ||
             n0 < 0 || n1 <= n0 || (int64_t) memory->seq_pos_max(seq_id) + 1 != n0) {
         LLAMA_LOG_ERROR("%s: invalid append boundary or sequence\n", __func__);
@@ -3535,6 +3540,7 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
 
     // Parse the complete host record before changing metadata or scheduling tensor writes.
     try {
+        llama_io_timer validation_timer("native_validate", size);
         llama_io_read_host validation(src, size, true);
         uint32_t magic;
         llama_seq_id source_seq;
@@ -3554,9 +3560,13 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
 
     // Non-SWA attention needs only suffix removal; back up the recurrent state that append replaces.
     const auto backup_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    std::vector<uint8_t> backup(state_seq_get_size(seq_id, backup_flags));
-    if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size()) {
-        return 0;
+    std::vector<uint8_t> backup;
+    {
+        llama_io_timer backup_timer("backup");
+        backup.resize(state_seq_get_size(seq_id, backup_flags));
+        if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size()) {
+            return 0;
+        }
     }
 
     llama_io_read_host io(src, size);
@@ -3568,6 +3578,7 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         if (magic != io_magic) {
             throw std::runtime_error("wrong sequence state magic");
         }
+        llama_io_timer parse_timer("native_parse", size);
         state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND);
         if (io.n_bytes() != size || memory->seq_pos_max(seq_id) != n1 - 1) {
             throw std::runtime_error("append length does not match the declared range");

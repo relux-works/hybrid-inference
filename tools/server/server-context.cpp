@@ -18,6 +18,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "hybrid-state.h"
+#include "llama-io.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3256,7 +3257,7 @@ private:
                             if (hybrid_model_hash.empty()) {
                                 throw std::runtime_error("Hybrid model hash was not initialized at startup");
                             }
-                            auto delta = hybrid::read_delta(task.slot_action.delta, hybrid_model_hash, n);
+                            auto delta = hybrid::read_delta_view(task.slot_action.delta, hybrid_model_hash, n);
                             if (delta.header.at("session_id") != task.slot_action.session_id) {
                                 throw std::runtime_error("Delta session mismatch");
                             }
@@ -6878,7 +6879,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
     task.id = res->rd.get_new_id();
     task.slot_action.id_slot = id_slot;
     if (!info) {
-        task.slot_action.delta = req.body;
+        {
+            llama_io_timer timer("task_copy", req.body.size());
+            task.slot_action.delta = req.body;
+        }
         for (const auto & header : req.headers) {
             std::string name = header.first;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });

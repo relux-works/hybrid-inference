@@ -1,5 +1,8 @@
 // Codec controls retained from A80013538; synthetic native body does not test engine import.
 #include "hybrid-state.h"
+#include "hash/hash.h"
+#include "hash/xxhash/xxhash.h"
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -52,6 +55,35 @@ static void codec_tests(size_t max_ctx) {
     }
     auto wire = hybrid::encode_delta(h, "abc");
     require(hybrid::read_delta(wire, hash, 0).state == "abc", "codec positive control");
+    // A borrowed decode references the owning envelope; the copying API retains its independent state.
+    const auto view = hybrid::read_delta_view(wire, hash, 0);
+    const auto owned = hybrid::read_delta(wire, hash, 0);
+    require(view.state == owned.state && view.header == owned.header, "borrowed decode differs");
+    require(view.state.data() == wire.data() + wire.size() - 48 - 3, "borrowed decode copied the body");
+    require(owned.state.data() != view.state.data(), "owning decode borrowed the body");
+    std::cout << "PASS test_borrowed_delta_lifetime_and_owning_control\n";
+    // Streaming checksums match the independent portable SHA and one-shot XXH3 across block/chunk boundaries and binary tails.
+    std::vector<size_t> sizes = {65535, 65536, 65537, 131135};
+    for (size_t i = 1; i <= 130; ++i) { sizes.push_back(i); }
+    for (size_t size : sizes) {
+        std::string body(size, '\0');
+        for (size_t i = 0; i < size; ++i) { body[i] = (char) (i * 37 + i / 17); }
+        const auto encoded = hybrid::encode_delta(h, body);
+        const auto digest = hash_sha256_hex(body.data(), body.size());
+        static const char digits[] = "0123456789abcdef";
+        std::string actual;
+        for (size_t i = encoded.size() - 32; i < encoded.size(); ++i) {
+            const auto c = (unsigned char) encoded[i];
+            actual += digits[c >> 4]; actual += digits[c & 15];
+        }
+        XXH128_canonical_t xxh;
+        XXH128_canonicalFromHash(&xxh, XXH3_128bits(body.data(), body.size()));
+        require(digest == actual, "test_streaming_checksum_block_chunk_and_binary_boundaries: SHA-256 differs from portable");
+        require(std::memcmp(&xxh, encoded.data() + encoded.size() - 48, 16) == 0, "streaming XXH3 differs from one-shot");
+        require(hybrid::read_delta(encoded, hash, 0).state == body, "binary checksum round trip failed");
+    }
+    require(hash_sha256_hex("abc", 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 known answer");
+    std::cout << "PASS test_streaming_checksum_block_chunk_and_binary_boundaries\n";
     require(hybrid::prefix_hash({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty prefix hash");
     auto rejects = [&](const std::string & name, const std::string & input, const std::string & model_hash, int64_t n0, const std::string & expected) {
         try { hybrid::read_delta(input, model_hash, n0); }
@@ -70,6 +102,8 @@ static void codec_tests(size_t max_ctx) {
     rejects("trailing", wire + "x", hash, 0, "truncated or trailing");
     auto corrupt = wire; corrupt[corrupt.size() - 49] ^= 1;
     rejects("corrupt-section", corrupt, hash, 0, "checksum mismatch");
+    corrupt = wire; corrupt[corrupt.size() - 48] ^= 1;
+    rejects("corrupt-section-hash", corrupt, hash, 0, "checksum mismatch");
     corrupt = wire; corrupt[corrupt.size() - 1] ^= 1;
     rejects("corrupt-body-hash", corrupt, hash, 0, "checksum mismatch");
     uint32_t length = 0;

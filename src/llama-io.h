@@ -3,6 +3,26 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+// Opt-in import timings include nested stages; tensor I/O includes backend waits.
+struct llama_io_timer {
+    const char * stage;
+    size_t bytes;
+    const bool enabled = std::getenv("LLAMA_HYBRID_IMPORT_PROFILE") != nullptr;
+    std::chrono::steady_clock::time_point start;
+    llama_io_timer(const char * stage, size_t bytes = 0) : stage(stage), bytes(bytes) {
+        if (enabled) { start = std::chrono::steady_clock::now(); }
+    }
+    ~llama_io_timer() {
+        if (enabled) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "hybrid_import stage=%s bytes=%zu ms=%.6f\n", stage, bytes, ms);
+        }
+    }
+};
 
 struct ggml_tensor;
 
