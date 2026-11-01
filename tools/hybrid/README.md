@@ -9,16 +9,19 @@ Local prototype on upstream e0f142d5. No upstream submission. Implements the pre
 Use CMake, a C++17 compiler, Make, Python 3 (standard library only), and `flock`. Vendored xxhash, SHA-256, nlohmann JSON and cpp-httplib provide checksums, JSON and HTTP. No model downloads are required.
 
 ```sh
-# If cmake is absent, install a task-local tool (30 MB wheel, about 87 MB installed).
-python3 -m pip install --no-cache-dir --target .temp/hybrid-a-r1-261030/cmake-tool cmake==4.4.4
-CMAKE="$PWD/.temp/hybrid-a-r1-261030/cmake-tool/cmake/data/bin/cmake"
+# Use the cmake on PATH; if there is none, install a local copy (30 MB wheel, about 87 MB installed).
+CMAKE=${CMAKE:-cmake}
+command -v "$CMAKE" >/dev/null || { python3 -m pip install --no-cache-dir --target .temp/cmake-tool cmake==4.4.4 &&
+  CMAKE="$PWD/.temp/cmake-tool/cmake/data/bin/cmake"; }
+# One build at a time on a shared host: every build takes the same lock file.
+LOCK=${LOCK:-$PWD/.temp/build.lock}; mkdir -p "$(dirname "$LOCK")"
 # Disable both unused UI sources before building; neither downloads nor local UI builds are needed.
-flock ~/Werkstatt/hybrid-models/.build.lock "$CMAKE" -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF
-# Incremental builds use the existing configured tree.
-# Stop if exact available bytes are below 26843545600 (25 GiB), or a build hold is active.
-df -B1 --output=avail /
+flock "$LOCK" "$CMAKE" -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF
+# Incremental builds use the existing configured tree. Check free disk first; the build tree takes several GB.
+df -B1 --output=avail .
 du -sb build
-flock ~/Werkstatt/hybrid-models/.build.lock "$CMAKE" --build build -j2 --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-server
+# JOBS=2 keeps a shared host responsive; use JOBS=$(nproc) on a dedicated one.
+flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-server
 du -sb build
 ```
 

@@ -1,7 +1,7 @@
 > **Fork notice.** This repository is a fork of llama.cpp with a proof of concept of hybrid prefill/decode
 > inference: see [HYBRID.md](HYBRID.md).
 
-Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF`, then build named targets under the lock described in the [node guide](tools/hybrid/README.md). The [M1 operator guide](tools/hybrid-bench/README.md) provides deployment, client setup and benchmark commands; its launchers always disable the unused UI download.
+Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF`, then build the named targets listed in the [node guide](tools/hybrid/README.md). The [M1 operator guide](tools/hybrid-bench/README.md) provides deployment, client setup and benchmark commands; its launchers always disable the unused UI download.
 
 Everything below is the upstream llama.cpp README.
 

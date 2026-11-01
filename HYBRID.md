@@ -13,7 +13,7 @@ This is research code, not a production service. What has and has not been verif
 ## Branches
 
 `main` is the pinned upstream base `e0f142d5` (llama.cpp, 2026-10-29) plus the prototype: M0 and M0.1 from pull
-request #1, and M0.2, append-only sessions, from pull request #2. The local `m1-integrated` branch contains M1 node limits, chunked extends and benchmark integration under review. Other branches are historical producer branches.
+request #1, M0.2, append-only sessions, from pull request #2, and M1, node limits, chunked extends and benchmark integration, from pull request #4. Other branches are historical producer branches.
 
 ## Components
 
@@ -25,7 +25,7 @@ request #1, and M0.2, append-only sessions, from pull request #2. The local `m1-
 | `tools/hybrid-bench/` | Locked offline-capable launchers, seeded three-mode benchmark, fresh and append-chain numerical checks, sanitized result bundles |
 | `tools/hybrid-proxy/` | Client proxy: maps conversations to server sessions, decides when to offload, keeps a journal for recovery and replay |
 
-## Status (2026-11-01, M1 prototype under review)
+## Status (2026-11-01, M1 prototype, verified on CPU)
 
 Use the [M1 operator guide](tools/hybrid-bench/README.md) for node deployment, token files, SSH tunneling, client setup, benchmark collection and PID-safe shutdown. Builds always disable both UI sources; use `--offline --model LOCAL.gguf` to prevent model downloads as well. Public listeners require `--public --token-file`; `/metrics` and health activity counters require authentication on public nodes.
 
