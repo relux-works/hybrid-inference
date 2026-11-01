@@ -20,6 +20,7 @@ from policy import Policy, extend_chunk_limit
 from concurrency import SessionQueue
 from journal import Capture, JournalConflict, Renderer, matching_messages, segment_range, settings_identity
 from store import Store, prefix_hash
+from release import release_diagnostic, release_retry
 
 LOG = logging.getLogger("hybrid")
 MAX_JSON = 8 * 1024 * 1024
@@ -698,8 +699,9 @@ class Proxy:
             decision["offload"] = False
         try:
             remote_started = time.monotonic()
-            path = self.sync(session, client) if mode != "local" else None
             if decision["offload"] and len(target) > local_n:
+                # Local turns leave their durable suffix for the replay worker.
+                path = self.sync(session, client)
                 # Flush a queued shadow with a critical extend at the local boundary.
                 if session["remote_n"] > local_n:
                     raise ValueError("server is ahead of local slot; local re-prefill required")
@@ -873,6 +875,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         app = self.server.app
+        remaining = []
         try:
             client = app.client(self.headers.get("Authorization", ""))
             if not app.benchmark or not self.path.startswith("/v1/sessions/"):
@@ -882,18 +885,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 session = app.store.get(sid, client["id"])
                 app.store.benchmark_mode(sid, "closed")
                 ids = [session["remote_id"]] + (session.get("journal") or {}).get("retired_remote_ids", [])
-                for remote_id in dict.fromkeys(ids):
-                    if remote_id:
-                        try:
-                            app.remote(client).request("DELETE", "/v1/sessions/" + urllib.parse.quote(remote_id, safe=""))
-                        except HTTPError as error:
-                            if error.status != 404:
-                                raise
+                remaining = list(dict.fromkeys(value for value in ids if value))
+                for remote_id in remaining[:]:
+                    path = "/v1/sessions/" + urllib.parse.quote(remote_id, safe="")
+                    release_retry(lambda: app.remote(client).request("DELETE", path))
+                    remaining.remove(remote_id)
                 self.json_response(200, {"status": "released"})
         except KeyError:
             self.json_response(404, {"error": "session not found"})
         except (HTTPError, OSError) as error:
-            self.json_response(error.status if isinstance(error, HTTPError) else 503, {"error": "release failed"})
+            secrets = list(app.clients) + [c['prefill_token'] for c in app.clients.values()]
+            self.json_response(error.status if isinstance(error, HTTPError) else 503,
+                dict(error="release failed", node_session_ids=remaining, **release_diagnostic(error, secrets)))
 
     def do_GET(self):
         if not self.server.app.benchmark:

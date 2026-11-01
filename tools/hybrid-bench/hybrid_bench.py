@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -23,6 +24,7 @@ from bench_common import (Refusal, http, private_json, read_private, require, sh
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
 from policy import extend_chunk_limit
+from release import release_diagnostic, release_retry
 
 # Measurement export v0.10, generated 2026-10-30, stats.json, agents.all.
 # Source SHA-256 binds the copied aggregates; no original conversations are used or read at runtime.
@@ -142,7 +144,8 @@ def run_checker(command, scratch):
     return process
 
 
-def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_backend=False):
+def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_backend=False, record=None):
+    record = record or (lambda row: None)
     token = next(iter(config['clients'].values()))['prefill_token']
     base = config['prefill_url']
     remote = http(base, '/v1/sessions', token, dict(model_sha256=config.get('node_model_sha256', config['model_sha256'])))['session_id']
@@ -154,6 +157,12 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         require(type(chunk) is int and 1 <= chunk <= safe_chunk, 'extend chunk exceeds native delta bound')
         n0 = 0
         paths = []
+        score_paths = []
+        reference_path = getattr(args, 'reference_logits', None)
+        if reference_path:
+            from reference_logits import reference_header, scoring_fixture
+            reference = reference_header(reference_path, args.reference_model_sha256)
+            scoring_fixture(reference, tokens, reference['m'], client, config, [], reference_path)
         import struct
         for endpoint in ends:
             while n0 < endpoint:
@@ -172,6 +181,10 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                         raise Refusal('ram budget refusal (HTTP 503)' if budget else 'checker node refusal (HTTP 503)') from None
                     raise
                 delta_path = scratch / ('check-' + str(n0) + '.delta')
+                if reference_path:
+                    source_path = scratch / ('score-source-' + str(n0) + '.delta')
+                    source_path.write_bytes(data)
+                    score_paths.append(str(source_path))
                 if config.get('hetero_quant'):
                     size, = struct.unpack('<I', data[:4])
                     require(0 < size <= 1024**2 and 4 + size + 48 <= len(data), 'invalid checker delta header')
@@ -186,65 +199,123 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
-                                     deltas=paths, max_ctx=client['context']))
+                                     deltas=paths, max_ctx=client['context'],
+                                     noise_chunks=args.noise_chunks, backend=client['backend'], uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
         process = run_checker([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
             '0' if client['backend'] == 'cpu' else '999'], scratch)
+        record(dict(stage='checker', checker_exit_code=process.returncode,
+                    check_mode='append_chain' if boundaries is not None else 'fresh', depth=len(tokens),
+                    result_json=result_path.read_text() if result_path.is_file() else None))
         require(result_path.is_file(), 'equivalence checker aborted before producing metrics')
         result = json.loads(result_path.read_text())
-        require(process.returncode in (0, 3), 'equivalence checker failed before valid metrics')
-        status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False))
+        validate_checker_result(result)
+        require(process.returncode in (0, 3, 5), 'equivalence checker failed before valid metrics')
+        status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False), client['backend'])
         result.update(exit_code=code, checker_exit_code=process.returncode, status=status,
                       check_mode='append_chain' if boundaries is not None else 'fresh',
                       append_endpoints=ends, delta_count=len(paths), cross_backend=cross_backend,
                       cross_backend_thresholds_calibrated=False if cross_backend else None,
                       hetero_quant_thresholds_calibrated=False if config.get('hetero_quant') else None,
-                      reference='same-partition and whole-prompt on client backend; full-vocabulary KL')
+                      reference='same-partition, whole-prompt and alternate partitions on client backend; full-vocabulary KL')
+        record(result)
+        if reference_path:
+            score_fixture = scoring_fixture(reference, tokens, reference['m'], client, config, score_paths, reference_path)
+            score_input, score_output = scratch / 'score.json', scratch / 'score.result.json'
+            private_json(score_input, score_fixture)
+            score_scratch = scratch / 'reference-scoring'
+            score_scratch.mkdir()
+            score_binary = Path(client['build_dir']) / 'bin/llama-hybrid-score'
+            score_process = run_checker([str(score_binary), client['model_path'], str(score_input), str(score_output),
+                                        '0' if client['backend'] == 'cpu' else '999'], score_scratch)
+            record(dict(stage='reference_checker', checker_exit_code=score_process.returncode,
+                        result_json=score_output.read_text() if score_output.is_file() else None))
+            require(score_process.returncode == 0 and score_output.is_file(), 'reference scorer refused inputs; no measurements written')
+            score_result = json.loads(score_output.read_text())
+            score_result['check_mode'] = result['check_mode']
+            record(score_result)
         return result
     finally:
-        request = urllib.request.Request(base + '/v1/sessions/' + remote, method='DELETE',
-                                         headers={'Authorization': 'Bearer ' + token})
-        active_error = sys.exc_info()[1]
-        try:
-            with urllib.request.urlopen(request, timeout=10):
+        release_session(base, remote, token, config, record, 'checker',
+                        'append_chain' if boundaries is not None else 'fresh')
+
+
+def release_session(base, sid, token, config, record, scope, mode):
+    request = urllib.request.Request(base + '/v1/sessions/' + sid, method='DELETE',
+                                     headers={'Authorization': 'Bearer ' + token})
+    try:
+        def delete():
+            with urllib.request.urlopen(request, timeout=30 if scope == 'mode' else 10):
                 pass
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                if isinstance(active_error, Refusal):
-                    raise Refusal(str(active_error) + f'; checker release failed (HTTP {error.code})') from None
-                raise
+        release_retry(delete)
+        return True
+    except (Exception, KeyboardInterrupt) as error:
+        secrets = [token, config.get('client_credential', ''), config.get('decode_token', '')]
+        secrets += list(config['clients']) + [c['prefill_token'] for c in config['clients'].values()]
+        diagnostic = release_diagnostic(error, secrets)
+        ids = [sid] if scope == 'checker' else []
+        if isinstance(error, urllib.error.HTTPError) and scope == 'mode':
+            try:
+                details = json.loads(error.read(8192))
+                if not isinstance(details, dict):
+                    details = {}
+                candidates = details.get('node_session_ids', [])
+                if isinstance(candidates, list) and all(isinstance(value, str) for value in candidates):
+                    ids = candidates
+                if (isinstance(details.get('exception_type'), str) and
+                        re.fullmatch('[A-Za-z_][A-Za-z0-9_]{0,63}', details['exception_type']) and
+                        isinstance(details.get('message'), str)):
+                    diagnostic = release_diagnostic(Exception(details['message']), secrets)
+                    diagnostic['exception_type'] = details['exception_type']
+            except (ValueError, OSError):
+                pass
+        record(dict(stage='release_error', status='failed', scope=scope, mode=mode,
+                    session_id=sid, node_session_ids=ids, node_sessions_unknown=scope == 'mode' and not ids,
+                    **diagnostic))
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        return False
 
 
-def classify_equivalence(result, cross_backend):
+def validate_checker_result(result):
+    fields = ('status_rule', 'backend', 'noise_partitions', 'noise_kl_nats', 'noise_reference_seconds',
+              'same_partition_exact', 'same_partition_within_floor', 'same_partition_kl_nats',
+              'same_partition_max_abs_logit_diff', 'same_partition_repeat_exact',
+              'same_partition_repeat_kl_nats', 'same_partition_repeat_max_abs_logit_diff',
+              'same_partition_repeat_seconds', 'same_partition_positions')
+    require(all(field in result for field in fields),
+            'incompatible equivalence checker: missing logit/noise fields; rebuild llama-hybrid-bench-check')
+
+
+def classify_equivalence(result, cross_backend, backend='cpu'):
+    require(result['backend'] == backend, 'checker backend label/device mismatch')
     if cross_backend:
-        return ('uncalibrated' if result['numerical_within_bounds'] else 'uncalibrated_outside_reference', 5)
-    return ('passed', 0) if result['same_partition_exact'] and result['numerical_within_bounds'] else ('failed', 3)
+        return ('uncalibrated', 5)
+    return ('passed', 0) if result['same_partition_within_floor'] and result['same_partition_agreed'] == result['k'] and (backend != 'cpu' or result['numerical_within_bounds']) else ('failed', 3)
 
 
 @contextlib.contextmanager
-def mode_session(config, client, sid, rows, mode):
+def mode_session(config, client, sid, rows, mode, record=None):
+    record = record or rows.append
     try:
         yield
     finally:
-        request = urllib.request.Request(client['proxy_url'] + '/v1/sessions/' + sid, method='DELETE',
-            headers={'Authorization': 'Bearer ' + config['client_credential']})
         active_error = sys.exc_info()[0] is not None
-        try:
-            try:
-                with urllib.request.urlopen(request, timeout=30):
-                    pass
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
+        released = release_session(client['proxy_url'], sid, config['client_credential'], config, record, 'mode', mode)
+        if not released and not active_error:
+            raise Refusal('mode release failed; see release_error rows for remaining sessions')
+        if released:
             token = next(iter(config['clients'].values()))['prefill_token']
-            health = http(config['prefill_url'], '/v1/health', token, timeout=5)
-            rows.append(dict(stage='release', mode=mode, status='released',
-                             node_sessions=health.get('sessions'), node_ram_bytes=health.get('ram_bytes'),
-                             node_evictions=health.get('evictions')))
-        except Exception as error:
-            rows.append(dict(stage='release', mode=mode, status='failed', reason=type(error).__name__))
-            if not active_error:
-                raise
+            try:
+                health = http(config['prefill_url'], '/v1/health', token, timeout=5)
+                record(dict(stage='release', mode=mode, status='released',
+                            node_sessions=health.get('sessions'), node_ram_bytes=health.get('ram_bytes'),
+                            node_evictions=health.get('evictions')))
+            except Exception as error:
+                record(dict(stage='release', mode=mode, status='unverified',
+                            **release_diagnostic(error, [token])))
+                if not active_error:
+                    raise
 
 
 def sanitized_info(value):
@@ -256,8 +327,17 @@ def sanitized_info(value):
 
 
 def bundle(root, name, rows, client, node):
+    for row in rows:
+        if row.get('stage') == 'equivalence':
+            validate_checker_result(row)
     path = root / (name + '.jsonl')
-    path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+    temporary = root / (name + '.jsonl.tmp')
+    with temporary.open('w') as target:
+        for row in rows:
+            target.write(json.dumps(row, sort_keys=True) + '\n')
+        target.flush()
+        os.fsync(target.fileno())
+    temporary.replace(path)
     summary = rows[-1]
     lines = ['# Hybrid benchmark ' + name, '', 'Status: ' + summary['status'] + '.', '',
              '| Mode | Calls | Mean TTFT (s) | Total (s) | Decode (tokens/s) |', '|---|---:|---:|---:|---:|']
@@ -272,11 +352,40 @@ def bundle(root, name, rows, client, node):
               'Decode rate uses native generation time; TTFT is the first nonempty streamed text/reasoning delta.']
     for row in rows:
         if row.get('stage') == 'equivalence':
+            lines += ['', f"Status: {row['status']} (rule: {row['status_rule']}; {row['check_mode']}, depth {row['depth']}).",
+                      '', '| Comparison | KL (nats/token) | Top-1 agreed | Free-running first divergence (0-based) |',
+                      '|---|---:|---:|---:|',
+                      f"| Hybrid / whole prompt | {row['mean_kl_nats']:.9g} | {row['top1_agreed']}/{row['k']} | {row['free_running_first_divergence']} |"]
+            for noise in row['noise_partitions']:
+                lines.append(f"| Local chunks {noise['chunk_tokens']} / whole prompt | {noise['noise_kl_nats']:.9g} | {noise['noise_top1_agreed']}/{row['k']} | {noise['noise_free_running_first_divergence']} |")
+            lines += [f"| Noise maximum KL / minimum agreement / earliest divergence | {row['noise_kl_nats']:.9g} | {row['noise_top1_agreed']}/{row['k']} | {row['noise_free_running_first_divergence']} |",
+                      '', f"Hybrid KL / maximum local noise KL: {row['kl_to_noise_ratio']} ({row['kl_to_noise_ratio_status']})."]
+            lines += ['', f"Same partition: KL {row['same_partition_kl_nats']:.9g}; maximum absolute logit difference {row['same_partition_max_abs_logit_diff']:.9g}; bit-exact {row['same_partition_exact']}; within measured floor {row['same_partition_within_floor']}.",
+                      f"Independent repeat: KL {row['same_partition_repeat_kl_nats']:.9g}; maximum absolute logit difference {row['same_partition_repeat_max_abs_logit_diff']:.9g}; bit-exact {row['same_partition_repeat_exact']}.",
+                      f"Extra reference wall time: repeat {row['same_partition_repeat_seconds']:.6f} s; noise {row['noise_reference_seconds']:.6f} s."]
             lines += ['', 'Equivalence: `' + json.dumps(row, sort_keys=True) + '`.']
         if row.get('stage') == 'error':
             lines += ['', 'Aborted: ' + row['reason'] + '.']
+        if row.get('stage') == 'release_error':
+            lines += ['', f"Release failed ({row['scope']}, {row['mode']}): {row['exception_type']}: {row['message']}.",
+                      'Node sessions that may remain: ' + ', '.join(row['node_session_ids']) + '.',
+                      'Session to reconcile: ' + row['session_id'] + '.']
+            if row['node_sessions_unknown']:
+                lines += ['Node session IDs unknown; list GET /v1/sessions with the client token.']
+        if row.get('stage') == 'checker':
+            lines += ['', f"Checker exit code ({row['check_mode']}, depth {row['depth']}): {row['checker_exit_code']}."]
+    for row in rows:
+        if row.get('stage') == 'reference_scoring':
+            lines += ['', 'Reference scoring: KL(D || arm), nats; measurements only.',
+                      '', '| Arm | Mean | Median | p90 | p99 | Max | Top-1 agreement |',
+                      '|---|---:|---:|---:|---:|---:|---:|']
+            for arm in ('local', 'hybrid', 'local_to_hybrid'):
+                if row.get(arm):
+                    values = row[arm]['kl_nats']
+                    lines.append('| ' + arm + ' | ' + ' | '.join(f'{values[k]:.9g}' for k in ('mean', 'median', 'p90', 'p99', 'max'))
+                                 + f" | {row[arm]['top1_agreement']:.6f} |")
     (root / (name + '.md')).write_text('\n'.join(lines) + '\n')
-    # Bundle only these public, content-free artifacts, never the config/database/state/check inputs.
+    # Bundle only public measurements, never token inputs or reference payloads.
     public = {name + '.jsonl': path.read_bytes(), name + '.md': (root / (name + '.md')).read_bytes(),
               'client-info.json': (json.dumps(sanitized_info(client), indent=2) + '\n').encode(),
               'node-info.json': (json.dumps(sanitized_info(node), indent=2) + '\n').encode()}
@@ -294,6 +403,9 @@ def bundle(root, name, rows, client, node):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'reference':
+        from reference_logits import produce
+        return produce(sys.argv[2:])
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--client-state', required=True)
     p.add_argument('--node-info', help='required when client was configured with --node-sha256 only')
@@ -307,12 +419,23 @@ def main():
     p.add_argument('--depths', type=int, nargs='+', help='override the depth ladder; smoke still controls tool/output sizes')
     p.add_argument('--request-timeout', type=int, help='HTTP response timeout in seconds for long CPU runs')
     p.add_argument('--check', action='store_true')
+    p.add_argument('--reference-logits', help='pinned full-vocabulary reference file for the exact --check context')
+    p.add_argument('--reference-model-sha256', help='expected reference GGUF SHA-256, required with --reference-logits')
     p.add_argument('--check-tokens', type=int, default=64)
+    p.add_argument('--noise-chunks', type=int, nargs='+', default=[128, 255], help='1..4 alternate local batch sizes in 1..256')
     p.add_argument('--check-depths', type=int, nargs='+', help='check first completed call at or above each depth')
     args = p.parse_args()
+    require(bool(args.reference_logits) == bool(args.reference_model_sha256) and (not args.reference_logits or args.check),
+            '--reference-logits requires --check and --reference-model-sha256')
+    reference_count = 0
+    if args.reference_logits:
+        from reference_logits import reference_header
+        reference_count = reference_header(args.reference_logits, args.reference_model_sha256)['m']
+        require(type(reference_count) is int and 1 <= reference_count <= 1048576, 'invalid reference continuation count')
     require(args.request_timeout is None or 1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
     require(re.fullmatch('[a-zA-Z0-9_-]{1,64}', args.label), 'label must contain 1-64 letters, digits, underscores or hyphens')
     require(1 <= args.check_tokens <= 256, '--check-tokens must be in 1..256')
+    require(1 <= len(args.noise_chunks) <= 4 and all(1 <= n <= 256 for n in args.noise_chunks), 'noise chunks must be 1..4 values in 1..256')
     state, root, scratch = Path(args.client_state), Path(args.output), Path(args.scratch)
     require(root.is_dir() and scratch.is_dir(), 'output and scratch directories must already exist')
     config = read_private(state / 'proxy-config.json')
@@ -321,6 +444,16 @@ def main():
     name = 'hybrid-bench-' + args.label + '-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     rows = [dict(stage='run', seed=args.seed, schedule=args.schedule, smoke=args.smoke, check_requested=args.check,
                  provenance=PROVENANCE, workload=list(schedule(args.seed, args.schedule == 'measured', args.smoke, args.depths)))]
+    def record(row):
+        row.update(client_model_sha256=client.get('model_sha256'), node_model_sha256=node.get('model_sha256'),
+                   client_quantization_type=client.get('quantization_type'), node_quantization_type=node.get('quantization_type'),
+                   hetero_quant=config.get('hetero_quant', False))
+        rows.append(row)
+        # Flush the checker evidence before DELETE or scratch cleanup can fail.
+        with (root / (name + '.jsonl')).open('a') as journal:
+            journal.write(json.dumps(row, sort_keys=True) + '\n')
+            journal.flush()
+            os.fsync(journal.fileno())
     code, skipped, aborted = 0, 0, 0
     checks = 0
     interrupted = False
@@ -347,12 +480,12 @@ def main():
         for mode in args.modes:
             history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.')]
             sid, previous = 'bench-' + uuid.uuid4().hex, 0
-            with mode_session(config, client, sid, rows, mode):
+            with mode_session(config, client, sid, rows, mode, record):
                 wanted = list(args.check_depths or ([128] if args.smoke else [4096, 32768, 131072]))
                 for index, step in enumerate(rows[0]['workload']):
                     incoming = []
                     if step['kind'] == 'depth':
-                        target = min(step['depth'], limit - step['output'] - args.check_tokens - 128)
+                        target = min(step['depth'], limit - step['output'] - max(args.check_tokens, reference_count) - 128)
                         if previous >= target:
                             rows.append(dict(stage='skip', mode=mode, reason='ladder depth already exceeded', requested_depth=step['depth']))
                             skipped += 1
@@ -392,8 +525,7 @@ def main():
                                         if r.get('stage') == 'call' and r.get('mode') == 'offload' for c in r.get('chunks', [])
                                         if c['status'] == 'imported' for endpoint in (c['n0'], c['n1'])]
                                     result = equivalence(config, client, tokens, args, check_dir, boundaries,
-                                                         node['backend'] != client['backend'])
-                                    rows.append(result)
+                                                         node['backend'] != client['backend'], record)
                                     checks += 1
                                     if result['exit_code']:
                                         code = result['exit_code']
@@ -431,8 +563,15 @@ def main():
         aborted += 1
         code = 2
         rows.append(dict(stage='error', reason=str(error) if isinstance(error, Refusal) else type(error).__name__))
+    release_errors = [r for r in rows if r.get('stage') == 'release_error']
+    if release_errors:
+        aborted += len(release_errors)
+        if not interrupted:
+            code = 2
     rows.append(dict(stage='summary', status='interrupted' if interrupted else 'aborted' if aborted else 'failed' if code == 3 else 'uncalibrated' if code == 5 else 'partial' if code else 'passed',
-                     skipped=skipped, aborted=aborted, checks=checks, exit_code=code))
+                     skipped=skipped, aborted=aborted, checks=checks, exit_code=code,
+                     release_failed=bool(release_errors),
+                     checker_exit_codes=[r['checker_exit_code'] for r in rows if r.get('stage') == 'checker']))
     for row in rows:
         row.update(client_model_sha256=client.get('model_sha256'), node_model_sha256=node.get('model_sha256'),
                    client_quantization_type=client.get('quantization_type'), node_quantization_type=node.get('quantization_type'),

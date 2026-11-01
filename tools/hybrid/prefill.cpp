@@ -157,6 +157,7 @@ int main(int argc, char ** argv) {
         llama_backend_init();
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = gpu_layers;
+        mp.load_mtp = false;
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], mp));
         if (!model || !llama_model_is_hybrid(model.get())) { throw std::runtime_error("a supported hybrid model is required"); }
         const json layout = hybrid::model_layout(model.get());

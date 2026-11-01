@@ -132,6 +132,8 @@ def parser():
     p.add_argument('--node-sha256')
     p.add_argument('--prefill-url', default='http://127.0.0.1:8091')
     p.add_argument('--decode-port', type=int, default=8090)
+    p.add_argument('--batch', type=int, default=256, help='client decoder batch; node remains 256')
+    p.add_argument('--ubatch', type=int, default=256, help='client decoder microbatch; node remains 256')
     return p
 
 
@@ -150,6 +152,8 @@ def main():
     args = parser().parse_args()
     require(1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
     require(1 <= args.startup_timeout <= 86400, '--startup-timeout must be in 1..86400')
+    require(1 <= args.ubatch <= args.batch <= 65536, '--batch/--ubatch require 1 <= ubatch <= batch <= 65536')
+    require(args.role == 'client' or (args.batch == args.ubatch == 256), 'node batch/ubatch are fixed at 256')
     state = Path(args.state).expanduser().resolve()
     if args.status or args.stop:
         result = control(state, args.stop)
@@ -206,7 +210,7 @@ def main():
                 raise Refusal(f'node authentication refused (HTTP {error.code})') from None
             if node:
                 plan['benchmark_context'] = min(plan['context'], node['context'])
-        targets = ['llama-hybrid-prefill'] if args.role == 'node' else ['llama-server', 'llama-hybrid-bench-check']
+        targets = ['llama-hybrid-prefill'] if args.role == 'node' else ['llama-server', 'llama-hybrid-bench-check', 'llama-hybrid-score']
         build_dir, record = build(args, targets, info)
         temporary = Path(tempfile.mkdtemp(prefix='.' + state.name + '-', dir=state.parent))
         os.chmod(temporary, 0o700)
@@ -262,7 +266,7 @@ def main():
             if args.extend_chunk_tokens is not None:
                 config['extend_chunk_tokens'] = args.extend_chunk_tokens
             private_json(temporary / 'proxy-config.json', config)
-            info.update(threads=2, threads_batch=2, batch=256, ubatch=256, **identity, commit=record['commit'], flags=record['flags'], binaries=record['binaries'],
+            info.update(threads=2, threads_batch=2, batch=args.batch, ubatch=args.ubatch, **identity, commit=record['commit'], flags=record['flags'], binaries=record['binaries'],
                         model_file=model.name, model_sha256=digest, context=plan['context'],
                         benchmark_context=plan.get('benchmark_context', plan['context']), sizing=plan,
                         hetero_quant=args.hetero_quant, node_model_sha256=expected,
@@ -274,7 +278,7 @@ def main():
                 private_json(temporary / 'node-info.json', node)
             command = [build_dir / 'bin/llama-server', '-m', model, '--host', '127.0.0.1', '--port', args.decode_port,
                 '-ngl', 999 if (args.cuda or info['backend'] == 'metal') else 0, '-t', 2, '-tb', 2,
-                '-c', plan['context'], '-np', 1, '-b', 256, '-ub', 256, '-ctk', 'q8_0', '-ctv', 'q8_0',
+                '-c', plan['context'], '-np', 1, '--spec-type', 'none', '-b', args.batch, '-ub', args.ubatch, '-ctk', 'q8_0', '-ctv', 'q8_0',
                 '-fa', 'on', '--jinja', '--slots', '--no-context-shift', '--cache-ram', 0, '--no-cache-idle-slots',
                 '--ctx-checkpoints', 0, '--checkpoint-min-step', 0, '--slot-save-path', str(state / 'slots') + '/',
                 '--api-key-file', state / 'decode-token']

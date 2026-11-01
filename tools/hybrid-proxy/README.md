@@ -75,6 +75,8 @@ python3 -m py_compile tools/hybrid-proxy/*.py
 
 The tests use ephemeral localhost ports and temporary SQLite/slot fixtures. They cover policy decisions, explicit and inferred mapping, shared-prefix forks, restart persistence, streaming, offline/lost-ack replay, 409/snapshot recovery, foreign-client 404s on all prefill session operations, 3 clients x 4 interleaved sessions, and atomic synthetic corruption rejection. See `RESULTS.md` for exact run evidence and engine limitations. Runtime databases, slots, diagnostics and test logs belong under `.temp/hybrid-b-r1-261030/`.
 
+`test_benchmark.BenchmarkProxyTests.test_burst_node_restart_then_offload` checks simulated node RAM loss after a local-kept call: offload rechecks the prefix, recreates and replays before importing from the replacement session. The [restart regression report](RESULTS-hybrid-a-r26-261101.md) records its R2 mutant control and suite results in `.temp/hybrid-a-r26-261101/`.
+
 Build the four named correctness targets listed below under the shared flock, with CPU-only settings and `-j2`. Check exact free bytes and retain the 25 GiB start/abort floor. Do not start a build while the orchestrator's disk hold is active.
 
 ```sh
@@ -106,6 +108,7 @@ build/bin/llama-hybrid-check-distributions ~/Werkstatt/hybrid-models/Qwen3.5-0.8
 | CMake and C++ compiler | CPU engine and the four named targets, under the shared flock | `build/`; monitor/build logs under `.temp/` |
 | Native checkers | Append, recurrent rejection, SWA guard and distribution commands above | stdout/stderr logs under `.temp/` |
 | Git | Scoped signed local commits (`git commit -S`), no pushes | Local feature-branch history |
+| Local-kept latency trace | `python3 tools/hybrid-proxy/bench_local.py --help`; existing binaries/model, no builds/downloads | `--artifacts` directory: `pairs.json`, source/binary hashes, server logs and PID cleanup receipts |
 
 ## Second fix round controls
 
@@ -141,3 +144,5 @@ M0.2 replaces the old assistant-continuation workaround with ordinary user turns
 Live node health is checked before sync. Native bytes/checksums and decoder layout validation remain intact. Whole snapshots are not translated; ahead-state recovery uses local continuation. Exact model SHA-256 is required by default. Experimental `--hetero-quant` (`hetero_quant=true` in the proxy) admits a different SHA only after a matching layout fingerprint; the proxy then rewrites the delta envelope SHA, bypassing the native SHA guard. A layout match establishes shapes only, not base-weight identity or numerical equivalence. Quality is unverified and uncalibrated: the r11 CPU Q4_0 node / Q8_0 client measurement gave mean KL 0.0145 nats/token (above the 0.01 reference) and top-1 62/64. The Q8 file was a requantization of Q4 weights, not an independent higher-precision source. Heterogeneous benchmark results remain uncalibrated even when their measured values meet the reference. See the [benchmark guide](../hybrid-bench/README.md) for setup, recorded identities and uncalibrated accuracy checks.
 
 With `benchmark=true`, authenticated `DELETE /v1/sessions/ID` releases that client's current and retired remote sessions and prevents their background recreation. A local-mode marker is persisted before generation, so interruption cannot enable remote replay. Ordinary responses have no benchmark fields and exactly one streaming DONE marker; default GET behavior remains HTTP 501.
+
+Policy-kept local turns leave shadow synchronization to the existing replay worker. Synchronous synchronization and prefix validation still precede every critical offload. The durable token/message commit, replay acknowledgement checks and fallback remain in place. A request can still wait behind a replay already holding its session ticket. The [local-kept latency report](RESULTS-hybrid-d-r4-261101.md) includes three CPU pairs, trace definitions, negative controls, and GPU commands.
