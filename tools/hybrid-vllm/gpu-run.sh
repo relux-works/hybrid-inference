@@ -45,6 +45,7 @@ export HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-1800} REQUEST_TIMEOUT=${REQUEST_TIMEOUT:
 export STOP_TIMEOUT=${STOP_TIMEOUT:-120}
 export BUILD_DIR=${BUILD_DIR:-$RUN_DIR/build}
 if [[ $BUILD_DIR != /* ]]; then BUILD_DIR=$repo/$BUILD_DIR; fi
+BUILD_DIR=$(realpath -m -- "$BUILD_DIR")
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export CUDACXX=${CUDACXX:-$CUDA_HOME/bin/nvcc}
 export CUDA_ARCH=${CUDA_ARCH:-120a-real}
@@ -58,44 +59,68 @@ PS4='+ ${BASH_SOURCE}:${LINENO}: '
 set -x
 trap 'status=$?; printf "FAIL exit=%s line=%s command=%q log=%s\n" "$status" "$LINENO" "$BASH_COMMAND" "$log" >&3; tail -n 30 "$log" >&3; exit "$status"' ERR
 owned_pid=
+command_pid=
+signal_status=0
 runner=
 backup=
 stop_pid() {
-    local status=0 deadline=$((SECONDS + STOP_TIMEOUT))
-    if kill -0 "$owned_pid" 2>/dev/null; then kill -TERM "$owned_pid" 2>/dev/null || :; fi
-    while kill -0 "$owned_pid" 2>/dev/null; do
+    local pid=${1:-$owned_pid} status=0 deadline=$((SECONDS + STOP_TIMEOUT))
+    if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || :; fi
+    while kill -0 "$pid" 2>/dev/null; do
         if (( SECONDS >= deadline )); then
-            printf 'Stop timeout after %s seconds; sending SIGKILL to owned PID %s\n' "$STOP_TIMEOUT" "$owned_pid"
-            kill -KILL "$owned_pid" 2>/dev/null || :
+            printf 'Stop timeout after %s seconds; sending SIGKILL to owned PID %s\n' "$STOP_TIMEOUT" "$pid"
+            kill -KILL "$pid" 2>/dev/null || :
             break
         fi
         sleep 1
     done
-    wait "$owned_pid" || status=$?
-    printf 'PID %s wait exit: %s\n' "$owned_pid" "$status"
-    owned_pid=
+    wait "$pid" || status=$?
+    printf 'PID %s wait exit: %s\n' "$pid" "$status"
+    if [[ $pid == "$owned_pid" ]]; then owned_pid=; fi
     case "$status" in 0|137|143) return 0 ;; *) return "$status" ;; esac
 }
 cleanup() {
     local status=$?
-    trap '' INT TERM HUP
+    trap '' INT TERM HUP PIPE
     trap - EXIT ERR
+    exec >> "$log" 2>&1
     if [[ -n $backup ]]; then
         cp -p -- "$backup" "$runner" || status=1
         cmp -- "$backup" "$runner" || status=1
     fi
-    if [[ -n $owned_pid ]]; then stop_pid || status=1; fi
+    if [[ -n $owned_pid ]]; then stop_pid || { if (( status == 0 )); then status=1; fi; }; fi
+    if [[ -n $command_pid ]]; then stop_pid "$command_pid" || { if (( status == 0 )); then status=1; fi; }; fi
     printf 'EXIT %s\n' "$status"
-    printf '%s exit=%s log=%s\n' "$step" "$status" "$log" >&3
+    printf '%s exit=%s log=%s\n' "$step" "$status" "$log" >&3 || :
     exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+interrupt() {
+    signal_status=$1
+    if [[ -n $command_pid ]]; then
+        kill -TERM "$command_pid" 2>/dev/null || :
+    else
+        exit "$signal_status"
+    fi
+}
+trap 'interrupt 130' INT
+trap 'interrupt 143' TERM
+trap 'interrupt 129' HUP
+trap 'interrupt 141' PIPE
+
+run_child() {
+    local status=0
+    [[ $STOP_TIMEOUT =~ ^[1-9][0-9]*$ ]]
+    "$@" &
+    command_pid=$!
+    wait "$command_pid" || status=$?
+    if (( signal_status )); then exit "$signal_status"; fi
+    command_pid=
+    return "$status"
+}
 
 exact_ref() {
-    local changes
+    local changes listing hidden= entry
     [[ ${EXPECTED_REF:-} =~ ^[0-9a-f]{40}$ ]]
     [[ $(git rev-parse HEAD) == "$EXPECTED_REF" ]]
     changes=$(git status --porcelain --untracked-files=all)
@@ -103,7 +128,24 @@ exact_ref() {
         printf 'Refusing dirty source tree (tracked or untracked files):\n%s\n' "$changes" >&2
         return 1
     fi
+    changes=$(git ls-files --others --exclude-per-directory=.gitignore)
+    listing=$(git ls-files -v)
+    while IFS= read -r entry; do
+        case "$entry" in [a-zS]\ *) hidden+="$entry"$'\n' ;; esac
+    done <<< "$listing"
+    if [[ -n $changes || -n $hidden ]]; then
+        printf 'Refusing locally hidden source state:\n%s\n%s' "$changes" "$hidden" >&2
+        return 1
+    fi
     printf '%s\n' "$EXPECTED_REF" > "$RUN_DIR/source.ref"
+}
+artifact_path() {
+    case "$1/" in "$repo/"*)
+        if ! git check-ignore -q -- "$1/"; then
+            printf 'Artifact directory must be outside the checkout or ignored: %s\n' "$1" >&2
+            return 1
+        fi ;;
+    esac
 }
 gather() {
     # This is the first gate, including on hosts without CUDA or vLLM imports.
@@ -111,6 +153,8 @@ gather() {
 }
 build() {
     exact_ref
+    artifact_path "$RUN_DIR"
+    artifact_path "$BUILD_DIR"
     if [[ -e $BUILD_DIR ]]; then
         assert_build
         printf 'Reusing verified build: %s\n' "$BUILD_DIR"
@@ -124,24 +168,28 @@ build() {
     fi
     [[ $BUILD_JOBS =~ ^[1-9][0-9]*$ ]]
     if [[ $host == agents1 || $host == relux-agents1 ]]; then (( BUILD_JOBS <= 4 )); fi
-    nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
+    run_child nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
         -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" \
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF
-    nice -n 10 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS" \
+    run_child nice -n 10 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS" \
         --target llama-server llama-hybrid-bench-check
     exact_ref
-    (cd -- "$BUILD_DIR" && sha256sum bin/llama-server bin/llama-hybrid-bench-check) > "$BUILD_DIR/binaries.sha256"
+    build_hashes > "$BUILD_DIR/binaries.sha256"
     printf '%s\n' "$EXPECTED_REF" > "$BUILD_DIR/build.ref"
     assert_build
+}
+build_hashes() {
+    [[ -x $BUILD_DIR/bin/llama-server && -x $BUILD_DIR/bin/llama-hybrid-bench-check ]]
+    (cd -- "$BUILD_DIR" && find -L bin -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
 }
 assert_build() {
     local hashes
     exact_ref
     [[ $(cat "$BUILD_DIR/build.ref") == "$EXPECTED_REF" ]]
-    hashes=$(cd -- "$BUILD_DIR" && sha256sum bin/llama-server bin/llama-hybrid-bench-check)
+    hashes=$(build_hashes)
     if [[ $hashes != "$(cat "$BUILD_DIR/binaries.sha256")" ]]; then
-        printf 'Receiver binary hashes FAILED: %s\n' "$BUILD_DIR" >&2
+        printf 'Receiver bin file hashes FAILED: %s\n' "$BUILD_DIR" >&2
         return 1
     fi
     cp -- "$BUILD_DIR/build.ref" "$BUILD_DIR/binaries.sha256" "$RUN_DIR/"
@@ -149,7 +197,7 @@ assert_build() {
 wait_health() {
     local url=$1 deadline=$((SECONDS + HEALTH_TIMEOUT))
     while kill -0 "$owned_pid" 2>/dev/null; do
-        if curl --fail --silent --max-time 5 "$url" > /dev/null; then return 0; fi
+        if run_child curl --fail --silent --max-time 5 "$url" > /dev/null; then return 0; fi
         if (( SECONDS >= deadline )); then
             printf 'Health timeout: %s\n' "$url" >&2
             return 1
@@ -187,7 +235,7 @@ PY
     owned_pid=$!
     printf '%s\n' "$owned_pid" > "$RUN_DIR/vllm.pid"
     wait_health "http://127.0.0.1:$VLLM_PORT/health"
-    curl --fail --max-time "$REQUEST_TIMEOUT" -H 'Content-Type: application/json' \
+    run_child curl --fail --max-time "$REQUEST_TIMEOUT" -H 'Content-Type: application/json' \
         --data-binary "@$RUN_DIR/request.json" "http://127.0.0.1:$VLLM_PORT/v1/completions" > "$RUN_DIR/response.json"
     cp -p -- "$backup" "$runner"
     cmp -- "$backup" "$runner"

@@ -1,7 +1,9 @@
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -44,9 +46,13 @@ esac
         self.command("cmake", '''printf 'cmake %s\\n' "$*" >> "$CALLS"
 if [[ $1 == -S ]]; then
     mkdir -p "$BUILD_DIR/bin"
-    printf '#!/bin/sh\\nexit "${CHECKER_EXIT:-0}"\\n' > "$BUILD_DIR/bin/llama-server"
+    printf '#!/bin/sh\\nprintf "receiver-ran\\\\n" >> "$CALLS"\\nexit "${CHECKER_EXIT:-0}"\\n' > "$BUILD_DIR/bin/llama-server"
     cp "$BUILD_DIR/bin/llama-server" "$BUILD_DIR/bin/llama-hybrid-bench-check"
     chmod +x "$BUILD_DIR/bin/llama-server" "$BUILD_DIR/bin/llama-hybrid-bench-check"
+    for lib in libllama-server-impl.so libggml-cuda.so.0 libllama.so.0; do
+        printf 'library built at %s\\n' "$EXPECTED_REF" > "$BUILD_DIR/bin/$lib"
+    done
+    ln -sf libllama.so.0 "$BUILD_DIR/bin/libllama.so"
 fi
 exit "${CMAKE_EXIT:-0}"
 ''')
@@ -63,7 +69,7 @@ exit "${CMAKE_EXIT:-0}"
         except subprocess.TimeoutExpired:
             self.fail("script did not finish within the bounded test deadline")
 
-    # CPU command doubles prove fresh parents, gate order, target flags and binary hash recording.
+    # CPU doubles prove fresh parents, gate order, target flags and the complete bin receipt.
     def test_build_and_paths(self):
         selected = self.root / "argument takes precedence/nested"
         result = self.run_step("build", selected)
@@ -74,7 +80,8 @@ exit "${CMAKE_EXIT:-0}"
         self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=120a-real", "\n".join(calls))
         self.assertIn("--target llama-server llama-hybrid-bench-check", "\n".join(calls))
         self.assertEqual((selected / "build.ref").read_text().strip(), "a" * 40)
-        self.assertEqual(len((selected / "binaries.sha256").read_text().splitlines()), 2)
+        self.assertEqual(len((selected / "binaries.sha256").read_text().splitlines()), 6)
+        self.assertIn("  bin/libllama-server-impl.so\n", (selected / "binaries.sha256").read_text())
         self.assertFalse(self.run_dir.exists())
         self.assertTrue((self.root / "disk-tmp").is_dir())
 
@@ -110,7 +117,7 @@ exit "${CMAKE_EXIT:-0}"
         subprocess.run([git, "init", "-q", str(source)], check=True)
         self.command("git", '''case "$1" in
     rev-parse) printf '%s\\n' "$EXPECTED_REF" ;;
-    status) "$REAL_GIT" -C "$PLANT_REPO" "$@" ;;
+    status|ls-files) "$REAL_GIT" -C "$PLANT_REPO" "$@" ;;
     diff) exit 0 ;;
 esac
 ''')
@@ -127,6 +134,75 @@ esac
         plant.unlink()
         result = self.run_step("build", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    # Real index flags and local excludes refuse behind a clean status double; no fixture commit is needed.
+    def test_locally_hidden_source_refusal(self):
+        source = self.root / "source"
+        source.mkdir()
+        git = shutil.which("git")
+        def real_git(*args):
+            return subprocess.run([git, "-C", str(source), *args], check=True, capture_output=True, text=True)
+        real_git("init", "-q")
+        plant = source / "hidden.cu"
+        plant.write_text("original\n")
+        real_git("add", "hidden.cu")
+        self.command("git", '''case "$1" in
+    rev-parse) printf '%s\\n' "$EXPECTED_REF" ;;
+    ls-files) "$REAL_GIT" -C "$PLANT_REPO" "$@" ;;
+esac
+''')
+        env = dict(REAL_GIT=git, PLANT_REPO=str(source))
+        for flag in ("skip-worktree", "assume-unchanged"):
+            with self.subTest(flag=flag):
+                real_git("update-index", "--" + flag, "hidden.cu")
+                plant.write_text("changed\n")
+                result = self.run_step("build", **env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Refusing locally hidden source state", result.stderr)
+                self.assertNotIn("cmake", self.calls.read_text())
+                plant.write_text("original\n")
+                real_git("update-index", "--no-" + flag, "hidden.cu")
+        untracked = source / "ignored.cu"
+        untracked.write_text("new source\n")
+        excludes = self.root / "local-excludes"
+        excludes.write_text("ignored.cu\n")
+        for config in ("core.excludesFile", "info/exclude"):
+            with self.subTest(config=config):
+                if config == "core.excludesFile":
+                    real_git("config", config, str(excludes))
+                else:
+                    real_git("config", "--unset", "core.excludesFile")
+                    (source / ".git/info/exclude").write_text("ignored.cu\n")
+                result = self.run_step("build", **env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ignored.cu", result.stderr)
+                self.assertNotIn("cmake", self.calls.read_text())
+        untracked.unlink()
+        result = self.run_step("build", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # Real ignore rules refuse in-repo run/build paths before cmake; ignored and outside paths pass.
+    def test_artifact_path_preflight(self):
+        git = shutil.which("git")
+        subprocess.run([git, "init", "-q", str(self.root)], check=True)
+        (self.root / ".gitignore").write_text(".temp/\n")
+        self.command("git", '''if [[ $1 == check-ignore ]]; then
+    exec "$REAL_GIT" -C "$PLANT_REPO" "$@"
+fi
+if [[ $1 == rev-parse ]]; then printf '%s\\n' "$EXPECTED_REF"; fi
+''')
+        env = dict(REAL_GIT=git, PLANT_REPO=str(self.root))
+        outside = self.root.parent / (self.root.name + "-outside")
+        self.addCleanup(shutil.rmtree, outside, True)
+        for run_dir, build_dir in ((self.root / "unignored", outside / "build"),
+                                   (self.root / ".temp/run", self.root / "unignored-build")):
+            result = self.run_step("build", run_dir, BUILD_DIR=str(build_dir), **env)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Artifact directory must be outside", result.stderr)
+            self.assertNotIn("cmake", self.calls.read_text())
+        for run_dir in (self.root / ".temp/accepted", outside / "run"):
+            result = self.run_step("build", run_dir, BUILD_DIR=str(run_dir / "build"), **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     # GPU hosts default to all cores; agents1 defaults to four and refuses explicit excess.
     def test_build_jobs_by_host(self):
@@ -178,6 +254,67 @@ esac
                     self.assertFalse((retry / "build.ref").exists())
                 finally:
                     path.write_bytes(original)
+
+    # r7h's four library-only plants refuse both reuse and checking before any receiver runs.
+    def test_shared_library_reuse_refusals(self):
+        self.command("nvidia-smi", "printf 'pid, process_name, used_memory\\n'\n")
+        result = self.run_step("build")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build_dir = self.run_dir / "build"
+        original = {p.name: p.read_bytes() for p in (build_dir / "bin").iterdir() if not p.is_symlink()}
+        for name in ("libllama-server-impl.so", "libggml-cuda.so.0", "libllama.so.0", "rebuilt_in_place_other_ref"):
+            with self.subTest(plant=name):
+                if name == "rebuilt_in_place_other_ref":
+                    subprocess.run([str(self.bin / "cmake"), "-S", "fixture"],
+                                   env=dict(self.env, BUILD_DIR=str(build_dir), EXPECTED_REF="b" * 40), check=True)
+                    self.assertEqual((build_dir / "bin/llama-server").read_bytes(), original["llama-server"])
+                    self.assertEqual((build_dir / "bin/llama-hybrid-bench-check").read_bytes(), original["llama-hybrid-bench-check"])
+                else:
+                    (build_dir / "bin" / name).write_bytes(b"changed library\n")
+                self.calls.unlink()
+                for step in ("build", "check"):
+                    retry = self.root / (name + "-" + step)
+                    result = self.run_step(step, retry, BUILD_DIR=str(build_dir))
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("Receiver bin file hashes FAILED", result.stderr)
+                    self.assertNotIn("cmake", self.calls.read_text())
+                    self.assertNotIn("receiver-ran", self.calls.read_text())
+                    self.assertFalse((retry / "build.ref").exists())
+                for filename, contents in original.items():
+                    (build_dir / "bin" / filename).write_bytes(contents)
+        self.calls.unlink()
+        result = self.run_step("check", self.root / "unchanged-check", BUILD_DIR=str(build_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("receiver-ran", self.calls.read_text())
+
+    # The receipt binds the file set and symlink content, including alias retargets outside bin.
+    def test_library_set_and_symlink_refusals(self):
+        result = self.run_step("build")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build_dir = self.run_dir / "build"
+        library = build_dir / "bin/libllama.so.0"
+        contents = library.read_bytes()
+        alias = build_dir / "bin/libllama.so"
+        extra = build_dir / "bin/new-library.so"
+        outside = self.root / "outside-library.so"
+        outside.write_bytes(b"other library\n")
+        for plant in ("add", "delete", "retarget"):
+            with self.subTest(plant=plant):
+                if plant == "add":
+                    extra.write_bytes(b"new library\n")
+                elif plant == "delete":
+                    library.unlink()
+                else:
+                    alias.unlink()
+                    alias.symlink_to(outside)
+                result = self.run_step("build", self.root / plant, BUILD_DIR=str(build_dir))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                extra.unlink(missing_ok=True)
+                library.write_bytes(contents)
+                alias.unlink()
+                alias.symlink_to(library.name)
+        result = self.run_step("build", self.root / "restored", BUILD_DIR=str(build_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     # A real child failure is visible in the terminal and log; the calling shell continues.
     def test_hidden_command_exit(self):
@@ -281,6 +418,62 @@ exec /bin/sleep "$@"
                 if signal == "2":
                     self.assertTrue((self.run_dir / "second-signal").exists())
                     self.assertEqual((self.run_dir / "second-signal").read_text(), "original runner\n")
+
+    # PID-only signals interrupt a blocked curl, retain the signal exit and reap both owned PIDs.
+    def test_capture_request_signals(self):
+        runner = self.capture_doubles()
+        ready = self.root / "request-ready"
+        os.mkfifo(ready)
+        self.command("curl", '''if [[ ${!#} == */health ]]; then read -r ready < "$RUN_DIR/server-ready"; exit 0; fi
+printf '%s\\n' "$$" > "$RUN_DIR/curl.pid"
+printf 'ready\\n' > "$REQUEST_READY"
+exec /bin/sleep 60
+''')
+        for sig, dead_stderr in ((signal.SIGTERM, False), (signal.SIGHUP, False),
+                                  (signal.SIGPIPE, False), (signal.SIGHUP, True)):
+            with self.subTest(signal=sig, dead_stderr=dead_stderr):
+                fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+                child = subprocess.Popen(["bash", str(self.script), "capture"],
+                                         env=dict(self.env, FAKE_RUNNER=str(runner), REQUEST_READY=str(ready)),
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertTrue(select.select([fd], [], [], 10)[0], "request did not reach curl")
+                    self.assertEqual(os.read(fd, 32), b"ready\n")
+                    curl_pid = int((self.run_dir / "curl.pid").read_text())
+                    if sig == signal.SIGHUP:
+                        os.kill(int((self.run_dir / "vllm.pid").read_text()), signal.SIGHUP)
+                    if dead_stderr:
+                        child.stderr.close()
+                    child.send_signal(sig)
+                    try:
+                        if dead_stderr:
+                            child.wait(timeout=10)
+                            stdout, stderr = child.stdout.read(), ""
+                        else:
+                            stdout, stderr = child.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.fail("signal did not interrupt the blocked request")
+                    result = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
+                    self.assert_capture_stopped(result, runner, 128 + sig)
+                    if not dead_stderr:
+                        self.assertIn("capture exit=" + str(128 + sig), stderr)
+                    self.assertIn("EXIT " + str(128 + sig), max(self.run_dir.glob("capture-*.log"), key=lambda p: p.stat().st_mtime_ns).read_text())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(curl_pid, 0)
+                finally:
+                    os.close(fd)
+                    if child.poll() is None:
+                        child.terminate()
+                    pid_file = self.run_dir / "curl.pid"
+                    if pid_file.exists():
+                        try:
+                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    child.wait(timeout=10)
+                    child.stdout.close()
+                    if not dead_stderr:
+                        child.stderr.close()
 
     # A fresh capture reuses verified binaries; successful teardown restores before stopping and checking GPU idleness.
     def test_capture_reuses_build(self):

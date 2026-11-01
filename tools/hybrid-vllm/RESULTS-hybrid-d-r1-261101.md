@@ -215,3 +215,63 @@ Two test-harness corrections are explicit: the initial script-only run exited 1 
 The finite set has 50 assertion kills, one uncredited error mutant and one required identity survivor. No formal surface table was supplied (brief gap). No requested r3 row is treated as out of contract. The earlier r7b finding 5 (three converter refusal tests) and r7d N2's structured upper-bound refusal are outside this brief's two Low findings/operator notes; both remain unchanged and explicit. No reviewer tests were removed. Self-review covered scope, security, design, tests, process ownership and claim accuracy. Runtime CUDA views, recurrent ownership/chronology, checkpoint/tokenizer provenance, calibrated quality bounds and long-depth capacity remain GPU gates.
 
 Task-board is absent (`goal-read-01.log`, exit 1); the existing `.temp/tasks.md` tracks this rework. No primary-goal mutation/clear, independent r3 acceptance, hosted check or landing is claimed. Signed local handoff and the authorized #hybrid / prototype-go summary are the delivery scope.
+
+## r5: shared-library build reuse (hybrid-d-r5-261101)
+
+Ready for review on `m3-vllm-bridge`, parent `8d9fffe902e84cd8097083b5f9ad88d748bd5eb9`. r7h requested changes to that r3 head; its acceptance is not claimed. Scope is `tools/hybrid-vllm/` only. CPU only, no GPU operations/model downloads, no push.
+
+Chose the complete bin manifest option, preserving shared builds. At build time and reuse, `find -L bin -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum` records the same sorted paths and contents, including library aliases and followed targets. `build.ref` still binds the exact source ref. Changed, added or removed libraries refuse before a checker can run, even with unchanged executable shims. Old shared builds with two-executable receipts refuse and need rebuilding. Static-only configuration would also close the finding, but changing the current link mode is unnecessary with a complete receipt.
+
+| r7h finding/note | Change and named regression |
+|---|---|
+| Blocking `reuse-hash-shim-only` | `test_shared_library_reuse_refusals`: server-impl, CUDA and libllama changes, plus in-place ref-B rebuild with byte-identical executables. Both build/check refuse without cmake or receiver execution; unchanged shared build still checks. `test_library_set_and_symlink_refusals` adds file-set and external alias-target controls. |
+| N1 aborted exit reporting | Preserve incoming nonzero exit through a server HUP; trap PIPE as 141 and mask it during cleanup's best-effort terminal write. Reopen the command log during cleanup so curl redirection cannot hide wait/exit records. `test_capture_request_signals` verifies TERM/HUP/PIPE and HUP with a dead stderr pipe, runner restoration and both recorded PIDs gone. |
+| N2 deferred TERM | Curl health/requests and CMake use recorded background children and interruptible wait. Signal handler terminates the active command and leaves wait before entering EXIT cleanup. FIFO-synchronized blocked-curl regression requires PID-only TERM to finish within its bounded hang detector. Foreground Python calls retain ordinary shell deferral. |
+| N4 locally hidden source | Independent untracked-file read honors repository .gitignore only; skip-worktree/assume-unchanged flags refuse without modifying the index. `test_locally_hidden_source_refusal` uses real index flags and global/info excludes behind an explicit clean-status double. `test_untracked_cuda_refusal` retains real porcelain. |
+| N5 artifact path | Normalize BUILD_DIR and check both run/build paths before CMake. `test_artifact_path_preflight` uses real ignore rules, two refused paths, and nearby ignored/outside positive controls. |
+
+Evidence root: `.temp/hybrid-d-r5-261101/`. Each guarded command has a numbered log and JSON with exact command, source hashes, environment, UTC times, exit and free-space samples. `controls-final.json` binds the final source to reuse/mutant verdicts; `shell-mutant-adaptations.json` preserves the reviewer script hash, all original names and exact adapted anchors. Bash 5.3.9, Python 3.14.4, GCC 15.2.0, torch 2.13.0+cpu and NumPy 2.5.4. On-disk TMPDIR, bytecode disabled, niced CPU validation; no tee pipeline.
+
+| Validation | Actual exit | Evidence and bound |
+|---|---|---|
+| Own SHA-256 object / native helper compilation | 0 / 0 | `build-sha256-01.log`, `build-native-01.log`. Four copied CPU library hashes match r3/r7h pins (`native-libraries.json`); core source diff is empty (`reused-source-diff.log`). No engine build. |
+| Full CPU/native suite | 0 | `tests-02.log`: 40/40, 37.162 s. All 35 previous test names retained; five new methods. Mandatory native BF16/f32 full import, FP8/BF16 append and checksum rejection run. Minimum free disk: 35,543,527,424 bytes. |
+| Torch-CPU gather directly / through script | 0 / 0 | `gather-01.log` and `script-gather-02.log`: 2/2 each. CPU BF16/uint8 views; no CUDA initialized (`runtime-versions-01.log`). Exporter/gather source unchanged. |
+| Unmodified reviewer reuse probe | 0 driver | `reviewer-reuse-02.log`, `reuse-final/results.json`: all 10 held. Identity build/check exits 0; all four library plants and remaining refusal controls exit 1 before checker execution, without cmake. |
+| Reviewer shell mutants plus seven new controls | 0 driver | `reviewer-shell-02.log`, `shell-final/shell-mutants.json`: identity exit 0, all 18 mutants exit 1 with named assertions and zero unittest errors. No setup failure counts as a kill. |
+| ASCII, Python/heredoc AST, retained test names, Bash syntax and diff whitespace | 0 | `source-check-02.log`, `bash-syntax-01.log`, `diff-check-02.log`. No hosted CI or type-check pass is claimed. |
+| CUDA build/capture, real vLLM/BF16/Q4_K_M, GPU descendants, logits/import, Metal | Unrun | CPU command doubles do not qualify these runtime paths. |
+
+The reviewer probes specifically confirm changed `libllama-server-impl.so`, `libggml-cuda.so.0`, `libllama.so.0` and an in-place rebuild at another ref all refuse at both build/check. This is integrity evidence for the local build receipt, not authentication against an actor who also rewrites receipts. System/CUDA runtime libraries outside bin are not pinned. Exclusive build custody is still required across the hash-then-run gap.
+
+Initial headroom was only 28.51 GB, so dependency installation/full native validation were deferred. A diagnostic watchdog stopped its driver with exit -15 at 28,179,972,096 free bytes; a subsequent live df sample was 28,159,176,704. No sample below 28 GB was observed. Shared headroom then recovered above 37 GB; CPU dependencies were installed only after that recovery. No foreign data/process was removed. Temporary CPU dependencies, copied libraries and native artifacts are removed after validation. `dependencies.md` records the exact install/build approach.
+
+Intermediate failures are retained in `revision-notes.md`: script-tests-01/02 exited 1 while exposing redirected cleanup output and exit-inside-wait behavior; the first shell batch exposed an unrelated HUP timeout and later exited 1 on a stale, not-applied PIPE anchor while the handler was revised. None is final evidence. A temporary fixture originally made an unsigned synthetic commit; that dependency was removed, and final tests make no fixture commit. The latest full suite and complete second shell batch cover the corrected source.
+
+| Mutant | Gate narrowed to | Named failing test | Exit / verdict and survivor bound |
+|---|---|---|---|
+| `cleanup_signals_armed` | Cleanup masks repeated signals through restore and stop | `test_capture_term_ignoring_cleanup` | 1, assertion killed |
+| `cleanup_stop_before_restore` | Runner restored before PID stop | `test_capture_term_ignoring_cleanup` | 1, assertion killed |
+| `no_kill_escalation` | Ignored TERM reaches bounded KILL | `test_capture_term_ignoring_cleanup` | 1, assertion killed |
+| `kill_status_not_accepted` | Successful teardown accepts its KILL wait status | `test_capture_reuses_build` | 1, assertion killed |
+| `exact_ref_diff_only` | Retain porcelain tracked-status/diagnostic gate; independent scan still sees untracked files | `test_build_refusals` | 1, assertion killed |
+| `exact_ref_untracked_no` | Retain porcelain untracked diagnostic beside the independent scan | `test_untracked_cuda_refusal` | 1, assertion killed |
+| `reuse_skips_hash` | Compare stored hashes before admitting reuse | `test_shared_library_reuse_refusals` | 1, assertion killed |
+| `reuse_skips_ref` | Build receipt must match expected ref | `test_build_reuse_refusals` | 1, assertion killed |
+| `reuse_hash_server_only` | Positive reuse requires matching complete receipt, not a one-file recomputation | `test_build_reuse` | 1, assertion killed |
+| `agents1_cap_off` | Explicit jobs above four refuse on agents1 | `test_build_refusals` | 1, assertion killed |
+| `agents1_default_uncapped` | Default build remains admissible at four jobs on agents1 | `test_build_jobs_by_host` | 1, assertion killed |
+| `r5_two_executable_receipt` | Unchanged shims cannot hide library-only changes | `test_shared_library_reuse_refusals` | 1, assertion killed |
+| `r5_no_symlink_targets` | Manifest includes followed alias content | `test_library_set_and_symlink_refusals` | 1, assertion killed |
+| `r5_hidden_source_admitted` | Local excludes/index flags cannot hide source state | `test_locally_hidden_source_refusal` | 1, assertion killed |
+| `r5_artifact_preflight_removed` | Bad in-repo run/build paths refuse before cmake | `test_artifact_path_preflight` | 1, assertion killed |
+| `r5_deferred_request_signal` | PID-only signal interrupts blocked curl | `test_capture_request_signals` | 1, assertion killed |
+| `r5_cleanup_clobbers_signal` | Server HUP does not overwrite script signal exit | `test_capture_request_signals` | 1, assertion killed |
+| `r5_pipe_untrapped` | PIPE has an explicit failing signal exit | `test_capture_request_signals` | 1, assertion killed |
+| `identity` | Unmodified shell fixtures admit the intended paths | None | 0, required survivor; CPU doubles only, no live CUDA/vLLM claim |
+
+Some positive-control kills detect an always-refusing implementation, rather than a negative bypass. The two porcelain mutants also check diagnostic behavior; the new independent untracked scan remains in those mutants. The finite set has 18 assertion kills and the required identity survivor. Earlier converter/gather plants were not replayed because their source/tests/configuration are unchanged; this request reruns the complete CPU suite, gather and shell controls.
+
+Reviewer rows R1-R6 remain explicit: R1 maps to capture cleanup/request-signal tests and cleanup/TERM/PIPE mutants; R2 to untracked/hidden-source tests and corresponding mutants; R3 to shared-library/file-set/reuse tests and receipt mutants; R4 to build-jobs/refusal tests and agents1 mutants; R5 to the full native suite plus direct/script gather; R6 to the green identity and named assertion controls above. The user brief supplied no formal surface table (brief gap). No requested r5 row is treated as out of contract. Earlier r7b converter-refusal gaps and r7d's structured upper-bound error are outside this reuse/runner scope and unchanged. All reviewer test names are retained.
+
+Self-review: `self-review.md`, scope/security/general/tests/design and process ownership. Board unavailable (`goal-read.log`, exit 1, missing .task-board); existing `.temp/tasks.md` tracks this task. Independent acceptance, hosted checks, landing and primary-goal clear are not claimed. Signed local handoff with the requested trailer and the authorized #hybrid/prototype-go summary is the delivery scope.
