@@ -117,6 +117,69 @@ class BenchmarkProxyTests(unittest.TestCase):
         self.assertEqual(info['prefix_hash'], prefix_hash(expected))
         self.assertEqual(current['remote_n'], len(expected))
 
+    # Simulated node RAM loss requires a prefix recheck and full replay before offload; no stale session may reach import.
+    def test_burst_node_restart_then_offload(self):
+        fixture = self.fixture
+        fixture.app.policy = Policy(local_rates=((0, 1e9),))
+        sid, _ = fixture.chat([4, 5, 6])
+        fixture.chat(fixture.app.store.get(sid)['tokens'] + [300, 301], sid=sid)
+        fixture.app.replay()
+        before = fixture.app.store.get(sid)
+        remote = fixture.app.remote(fixture.config['clients']['fixture-a'])
+        old_path = '/v1/sessions/' + before['remote_id']
+        self.assertEqual(remote.request('GET', old_path)['tokens'], before['tokens'])
+        fixture.chat(before['tokens'] + [7, 8], sid=sid)
+        durable = fixture.app.store.get(sid)['tokens']
+        self.assertEqual(fixture.decode.app.imports, 0)
+        self.assertEqual(remote.request('GET', old_path)['tokens'], before['tokens'])
+        with fixture.prefill.app.db:
+            fixture.prefill.app.db.execute('DELETE FROM sessions')
+
+        events = []
+        dispatch = fixture.prefill.app.handle
+        decode = fixture.app.decode.request
+
+        def record_node(method, path, query, body, client):
+            result = dispatch(method, path, query, body, client)
+            events.append((method, path, body, result[0]))
+            return result
+
+        def record_decode(method, path, *args, **kwargs):
+            if 'action=import_delta' in path:
+                events.append(('import', args[1]['X-Hybrid-Session']))
+            return decode(method, path, *args, **kwargs)
+
+        fixture.app.policy = Policy(always=True)
+        with mock.patch.object(fixture.prefill.app, 'handle', side_effect=record_node), mock.patch.object(
+                fixture.app.decode, 'request', side_effect=record_decode):
+            fixture.chat(durable + [9, 10], sid=sid)
+        current = fixture.app.store.get(sid)
+        self.assertNotEqual(current['remote_id'], before['remote_id'])
+        self.assertEqual(fixture.decode.app.imports, 1)
+        self.assertTrue(current['offload'])
+        self.assertEqual(current['tokens'], durable + [9, 10, 901, 902])
+        new_path = '/v1/sessions/' + current['remote_id']
+        self.assertEqual(events[0][:2], ('GET', old_path))
+        self.assertEqual(events[0][3], 404)
+        self.assertEqual(events[1][:2], ('POST', '/v1/sessions'))
+        self.assertEqual(events[1][3], 200)
+        self.assertEqual(events[2][:2], ('GET', new_path))
+        self.assertEqual(events[2][3], 200)
+        extends = [event for event in events if event[1].endswith('/extend')]
+        self.assertEqual(extends, [
+            ('POST', new_path + '/extend', dict(n0=0, prefix_hash_n0=prefix_hash([]),
+                tokens=durable, return_delta=False), 202),
+            ('POST', new_path + '/extend', dict(n0=len(durable), prefix_hash_n0=prefix_hash(durable),
+                tokens=[9], return_delta=True), 200)])
+        self.assertEqual(events[-1], ('import', current['remote_id']))
+        fixture.app.replay()
+        fixture.app.replay()
+        current = fixture.app.store.get(sid)
+        info = remote.request('GET', new_path)
+        self.assertEqual(info['tokens'], current['tokens'])
+        self.assertEqual(info['prefix_hash'], prefix_hash(current['tokens']))
+        self.assertEqual(current['remote_n'], len(current['tokens']))
+
     # The next offload flushes the deferred suffix and still refuses a divergent node before importing anything.
     def test_policy_local_then_offload_checks_prefix(self):
         fixture = self.fixture

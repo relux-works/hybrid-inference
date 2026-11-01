@@ -75,6 +75,8 @@ python3 -m py_compile tools/hybrid-proxy/*.py
 
 The tests use ephemeral localhost ports and temporary SQLite/slot fixtures. They cover policy decisions, explicit and inferred mapping, shared-prefix forks, restart persistence, streaming, offline/lost-ack replay, 409/snapshot recovery, foreign-client 404s on all prefill session operations, 3 clients x 4 interleaved sessions, and atomic synthetic corruption rejection. See `RESULTS.md` for exact run evidence and engine limitations. Runtime databases, slots, diagnostics and test logs belong under `.temp/hybrid-b-r1-261030/`.
 
+`test_benchmark.BenchmarkProxyTests.test_burst_node_restart_then_offload` checks simulated node RAM loss after a local-kept call: offload rechecks the prefix, recreates and replays before importing from the replacement session. The [restart regression report](RESULTS-hybrid-a-r26-261101.md) records its R2 mutant control and suite results in `.temp/hybrid-a-r26-261101/`.
+
 Build the four named correctness targets listed below under the shared flock, with CPU-only settings and `-j2`. Check exact free bytes and retain the 25 GiB start/abort floor. Do not start a build while the orchestrator's disk hold is active.
 
 ```sh
