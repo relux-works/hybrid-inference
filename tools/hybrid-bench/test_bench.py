@@ -454,11 +454,10 @@ class CleanupTests(unittest.TestCase):
             same_partition_repeat_max_abs_logit_diff=0, same_partition_repeat_seconds=.1,
             same_partition_positions=[])
 
-    def run_fake_node(self, failure, checker_code=0):
+    def run_fake_node(self, failure, checker_code=0, failed_session='checker-2', interrupt=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sessions, attempts, before_delete = set(), {}, []
-            test = self
             class Handler(http.server.BaseHTTPRequestHandler):
                 def log_message(self, *_):
                     pass
@@ -487,19 +486,13 @@ class CleanupTests(unittest.TestCase):
                     if sid.startswith('checker-'):
                         journal = next(root.glob('hybrid-bench-*.jsonl'))
                         saved = [json.loads(line) for line in journal.read_text().splitlines()]
-                        # Both rows must already be on disk at the first cleanup call, not only at bundle time.
-                        test.assertEqual(saved[-2]['stage'], 'checker')
-                        test.assertEqual(saved[-2]['checker_exit_code'], checker_code)
-                        test.assertEqual(json.loads(saved[-2]['result_json']), test.checker_result(checker_code))
-                        test.assertEqual(saved[-1]['stage'], 'equivalence')
-                        test.assertEqual(saved[-1]['checker_exit_code'], checker_code)
-                        before_delete.append(sid)
+                        before_delete.append((sid, saved))
                         attempts[sid] = attempts.get(sid, 0) + 1
-                        if sid == 'checker-2' and (failure == 'permanent' or failure == 'transient' and attempts[sid] == 1):
+                        if sid == failed_session and (failure == 'permanent' or failure == 'transient' and attempts[sid] == 1):
                             self.connection.shutdown(socket.SHUT_RDWR)
                             self.connection.close()
                             return
-                        if sid == 'checker-2' and failure == 'lost_ack':
+                        if sid == failed_session and failure == 'lost_ack':
                             if attempts[sid] == 1:
                                 sessions.discard(sid)
                                 self.connection.shutdown(socket.SHUT_RDWR)
@@ -507,7 +500,7 @@ class CleanupTests(unittest.TestCase):
                             else:
                                 self.reply(dict(error='already released'), 404)
                             return
-                        if sid == 'checker-2' and failure == 'unauthorized':
+                        if sid == failed_session and failure == 'unauthorized':
                             self.reply(dict(error='unauthorized'), 401)
                             return
                         sessions.discard(sid)
@@ -540,13 +533,26 @@ class CleanupTests(unittest.TestCase):
                 path='offload', remote_applied=131, server_prefill_ms=1, wire_bytes=10, slot=0, chunks=[])
             argv = ['hybrid_bench.py', '--client-state', str(root), '--scratch', str(root), '--output', str(root),
                     '--modes', 'offload', '--smoke', '--check', '--check-tokens', '8']
+            real_urlopen = hybrid_bench.urllib.request.urlopen
+            def urlopen(request, **kwargs):
+                if interrupt == 'delete' and request.get_method() == 'DELETE' and request.full_url.endswith('/' + failed_session):
+                    attempts[failed_session] = attempts.get(failed_session, 0) + 1
+                    raise KeyboardInterrupt()
+                return real_urlopen(request, **kwargs)
             try:
                 with mock.patch('sys.argv', argv), mock.patch.object(hybrid_bench, 'http', side_effect=request), \
                         mock.patch.object(hybrid_bench, 'run_checker', side_effect=checker), \
                         mock.patch.object(hybrid_bench, 'schedule', return_value=iter([dict(kind='depth', depth=128, output=4)])), \
                         mock.patch.object(hybrid_bench, 'stream_chat', return_value=('mode-session', {}, trace, .1, .2)), \
-                        mock.patch('release.time.sleep') as sleep:
+                        mock.patch.object(hybrid_bench.urllib.request, 'urlopen', side_effect=urlopen), \
+                        mock.patch('release.time.sleep', side_effect=KeyboardInterrupt() if interrupt == 'backoff' else None) as sleep:
                     code = hybrid_bench.main()
+                # Snapshots come from inside DELETE; assert here so a violation fails in the test thread.
+                for sid, saved in before_delete:
+                    self.assertEqual([row['stage'] for row in saved[-2:]], ['checker', 'equivalence'])
+                    self.assertEqual(saved[-2]['checker_exit_code'], checker_code)
+                    self.assertEqual(json.loads(saved[-2]['result_json']), self.checker_result(checker_code))
+                    self.assertEqual(saved[-1]['checker_exit_code'], checker_code)
                 path = next(root.glob('hybrid-bench-*.jsonl'))
                 rows = [json.loads(line) for line in path.read_text().splitlines()]
                 markdown = path.with_suffix('.md').read_text()
@@ -590,6 +596,64 @@ class CleanupTests(unittest.TestCase):
                     self.assertIn('Release failed (checker, append_chain)', markdown)
                     self.assertIn('Node sessions that may remain: checker-2', markdown)
                     self.assertEqual(sleeps, [mock.call(.5), mock.call(1.0)])
+
+    # A fresh-path DELETE outage retains both checks and reports only the fresh session, for passing and failing verdicts.
+    def test_checker_result_survives_fresh_delete(self):
+        for checker_code in (0, 3):
+            with self.subTest(checker_code=checker_code):
+                code, rows, markdown, attempts, sessions, _, sleeps = self.run_fake_node('permanent', checker_code, 'checker-1')
+                self.assertEqual(code, 2)
+                self.assertEqual([row['check_mode'] for row in rows if row['stage'] == 'equivalence'], ['fresh', 'append_chain'])
+                self.assertEqual(rows[-1]['checker_exit_codes'], [checker_code] * 2)
+                self.assertTrue(rows[-1]['release_failed'])
+                error, = [row for row in rows if row['stage'] == 'release_error']
+                self.assertEqual((error['mode'], error['exception_type'], error['node_session_ids']), ('fresh', 'RemoteDisconnected', ['checker-1']))
+                self.assertEqual(sessions, ['checker-1'])
+                self.assertEqual(attempts, {'checker-1': 3, 'checker-2': 1})
+                self.assertEqual(sleeps, [mock.call(.5), mock.call(1.0)])
+                self.assertIn('Release failed (checker, fresh)', markdown)
+
+    # Ctrl-C in DELETE or retry backoff keeps the checker outcome and leftover ID in the journal/archive, and retains exit 130.
+    def test_interrupt_during_checker_release(self):
+        for sid in ('checker-1', 'checker-2'):
+            for interrupt in ('delete', 'backoff'):
+                with self.subTest(sid=sid, interrupt=interrupt):
+                    code, rows, markdown, attempts, sessions, _, sleeps = self.run_fake_node('permanent', failed_session=sid, interrupt=interrupt)
+                    self.assertEqual(code, 130)
+                    count = 1 if sid == 'checker-1' else 2
+                    self.assertEqual(len([row for row in rows if row['stage'] == 'equivalence']), count)
+                    self.assertEqual(rows[-1]['checker_exit_codes'], [0] * count)
+                    self.assertEqual(rows[-1]['status'], 'interrupted')
+                    self.assertTrue(rows[-1]['release_failed'])
+                    error, = [row for row in rows if row['stage'] == 'release_error']
+                    self.assertEqual((error['exception_type'], error['session_id'], error['node_session_ids']), ('KeyboardInterrupt', sid, [sid]))
+                    self.assertFalse(error['node_sessions_unknown'])
+                    self.assertEqual(sessions, [sid])
+                    self.assertEqual(attempts[sid], 1)
+                    self.assertEqual(sleeps, [mock.call(.5)] if interrupt == 'backoff' else [])
+                    self.assertIn('Node sessions that may remain: ' + sid, markdown)
+
+    # Mode release restores its 30 s per-attempt budget; checker DELETE keeps 10 s. Interrupts propagate with honest unknown node IDs.
+    def test_release_timeout_and_mode_interrupt(self):
+        config = dict(clients={'client-secret': dict(prefill_token='node-secret')})
+        for scope, timeout in (('checker', 10), ('mode', 30)):
+            for interrupted in (False, True):
+                with self.subTest(scope=scope, interrupted=interrupted):
+                    rows = []
+                    with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', side_effect=KeyboardInterrupt() if interrupted else None) as delete:
+                        if interrupted:
+                            with self.assertRaises(KeyboardInterrupt):
+                                hybrid_bench.release_session('http://fixture', 'session', 'client-secret', config, rows.append, scope, 'offload')
+                        else:
+                            self.assertTrue(hybrid_bench.release_session('http://fixture', 'session', 'client-secret', config, rows.append, scope, 'offload'))
+                    self.assertEqual(delete.call_args.kwargs['timeout'], timeout)
+                    if interrupted:
+                        row, = rows
+                        self.assertEqual(row['exception_type'], 'KeyboardInterrupt')
+                        self.assertEqual(row['node_session_ids'], ['session'] if scope == 'checker' else [])
+                        self.assertEqual(row['node_sessions_unknown'], scope == 'mode')
+                    else:
+                        self.assertEqual(rows, [])
 
     # A dropped connection retries once; success or 404 after a lost acknowledgement leaves no release-error row or failure exit.
     def test_transient_delete_recovers(self):
@@ -640,7 +704,7 @@ class CleanupTests(unittest.TestCase):
             with mock.patch.object(Path, 'open', opened):
                 with self.assertRaisesRegex(OSError, 'injected partial write'):
                     bundle(root, 'fixture', [dict(stage='summary', status='passed', skipped=0, aborted=0, exit_code=0)], {}, {})
-            self.assertEqual(path.read_text(), saved)
+            self.assertEqual(path.read_text(), saved, 'durable checker journal changed')
             self.assertFalse((root / 'fixture.tar.gz').exists())
 
     # Proxy release diagnostics retain known node IDs; malformed responses fall back to the HTTP error without hiding the checker result.

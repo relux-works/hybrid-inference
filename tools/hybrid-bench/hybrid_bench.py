@@ -220,11 +220,11 @@ def release_session(base, sid, token, config, record, scope, mode):
                                      headers={'Authorization': 'Bearer ' + token})
     try:
         def delete():
-            with urllib.request.urlopen(request, timeout=10):
+            with urllib.request.urlopen(request, timeout=30 if scope == 'mode' else 10):
                 pass
         release_retry(delete)
         return True
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
         secrets = [token, config.get('client_credential', ''), config.get('decode_token', '')]
         secrets += list(config['clients']) + [c['prefill_token'] for c in config['clients'].values()]
         diagnostic = release_diagnostic(error, secrets)
@@ -247,6 +247,8 @@ def release_session(base, sid, token, config, record, scope, mode):
         record(dict(stage='release_error', status='failed', scope=scope, mode=mode,
                     session_id=sid, node_session_ids=ids, node_sessions_unknown=scope == 'mode' and not ids,
                     **diagnostic))
+        if isinstance(error, KeyboardInterrupt):
+            raise
         return False
 
 
