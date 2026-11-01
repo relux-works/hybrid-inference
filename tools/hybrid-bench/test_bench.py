@@ -318,7 +318,7 @@ class BenchmarkTests(unittest.TestCase):
 
 
 class ProcessControlTests(unittest.TestCase):
-    # The startup deadline is opt-in per launch and bounded; bad values refuse before any state change.
+    # The startup deadline has a 600 s default, can be set per launch and is bounded; bad values refuse before any state change.
     def test_startup_timeout_bounds(self):
         self.assertEqual(manage.parser().parse_args(['client', '--state', 'fixture']).startup_timeout, 600)
         self.assertEqual(manage.parser().parse_args(['node', '--state', 'fixture', '--startup-timeout', '1200']).startup_timeout, 1200)
@@ -338,10 +338,11 @@ class ProcessControlTests(unittest.TestCase):
             with mock.patch.object(common, 'output', side_effect=common.subprocess.CalledProcessError(1, 'ps')):
                 self.assertIsNone(common.process_identity(1234))
 
-    # Stopping an owned child reaps it, on the Linux path and on the ps path used on macOS (exercised here with this
-    # host's ps); before the fix the ps path saw the zombie as still running and refused with "has not stopped".
+    # Stopping an owned child reaps it, on the ps path used on macOS (any host with ps) and on the Linux /proc path where
+    # /proc exists; before the fix the ps path saw the zombie as still running and refused with "has not stopped".
     def test_control_reaps_owned_child(self):
-        for system in ('Linux', 'Darwin'):
+        # the Linux path needs /proc, the ps path runs on any host with ps
+        for system in ('Darwin',) + (('Linux',) if Path('/proc/self/stat').exists() else ()):
             with self.subTest(system=system), tempfile.TemporaryDirectory() as directory, \
                     mock.patch.object(common.platform, 'system', return_value=system):
                 child = common.subprocess.Popen(['python3', '-c', 'import time; time.sleep(60)'])
