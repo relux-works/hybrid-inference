@@ -676,6 +676,10 @@ static void test_prompt_reuse_threshold(testing & t) {
             t.assert_true("first required cell present", expected - 1 < threshold);
             t.assert_true("first required cell missing", !(expected < threshold));
         }
+        for (llama_pos next : {0, 1, 2, 4, 10}) {
+            t.assert_equal("one-token SWA window", std::max(1, next + (has_new_tokens ? 1 : 0)),
+                           server_prompt_reuse_threshold(next, 1, has_new_tokens));
+        }
         // Dense and recurrent models keep the old threshold, including its zero boundary.
         for (llama_pos next : {0, 1, 2, 4, 10}) {
             t.assert_equal("non-SWA unchanged", std::max(0, next - (has_new_tokens ? 0 : 1)),

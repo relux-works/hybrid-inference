@@ -89,8 +89,8 @@ class BenchmarkTests(unittest.TestCase):
                 identity = common.model_identity(model.name)
             self.assertEqual(plan['kv_bytes_per_token'], full)
             self.assertEqual(plan['window_kv_bytes_per_token'], window_row)
-            # Transfer sizing includes stale ring cells and their physical indices, not just unmasked positions.
-            self.assertEqual(plan['window_state_bytes'], ((window + 256 + 255) // 256) * 256 * (window_row + 28) + 16)
+            # Masked ring rows carry metadata only; K/V is bounded by the retained window.
+            self.assertEqual(plan['window_state_bytes'], window * window_row + ((window + 256 + 255) // 256) * 256 * 28 + 16)
             self.assertEqual(plan['recurrent_state_bytes'], 0)
             self.assertEqual(identity['model_layout']['sliding_window'], window)
             fixed = plan['window_state_bytes']
@@ -103,6 +103,36 @@ class BenchmarkTests(unittest.TestCase):
             self.assertGreater((bound + 1) * (full + 24) + fixed + 1024**2, 512 * 1024**2)
             with self.assertRaisesRegex(ValueError, 'invalid native delta geometry'):
                 extend_chunk_limit(full, 0, 511 * 1024**2)
+
+    # Production q8_0 geometries must leave room for a nonempty full-attention chunk under 512 MiB.
+    def test_swa_production_geometry_budget(self):
+        for arch, window, count, full_layers, heads, dim, full_heads, full_dim, row in [
+                ('gemma4', 1024, 60, 10, 16, 256, 4, 512, 435200),
+                ('muse-glimmer', 2048, 52, 13, 2, 128, 2, 128, 21216)]:
+            meta = self.swa_metadata(arch)
+            pattern = [(i + 1) % (count // full_layers) != 0 for i in range(count)]
+            meta.update({arch + '.' + key: value for key, value in dict(
+                block_count=count, **{'attention.head_count': 32,
+                'attention.head_count_kv': [heads if sliding else full_heads for sliding in pattern],
+                'attention.key_length': full_dim, 'attention.value_length': full_dim,
+                'attention.key_length_swa': dim, 'attention.value_length_swa': dim,
+                'attention.sliding_window': window, 'attention.sliding_window_pattern': pattern,
+                'attention.shared_kv_layers': 0}).items()})
+            with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+                plan = common.context_plan(model.name, dict(available_memory_bytes=512 * common.GIB,
+                    available_vram_bytes=96 * common.GIB), 8192)
+            self.assertEqual(plan['window_kv_bytes_per_token'], row)
+            fixed = window * row + (window + 256) * 28 + 16
+            self.assertEqual(plan['window_state_bytes'], fixed)
+            bound = extend_chunk_limit(plan['kv_bytes_per_token'], 0, fixed)
+            self.assertGreater(bound, 0)
+            self.assertLessEqual(bound * (plan['kv_bytes_per_token'] + 24) + fixed + 1024**2, 512 * 1024**2)
+            # An actually oversized window must still refuse rather than dropping the fixed-state budget.
+            meta[arch + '.attention.sliding_window'] = window * 16
+            with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+                with self.assertRaisesRegex(common.Refusal, 'window exceeds delta budget'):
+                    common.context_plan(model.name, dict(available_memory_bytes=512 * common.GIB,
+                        available_vram_bytes=96 * common.GIB), 8192)
 
     # Read both architecture prefixes and a real GGUF boolean mask; per-layer head counts change allocated row sums.
     def test_swa_gguf_metadata_reader_and_per_layer_heads(self):

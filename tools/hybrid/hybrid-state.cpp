@@ -1,6 +1,7 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
 #include "llama-model.h"
+#include "llama-memory.h"
 #include "hash/xxhash/xxhash.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
@@ -235,8 +236,9 @@ void prefill(llama_context * ctx, const std::vector<llama_token> & tokens, size_
 }
 
 std::string save_state(llama_context * ctx) {
-    std::string state(llama_state_seq_get_size(ctx, 0), '\0');
-    require(!state.empty() && llama_state_seq_get_data(ctx, reinterpret_cast<uint8_t *>(&state[0]), state.size(), 0) == state.size(), "cannot save state");
+    const auto flags = llama_get_model(ctx)->hparams.swa_type == LLAMA_SWA_TYPE_STANDARD ? LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT : 0;
+    std::string state(llama_state_seq_get_size_ext(ctx, 0, flags), '\0');
+    require(!state.empty() && llama_state_seq_get_data_ext(ctx, reinterpret_cast<uint8_t *>(&state[0]), state.size(), 0, flags) == state.size(), "cannot save state");
     return state;
 }
 
@@ -244,7 +246,8 @@ void load_state(llama_context * ctx, const std::string & state) {
     if (state.empty()) {
         llama_memory_clear(llama_get_memory(ctx), true);
     } else {
-        require(llama_state_seq_set_data(ctx, reinterpret_cast<const uint8_t *>(state.data()), state.size(), 0) == state.size(), "cannot load state");
+        const auto flags = llama_get_model(ctx)->hparams.swa_type == LLAMA_SWA_TYPE_STANDARD ? LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT : 0;
+        require(llama_state_seq_set_data_ext(ctx, reinterpret_cast<const uint8_t *>(state.data()), state.size(), 0, flags) == state.size(), "cannot load state");
     }
 }
 

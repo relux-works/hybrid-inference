@@ -91,6 +91,18 @@ static std::string cache_record(llama_kv_cache * cache, const llama_hparams & hp
     return out.data;
 }
 
+static std::string window_record(llama_kv_cache * cache, const llama_hparams & hp, const std::vector<int> & positions, uint32_t streams = 1) {
+    const auto legacy = cache_record(cache, hp, positions, streams);
+    writer out;
+    out.scalar<uint32_t>(streams | 0xc0000000u);
+    out.scalar<uint32_t>(positions.size());
+    if (positions.empty()) { return out.data; }
+    out.scalar<uint32_t>(cache->get_size());
+    out.scalar<uint32_t>(positions.size());
+    for (uint32_t i = 0; i < positions.size(); ++i) { out.scalar<uint32_t>(i); }
+    return out.data + legacy.substr(8);
+}
+
 static std::string snapshot(llama_kv_cache_iswa & cache, int seq = -1) {
     writer out;
     cache.get_base()->state_write(out, seq, 0);
@@ -144,9 +156,10 @@ static void run(llm_arch arch, bool unified) {
                              false, false, false, unified, 512, 2, 256, nullptr, nullptr,
                              [&](int32_t il) { return hp.has_kv(il) ? -1 : 6 - (hp.is_swa(il) ? 2 : 1); }, nullptr);
     auto record = [&](const std::vector<int> & base, const std::vector<int> & window) {
-        return cache_record(cache.get_base(), hp, base) + cache_record(cache.get_swa(), hp, window);
+        return cache_record(cache.get_base(), hp, base) + window_record(cache.get_swa(), hp, window);
     };
-    const auto prefix = record({0, 1, 2, 3, 4, 5, 6, 7}, {6, 7, 4, 5});
+    const auto prefix = cache_record(cache.get_base(), hp, {0, 1, 2, 3, 4, 5, 6, 7}) +
+                        cache_record(cache.get_swa(), hp, {6, 7, 4, 5});
     for (int seq : {0, 1}) {
         reader input(prefix);
         cache.state_read(input, seq, 0);
@@ -172,6 +185,16 @@ static void run(llm_arch arch, bool unified) {
         require(snapshot(cache, 1) == neighbor, "rejected import changed neighbor");
         std::cout << "PASS " << name << '\n';
     };
+    // Both compacted v0 and full-payload v1 transfers refuse without changing either sequence.
+    const auto legacy = cache_record(cache.get_base(), hp, {8, 9, 10}) + cache_record(cache.get_swa(), hp, {9, 10, 7, 8});
+    auto previous = good;
+    const uint32_t previous_version = 0x80000001u;
+    const size_t window_offset = cache_record(cache.get_base(), hp, {8, 9, 10}).size();
+    memcpy(&previous[window_offset], &previous_version, sizeof(previous_version));
+    for (bool validate : {false, true}) {
+        reject("swa_legacy_compacted_record_refused", legacy, 11, validate, -1, "unsupported sliding-window record version");
+        reject("swa_previous_layout_version_refused", previous, 11, validate, -1, "unsupported sliding-window record version");
+    }
     // Each malformed position set or short buffer must fail before changing either cache.
     reject("window_endpoint_mismatch", record({8, 9, 10}, {6, 7, 8, 9}), 11, true);
     reject("window_duplicate_position", record({8, 9, 10}, {7, 8, 9, 9}), 11, true);
@@ -186,9 +209,9 @@ static void run(llm_arch arch, bool unified) {
         memcpy(&changed[at], &value, sizeof(value));
         return changed;
     };
-    reject("window_invalid_source_sequence", changed32(window_at + 16, -1), 11, true);
-    reject("window_layer_count_mismatch", changed32(window_at + 8 + 4 * 12 + 4, 999), 11, true);
-    reject("window_key_type_mismatch", changed32(window_at + 8 + 4 * 12 + 16, GGML_TYPE_F32), 11, true);
+    reject("window_invalid_source_sequence", changed32(window_at + 40, -1), 11, true);
+    reject("window_layer_count_mismatch", changed32(window_at + 32 + 4 * 12 + 4, 999), 11, true);
+    reject("window_key_type_mismatch", changed32(window_at + 32 + 4 * 12 + 16, GGML_TYPE_F32), 11, true);
     // Inject after all full-cache writes are queued and window metadata is replaced; discard must preserve physical state.
     reject("failed_apply_restores_both_caches_exactly", good, 11, false, 2 * cache.get_base()->get_layer_ids().size() + 1);
     reject("failed_apply_truncation_restores_exactly", good.substr(0, good.size() - 1), 11, false);
@@ -242,7 +265,7 @@ static void run(llm_arch arch, bool unified) {
     cache.state_write_range(delta, 0, 8, 11, 0);
     const auto window = cache_record(cache.get_swa(), hp, {9, 10, 7, 8}, cache.get_swa()->get_n_stream());
     writer physical;
-    physical.scalar<uint32_t>(cache.get_swa()->get_n_stream() | 0x80000000u);
+    physical.scalar<uint32_t>(cache.get_swa()->get_n_stream() | 0xc0000000u);
     physical.scalar<uint32_t>(4);
     physical.scalar<uint32_t>(cache.get_swa()->get_size());
     physical.scalar<uint32_t>(4);
@@ -279,6 +302,7 @@ static void run(llm_arch arch, bool unified) {
     bad_layout("swa_layout_index_out_of_bounds", 16, cache.get_swa()->get_size(), "invalid sliding-window cell index");
     bad_layout("swa_layout_duplicate_index", 20, 0, "invalid sliding-window cell index");
     bad_layout("swa_layout_incomplete_window", 4, 3, "incomplete sliding-window layout");
+    bad_layout("swa_layout_negative_position", 32, UINT32_MAX, "invalid sliding-window position");
     bad_layout("swa_layout_position_out_of_range", 32, 11, "cache range position mismatch");
     bad_layout("swa_layout_duplicate_position", 32, 10, "cache range position mismatch");
     // A failure after restoring the physical allocator head rolls back cells, head and deferred tensor writes.
@@ -309,6 +333,57 @@ static void run(llm_arch arch, bool unified) {
     { reader input(exported); cache.state_read_append(input, 0, 8, 11, false); }
     require(snapshot(cache, 1) == neighbor, "physical import changed neighbor");
     std::cout << "PASS swa_physical_layout_roundtrip_and_refusals\n";
+    // Ordinary sequence and PARTIAL_ONLY records retain the independent legacy byte layout.
+    writer ordinary;
+    cache.state_write(ordinary, 0, 0);
+    const auto legacy_window = cache_record(cache.get_swa(), hp, {9, 10, 7, 8}, cache.get_swa()->get_n_stream());
+    const auto legacy_sequence = cache_record(cache.get_base(), hp, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, cache.get_base()->get_n_stream()) + legacy_window;
+    require(ordinary.data == legacy_sequence, "swa_generic_state_legacy_bytes");
+    writer partial, legacy_partial;
+    cache.state_write(partial, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    cache.get_swa()->state_write(legacy_partial, 0, 0);
+    require(partial.data == legacy_window && partial.data == legacy_partial.data, "swa_checkpoint_legacy_bytes");
+    std::cout << "PASS swa_generic_and_checkpoint_legacy_bytes\n";
+
+    // A partially freed ring has indices [7,11), so prefix placement cannot pass this round trip.
+    cache.clear(true);
+    fresh.clear(true);
+    std::vector<int> positions(11);
+    std::iota(positions.begin(), positions.end(), 0);
+    const auto nonprefix = cache_record(cache.get_base(), hp, positions) + cache_record(cache.get_swa(), hp, positions);
+    { reader input(nonprefix); cache.state_read(input, 0, 0); }
+    cache.get_swa()->seq_rm(0, 0, 7);
+    writer nonprefix_delta, source_layout, imported_layout;
+    cache.state_write_range(nonprefix_delta, 0, 0, 11, 0);
+    { reader input(nonprefix_delta.data); fresh.state_read_append(input, 0, 0, 11, false); }
+    cache.get_swa()->state_write(source_layout, 0, LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT);
+    fresh.get_swa()->state_write(imported_layout, 0, LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT);
+    require(source_layout.data == imported_layout.data, "swa_nonprefix_physical_indices");
+    require(fresh.get_swa()->get_cells(0).seq_has(7, 0) && !fresh.get_swa()->get_cells(0).seq_has(0, 0),
+            "swa_nonprefix_physical_indices");
+    std::cout << "PASS swa_nonprefix_physical_indices\n";
+
+    // Hundreds of masked rows add metadata but no tensor bytes, with the retained four rows unchanged.
+    cache.clear(true);
+    positions.resize(273);
+    std::iota(positions.begin(), positions.end(), 0);
+    const auto occupied = cache_record(cache.get_base(), hp, positions) + cache_record(cache.get_swa(), hp, positions);
+    { reader input(occupied); cache.state_read(input, 0, 0); }
+    writer sparse;
+    cache.get_swa()->state_write(sparse, 0, LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT);
+    const size_t layers = cache.get_swa()->get_layer_ids().size();
+    size_t row_bytes = 0;
+    for (auto il : cache.get_swa()->get_layer_ids()) {
+        row_bytes += ggml_row_size(GGML_TYPE_Q8_0, hp.n_embd_k_gqa(il)) + ggml_row_size(GGML_TYPE_Q8_0, hp.n_embd_v_gqa(il));
+    }
+    const size_t expected_bytes = 32 + 24 * layers + 16 * positions.size() + 4 * row_bytes +
+                                  4 * (cache.get_swa()->get_n_stream() - 1);
+    require(sparse.data.size() == expected_bytes, "swa_masked_rows_metadata_only");
+    writer compact;
+    cache.get_swa()->state_write(compact, 0, 0);
+    require(sparse.data.size() - compact.data.size() == 8 + 16 * positions.size() - 4 * 12,
+            "swa_masked_rows_metadata_only");
+    std::cout << "PASS swa_masked_rows_metadata_only bytes=" << sparse.data.size() << '\n';
 }
 
 static void tiny_model(const char * path) {
@@ -364,7 +439,6 @@ static void tiny_model(const char * path) {
     require(ok && close_result == 0, "cannot write tiny model");
 }
 
-// Real attention must match the same prefill partition after fresh and nonzero-prefix imports.
 static void cells(llama_context * ctx, const char * name, int end) {
     auto * memory = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx));
     require(memory, "tiny model did not allocate SWA cache");
@@ -396,12 +470,54 @@ static std::string physical_state(llama_context * ctx) {
     return out.data;
 }
 
+// Another slot may reuse masked cells without preventing an ordinary checkpoint or slot restore.
+static void unified_restore(llama_model * model) {
+    for (int depth : {10, 256, 300, 512, 520, 600}) {
+        for (llama_state_seq_flags flags : {LLAMA_STATE_SEQ_FLAGS_NONE, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY}) {
+            auto cp = llama_context_default_params();
+            cp.n_ctx = 1024;
+            cp.n_batch = cp.n_ubatch = 256;
+            cp.n_seq_max = 2;
+            cp.kv_unified = true;
+            cp.swa_full = false;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+            cp.n_threads = cp.n_threads_batch = 2;
+            hybrid::context_ptr ctx(llama_init_from_model(model, cp));
+            require(bool(ctx), "unified context allocation failed");
+            hybrid::prefill(ctx.get(), std::vector<llama_token>(depth, 3), 0);
+            std::string checkpoint(llama_state_seq_get_size_ext(ctx.get(), 0, flags), '\0');
+            require(llama_state_seq_get_data_ext(ctx.get(), (uint8_t *) checkpoint.data(), checkpoint.size(), 0, flags) == checkpoint.size(), "checkpoint save failed");
+            llama_batch batch = llama_batch_init(3, 0, 1);
+            for (int i = 0; i < 3; ++i) {
+                batch.token[i] = 4;
+                batch.pos[i] = i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 1;
+                batch.logits[i] = i == 2;
+            }
+            batch.n_tokens = 3;
+            const int result = llama_decode(ctx.get(), batch);
+            llama_batch_free(batch);
+            require(result == 0, "neighbor decode failed");
+            auto * memory = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+            const auto neighbor = snapshot(*memory, 1);
+            require(llama_state_seq_set_data_ext(ctx.get(), (const uint8_t *) checkpoint.data(), checkpoint.size(), 0, flags) == checkpoint.size(),
+                    "swa_unified_multislot_checkpoint_restore");
+            require(snapshot(*memory, 1) == neighbor, "swa_unified_restore_preserves_neighbor");
+            std::cout << "PASS swa_unified_multislot_checkpoint_restore depth=" << depth << " flags=" << flags << " bytes=" << checkpoint.size() << '\n';
+        }
+    }
+}
+
+// Real attention must match the same prefill partition after fresh and nonzero-prefix imports.
 static void inference(const char * path) {
     tiny_model(path);
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
     hybrid::model_ptr model(llama_model_load_from_file(path, mp));
     require(bool(model), "cannot load tiny model");
+    unified_restore(model.get());
     bool all_exact = true;
     for (int depth : {3, 4, 5, 19, 273, 510, 512, 514, 531}) {
         for (bool chain : {false, true}) {
