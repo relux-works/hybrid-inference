@@ -1,3 +1,6 @@
+// Modified from alesha-pro/llama.cpp-mirai-s fdb1e815 by hybrid-inference: sm_80/HIP/MUSA guards.
+// The companion ggml-cuda.cu adds an Ampere gate for Mirai ops; see tools/mirai-s/NOTICE.
+//
 // Mirai S linears on CUDA, ported from the kernels of Mirai's vLLM plugin (mirai_s 0.2.1, Apache-2.0) to ggml: f32
 // activations in and out, weights in the GGUF layout of tools/mirai-s/convert_mirai_s_to_gguf.py, the row scale fused
 // into the output. The math and layouts are documented in ggml-cpu/mirai-s.cpp, the reference implementation.

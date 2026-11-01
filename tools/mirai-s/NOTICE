@@ -1,5 +1,7 @@
 Mirai S support in this fork
 
+Modified from alesha-pro/llama.cpp-mirai-s fdb1e815 by hybrid-inference: add port provenance and change notices.
+
 ggml/src/ggml-cuda/mirai-s.cu and ggml/src/ggml-cpu/mirai-s.cpp port the math and CUDA kernels of Mirai Labs'
 mirai_s vLLM plugin, version 0.2.1, shipped in the vllm/ folder of
 https://huggingface.co/trymirai/Qwen3.8-27B-S-experimental under the Apache License 2.0 (text in

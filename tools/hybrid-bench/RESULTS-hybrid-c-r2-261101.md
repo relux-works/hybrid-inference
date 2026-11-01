@@ -59,7 +59,7 @@ Self-review used scope, security, general and tests checks, plus inspection of b
 
 ## GPU-host Mirai study commands (unrun)
 
-Run from this combined branch on the GPU host, using already verified local weights. `build-study-mirai-cuda` is a CUDA build of the combined tree, not the agents1 CPU build. Both client `--build-dir` and node `--node-build-dir` below point to it. Require an admitted Ampere-or-newer NVIDIA device, existing CUDA toolchain, available build slot and exclusive GPU use. Record toolchain/driver versions and build identities with the study. Complete r1's moderate-context greedy-token parity against alesha-pro before admitting Mirai measurement arms. This run does not establish that gate.
+Run from this combined branch on the GPU host, using already verified local weights. `build-study-mirai-cuda` is a CUDA build of the combined tree, not the agents1 CPU build. Both client `--build-dir` and node `--node-build-dir` below point to it. Require an admitted Ampere-or-newer NVIDIA device, existing CUDA toolchain, available build slot and exclusive GPU use. Record toolchain/driver versions and build identities with the study. The commands below enforce compute capability >= 8.0 before building, then collect and compare all ten greedy parity cases before any Mirai study arm. The orchestrator measured 10/10 identical cases on 2026-11-01 at the original combined head `5464a4fa`; see [the measured setup](../mirai-s/README.md#measured-port-parity-2026-11-01). That result is supplied evidence, not a GPU run by hybrid-c-r4. Requalify the current build with the block below.
 
 These are r27's fetch/pin, prepare D20/N32768/M2048, shared BF16 reference, local controls, three sequential Mirai imported arms and seed42 report steps, with r28 receipts and default delta deletion. Use a fresh study directory. MTP remains disabled: scorer uses the unchanged default `load_mtp=false`, prefill explicitly disables it, and the client launcher retains `--spec-type none`. Imported scoring needs room for two client contexts and sequential schedule probes. At the default 20 documents/chunk4096, r28 requires about 6.96875 GiB free for a pending imported arm; shared BF16 reference payloads add about 18.947 GiB at V248320. Keep the resulting book pins, immutable local model/build files and shared D references for resume. Do not add `--keep-deltas` unless its larger disk budget is available.
 
@@ -79,6 +79,19 @@ Q4_MODEL=/models/Qwen3.8-27B-Q4_K_M.gguf
 MIRAI=/models/Qwen3.8-27B-S-mirai.gguf
 STUDY="$STUDY_HOME/qwen27b"
 D_SHA=$(sha256sum "$D_MODEL" | cut -d ' ' -f 1)
+FORK="$STUDY_HOME/mirai-fork"
+FORK_SHA=fdb1e815dbbad220c2f41b94535049fdbd20c3ca
+PARITY=tools/mirai-s/parity.py
+
+# Reject unsupported or unknown devices before either CUDA build.
+if ! nvidia-smi --query-gpu=compute_cap --format=csv,noheader > "$STUDY_HOME/compute-cap.txt"; then
+  echo "STOP: cannot query NVIDIA compute capability; Mirai requires >= 8.0." >&2
+  exit 1
+fi
+if ! awk 'NF != 1 || $1 !~ /^[0-9]+[.][0-9]+$/ || ($1 + 0) < 8.0 { bad=1 } END { exit (NR == 0 || bad) }' "$STUDY_HOME/compute-cap.txt"; then
+  echo "STOP: Mirai requires compute capability >= 8.0 on every enumerated GPU." >&2
+  exit 1
+fi
 
 git rev-parse HEAD > "$STUDY_HOME/source-head.txt"
 git merge-base --is-ancestor eed20cace1c42a3ec094b84a7410a4d3c7c4ffb6 HEAD
@@ -88,11 +101,64 @@ nice -n 10 cmake -S . -B "$BUILD" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=nati
 nice -n 10 cmake --build "$BUILD" -j4 --target llama-server llama-hybrid-score llama-hybrid-prefill llama-hybrid-check-identity
 sha256sum "$D_MODEL" "$Q8_MODEL" "$Q4_MODEL" "$MIRAI" > "$STUDY_HOME/model-sha256.txt"
 nvidia-smi > "$STUDY_HOME/nvidia-smi.txt"
+
+# Use a fresh pinned fork checkout; the documentation-only d1c5a693 is not needed for parity.
+git clone --filter=blob:none --no-checkout https://github.com/alesha-pro/llama.cpp-mirai-s "$FORK"
+git -C "$FORK" checkout --detach "$FORK_SHA"
+test "$(git -C "$FORK" rev-parse HEAD)" = "$FORK_SHA"
+nice -n 10 cmake -S "$FORK" -B "$FORK/build-parity" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native \
+  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF
+nice -n 10 cmake --build "$FORK/build-parity" -j4 --target llama-server
 "$BUILD/bin/llama-hybrid-check-identity" "$D_MODEL" > "$STUDY_HOME/bf16-identity.json"
 "$BUILD/bin/llama-hybrid-check-identity" "$MIRAI" > "$STUDY_HOME/mirai-identity.json"
 
 # Fetch books on the GPU host and retain the resulting pinned manifest.
 tools/hybrid-bench/fetch --manifest tools/hybrid-bench/gutenberg_sources.json --output "$STUDY_HOME/books"
+
+# Both servers use the same GGUF, context, q8_0 KV, flash attention, one slot and MTP off.
+PARITY_PID=
+cleanup_parity() {
+  if [ -n "$PARITY_PID" ]; then
+    kill "$PARITY_PID" 2>/dev/null || :
+    wait "$PARITY_PID" 2>/dev/null || :
+    PARITY_PID=
+  fi
+}
+trap cleanup_parity EXIT
+trap 'exit 1' INT TERM
+for side in fork port; do
+  case "$side" in
+    fork) PARITY_BIN="$FORK/build-parity/bin/llama-server"; PARITY_INPUT=(--text-dir "$STUDY_HOME/books");;
+    port) PARITY_BIN="$BUILD/bin/llama-server"; PARITY_INPUT=(--reuse "$STUDY_HOME/parity-fork.json");;
+  esac
+  GGML_CUDA_FA_VEC_GQA=0 GGML_CUDA_GDN_CHUNKED=0 LLAMA_SERVER_TEXT_ALIGN=0 \
+    nice -n 10 "$PARITY_BIN" -m "$MIRAI" -ngl 999 -fa on -ctk q8_0 -ctv q8_0 -c 20480 -np 1 \
+    --spec-type none --host 127.0.0.1 --port 8120 --no-webui > "$STUDY_HOME/parity-$side-server.log" 2>&1 &
+  PARITY_PID=$!
+  printf '%s\n' "$PARITY_PID" > "$STUDY_HOME/parity-$side.pid"
+  PARITY_READY=0
+  for attempt in $(seq 1 600); do
+    kill -0 "$PARITY_PID"
+    if curl --silent --fail http://127.0.0.1:8120/health > /dev/null; then PARITY_READY=1; break; fi
+    sleep 1
+  done
+  if [ "$PARITY_READY" != 1 ]; then echo "STOP: parity server $side was not ready." >&2; exit 1; fi
+  if ! python3 "$PARITY" collect --url http://127.0.0.1:8120 --side "$side" \
+    --out "$STUDY_HOME/parity-$side.json" "${PARITY_INPUT[@]}" > "$STUDY_HOME/parity-$side.log" 2>&1; then
+    echo "STOP: parity collection failed for $side; no Mirai study arm is admitted." >&2
+    exit 1
+  fi
+  cleanup_parity
+done
+trap - EXIT INT TERM
+if ! python3 "$PARITY" compare --a "$STUDY_HOME/parity-fork.json" --b "$STUDY_HOME/parity-port.json" \
+  > "$STUDY_HOME/parity-compare.txt" 2>&1; then
+  cat "$STUDY_HOME/parity-compare.txt"
+  echo "STOP: Mirai parity failed; no Mirai study arm is admitted." >&2
+  exit 1
+fi
+cat "$STUDY_HOME/parity-compare.txt"
+
 nice -n 10 "$BUILD/bin/llama-server" -m "$D_MODEL" -ngl 999 -c 35072 -np 1 \
   --host 127.0.0.1 --port 8099 --no-webui > "$STUDY_HOME/tokenizer.log" 2>&1 &
 TOKENIZER_PID=$!
