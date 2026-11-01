@@ -158,7 +158,7 @@ int main(int argc, char ** argv) {
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = gpu_layers;
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], mp));
-        if (!model || !llama_model_is_hybrid(model.get())) { throw std::runtime_error("a supported hybrid model is required"); }
+        if (!model) { throw std::runtime_error("a supported hybrid model is required"); }
         const json layout = hybrid::model_layout(model.get());
         const std::string fingerprint = hybrid::layout_fingerprint(layout);
         auto cp = llama_context_default_params();
@@ -169,6 +169,7 @@ int main(int argc, char ** argv) {
         cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         cp.offload_kqv = gpu_layers > 0;
+        cp.swa_full = false;
         hybrid::context_ptr ctx(llama_init_from_model(model.get(), cp));
         if (!ctx) { throw std::runtime_error("cannot create context"); }
         const std::string empty_state = hybrid::save_state(ctx.get());

@@ -21,7 +21,7 @@ flock "$LOCK" "$CMAKE" -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_U
 df -B1 --output=avail .
 du -sb build
 # JOBS=2 keeps a shared host responsive; use JOBS=$(nproc) on a dedicated one.
-flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-server
+flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-hybrid-check-swa llama-server
 du -sb build
 ```
 
@@ -119,3 +119,16 @@ build/bin/llama-hybrid-check-distributions "$MODEL" "$ARTIFACTS/deep/deep.tokens
 `test_limits.py` checks LRU replay, atomic impossible-budget rejection, concurrent snapshot/extend pinning, all-pinned refusal and disconnect release, inclusive request limits, invalid CLI arguments, and metrics. `--case identity` compares two actual local quantizations. `--case deep` writes the node's 39999-token delta plus a 40000-token prompt; the distribution checker imports that exact delta, checks independent same-partition 64/64 and teacher-forced whole-prompt KL/top-1, and reports free-running divergence. Existing golden continuations remain checked when present; a new HTTP fixture obtains its continuation from the imported context and compares it with independently computed references. Header fixtures accept an exact range/absolute byte budget and reject one byte over in both writer and reader. Long contexts use the largest bounded worst-case-ID chunk rather than assuming a whole context fits one header.
 
 Results and finite limits for the node-limits run are in [RESULTS-hybrid-a-r10-261031.md](RESULTS-hybrid-a-r10-261031.md). Hash and remove native state dumps after validation; keep only content-free numbers, manifests and logs for review.
+
+## Sliding-window models
+
+The prototype admits dense `qwen35`, `gemma4` and `muse-glimmer`; unknown architectures refuse. Gemma 4 and Muse Glimmer use full-attention range KV plus a replacement of the entire live sliding window, rather than recurrent state. [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) records upstream layout, shared layers, validation and rollback. Qwen35 version-1 fingerprints remain unchanged; SWA fingerprints also bind the window, layer masks, source-layer reuse and full/window head sizes. Native model SHA and experimental heterogeneous-quant rules are unchanged. Node contexts use reduced window allocations.
+
+Model-free allocated CPU-cache tests (positive, malformed positions, truncation, tensor layout and failed-apply rollback):
+
+```sh
+nice -n 19 build/bin/llama-hybrid-check-swa
+HYBRID_SWA_CHECKER="$PWD/build/bin/llama-hybrid-check-swa" python3 tools/hybrid-bench/test_bench.py
+```
+
+The second command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. These tests do not establish real-model or GPU logit equivalence. [The r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md) contains the rented-GPU integration commands; no SWA model is available on this CPU host.

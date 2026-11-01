@@ -8,6 +8,9 @@ import threading
 import urllib.error
 from types import SimpleNamespace
 import json
+import os
+import subprocess
+import struct
 from pathlib import Path
 import tarfile
 import tempfile
@@ -61,6 +64,119 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(common.Refusal, 'exact-ref build'):
                 manage.build(args, ['llama-hybrid-prefill'], {})
             run.assert_not_called()
+
+    @staticmethod
+    def swa_metadata(arch):
+        values = dict(block_count=8 if arch == 'gemma4' else 4, embedding_length=64,
+            context_length=262144 if arch == 'gemma4' else 131072,
+            **{'attention.head_count': 1, 'attention.head_count_kv': 1,
+               'attention.key_length': 64, 'attention.value_length': 64,
+               'attention.sliding_window': 1024 if arch == 'gemma4' else 2048})
+        if arch == 'gemma4':
+            values.update({'attention.sliding_window_pattern': [1, 1, 0, 1, 1, 0, 1, 0],
+                           'attention.shared_kv_layers': 2,
+                           'attention.key_length_swa': 32, 'attention.value_length_swa': 32})
+        return {'general.architecture': arch, 'vocab_size': 0,
+                'vocab_sha256': hashlib.sha256(b'').hexdigest(),
+                **{arch + '.' + key: value for key, value in values.items()}}
+
+    # Geometry counts only allocated source layers and distinguishes full/window widths and fixed cell bytes.
+    def test_swa_metadata_geometry_and_chunk_budget(self):
+        for arch, full, window_row, window in [('gemma4', 272, 272, 1024), ('muse-glimmer', 136, 408, 2048)]:
+            meta = self.swa_metadata(arch)
+            with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+                plan = common.context_plan(model.name, dict(available_memory_bytes=64 * common.GIB), 4096)
+                identity = common.model_identity(model.name)
+            self.assertEqual(plan['kv_bytes_per_token'], full)
+            self.assertEqual(plan['window_kv_bytes_per_token'], window_row)
+            self.assertEqual(plan['window_state_bytes'], window * (window_row + 24))
+            self.assertEqual(plan['recurrent_state_bytes'], 0)
+            self.assertEqual(identity['model_layout']['sliding_window'], window)
+            fixed = plan['window_state_bytes']
+            bound = extend_chunk_limit(full, 0, fixed)
+            self.assertLessEqual(bound * (full + 24) + fixed + 1024**2, 512 * 1024**2)
+            # An enlarged fixed window, rather than the header bound, constrains this control.
+            fixed = 500 * 1024**2
+            bound = extend_chunk_limit(full, 0, fixed)
+            self.assertLessEqual(bound * (full + 24) + fixed + 1024**2, 512 * 1024**2)
+            self.assertGreater((bound + 1) * (full + 24) + fixed + 1024**2, 512 * 1024**2)
+            with self.assertRaisesRegex(ValueError, 'invalid native delta geometry'):
+                extend_chunk_limit(full, 0, 511 * 1024**2)
+
+    # Read both architecture prefixes and a real GGUF boolean mask; per-layer head counts change allocated row sums.
+    def test_swa_gguf_metadata_reader_and_per_layer_heads(self):
+        def string(value):
+            data = value.encode()
+            return struct.pack('<Q', len(data)) + data
+        for arch in ('gemma4', 'muse-glimmer'):
+            meta = self.swa_metadata(arch)
+            meta.pop('vocab_size')
+            meta.pop('vocab_sha256')
+            meta[arch + '.attention.sliding_window_pattern'] = [True, True, False, True, True, False, True, False] if arch == 'gemma4' else [True, True, True, False]
+            wire = b'GGUF' + struct.pack('<IQQ', 3, 0, len(meta) + 1)
+            for key, value in meta.items():
+                wire += string(key)
+                if isinstance(value, str):
+                    wire += struct.pack('<I', 8) + string(value)
+                elif isinstance(value, list):
+                    wire += struct.pack('<IIQ', 9, 7, len(value)) + bytes(value)
+                else:
+                    wire += struct.pack('<II', 4, value)
+            wire += string('tokenizer.ggml.tokens') + struct.pack('<IIQ', 9, 8, 1) + string('token')
+            with tempfile.NamedTemporaryFile() as fixture:
+                Path(fixture.name).write_bytes(wire)
+                actual = common.model_metadata(fixture.name)
+                self.assertEqual(actual[arch + '.attention.sliding_window_pattern'], meta[arch + '.attention.sliding_window_pattern'])
+                identity = common.model_identity(fixture.name)
+                self.assertEqual(identity['model_layout']['vocab_size'], 1)
+                self.assertEqual(identity['model_layout']['vocab_sha256'], hashlib.sha256(struct.pack('<Q', 5) + b'token').hexdigest())
+        meta = self.swa_metadata('gemma4')
+        meta['gemma4.attention.head_count_kv'] = list(range(1, 9))
+        with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+            plan = common.context_plan(model.name, dict(available_memory_bytes=64 * common.GIB), 4096)
+        self.assertEqual(plan['kv_bytes_per_token'], 9 * 136)
+        self.assertEqual(plan['window_kv_bytes_per_token'], 12 * 68)
+
+    # Compare native and GGUF-derived fingerprints on the same synthetic geometry and empty vocabulary.
+    @unittest.skipUnless(os.environ.get('HYBRID_SWA_CHECKER'), 'set HYBRID_SWA_CHECKER for allocated-cache identity controls')
+    def test_swa_native_python_identity(self):
+        result = subprocess.run([os.environ['HYBRID_SWA_CHECKER']], check=True, capture_output=True, text=True)
+        native = [json.loads(line[7:]) for line in result.stdout.splitlines() if line.startswith('LAYOUT ')]
+        self.assertEqual(len(native), 4)
+        for identity in native:
+            arch = identity['model_layout']['architecture']
+            meta = self.swa_metadata(arch)
+            meta[arch + '.attention.sliding_window'] = 4
+            if arch == 'muse-glimmer':
+                meta[arch + '.attention.key_length_swa'] = 32
+                meta[arch + '.attention.value_length_swa'] = 32
+            with mock.patch.object(common, 'model_metadata', return_value=meta):
+                python = common.model_identity('fixture')
+            self.assertEqual(python['model_layout'], identity['model_layout'])
+            self.assertEqual(python['layout_fingerprint'], identity['layout_fingerprint'])
+
+    # Window, layer masks and shared-source allocation are part of identity; unknown or malformed layouts refuse.
+    def test_swa_identity_negatives(self):
+        for arch in ('gemma4', 'muse-glimmer'):
+            meta = self.swa_metadata(arch)
+            with mock.patch.object(common, 'model_metadata', return_value=meta):
+                original = common.model_identity('fixture')['layout_fingerprint']
+                for key, value in [('attention.sliding_window', 512), ('attention.head_count_kv', [2] * meta[arch + '.block_count'])]:
+                    changed = dict(meta, **{arch + '.' + key: value})
+                    with mock.patch.object(common, 'model_metadata', return_value=changed):
+                        self.assertNotEqual(common.model_identity('fixture')['layout_fingerprint'], original)
+            invalid = [dict(meta, **{arch + '.attention.sliding_window': 0}),
+                       dict(meta, **{arch + '.attention.sliding_window_pattern': [True]}),
+                       dict(meta, **{arch + '.attention.shared_kv_layers': 100})]
+            for changed in invalid:
+                with mock.patch.object(common, 'model_metadata', return_value=changed):
+                    with self.assertRaises(common.Refusal):
+                        common.model_identity('fixture')
+        with mock.patch.object(common, 'model_metadata', return_value={'general.architecture': 'unknown'}):
+            with self.assertRaisesRegex(common.Refusal, 'unsupported hybrid architecture'):
+                common.context_plan('fixture', {})
+            with self.assertRaisesRegex(common.Refusal, 'unsupported hybrid architecture'):
+                common.model_identity('fixture')
 
     # Both build modes disable UI downloads; offline model-download requests refuse before preflight.
     def test_offline_build_flags(self):

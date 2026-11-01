@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-kv-cache-iswa.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -3531,6 +3532,15 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         LLAMA_LOG_ERROR("%s: invalid append boundary or sequence\n", __func__);
         return 0;
     }
+    synchronize();
+    auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+    auto read_append = [&](llama_io_read_i & io, bool validate) {
+        if (iswa) {
+            iswa->state_read_append(io, seq_id, n0, n1, validate);
+        } else {
+            state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND | (validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0));
+        }
+    };
 
     // Parse the complete host record before changing metadata or scheduling tensor writes.
     try {
@@ -3542,7 +3552,7 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         if (magic != io_magic || source_seq < 0 || source_seq >= LLAMA_MAX_SEQ) {
             throw std::runtime_error("invalid sequence state header");
         }
-        state_seq_read_data(validation, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE);
+        read_append(validation, true);
         if (validation.n_bytes() != size) {
             throw std::runtime_error("append has trailing bytes");
         }
@@ -3553,8 +3563,8 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
 
     // Non-SWA attention needs only suffix removal; back up the recurrent state that append replaces.
     const auto backup_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    std::vector<uint8_t> backup(state_seq_get_size(seq_id, backup_flags));
-    if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size()) {
+    std::vector<uint8_t> backup(iswa ? 0 : state_seq_get_size(seq_id, backup_flags));
+    if (!iswa && (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size())) {
         return 0;
     }
 
@@ -3567,7 +3577,7 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         if (magic != io_magic) {
             throw std::runtime_error("wrong sequence state magic");
         }
-        state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND);
+        read_append(io, false);
         if (io.n_bytes() != size || memory->seq_pos_max(seq_id) != n1 - 1) {
             throw std::runtime_error("append length does not match the declared range");
         }
@@ -3576,8 +3586,8 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         io.discard();
         LLAMA_LOG_ERROR("%s: rejected append: %s\n", __func__, err.what());
         // Restore the old recurrent position before removing the failed attention suffix.
-        if (state_seq_set_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size() ||
-                !memory->seq_rm(seq_id, n0, -1)) {
+        if (!iswa && (state_seq_set_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size() ||
+                !memory->seq_rm(seq_id, n0, -1))) {
             throw std::runtime_error("failed to restore sequence after rejected append");
         }
         return 0;

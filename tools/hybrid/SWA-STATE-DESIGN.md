@@ -1,0 +1,33 @@
+# Sliding-window state transfer
+
+Run: hybrid-a-r16-261101. Source baseline: public main 0124e89a93, fork base e0f142d5. The ISWA, Gemma 4, Muse Glimmer and hparam implementations below are unchanged from the fork base. This is an internal prototype, with no upstream submission.
+
+## Upstream memory and native bytes
+
+`llama_model::create_memory` selects `llama_kv_cache_iswa` for these two architectures. It owns `kv_base` (non-window layers) followed by `kv_swa` (window layers), with independent cells, allocation heads and tensors. Neither architecture has recurrent state. Base capacity is the context size per sequence; window capacity is pad256(min(base capacity, window * (unified ? max sequences : 1) + microbatch)). `swa_full` instead allocates base capacity for the window too; it does not change masking semantics.
+
+Each native cache starts with u32 stream count. Each stream has u32 cell count; a zero count has no further bytes. Nonempty streams contain all cell metadata followed by all tensor data. Cell metadata is i32 position, u32 sequence count, optional `llama_kv_cell_ext` (x/y/token, 12 bytes), then i32 source sequence IDs. Single-sequence restore requires one ID per cell and remaps that ID to the destination. Physical cell order is serialized, so wrapped window positions need not be sorted. Streams can be remapped across unified and non-unified contexts.
+
+Tensor data starts with four u32 values: V transposition, allocated layer count, K rotation, V rotation. All K layers precede all V layers. Each K layer has i32 ggml type, u64 row bytes, then count rows. Non-transposed V has the same header and row arrangement. Transposed V instead has i32 type, u32 element bytes, u32 GQA width, then one cell span per embedding element. Type, dimensions, transposition, rotations and every buffer boundary are checked against the allocated cache before scheduling host tensor writes. Q8_0 rows use 34 bytes per 32 elements. Shared/reused layers are serialized once, for the allocated source layer.
+
+For standard SWA, a cached position q is masked at query position p when p-q >= window. Slot allocation may reuse masked cells at the next sequence position; physical stale cells can remain until overwritten. Sequence export filters masked cells at the current maximum, hence exports exactly the last min(window, p1) positions for a contiguous causal sequence ending at p1-1. Export must not send stale allocation padding or limit the window to the new full-attention range.
+
+## Architecture geometry
+
+Muse Glimmer reads `attention.sliding_window`, with default sliding pattern interval 4 (three window layers then one full layer); metadata can override the interval or supply a layer array. The 52-layer 30B model has 39 window and 13 full layers. It applies RoPE only in window layers and NoPE in full layers. Attention gates and QK norms add no persistent cache section. Its declared window/context in this brief are 2048/131072; runtime sizing reads GGUF values.
+
+Gemma 4 requires the per-layer `attention.sliding_window_pattern` array and `attention.key_length_swa`/`value_length_swa`, separate from full-attention head dimensions. The 60-layer 31B pattern is five window layers then one full layer. Optional `attention.shared_kv_layers` makes only the first L-shared layers allocate KV; later window layers reuse source L-shared-2 and full layers reuse L-shared-1. Cache construction filters `has_kv` before allocation. Per-layer KV-head counts must be used with the appropriate head dimensions. Alternative V projection can reuse K weights, but K and V cache tensors both exist. Per-layer embeddings, proportional RoPE, softcapping and optional FFN experts add no persistent memory. The brief's window/context are 1024/262144, read from GGUF at runtime.
+
+## Delta and transaction design
+
+Keep the existing HYBD envelope, one native-state section, native model SHA guard, Q8_0 KV type, and checksum algorithms. The native section contains the usual sequence magic/ID, then the complete base-cache record restricted to [p0,p1), then the complete window-cache record restricted to [max(0,p1-window),p1). The existing section and body checksums cover both caches. Standard snapshots retain their upstream format. Initial and append imports use the same delta format. No numerical checker or evaluator schema changes are required, preserving compatibility with pending PR 9.
+
+Before mutation, parse both records completely with tensor writes disabled. Require one populated stream per cache, exact position sets (accept arbitrary physical order), the declared full range, exact window length and endpoint, matching tensor layouts, and no trailing bytes. Bare window-cache append remains unsupported; only ISWA's coordinated path replaces the window. Unknown architectures and nonstandard sliding types remain refused by prototype admission.
+
+Host tensor reads already defer every tensor write until reader destruction; `discard()` cancels all pending writes. The ISWA append operation saves both caches' complete cell metadata and allocator heads before mutation, discards pending writes and restores those copies on an apply failure. This restores physical allocation and both caches' pre-import bytes exactly, including other sequences; it does not attempt to reconstruct a wrapped cache from a logical sequence snapshot. The existing recurrent-only transaction remains unchanged for Qwen35. Backend fatal errors/process death are outside the recoverable exception contract.
+
+Fingerprint version 1 stays byte-for-byte unchanged for Qwen35. For these SWA models add window/type and per-layer window/source allocation identity. Python GGUF sizing must construct exactly the same layout. Geometry sums only allocated full-layer K/V row sizes; its fixed window bytes include window-layer rows plus window cell metadata. Context sizing also budgets the microbatch and pad256 window allocation; delta planning reserves the complete window irrespective of the current prefix depth. Policy transfer cost and safety chunk bounds use that fixed part. Native model SHA and experimental heterogeneous-quant admission/calibration rules remain unchanged.
+
+## Validation boundaries
+
+Synthetic allocated CPU caches exercise wrapped ordering, full-range append plus window replacement, source-layer reuse, differing full/window widths, cross-cache endpoint and count negatives, truncation and injected apply failure with exact before/after bytes. Metadata fixtures independently test geometry and launch refusal. This host has neither SWA model: real Gemma 4/Muse Glimmer conversion, logits and GPU inference remain unrun, with commands retained in the run report. No model downloads are authorized.

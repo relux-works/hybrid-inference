@@ -61,6 +61,7 @@ static hybrid::context_ptr context(llama_model * model, int depth, bool gpu) {
     auto cp = llama_context_default_params();
     cp.n_ctx = depth;
     cp.n_batch = cp.n_ubatch = 256;
+    cp.swa_full = false;
     cp.n_threads = cp.n_threads_batch = 2;
     cp.n_seq_max = 1;
     cp.type_k = cp.type_v = GGML_TYPE_Q8_0;

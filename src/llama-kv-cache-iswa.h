@@ -81,7 +81,9 @@ public:
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_read_append(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, bool validate);
 
     //
     // llama_kv_cache_iswa specific API
@@ -92,6 +94,8 @@ public:
 
 private:
     const bool unified;
+    const uint32_t n_swa;
+    const llama_swa_type swa_type;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;

@@ -145,3 +145,5 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 ### Hybrid prefill prototype tools
 
 The local CPU prefill node, shared state-delta codec, correctness checker, and HTTP isolation tests are documented in [tools/hybrid/README.md](tools/hybrid/README.md), including exact CMake, flock, Python and run commands. Binaries go to `build/bin/`; logs and task-local tools go to `.temp/`; golden state fixtures go to `~/Werkstatt/hybrid-models/golden/`.
+
+Sliding-window transfer for Gemma 4 and Muse Glimmer is described in [SWA-STATE-DESIGN.md](tools/hybrid/SWA-STATE-DESIGN.md). Build `llama-hybrid-check-swa` with the locked named-target command in the node guide, then run `nice -n 19 build/bin/llama-hybrid-check-swa` for model-free allocated-cache tests. Logs belong under `.temp/`; real-model GPU qualification commands are in the [r16 report](tools/hybrid-bench/RESULTS-hybrid-a-r16-261101.md).

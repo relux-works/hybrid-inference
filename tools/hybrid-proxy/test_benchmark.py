@@ -24,7 +24,8 @@ class BenchmarkProxyTests(unittest.TestCase):
         from pathlib import Path
         config = dict(self.fixture.config)
         config['policy'] = dict(kv_bytes=1, state_bytes=0)
-        for geometry in ({}, dict(kv_bytes=6528, state_bytes=20201472)):
+        for geometry in ({}, dict(kv_bytes=6528, state_bytes=20201472),
+                         dict(kv_bytes=272, state_bytes=0, window_bytes=500 * 1024**2)):
             safe = extend_chunk_limit(**geometry)
             config['delta_geometry'] = geometry
             with tempfile.TemporaryDirectory() as directory:

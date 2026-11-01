@@ -42,6 +42,8 @@ std::string layout_fingerprint(const json & layout) {
 
 json model_layout(const llama_model * model) {
     const auto & hp = model->hparams;
+    const bool swa = model->arch == LLM_ARCH_GEMMA4 || model->arch == LLM_ARCH_MUSE_GLIMMER;
+    require(swa || model->arch == LLM_ARCH_QWEN35, "unsupported hybrid architecture");
     const auto & vocab = model->vocab;
     sha256_t hash;
     sha256_init(&hash);
@@ -62,12 +64,23 @@ json model_layout(const llama_model * model) {
         layers.push_back({{"heads", hp.n_head(i)}, {"kv_heads", hp.n_head_kv(i)},
                           {"key_dim", hp.n_embd_head_k(i)}, {"value_dim", hp.n_embd_head_v(i)},
                           {"recurrent", hp.is_recr(i)}});
+        if (swa) {
+            const int32_t source = hp.has_kv(i) ? i : hp.n_layer_kv_from_start - (hp.is_swa(i) ? 2 : 1);
+            layers.back()["sliding"] = hp.is_swa(i);
+            layers.back()["kv_source"] = source;
+        }
     }
-    return {{"version", 1}, {"architecture", model->arch_name()}, {"layer_count", hp.n_layer()},
+    json layout = {{"version", 1}, {"architecture", model->arch_name()}, {"layer_count", hp.n_layer()},
             {"embedding_size", hp.n_embd}, {"layers", layers},
             {"recurrent_layout", {{"conv", hp.ssm_d_conv}, {"inner", hp.ssm_d_inner},
                                   {"state", hp.ssm_d_state}, {"rank", hp.ssm_dt_rank}, {"groups", hp.ssm_n_group}}},
             {"vocab_size", vocab.n_tokens()}, {"vocab_sha256", hex(digest, sizeof(digest))}};
+    if (swa) {
+        require(hp.swa_type == LLAMA_SWA_TYPE_STANDARD && hp.n_swa > 0, "unsupported hybrid sliding window");
+        layout["sliding_window"] = hp.n_swa;
+        layout["sliding_window_type"] = "standard";
+    }
+    return layout;
 }
 
 std::string file_hash(const std::string & path) {
@@ -192,6 +205,7 @@ context_ptr make_context(llama_model * model, uint32_t n_ctx) {
     params.type_v = GGML_TYPE_Q8_0;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.offload_kqv = false;
+    params.swa_full = false;
     context_ptr ctx(llama_init_from_model(model, params));
     require(bool(ctx), "cannot create CPU q8_0 context");
     return ctx;

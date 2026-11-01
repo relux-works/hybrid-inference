@@ -181,7 +181,7 @@ def model_metadata(path):
         metadata = {}
         for _ in range(count):
             key, kind = string(), scalar('I')
-            keep = key in ('general.architecture', 'general.file_type') or key.startswith(('qwen35.', 'qwen35moe.'))
+            keep = key in ('general.architecture', 'general.file_type') or key.startswith(('qwen35.', 'qwen35moe.', 'gemma4.', 'muse-glimmer.'))
             if key == 'tokenizer.ggml.tokens':
                 require(kind == 9 and scalar('I') == 8, 'invalid GGUF token array')
                 token_count = scalar('Q')
@@ -200,30 +200,128 @@ def model_metadata(path):
     return metadata
 
 
+def swa_layout(meta):
+    arch = meta['general.architecture']
+    require(arch in ('gemma4', 'muse-glimmer'), 'unsupported hybrid architecture')
+    def integer(name, default=None):
+        value = meta.get(arch + '.' + name, default)
+        require(type(value) is int and value > 0, 'missing or invalid GGUF sizing key: ' + name)
+        return value
+    count = integer('block_count')
+    require(count <= 512, 'invalid layout layer count')
+    window = integer('attention.sliding_window')
+    require(window <= 2**31 - 1, 'invalid sliding window')
+    pattern = meta.get(arch + '.attention.sliding_window_pattern')
+    if arch == 'muse-glimmer' and not isinstance(pattern, list):
+        interval = 4 if pattern is None else pattern
+        require(type(interval) is int and interval > 0, 'invalid sliding pattern interval')
+        pattern = [(i + 1) % interval != 0 for i in range(count)]
+    require(isinstance(pattern, list) and len(pattern) == count and
+            all(type(v) in (bool, int) and v in (0, 1) for v in pattern), 'invalid sliding layer table')
+    shared = meta.get(arch + '.attention.shared_kv_layers', 0)
+    require(type(shared) is int and 0 <= shared <= count - 2 and
+            (arch == 'gemma4' or shared == 0), 'invalid shared KV layers')
+    allocated = count - shared
+    if shared:
+        require(bool(pattern[allocated - 2]) and not pattern[allocated - 1], 'invalid shared KV source pattern')
+    def layer_value(name, i, default=None):
+        value = meta.get(arch + '.' + name, default)
+        if isinstance(value, list):
+            require(len(value) == count, 'invalid per-layer geometry: ' + name)
+            value = value[i]
+        require(type(value) is int and value > 0, 'invalid layer geometry: ' + name)
+        return value
+    embedding = integer('embedding_length')
+    full_k = integer('attention.key_length', embedding // layer_value('attention.head_count', 0))
+    full_v = integer('attention.value_length', embedding // layer_value('attention.head_count', 0))
+    window_k = integer('attention.key_length_swa', None if arch == 'gemma4' else full_k)
+    window_v = integer('attention.value_length_swa', None if arch == 'gemma4' else full_v)
+    layers = []
+    for i in range(count):
+        sliding = bool(pattern[i])
+        source = i if i < allocated else allocated - (2 if sliding else 1)
+        layers.append(dict(heads=layer_value('attention.head_count', i),
+            kv_heads=layer_value('attention.head_count_kv', i, layer_value('attention.head_count', i)),
+            key_dim=window_k if sliding else full_k, value_dim=window_v if sliding else full_v,
+            recurrent=False, sliding=sliding, kv_source=source))
+    require(any(v['sliding'] for v in layers[:allocated]) and
+            any(not v['sliding'] for v in layers[:allocated]), 'both cache types are required')
+    return dict(version=1, architecture=arch, layer_count=count, embedding_size=embedding,
+        layers=layers, recurrent_layout=dict(conv=0, inner=0, state=0, rank=0, groups=0),
+        vocab_size=meta['vocab_size'], vocab_sha256=meta['vocab_sha256'],
+        sliding_window=window, sliding_window_type='standard')
+
+
+def swa_context_plan(model, meta, info, requested, client):
+    layout = swa_layout(meta)
+    full = window_rows = 0
+    for i, layer in enumerate(layout['layers']):
+        require(layer['key_dim'] % 32 == 0 and layer['value_dim'] % 32 == 0, 'unsupported q8_0 cache geometry')
+        if layer['kv_source'] != i:
+            continue
+        row = layer['kv_heads'] * (layer['key_dim'] + layer['value_dim']) * 34 // 32
+        if layer['sliding']:
+            window_rows += row
+        else:
+            full += row
+    window = layout['sliding_window']
+    window_bytes = window * (window_rows + 24)
+    # Include a 256-token microbatch and pad256 capacity in allocation sizing.
+    allocation = ((window + 256 + 255) // 256) * 256 * window_rows
+    weights = Path(model).stat().st_size
+    capacity = info.get('available_vram_bytes', info['available_memory_bytes'])
+    memory_ctx = ((int(capacity * .8) - weights - 2 * GIB - allocation) // full // 256) * 256
+    host_available = int(info['available_memory_bytes'] * .8) - 2 * GIB
+    sessions_held = 2
+    store_ctx = ((max(0, host_available // 3) // sessions_held - window_bytes - 1024**2) // (full + 32) // 256) * 256
+    host_ctx = ((host_available - 4 * allocation) // (4 * full) // 256) * 256
+    trained = meta.get(layout['architecture'] + '.context_length')
+    require(type(trained) is int and trained > 0, 'invalid context length')
+    limit = min(memory_ctx, host_ctx, store_ctx, trained)
+    ctx = requested if requested is not None else limit
+    require(type(ctx) is int and 256 <= ctx <= limit,
+            f'context {ctx} cannot fit: maximum {limit}; memory={memory_ctx}, host staging={host_ctx}, session store={store_ctx}')
+    # Refuse a window too large for even one safe critical extend.
+    require(window_bytes + full + 24 + 1024**2 <= 512 * 1024**2, 'window exceeds delta budget')
+    ram_budget = sessions_held * (window_bytes + ctx * (full + 32) + 1024**2)
+    return dict(context=ctx, maximum_context=limit, sessions_held=sessions_held, max_ctx=ctx,
+        ram_budget_mib=(ram_budget + 1024**2 - 1) // 1024**2,
+        max_request_mib=max(1, (4096 + 11 * ctx + 1024**2 - 1) // 1024**2),
+        kv_bytes_per_token=full, recurrent_state_bytes=0, window_state_bytes=window_bytes,
+        window_kv_bytes_per_token=window_rows, window_allocation_bytes=allocation,
+        weights_bytes=weights, margin_fraction=.20, compute_reserve_bytes=2 * GIB,
+        memory_limit=memory_ctx, store_limit=store_ctx, node_default_max_ctx=16384,
+        delta_body_limit_bytes=512 * 1024**2, delta_header_limit_bytes=1024**2,
+        checkpoint_count=0 if client else None)
+
+
 def model_identity(path):
     meta = model_metadata(path)
     arch = meta['general.architecture']
-    require(arch == 'qwen35', 'layout identity supports dense qwen35 only')
+    require(arch in ('qwen35', 'gemma4', 'muse-glimmer'), 'unsupported hybrid architecture')
     def get(key):
         return meta[arch + '.' + key]
-    count = get('block_count')
-    require(type(count) is int and 0 < count <= 1024, 'invalid layout layer count')
-    recurrent = meta.get(arch + '.attention.recurrent_layers')
-    if recurrent is None:
-        interval = meta.get(arch + '.full_attention_interval', 4)
-        require(type(interval) is int and interval > 0, 'invalid attention interval')
-        recurrent = [(i + 1) % interval != 0 for i in range(count)]
-    require(isinstance(recurrent, list) and len(recurrent) == count, 'invalid recurrent layout')
-    def layer_value(key, i):
-        value = get(key)
-        return value[i] if isinstance(value, list) else value
-    layout = dict(version=1, architecture=arch, layer_count=count, embedding_size=get('embedding_length'),
-        layers=[dict(heads=layer_value('attention.head_count', i), kv_heads=layer_value('attention.head_count_kv', i),
-                     key_dim=layer_value('attention.key_length', i), value_dim=layer_value('attention.value_length', i),
-                     recurrent=bool(recurrent[i])) for i in range(count)],
-        recurrent_layout={name: get('ssm.' + key) for name, key in
-            [('conv', 'conv_kernel'), ('inner', 'inner_size'), ('state', 'state_size'), ('rank', 'time_step_rank'), ('groups', 'group_count')]},
-        vocab_size=meta['vocab_size'], vocab_sha256=meta['vocab_sha256'])
+    if arch != 'qwen35':
+        layout = swa_layout(meta)
+    else:
+        count = get('block_count')
+        require(type(count) is int and 0 < count <= 1024, 'invalid layout layer count')
+        recurrent = meta.get(arch + '.attention.recurrent_layers')
+        if recurrent is None:
+            interval = meta.get(arch + '.full_attention_interval', 4)
+            require(type(interval) is int and interval > 0, 'invalid attention interval')
+            recurrent = [(i + 1) % interval != 0 for i in range(count)]
+        require(isinstance(recurrent, list) and len(recurrent) == count, 'invalid recurrent layout')
+        def layer_value(key, i):
+            value = get(key)
+            return value[i] if isinstance(value, list) else value
+        layout = dict(version=1, architecture=arch, layer_count=count, embedding_size=get('embedding_length'),
+            layers=[dict(heads=layer_value('attention.head_count', i), kv_heads=layer_value('attention.head_count_kv', i),
+                         key_dim=layer_value('attention.key_length', i), value_dim=layer_value('attention.value_length', i),
+                         recurrent=bool(recurrent[i])) for i in range(count)],
+            recurrent_layout={name: get('ssm.' + key) for name, key in
+                [('conv', 'conv_kernel'), ('inner', 'inner_size'), ('state', 'state_size'), ('rank', 'time_step_rank'), ('groups', 'group_count')]},
+            vocab_size=meta['vocab_size'], vocab_sha256=meta['vocab_sha256'])
     fingerprint = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     kind = meta.get('general.file_type')
     quant = {0: 'F32', 1: 'F16', 2: 'Q4_0', 7: 'Q8_0', 15: 'Q4_K_M', 32: 'BF16'}.get(kind, str(kind))
@@ -243,7 +341,9 @@ def validate_identity(digest, identity, expected, node_identity, hetero=False):
 def context_plan(model, info, requested=None, client=False):
     meta = model_metadata(model)
     arch = meta.get('general.architecture')
-    require(arch == 'qwen35', 'automatic sizing currently supports qwen35 dense hybrid GGUF only')
+    if arch in ('gemma4', 'muse-glimmer'):
+        return swa_context_plan(model, meta, info, requested, client)
+    require(arch == 'qwen35', 'unsupported hybrid architecture')
     def get(name):
         value = meta.get(arch + '.' + name)
         require(isinstance(value, int) and value > 0, 'missing or invalid GGUF sizing key: ' + name)

@@ -2129,12 +2129,20 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
+std::function<void()> llama_kv_cache::state_meta_restore() {
+    return [this, cells = v_cells, heads = v_heads]() {
+        v_cells = cells;
+        v_heads = heads;
+    };
+}
+
 void llama_kv_cache::state_read_sinfo(
         llama_io_read_i & io,
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in,
+const std::pair<llama_pos, llama_pos> * range) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2197,7 +2205,7 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append, validate);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append, validate, range);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2207,7 +2215,7 @@ const slot_info_vec_t *   sinfos_in) {
 
         if (!res) {
             // The append transaction removes its suffix; clearing here would destroy the retained prefix.
-            if (!validate && !append) {
+            if (!validate && !append && !range) {
                 state_clear(seq_id, strm, sinfo);
             }
             throw std::runtime_error("failed to restore kv cache");
@@ -2216,6 +2224,9 @@ const slot_info_vec_t *   sinfos_in) {
         if (sinfos_out) {
             (*sinfos_out)[s] = sinfo;
         }
+    }
+    if (range && !appended) {
+        throw std::runtime_error("missing cache range");
     }
 }
 
@@ -2353,7 +2364,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append, bool validate) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append, bool validate, const std::pair<llama_pos, llama_pos> * range) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2363,6 +2374,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
+
+        if (range && (range->first < 0 || range->second <= range->first ||
+                (int64_t) range->second - range->first != cell_count)) {
+            throw std::runtime_error("cache range length mismatch");
+        }
+        std::vector<bool> seen(range ? cell_count : 0, false);
 
         const int64_t next_pos = (int64_t) seq_pos_max(dest_seq_id) + 1;
         if (!append && !validate) {
@@ -2387,6 +2404,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
+
+            if (range) {
+                if (pos < range->first || pos >= range->second || seen[pos - range->first]) {
+                    throw std::runtime_error("cache range position mismatch");
+                }
+                seen[pos - range->first] = true;
+            }
 
             if (append && (int64_t) pos != next_pos + i) {
                 LLAMA_LOG_ERROR("%s: append positions must be contiguous at the current sequence end\n", __func__);
@@ -2417,6 +2441,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             {
                 llama_seq_id seq_id;
                 io.read(&seq_id, sizeof(seq_id));
+                if (range && (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ)) {
+                    throw std::runtime_error("invalid cache range sequence ID");
+                }
             }
 
             ubatch.pos[i]      = pos;

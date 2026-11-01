@@ -3,9 +3,11 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-io.h"
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 
 //
 // llama_kv_cache_iswa
@@ -47,7 +49,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) : unified(unified) {
+    const  layer_share_cb & share) : unified(unified), n_swa(hparams.n_swa), swa_type(hparams.swa_type) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -262,6 +264,38 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     kv_base->state_read(io, seq_id, flags);
     kv_swa ->state_read(io, seq_id, flags);
+}
+
+void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    if (swa_type != LLAMA_SWA_TYPE_STANDARD || n_swa == 0) {
+        throw std::runtime_error("range export requires standard sliding-window memory");
+    }
+    kv_base->state_write_range(io, seq_id, p0, p1, flags);
+    kv_swa->state_write_range(io, seq_id, std::max<int64_t>(0, (int64_t) p1 - n_swa), p1, flags);
+}
+
+void llama_kv_cache_iswa::state_read_append(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, bool validate) {
+    if (swa_type != LLAMA_SWA_TYPE_STANDARD || n_swa == 0 || seq_id < 0 || p0 < 0 || p1 <= p0 ||
+            (int64_t) kv_base->seq_pos_max(seq_id) + 1 != p0 ||
+            kv_base->seq_pos_max(seq_id) != kv_swa->seq_pos_max(seq_id)) {
+        throw std::runtime_error("invalid sliding-window append boundary");
+    }
+    const std::pair<llama_pos, llama_pos> base_range {p0, p1};
+    const std::pair<llama_pos, llama_pos> swa_range {(llama_pos) std::max<int64_t>(0, (int64_t) p1 - n_swa), p1};
+    const auto flags = validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0;
+    const auto restore_base = validate ? std::function<void()>() : kv_base->state_meta_restore();
+    const auto restore_swa  = validate ? std::function<void()>() : kv_swa->state_meta_restore();
+    try {
+        kv_base->state_read_sinfo(io, seq_id, flags | LLAMA_STATE_SEQ_FLAGS_APPEND, nullptr, nullptr, &base_range);
+        kv_swa ->state_read_sinfo(io, seq_id, flags, nullptr, nullptr, &swa_range);
+    } catch (...) {
+        io.discard();
+        if (!validate) {
+            restore_base();
+            restore_swa();
+        }
+        throw;
+    }
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {

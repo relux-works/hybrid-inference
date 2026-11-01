@@ -28,3 +28,6 @@ target_link_libraries(llama-hybrid-check-codec PRIVATE hybrid-state)
 
 add_executable(llama-hybrid-bench-check ../hybrid-bench/check.cpp)
 target_link_libraries(llama-hybrid-bench-check PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-check-swa check-swa.cpp)
+target_link_libraries(llama-hybrid-check-swa PRIVATE hybrid-state)
