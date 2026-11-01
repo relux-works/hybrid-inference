@@ -11,3 +11,5 @@ The rest of the fork is llama.cpp (https://github.com/ggml-org/llama.cpp, MIT, s
 Port provenance: alesha-pro/llama.cpp-mirai-s, commit fdb1e815dbbad220c2f41b94535049fdbd20c3ca.
 The hybrid-inference port adapts integration and tests to a newer llama.cpp base and validates trunk-only state identity.
 Plugin-derived code retains Apache-2.0 terms; the repository's other code retains its existing license.
+
+Modified from the source port: ggml/src/ggml-cuda/mirai-s.cu adds sm_80, HIP and MUSA guards; ggml/src/ggml-cuda/ggml-cuda.cu adds an Ampere gate for Mirai ops in supports_op.
