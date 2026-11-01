@@ -95,16 +95,18 @@ build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.
 
 ## Configurable-limit qualification
 
-Use a local small hybrid GGUF; no test downloads models. State dumps and private logs must stay in the chosen `.temp/` directory. The deep fixture is an explicit opt-in CPU test and can take substantially longer than the small regressions.
+Use a local small hybrid GGUF; no test downloads models. State dumps and private logs must stay in the chosen `.temp/` directory. The deep fixture is an explicit opt-in CPU test and can take substantially longer than the small regressions. For the identity control, add `llama-quantize` to the named targets in the locked incremental build above, then create a local Q8_0 copy with the command below. Re-quantization changes the file and storage precision; it does not recover information lost by the original quantization. The output stays at the selected local model-cache path.
 
 ```sh
 MODEL=/path/to/small-hybrid.gguf
+REQUANTIZED=/path/to/local-requantized.gguf
 ARTIFACTS=.temp/node-limits
+build/bin/llama-quantize --allow-requantize "$MODEL" "$REQUANTIZED" Q8_0 2
 build/bin/llama-hybrid-prefill "$MODEL" .temp/clients.json 8091 --max-ctx 65536 --ram-budget-mib 1024 --max-request-mib 2
 build/bin/llama-hybrid-check-codec --max-ctx 65536
 build/bin/llama-hybrid-check-codec --max-ctx 262144
 python3 tools/hybrid/test_limits.py --binary build/bin/llama-hybrid-prefill --model "$MODEL" --artifacts "$ARTIFACTS/limits"
-python3 tools/hybrid/test_limits.py --binary build/bin/llama-hybrid-prefill --model "$MODEL" --requantized /path/to/local-requantized.gguf --artifacts "$ARTIFACTS/identity" --case identity
+python3 tools/hybrid/test_limits.py --binary build/bin/llama-hybrid-prefill --model "$MODEL" --requantized "$REQUANTIZED" --artifacts "$ARTIFACTS/identity" --case identity
 python3 tools/hybrid/test_limits.py --binary build/bin/llama-hybrid-prefill --model "$MODEL" --artifacts "$ARTIFACTS/deep" --case deep
 build/bin/llama-hybrid-check-distributions "$MODEL" "$ARTIFACTS/deep/deep.tokens.json" --max-ctx 65536
 ```
