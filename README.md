@@ -19,6 +19,8 @@ Mirai prototype tools (CPU checks use existing local headers and never download 
 
 Set `TMPDIR` to an existing disk directory for builds and tests. The header hashes and metadata-only fixtures are recorded in `tools/hybrid-bench/fixtures/mirai-s-headers.json`.
 
+Local-kept hybrid latency: `python3 tools/hybrid-proxy/bench_local.py --help` uses existing binaries and models, writes paired timing/token/replay evidence under the supplied `--artifacts` directory, and stops its recorded server PIDs. See the [CPU measurements and GPU commands](tools/hybrid-proxy/RESULTS-hybrid-d-r4-261101.md).
+
 Everything below is the upstream llama.cpp README.
 
 # llama.cpp

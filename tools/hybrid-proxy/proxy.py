@@ -699,8 +699,9 @@ class Proxy:
             decision["offload"] = False
         try:
             remote_started = time.monotonic()
-            path = self.sync(session, client) if mode != "local" else None
             if decision["offload"] and len(target) > local_n:
+                # Local turns leave their durable suffix for the replay worker.
+                path = self.sync(session, client)
                 # Flush a queued shadow with a critical extend at the local boundary.
                 if session["remote_n"] > local_n:
                     raise ValueError("server is ahead of local slot; local re-prefill required")

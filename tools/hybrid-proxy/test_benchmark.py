@@ -6,8 +6,8 @@ import unittest
 
 import test_proxy
 from proxy import HTTPError, Node, Proxy
-from policy import extend_chunk_limit
-from store import prefix_hash
+from policy import Policy, extend_chunk_limit
+from store import Store, prefix_hash
 
 
 class BenchmarkProxyTests(unittest.TestCase):
@@ -63,6 +63,82 @@ class BenchmarkProxyTests(unittest.TestCase):
         fixture.client.request('POST', '/v1/chat/completions', dict(body, _tokens=[5, 6, 7]),
                                {'X-Hybrid-Bench-Mode': 'offload'})
         self.assertEqual(fixture.decode.app.imports, 1)
+
+    # Policy-kept calls use the same local token path without any synchronous node access, including production mode.
+    def test_policy_local_skips_sync_and_preserves_tokens(self):
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        fixture.app.policy = Policy(local_rates=((0, 1e9),))
+        for index, mode in enumerate((None, 'hybrid', 'local')):
+            for stream in (False, True):
+                tokens = [100 + index, int(stream), 7]
+                with self.subTest(mode=mode, stream=stream), mock.patch.object(
+                        fixture.app, 'remote', wraps=fixture.app.remote) as remote:
+                    with fixture.client.open('POST', '/v1/chat/completions',
+                            dict(messages=[], _tokens=tokens, stream=stream),
+                            {'X-Hybrid-Bench-Mode': mode} if mode else {}) as response:
+                        sid = response.headers['X-Hybrid-Session']
+                        wire = response.read()
+                    with fixture.app.reserve(sid):
+                        pass
+                    self.assertEqual(remote.call_count, 0, 'local policy contacted the node')
+                self.assertEqual(fixture.app.store.get(sid)['tokens'], tokens + [901, 902])
+                self.assertEqual(fixture.decode.app.imports, 0)
+                if stream:
+                    self.assertEqual(wire.count(b'data: [DONE]'), 1)
+
+    # Deferred shadow survives restart/outage/lost acknowledgement; only a later GET may advance remote_n.
+    def test_policy_local_durable_replay_after_restart(self):
+        from pathlib import Path
+        fixture = self.fixture
+        fixture.app.policy = Policy(local_rates=((0, 1e9),))
+        sid, _ = fixture.chat([11, 12, 13])
+        expected = [11, 12, 13, 901, 902]
+        current = fixture.app.store.get(sid)
+        self.assertIsNone(current['remote_id'])
+        self.assertEqual(current['remote_n'], 0)
+        fixture.app.store.close()
+        fixture.app.store = Store(str(Path(fixture.temp.name) / 'proxy.sqlite'), fixture.app.model)
+        fixture.prefill.app.available = False
+        fixture.app.replay()
+        self.assertEqual(fixture.app.store.get(sid)['tokens'], expected)
+        self.assertEqual(fixture.app.store.get(sid)['remote_n'], 0)
+        fixture.prefill.app.available = True
+        fixture.prefill.app.lose_ack_once = True
+        fixture.app.replay()
+        self.assertEqual(fixture.app.store.get(sid)['remote_n'], 0)
+        fixture.app.replay()
+        fixture.app.replay()
+        current = fixture.app.store.get(sid)
+        self.assertIsNotNone(current['remote_id'])
+        info = fixture.app.remote(fixture.config['clients']['fixture-a']).request(
+            'GET', '/v1/sessions/' + current['remote_id'])
+        self.assertEqual(info['tokens'], expected)
+        self.assertEqual(info['prefix_hash'], prefix_hash(expected))
+        self.assertEqual(current['remote_n'], len(expected))
+
+    # The next offload flushes the deferred suffix and still refuses a divergent node before importing anything.
+    def test_policy_local_then_offload_checks_prefix(self):
+        fixture = self.fixture
+        fixture.app.policy = Policy(local_rates=((0, 1e9),))
+        sid, _ = fixture.chat([21, 22, 23])
+        expected = fixture.app.store.get(sid)['tokens'] + [24, 25]
+        fixture.app.policy = Policy(always=True)
+        fixture.chat(expected, sid=sid)
+        self.assertEqual(fixture.app.store.get(sid)['tokens'], expected + [901, 902])
+        self.assertGreater(fixture.decode.app.imports, 0)
+        fixture.app.replay()
+        fixture.app.replay()
+        before = fixture.app.store.get(sid)
+        with fixture.prefill.app.db:
+            fixture.prefill.app.db.execute('UPDATE sessions SET tokens=? WHERE id=?',
+                                          (json.dumps([99]), before['remote_id']))
+        imports = fixture.decode.app.imports
+        with self.assertRaises(HTTPError) as error:
+            fixture.chat(before['tokens'] + [26, 27], sid=sid)
+        self.assertEqual(error.exception.status, 409)
+        self.assertEqual(fixture.decode.app.imports, imports)
+        self.assertEqual(fixture.app.store.get(sid)['tokens'], before['tokens'])
 
 class ChunkAndLifecycleTests(unittest.TestCase):
     setUp = BenchmarkProxyTests.setUp

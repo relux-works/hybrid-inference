@@ -406,6 +406,7 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(len(queued), 3)
             self.assertEqual(queued[0][3]["n0"], queued[1][3]["n0"])
             old = self.app.store.get(sid)
+            self.assertEqual(old["remote_n"], queued[0][3]["n0"])
             continued, _ = self.chat(old["tokens"] + [13, 14], sid=sid)
             self.assertEqual(continued, sid)
             self.assertTrue(self.app.store.get(sid)["offload"])
