@@ -149,3 +149,9 @@ GPU/Metal timings must be measured by the owner; no hardware throughput is assum
 | 131072 | 9830400 tokens | 163.8 minutes plus overhead |
 
 These are planning calculations, not observed GPU runtimes. Historically, with the rejected framing control, the five 2k cases at one position took 160.263 seconds of requests across all treatments; one 8k retrieval case took 231.130 seconds. Startup, identity hashing, generator checks and cleanup add time. Request timeouts apply to individual requests, not the entire sweep. Those historical timings do not price the new control. The [CPU evidence report](RESULTS-hybrid-b-r21-261101.md) records failures, limits and the exact GPU invocation.
+
+## Reference-logit study
+
+`hybrid-eval` does not yet accept `--reference-logits`. Its current endpoint samples free-running task answers and scores those answers. Different arms can produce different answers, so reusing each answer as its continuation would compare different token positions. The evaluator also does not export its answer-prefix state as a native delta chain. A valid integration needs a per-item fixed continuation and the exact framed answer-prefix token/state identity shared across arms, plus a mapping from each item to its D reference. Adding a file flag alone would not establish those contracts.
+
+Use the fixed-token scorer in [tools/hybrid-bench/README.md](../hybrid-bench/README.md#reference-model-teacher-forced-scoring) for this prototype's KL(D || arm) study. Task accuracy, local partition controls and free-running answer disagreement remain the existing evaluator measures. This is a declared integration gap, not a substitute for the GPU reference-model study.

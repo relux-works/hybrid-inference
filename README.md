@@ -159,3 +159,5 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 ### Hybrid prefill prototype tools
 
 The local CPU prefill node, shared state-delta codec, correctness checker, and HTTP isolation tests are documented in [tools/hybrid/README.md](tools/hybrid/README.md), including exact CMake, flock, Python and run commands. Binaries go to `build/bin/`; logs and task-local tools go to `.temp/`; golden state fixtures go to `~/Werkstatt/hybrid-models/golden/`.
+
+Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.

@@ -62,7 +62,7 @@ The generated proxy config sets `hetero_quant`, `node_model_sha256`, `layout_fin
 
 Use `--extend-chunk-tokens N` at setup to lower the critical-extend chunk size. Critical chunks use `(512 MiB - recurrent_bytes - 1 MiB) // (kv_bytes_per_token + 24)`, also limited by `(1 MiB - 4096) // 11` for the JSON header. The 24 bytes are native per-cell metadata for one sequence; the 1 MiB reserve covers fixed serialization overhead. The boundary includes this reserve: one more token violates the reserved planning bound, although it can still fit the raw body cap. The launcher writes separate `delta_geometry` values from GGUF metadata; policy cost estimates do not control this safety bound. Without launcher geometry the proxy and benchmark use a conservative 27B bound (34,816 KV bytes/token, 157,000,000 recurrent bytes), safe also for 0.8B (6,528 KV bytes/token, 20,201,472 recurrent bytes). Explicit chunk sizes above the planning bound refuse startup. These are the supported 0.8B/27B geometries; other geometry needs verified `delta_geometry` before use. Each `[n0,n1)` extend has its own delta import and prefix verification. A later failure retains verified earlier chunks for local continuation; a subsequent sync reconciles the remote prefix. Explicit sizes above those bounds refuse proxy startup.
 
-Setup builds `llama-server` and `llama-hybrid-bench-check`, starts the protected decoder and proxy, and waits for health. Each launched process has `--startup-timeout` seconds (default 600) to become healthy. The decoder and the node hash the whole GGUF at load with a portable SHA-256, which takes minutes for a 27B file on some machines; a failed or timed-out start stops only the processes it launched and reaps them. The proxy config, credential and PID files are private. `--skip-build` requires an existing matching build record and binary hashes; use it only after a successful build of the same ref/backend. The config includes `node_token_file`, `client_credential` and the existing proxy `clients` mapping; never share this file.
+Setup builds `llama-server`, `llama-hybrid-bench-check` and `llama-hybrid-score`, starts the protected decoder and proxy, and waits for health. Each launched process has `--startup-timeout` seconds (default 600) to become healthy. The decoder and the node hash the whole GGUF at load with a portable SHA-256, which takes minutes for a 27B file on some machines; a failed or timed-out start stops only the processes it launched and reaps them. The proxy config, credential and PID files are private. `--skip-build` requires an existing matching build record and binary hashes; use it only after a successful build of the same ref/backend. The config includes `node_token_file`, `client_credential` and the existing proxy `clients` mapping; never share this file.
 
 ## 4. Smoke run
 
@@ -202,3 +202,79 @@ nice -n 10 python3 tools/hybrid-bench/test_integrated.py --case noise \
 ```
 
 The artifact directory must not already exist. `--baseline-checker /path/to/M1-checker` additionally compares every original CPU metric and exit code with the unchanged M1 executable. Set the library search path to the matching build when running a retained executable. The test retains the one-byte checksum mismatch control (exit 2, no metrics) and adds two bodies with valid recomputed canonical XXH3-128 and SHA-256 trailers: stride 1031/xor 0x40 corruption and stride 4099/xor 0x01 loss after byte 4096. Both must import successfully and fail the same-partition logit gate with exit 3; the lossy case must keep all eight argmax tokens. It reuses the existing proxy test helper and its system libxxhash dependency. A clean delta must pass. CPU-only builds also refuse a GPU request and a false CUDA label with exit 2. `--gpu-available` skips only the unavailable-GPU refusal control when running the suite on a GPU-capable host; this suite still selects CPU computations.
+
+## Reference-model teacher-forced scoring
+
+`llama-hybrid-score` is a sibling of the equivalence checker. It scores a fixed continuation instead of sampling. Position N predicts `continuation[0]` after the N context tokens; position N+i predicts `continuation[i]` after the preceding i continuation tokens. All vocabulary logits are requested in batches (`score_batch`, default 32, maximum 256). The last continuation token does not need a decode. Contexts use two CPU threads, q8_0 KV, flash attention and f32 recurrent state, matching the checker. A reference is always produced from local prefill.
+
+Build with the existing project configuration and build lock:
+
+```sh
+cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DGGML_CUDA=OFF
+flock /home/agent/Werkstatt/hybrid-models/.build.lock cmake --build build -j2 --target llama-hybrid-score
+```
+
+Create a private JSON input with two arrays: `{"tokens":[...],"continuation":[...]}`. These are token IDs, with the exact tokenizer shared by D and the arms. Reserve at least N+M context capacity. Use an existing directory on disk for TMPDIR and scratch; outputs must not exist. No model download is performed.
+
+```sh
+mkdir -p .temp/reference/tmp
+TMPDIR="$PWD/.temp/reference/tmp" nice -n 10 python3 tools/hybrid-bench/hybrid_bench.py reference \
+  --model "$REFERENCE_MODEL" --tokens .temp/reference/tokens.json \
+  --output .temp/reference/D.logprobs --result .temp/reference/D.encoding.json \
+  --scratch .temp/reference --build-dir build --gpu-layers 0 --score-batch 32 --max-ctx 65536
+```
+
+The producer prints the native exit code and writes its log and PID under scratch. The binary reference includes context and continuation tokens and full distributions; keep it private. The result JSON contains only hashes, settings, numerical summaries and per-position measurements. Keep the encoding result next to the reference to retain the measured precision bound.
+
+For the existing benchmark flow, add `--reference-logits /absolute/D.logprobs --reference-model-sha256 "$REFERENCE_MODEL_SHA256" --check`. Use a reference prepared for the exact token context of that check (including chat framing) and select the corresponding `--check-depths` and schedule. The reference scores all M continuation tokens from the file; `--check-tokens` controls the older equivalence check independently (up to 256). A file represents one N/M and token sequence, not a wildcard for multiple depth rungs. A mismatched context refuses; it never silently selects different positions or regenerates D. References for arbitrary task texts can also be scored directly without the synthetic schedule:
+
+```sh
+build/bin/llama-hybrid-score "$CLIENT_MODEL" .temp/reference/client-fixture.json .temp/reference/client-result.json 0
+```
+
+The client fixture contains `tokens`, `continuation`, `model_sha256` (client), `reference_logits`, `reference_model_sha256` (D), `max_ctx`, and optionally `score_batch`. Add `deltas` as an ordered path array to import a chain ending at N-1; the client computes the last context token, exactly as `--check` does. For heterogeneous imports also supply `hetero_quant: true`, `node_model_sha256` and `node_layout_fingerprint`. The native scorer verifies the source hash without relabeling delta headers, and requires the node layout to match the client layout. Launchers continue to require `--hetero-quant` for different file hashes with equal layout fingerprints. Client setup now also builds and hashes `llama-hybrid-score`.
+
+JSONL and the Markdown bundle report `reference_scoring` separately from equivalence. `local` is KL(D || local client), `hybrid` is KL(D || imported client), and `local_to_hybrid` is KL(local client || imported client), all in nats. Each has mean, median, p90, p99, maximum and top-1 agreement. Quantiles use linear interpolation at `(M-1)*p`. The old same-partition and partition-noise metrics remain. Scoring status `measured` is descriptive and adds no quality ranking or acceptance threshold. The existing heterogeneous equivalence status remains `uncalibrated` (exit 5).
+
+The versioned binary format, integrity checks, float16 precision measurements, CPU results and GPU limitations are in [RESULTS-hybrid-b-r26-261101.md](RESULTS-hybrid-b-r26-261101.md). Malformed files and mismatched model/token/N/M/vocabulary identities return 2 with no score result. Output files are published from temporary files after successful scoring; pre-existing outputs refuse overwrite.
+
+CPU regression command (no downloads; the directory must be new):
+
+```sh
+TMPDIR="$PWD/.temp/reference/tmp" nice -n 10 python3 tools/hybrid-bench/test_reference_native.py \
+  --client /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf \
+  --reference /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q8_0-requant.gguf \
+  --artifacts .temp/reference/native
+python3 -m unittest discover -s tools/hybrid-bench -p test_reference.py -v
+```
+
+Native logs, exact commands/exits, reference files, PID records, CPU measurements and a sanitized orchestration archive go under the artifact directory. The optional integration launches and stops its own loopback Q8 prefill node.
+
+## Natural-text hetero-quant study
+
+`python3 tools/hybrid-bench/hetero_study.py --help` lists the standard-library study driver. `tools/hybrid-bench/fetch --manifest tools/hybrid-bench/gutenberg_sources.json --output /private/books` invokes curl only on the GPU host and writes a pinned `manifest.json`. The source list is unpinned until that first fetch; retain the resulting pins with the study. A repeated fetch checks both the local books and fresh downloaded bytes against those pins. No downloads were used to develop or test the driver.
+
+`prepare` verifies local document hashes and sizes before using a numeric-loopback llama-server `/props` and `/tokenize`. It adds model special tokens, disables special-string parsing, and takes the first N context plus M continuation IDs without chat framing, normalization, header removal or sampling. Each model family/rung needs its own prepared study and D reference. All fixture, reference, delta, result, PID and report artifacts stay under private directories with mode 0600 files. See [the GPU runbook](RESULTS-hybrid-b-r27-261101.md) for exact commands, manifest schema and disk budgets.
+
+`reference` locally prefills D. `arm` accepts `--kind local|imported --label LABEL --client-model PATH [--node-model PATH]` or `--spec FILE` containing those four fields with underscores. Cross-hash imports require `--hetero-quant`. Imported arms run an owned prefill node per document, export an original bounded delta chain through N-1, stop and reap the node, then run the client scorer; the client evaluates the final context token itself. `--build-dir` selects the client/scorer build; `--node-build-dir` optionally selects a different node build. No proxy, envelope SHA rewriting or network service outside loopback is used.
+
+The host-wide advisory `--lock` (before the subcommand) serializes cooperating invocations across study directories. Stop an externally started tokenizer before reference/arm. The driver cannot reserve the GPU against unrelated programs. It records every owned native PID and exit, handles TERM/interrupt with terminate/wait/kill of that Popen child only, and never kills PIDs recovered from disk. Successful per-document receipts bind index, fixture, model/build/settings, reference SHA-256, delta hashes/sizes and row/result hashes. Repeating an arm checks live inputs and the recorded bindings before skipping completed documents. Default successful scoring deletes that document's delta files; `--keep-deltas` retains them for debugging. Failed attempts remove their own partial deltas even with that option, retaining logs. SIGKILL or a host crash can leave orphan files. Missing debug delta files do not invalidate a scored row; changed recorded hashes, bindings or damaged rows refuse. Existing valid reports are preserved if a later input check fails; no new report is written.
+
+`--chunk-tokens` must be a multiple of 256 in 256..8192, preserving node/local prefill partitions. Before native arm work, the driver prints a JSON disk budget and refuses if available space is below budget plus margin. The bound reserves 514 MiB per possible delta response, 100 MiB per pending document for rows/logs, and a margin of max(1 GiB, 10% of budget). Default deletion reserves only the largest pending document chain; `--keep-deltas` reserves all pending chains. Shared references and models already occupy disk and are excluded from this incremental budget. This is an admission check on current free space, not a reservation against unrelated writers.
+
+`report --arms local imported --seed 42` writes numeric CSV, Markdown and JSON. It verifies current fixture and row/result file hashes, receipt checksums, and the recorded index/arm/reference/delta binding chain. It reads cached reference headers and hashes, without opening reference payloads, model/build files, books, manifests or delta files. Regenerated reference receipts and changed completed-document bindings refuse stale rows. It does not establish that large files still exist or still match their recorded hashes; those are checked when producing/resuming arms. Receipt checksums detect corruption, not coordinated malicious rewrites. JSON `settings.verification` records this scope. Receipts from before r28 lack this chain/header metadata and must be regenerated in a fresh study.
+
+Position rows contain KL(D || arm) in nats and D top-1 agreement. Quantiles interpolate at `(count-1)*p`. Document rows list means; the `documents` aggregate bootstraps those means over whole documents, 10,000 seeded samples and percentile 95% intervals. Paired rows give later-listed arm minus earlier-listed arm on the exact same documents, including top-1 differences. Individual document rows have no within-document interval. No token-level independence is assumed.
+
+The r6q findings are addressed in the native scorer: all local prefills split N-1 plus one token, matching the imported arm's final decode; references bind that context schedule and continuation `score_batch`. Every run also compares primary full-precision client distributions with fresh-prefix probes at continuation indices 0, M/2 and M-1, for each available arm. The report's `schedule_probes` rows summarize these arm-side KL/top-1 observations separately from D || arm and float16 encoding error. Probes bound only sampled positions and schedules. Primary contexts are freed before probes, so imported scoring retains at most two contexts at once. References predating this schedule contract must be regenerated. D uses BF16 weights with q8_0 KV, f32 recurrent state and flash attention.
+
+CPU checks, with local 0.8B GGUF files and disk-backed TMPDIR:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/hybrid-bench -p test_hetero_study.py -v
+PYTHONDONTWRITEBYTECODE=1 nice -n 10 python3 tools/hybrid-bench/test_hetero_study_native.py \
+  --client /local/Qwen3.5-0.8B-Q4_0.gguf --reference /local/Qwen3.5-0.8B-Q8_0-requant.gguf \
+  --build-dir build --artifacts .temp/study-cpu
+```
+
+The existing CMake target `llama-hybrid-score` builds the scorer; `llama-hybrid-prefill` and `llama-server` provide import and tokenization. curl is used only by fetch. Native logs, commands, exit codes and numeric witnesses live under `--artifacts`; model-free unit tests use their private temporary fixtures. No new Python packages or test framework are required.

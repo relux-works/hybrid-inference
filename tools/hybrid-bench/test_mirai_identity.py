@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import bench_common as common
+import hetero_study as study
 
 FIXTURES = json.loads((Path(__file__).parent / 'fixtures/mirai-s-headers.json').read_text())['models']
 FINGERPRINT = 'd4fb520322100b1e438d60aa641ee86bd0d22576198a6dc49890c04f181924a8'
@@ -229,6 +230,40 @@ class NativeHeaderTests(unittest.TestCase):
                 native, python = json.loads(result.stdout), common.model_identity(path)
                 self.assertEqual(native, {key: python[key] for key in native})
                 self.assertEqual(native['layout_fingerprint'], FINGERPRINT)
+
+    # Real headers pass driver SHA admission and shared/native layout checks with hetero enabled; no weights are scored.
+    def test_study_mirai_bf16_hetero_identity(self):
+        mirai = HEADERS / 'mirai-s.header.gguf'
+        stock = HEADERS / 'qwen3.8-27b-bf16.header.gguf'
+        args = study.parser().parse_args(['arm', '--study', str(HEADERS), '--kind', 'imported', '--label', 'Mirai-BF16',
+                                         '--client-model', str(mirai), '--node-model', str(stock), '--hetero-quant',
+                                         '--reference-model-sha256', common.sha256(stock)])
+        spec = study.arm_spec(args)
+        self.assertNotEqual(spec['client_model']['sha256'], spec['node_model']['sha256'])
+        client, reference = common.model_identity(mirai), common.model_identity(stock)
+        common.validate_identity(spec['client_model']['sha256'], client, spec['node_model']['sha256'], reference, spec['hetero_quant'])
+        for name, identity in [('mirai-s', client), ('qwen3.8-27b-bf16', reference)]:
+            native = self.native(fixture(name), name, 'study-' + name)
+            self.assertEqual(native, {key: identity[key] for key in native})
+            self.assertEqual(native['model_layout']['layer_count'], 64)
+        args.hetero_quant = False
+        with self.assertRaisesRegex(study.Refusal, 'node/client mismatch requires --hetero-quant'):
+            study.arm_spec(args)
+
+    # An unknown tensor fails both header admission and the scorer's native loader; hetero cannot waive tensor accounting.
+    def test_study_unknown_extra_refused(self):
+        stock = common.model_identity(HEADERS / 'qwen3.8-27b-bf16.header.gguf')
+        source = HEADERS / 'mirai-s.header.gguf'
+        common.validate_identity(common.sha256(source), common.model_identity(source),
+                                 common.sha256(HEADERS / 'qwen3.8-27b-bf16.header.gguf'), stock, True)
+        meta = fixture()
+        meta['_tensors']['blk.64.nextn.surprise.weight'] = ([5120], 0)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'unknown-extra.gguf'
+            header_fixture(source, path, meta)
+            with self.assertRaisesRegex(common.Refusal, 'unknown extra tensors'):
+                common.model_identity(path)
+        self.native(meta, case='study-unknown-extra', expected='wrong number of tensors')
 
     # Full native loaders validate every real name/shape/type without reading weights or enabling MTP.
     def test_native_python_equality(self):

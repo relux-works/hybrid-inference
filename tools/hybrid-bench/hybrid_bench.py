@@ -157,6 +157,12 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         require(type(chunk) is int and 1 <= chunk <= safe_chunk, 'extend chunk exceeds native delta bound')
         n0 = 0
         paths = []
+        score_paths = []
+        reference_path = getattr(args, 'reference_logits', None)
+        if reference_path:
+            from reference_logits import reference_header, scoring_fixture
+            reference = reference_header(reference_path, args.reference_model_sha256)
+            scoring_fixture(reference, tokens, reference['m'], client, config, [], reference_path)
         import struct
         for endpoint in ends:
             while n0 < endpoint:
@@ -175,6 +181,10 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                         raise Refusal('ram budget refusal (HTTP 503)' if budget else 'checker node refusal (HTTP 503)') from None
                     raise
                 delta_path = scratch / ('check-' + str(n0) + '.delta')
+                if reference_path:
+                    source_path = scratch / ('score-source-' + str(n0) + '.delta')
+                    source_path.write_bytes(data)
+                    score_paths.append(str(source_path))
                 if config.get('hetero_quant'):
                     size, = struct.unpack('<I', data[:4])
                     require(0 < size <= 1024**2 and 4 + size + 48 <= len(data), 'invalid checker delta header')
@@ -209,6 +219,21 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                       hetero_quant_thresholds_calibrated=False if config.get('hetero_quant') else None,
                       reference='same-partition, whole-prompt and alternate partitions on client backend; full-vocabulary KL')
         record(result)
+        if reference_path:
+            score_fixture = scoring_fixture(reference, tokens, reference['m'], client, config, score_paths, reference_path)
+            score_input, score_output = scratch / 'score.json', scratch / 'score.result.json'
+            private_json(score_input, score_fixture)
+            score_scratch = scratch / 'reference-scoring'
+            score_scratch.mkdir()
+            score_binary = Path(client['build_dir']) / 'bin/llama-hybrid-score'
+            score_process = run_checker([str(score_binary), client['model_path'], str(score_input), str(score_output),
+                                        '0' if client['backend'] == 'cpu' else '999'], score_scratch)
+            record(dict(stage='reference_checker', checker_exit_code=score_process.returncode,
+                        result_json=score_output.read_text() if score_output.is_file() else None))
+            require(score_process.returncode == 0 and score_output.is_file(), 'reference scorer refused inputs; no measurements written')
+            score_result = json.loads(score_output.read_text())
+            score_result['check_mode'] = result['check_mode']
+            record(score_result)
         return result
     finally:
         release_session(base, remote, token, config, record, 'checker',
@@ -349,8 +374,18 @@ def bundle(root, name, rows, client, node):
                 lines += ['Node session IDs unknown; list GET /v1/sessions with the client token.']
         if row.get('stage') == 'checker':
             lines += ['', f"Checker exit code ({row['check_mode']}, depth {row['depth']}): {row['checker_exit_code']}."]
+    for row in rows:
+        if row.get('stage') == 'reference_scoring':
+            lines += ['', 'Reference scoring: KL(D || arm), nats; measurements only.',
+                      '', '| Arm | Mean | Median | p90 | p99 | Max | Top-1 agreement |',
+                      '|---|---:|---:|---:|---:|---:|---:|']
+            for arm in ('local', 'hybrid', 'local_to_hybrid'):
+                if row.get(arm):
+                    values = row[arm]['kl_nats']
+                    lines.append('| ' + arm + ' | ' + ' | '.join(f'{values[k]:.9g}' for k in ('mean', 'median', 'p90', 'p99', 'max'))
+                                 + f" | {row[arm]['top1_agreement']:.6f} |")
     (root / (name + '.md')).write_text('\n'.join(lines) + '\n')
-    # Bundle only these public, content-free artifacts, never the config/database/state/check inputs.
+    # Bundle only public measurements, never token inputs or reference payloads.
     public = {name + '.jsonl': path.read_bytes(), name + '.md': (root / (name + '.md')).read_bytes(),
               'client-info.json': (json.dumps(sanitized_info(client), indent=2) + '\n').encode(),
               'node-info.json': (json.dumps(sanitized_info(node), indent=2) + '\n').encode()}
@@ -368,6 +403,9 @@ def bundle(root, name, rows, client, node):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'reference':
+        from reference_logits import produce
+        return produce(sys.argv[2:])
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--client-state', required=True)
     p.add_argument('--node-info', help='required when client was configured with --node-sha256 only')
@@ -381,10 +419,19 @@ def main():
     p.add_argument('--depths', type=int, nargs='+', help='override the depth ladder; smoke still controls tool/output sizes')
     p.add_argument('--request-timeout', type=int, help='HTTP response timeout in seconds for long CPU runs')
     p.add_argument('--check', action='store_true')
+    p.add_argument('--reference-logits', help='pinned full-vocabulary reference file for the exact --check context')
+    p.add_argument('--reference-model-sha256', help='expected reference GGUF SHA-256, required with --reference-logits')
     p.add_argument('--check-tokens', type=int, default=64)
     p.add_argument('--noise-chunks', type=int, nargs='+', default=[128, 255], help='1..4 alternate local batch sizes in 1..256')
     p.add_argument('--check-depths', type=int, nargs='+', help='check first completed call at or above each depth')
     args = p.parse_args()
+    require(bool(args.reference_logits) == bool(args.reference_model_sha256) and (not args.reference_logits or args.check),
+            '--reference-logits requires --check and --reference-model-sha256')
+    reference_count = 0
+    if args.reference_logits:
+        from reference_logits import reference_header
+        reference_count = reference_header(args.reference_logits, args.reference_model_sha256)['m']
+        require(type(reference_count) is int and 1 <= reference_count <= 1048576, 'invalid reference continuation count')
     require(args.request_timeout is None or 1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
     require(re.fullmatch('[a-zA-Z0-9_-]{1,64}', args.label), 'label must contain 1-64 letters, digits, underscores or hyphens')
     require(1 <= args.check_tokens <= 256, '--check-tokens must be in 1..256')
@@ -438,7 +485,7 @@ def main():
                 for index, step in enumerate(rows[0]['workload']):
                     incoming = []
                     if step['kind'] == 'depth':
-                        target = min(step['depth'], limit - step['output'] - args.check_tokens - 128)
+                        target = min(step['depth'], limit - step['output'] - max(args.check_tokens, reference_count) - 128)
                         if previous >= target:
                             rows.append(dict(stage='skip', mode=mode, reason='ladder depth already exceeded', requested_depth=step['depth']))
                             skipped += 1
