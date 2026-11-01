@@ -1,5 +1,5 @@
 # Unresolved questions
 
-- Hybrid r20: the matching-call bench workload is authorized after F1 and guard rework and receipt of real `tools` captures. Captures are still pending; the workload remains unchanged until they arrive. Preserve synthetic tool payload sizes and Qwen workload bytes. See tools/hybrid-proxy/RESULTS-hybrid-a-r19-templates-261101.md.
+- Hybrid r21: the real r20 tools captures arrived and the conditional matching-call workload is implemented for review, preserving synthetic payload sizes and Qwen request bytes. CPU render/journal evidence does not qualify the real long-context benchmark or GPU state. See tools/hybrid-proxy/RESULTS-hybrid-a-r19-templates-261101.md.
 - Template redistribution: Muse Glimmer licence remains unconfirmed. Current fixtures contain hashes instead of full template sources; external oracle sources are hash-checked. Inherited r19 commits still contain the original sources and are preserved by the explicit no-rewrite instruction. Publication of that history needs a licence or ownership decision.
 - Real GPU qualification remains pending for Gemma 4 and Muse Glimmer: emitted stop tokens, complete sampled IDs, native checkpoint rollback, transfer identity and same-partition numerical equivalence must be measured on the actual host. CPU fixture replay establishes byte/token/frame contracts only.

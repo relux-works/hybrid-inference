@@ -17,12 +17,16 @@ from template_oracle import TemplateOracle, source_fixture
 FIXTURES = Path(__file__).with_name("fixtures") / "templates"
 
 
-def cases():
+def cases(r20=False):
     for path in sorted(FIXTURES.glob("*.json")):
+        if path.stem.endswith("-r20") != r20:
+            continue
         fixture = json.loads(path.read_text())
         for name, shape in fixture["shapes"].items():
             for variant, render in shape["renders"].items():
                 body = dict(messages=shape["messages"], add_generation_prompt=variant.startswith("agp/"))
+                if shape.get("tools") is not None:
+                    body["tools"] = shape["tools"]
                 if variant.endswith("enable_thinking_false"):
                     body["chat_template_kwargs"] = dict(enable_thinking=False)
                 yield fixture, name, variant, body, render
@@ -572,6 +576,25 @@ class TemplateHTTPTests(unittest.TestCase):
             self.assertEqual(text.encode()[byte(row["start"]):byte(row["end"])], b"A2<turn|>\n")
             self.assertEqual(self.decode.app.info(self.decode.app.slots[session["slot"]])["tokens"], session["tokens"])
 
+    # Each r20 shape persists captured token IDs/ranges through HTTP with the benchmark's generation/thinking flags.
+    def test_http_r20_shapes(self):
+        for fixture, name, variant, body, captured in cases(r20=True):
+            if variant != "agp/enable_thinking_false":
+                continue
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                self.decode.app.template_fixture = FixtureTemplate(fixture)
+                with self.client.open("POST", "/v1/chat/completions", body) as response:
+                    sid = response.headers["X-Hybrid-Session"]
+                    response.read()
+                with self.app.reserve(sid):
+                    pass
+                session = self.app.store.get(sid)
+                tokens = [p["id"] for p in captured["tokens_add_special"]]
+                self.assertEqual(session["tokens"][:len(tokens)], tokens)
+                layout, _ = self.app.renderer.layout(body, captured["text"], tokens)
+                self.assertEqual(session["journal"]["message_boundaries"][:len(layout)], layout)
+                self.assertEqual(self.decode.app.info(self.decode.app.slots[session["slot"]])["tokens"], session["tokens"])
+
     # Gemma's unsupported unmatched tool response is rejected before journal, slot or remote state changes.
     def test_http_gemma_unmatched_tool_atomic(self):
         fixture = self.configure()
@@ -668,6 +691,128 @@ class TemplateHTTPTests(unittest.TestCase):
                 return dict(prompt=result["prompt"].replace("SYS", "BAD"))
             return result
         self.reject(mutate, "generation prompt changed previous messages")
+
+
+class CapturedR20Tests(unittest.TestCase):
+    # All 96 real r20 renders and both captured token modes match, including fixed tool definitions.
+    def test_replay(self):
+        count = 0
+        for fixture, name, variant, body, captured in cases(r20=True):
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                template = FixtureTemplate(fixture)
+                self.assertEqual(template.render(body), captured["text"])
+                for initial, key in ((False, "tokens_plain"), (True, "tokens_add_special")):
+                    self.assertEqual(template.tokenize(captured["text"], initial, True), captured[key])
+                count += 1
+        self.assertEqual(count, 96)
+
+    def check_ranges(self, renderer, body, captured):
+        text = captured["text"]
+        tokens = [p["id"] for p in captured["tokens_add_special"]]
+        layout, end = renderer.layout(body, text, tokens)
+        raw = renderer.token_bytes(text, tokens)
+        def byte(position):
+            return sum(map(len, raw[:position["n"]])) + position["byte_offset"]
+        opening = renderer.family(body)[0]
+        search, previous = 0, None
+        segments = []
+        self.assertEqual([row["message_index"] for row in layout], list(range(len(body["messages"]))))
+        for message, row in zip(body["messages"], layout):
+            role = message["role"]
+            if role == "tool":
+                header = "<|tool_response>" if opening == "<|turn>" else "<|im_start|>user\n<tool_response>\n" if opening == "<|im_start|>" else "<|start|>tool "
+            elif opening == "<|turn>" and role == "assistant" and previous == "assistant":
+                header = "<|tool_call>" if message.get("tool_calls") else message["content"]
+            else:
+                header = opening + ("model" if role == "assistant" and opening == "<|turn>" else role)
+            expected = text.encode().index(header.encode(), search)
+            self.assertEqual(byte(row["start"]), expected)
+            self.assertLess(byte(row["start"]), byte(row["end"]))
+            segment = text.encode()[byte(row["start"]):byte(row["end"])].decode()
+            segments.append(segment)
+            search = expected + len(header.encode())
+            if role != "tool":
+                previous = role
+        self.assertEqual(byte(end), len(renderer.render(dict(body, add_generation_prompt=False)).encode()))
+        for index, message in enumerate(body["messages"]):
+            if message["role"] == "tool":
+                payload = message["content"].strip()
+                self.assertIn(payload, segments[index])
+                self.assertTrue(all(payload not in segment for i, segment in enumerate(segments) if i != index))
+                if payload == "x x x x":
+                    row = layout[index]
+                    pieces = captured["tokens_add_special"][row["start"]["n"]:row["end"]["n"]]
+                    filler = [p for p in pieces if p["piece"] in ("x", " x")]
+                    self.assertEqual(len(filler), 4)
+                    self.assertEqual("".join(p["piece"] for p in filler).strip(), payload)
+        self.assertEqual([b["message_index"] for b in renderer.user_boundaries(body, text, tokens)],
+                         [i for i, m in enumerate(body["messages"]) if m["role"] == "user"])
+        return tokens
+
+    # Starts are checked independently against real bytes; continued calls/answers and each response own disjoint ranges.
+    def test_ranges(self):
+        for fixture, name, variant, body, captured in cases(r20=True):
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                node = ReplayNode(fixture)
+                self.addCleanup(node.state.close)
+                self.check_ranges(Renderer(node), body, captured)
+
+    # Real r20 suffixes retain tool payloads and anchor IDs; a merged Gemma A1 cannot supply an old closing anchor.
+    def test_append(self):
+        for fixture, name, variant, body, captured in cases(r20=True):
+            if name == "system_user_tools":
+                continue
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                node = ReplayNode(fixture)
+                self.addCleanup(node.state.close)
+                renderer = Renderer(node)
+                text, tokens = captured["text"], [p["id"] for p in captured["tokens_add_special"]]
+                past = 4 if name == "consecutive_assistants" or name.startswith("bench_tool") else 5 if name.startswith("call_tool_answer") else 3
+                prompt, _, _, tail = renderer.append(body, text, tokens, past, [71, 72])
+                self.assertEqual(prompt, [71, 72] + tail)
+                layout, _ = renderer.layout(body, text, tokens, start=past, token_base=len(tokens) - len(tail), anchor_base=2)
+                self.assertTrue(all(row["start"]["n"] >= 2 for row in layout))
+                if name.startswith("bench_tool"):
+                    self.assertIn("x x x x", b"".join(renderer.token_bytes(text, tokens)[len(tokens) - len(tail):]).decode())
+                    if fixture["label"].startswith("gemma"):
+                        with self.assertRaisesRegex(JournalConflict, "exact end-of-turn"):
+                            renderer.append(body, text, tokens, 3, [71, 72])
+
+    # An uncaptured tool schema cannot borrow the captured preamble or pretend to have token evidence.
+    def test_uncaptured_tools(self):
+        for fixture, _, _, body, _ in cases(r20=True):
+            if body.get("tools"):
+                template = FixtureTemplate(fixture)
+                self.assertTrue(template.render(body))
+                body = copy.deepcopy(body)
+                body["tools"][0]["function"]["name"] = "unknown"
+                with self.assertRaisesRegex(ValueError, "outside captured schema"):
+                    template.render(body)
+
+
+class R20OracleTests(unittest.TestCase):
+    # The external digest-checked oracle validates all 96 captures and the stub's live layout/append probes.
+    def test_captures_and_probes(self):
+        oracles = {}
+        for fixture, name, variant, body, captured in cases(r20=True):
+            if fixture["label"] not in oracles:
+                oracles[fixture["label"]] = TemplateOracle(fixture)
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                oracle = oracles[fixture["label"]]
+                self.assertEqual(oracle.render(body), captured["text"])
+                node = ReplayNode(fixture)
+                self.addCleanup(node.state.close)
+                node.template.props = oracle.fixture["props"]
+                node.template.render = oracle.render
+                renderer = Renderer(node)
+                CapturedR20Tests.check_ranges(self, renderer, body, captured)
+                if name != "system_user_tools":
+                    past = 4 if name == "consecutive_assistants" or name.startswith("bench_tool") else 5 if name.startswith("call_tool_answer") else 3
+                    tokens = [p["id"] for p in captured["tokens_add_special"]]
+                    stub = ReplayNode(fixture)
+                    self.addCleanup(stub.state.close)
+                    self.assertEqual(renderer.append(body, captured["text"], tokens, past, [71]),
+                                     Renderer(stub).append(body, captured["text"], tokens, past, [71]))
 
 
 if __name__ == "__main__":

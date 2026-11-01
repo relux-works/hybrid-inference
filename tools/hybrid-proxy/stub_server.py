@@ -122,10 +122,23 @@ class FixtureTemplate:
         args = call["function"]["arguments"]
         return json.loads(args) if isinstance(args, str) else args
 
+    def tool_system(self, body, system, fallback):
+        if not body.get("tools"):
+            return fallback
+        shape = self.fixture["shapes"].get("system_user_tools", {})
+        if body["tools"] != shape.get("tools"):
+            raise ValueError("tool definitions outside captured schema")
+        thinking = body.get("chat_template_kwargs", {}).get("enable_thinking", True)
+        variant = "no_agp/" + ("default" if thinking else "enable_thinking_false")
+        text = shape["renders"][variant]["text"]
+        user = "<|turn>user\n" if self.label.startswith("gemma") else "<|start|>user<|message|>" if self.label.startswith("muse") else "<|im_start|>user\n"
+        # Reuse only the captured fixed-schema system preamble; message probes still render independently.
+        return text[:text.index(user)].replace("SYS", system)
+
     def render(self, body):
         messages = body["messages"]
-        if body.get("tools") or any(not isinstance(m.get("content") or "", str) for m in messages):
-            raise ValueError("fixture renderer only covers text and calls without tool definitions")
+        if any(not isinstance(m.get("content") or "", str) for m in messages):
+            raise ValueError("fixture renderer only covers text and calls")
         thinking = body.get("chat_template_kwargs", {}).get("enable_thinking", True)
         last_assistant = messages[-1]["role"] == "assistant"
         agp = body.get("add_generation_prompt", True) and not last_assistant
@@ -135,6 +148,7 @@ class FixtureTemplate:
             system = messages[0]["content"].strip() if messages[0]["role"] == "system" else ""
             system = ((instruction + ("\n\n" if system else "")) if thinking else "") + system
             text = opening + "system\n" + system + closing if system else ""
+            text = self.tool_system(body, messages[0]["content"].strip() if messages[0]["role"] == "system" else "", text)
             for index, m in enumerate(messages):
                 role, content = m["role"], (m.get("content") or "").strip()
                 if role == "system":
@@ -164,6 +178,7 @@ class FixtureTemplate:
             opening, closing = "<|turn>", "<turn|>\n"
             system = messages[0]["content"].strip() if messages[0]["role"] == "system" else ""
             text = opening + "system\n" + ("<|think|>\n" if thinking else "") + system + closing if system or thinking else ""
+            text = self.tool_system(body, system, text)
             last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
             previous_role = None
             for index, m in enumerate(messages):
@@ -206,6 +221,7 @@ class FixtureTemplate:
         opening, closing = "<|start|>", "<|eot|>"
         system = messages[0]["content"] if messages[0]["role"] == "system" else "You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-11-01."
         text = opening + "system<|message|>" + system + '\n\nReasoning strength: high.\n\n# Valid recipients: "self", "user".' + closing
+        text = self.tool_system(body, system, text)
         names = {c["id"]: c["function"]["name"] for m in messages for c in m.get("tool_calls", [])}
         for index, m in enumerate(messages):
             role, content = m["role"], m.get("content") or ""

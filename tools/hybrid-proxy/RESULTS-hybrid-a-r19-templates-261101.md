@@ -157,3 +157,72 @@ Self-review covers scope, security, general and tests; notes are in `review-01.m
 ### Bench capture dependency
 
 No new capture directory has been supplied or observed in `#hybrid/prototype-go` at this checkpoint. Existing fixtures have no root tools definitions, so they cannot prove the requested workload change. The deterministic candidate is a fresh user request before a matching synthetic assistant call, followed by the unchanged response blob and continuation user; the user delimiter preserves A1's existing closing without rewriting immutable history or adding a sampled decode round. A call inserted directly after A1 would merge the Gemma turn and is unsuitable. Validate the candidate against captured tools renders and exact append before implementation. See the tracked design note `.temp/hybrid-a-r20-261101/bench-plan.md`. Qwen workload bytes remain unchanged at this checkpoint.
+
+## r21 matched synthetic tool turns
+
+Additive continuation of signed r20 head `4aeba4a2fe0a06df67448bb06bbfb949e1fa104b`; no rewrite or push. CPU only, no downloads or target-model/GPU access. Evidence is under `.temp/hybrid-a-r21-261101/`. This local prototype is ready for review after the checks below; independent acceptance is not claimed.
+
+The bench probes the active `/apply-template` with an unmatched nonce result using the benchmark's thinking setting. A single preserved nonce retains the old workload. A dropped result or HTTP 400/422 rejection selects a fresh user request, matching assistant `read` call, unchanged synthetic tool result and existing continuation user. The fresh user request preserves the preceding sampled assistant's closing delimiter, without an extra generation round. Duplicate unmatched probes, missing/duplicate matched probes and HTTP authentication/server/transport failures abort. The verdict is recorded as `tool_call_added` in probe and call rows (false for depth rows). Payload construction, token-count validation, schedule and RNG are unchanged.
+
+Qwen and Glimmer retain the original unmatched-tool path. `SyntheticToolTests.test_qwen_request_bytes` compares old message lists, renders and actual `stream_chat` request JSON bytes over both complete fixed/measured schedules. `test_main_call_verdict` exercises main's actual requests and persisted result fields for Qwen and Gemma. Gemma matching-call append retains the sampled anchor; the direct A1 -> call capture merges the model turn and therefore cannot use A1's former closing as an incremental anchor. This case is explicitly rejected and the inserted user solves it.
+
+### Captures, ranges and redaction
+
+Three new `fixtures/templates/*-r20.json` files preserve all 96 real renders and 192 real tokenizations from b12094-74f8f4c3a, with both full template properties replaced by SHA-256 only. Existing fixtures are unchanged. The source filename selects the corresponding external capture for digest verification. Missing sources/Jinja2 still skip with a reason; a present wrong digest fails. Inherited r19 source-bearing objects remain unchanged under the no-rewrite instruction; the existing publication/licence question remains open.
+
+The fixture renderer accepts only the captured fixed `read` tool schema, borrowing its captured static system preamble while independently rendering each message/probe. No general schema or uncaptured-tokenizer claim is made. The external Jinja oracle matches all 96 r20 renders and their layout/user/append probes. Its test-only tool conversion restores the server wrapper field order and observed fixed-schema parameter order lost in the sorted capture JSON; this is documented as a finite oracle limit. The original oracle coverage remains 88 renders/84 supported probe variants, excluding eight server-assembled assistant-prefill renders.
+
+`CapturedR20Tests` checks all eight new shapes, all generation/thinking variants and both tool-definition choices. Starts are independently found in captured bytes, not inferred from agreement between two frame implementations. Consecutive Gemma assistants, continued calls and call/tool/answer segments own disjoint ranges. Every bench tool range contains the actual four captured filler token IDs: Gemma 1123 x4; Glimmer 831 x4; Qwen 87 then 830 x3 (its pre-existing leading-space trim). Both matched bench shapes retain all four tokens. Twenty-four HTTP admissions cover every family/shape under benchmark generation/thinking flags and verify persisted captured IDs and ranges against decoder stub slot state. Production journal code required no change.
+
+Fixture SHA-256 after redaction:
+
+- `gemma4-31b-r20.json`: `007c5d23c336b84608af71aad27a8f91635f29bf21c020802b860cc3d1d9cd48`
+- `muse-glimmer-30b-r20.json`: `e56eeec8913355d6bf7a09daa324122556d6cc8aa9567daabd1553d2714141ed`
+- `qwen3.8-27b-r20.json`: `766102cd17dbe12726202fbec2490469929d1c401e535703f06b3f2f3ec8c709`
+
+### Validation
+
+Commands use `TMPDIR=$PWD/.temp/hybrid-a-r21-261101` on disk and `PYTHONDONTWRITEBYTECODE=1`. No upstream hosted checks or C++ rebuild are claimed; C++ source is unchanged.
+
+| Check | Result | Evidence |
+|---|---|---|
+| `python3 -B -m unittest discover -s tools/hybrid-proxy -p 'test_*.py'` | exit 0, 112 tests | `proxy-02.log` |
+| `HYBRID_SWA_CHECKER=$PWD/build/bin/llama-hybrid-check-swa python3 -B -m unittest discover -s tools/hybrid-bench -p test_bench.py` | exit 0, 54 tests, no skips | `bench-04.log` |
+| `python3 -B -m unittest discover -s tools/hybrid-eval -p test_eval.py` | exit 0, 11 tests | `eval-01.log` |
+| Full template suite with external sources | exit 0, 43 tests, no skips | `templates-03.log` (96 HTTP variants before narrowing that check to 24 benchmark-flag admissions) |
+| `python3 -B -m unittest discover -s tools/hybrid-proxy -p test_templates.py -k test_ranges -v` | exit 0, explicit captured filler-token count assertions | `payload-tokens-01.log` |
+| Source-absent full template suite | exit 0, 43 tests, 6 explicit source-absence skips | `source-absent-01.log` |
+| Source-absent bench oracle | exit 0, 1 explicit source-absence skip | `bench-source-absent-01.log` |
+| Changed Python syntax/ASCII, exact derived-capture equality, source hashes and prior test-name retention | exit 0 | `audit-01.log` |
+| `git diff --check` | exit 0 | `diff-check-01.log` |
+
+The exact upstream `ty` and `editorconfig-checker` tools are absent; no downloads/installations were attempted. Their checks are unrun, not passing. The code-style workflow's C++ model-naming gate is outside this Python/fixture delta.
+
+Development failures retained: `templates-01.log` exited 1 on Qwen/Glimmer tool-schema JSON ordering before the oracle conversion was corrected; no captured bytes were modified to match the oracle. `bench-01.log` exited 1 because the existing decoder mock referenced a wrong variable while being updated to preserve probe content (11 assertion failures and one error); the mock correction is included. `bench-02` and `bench-03` pass with only the existing optional checker skip; `bench-04` enables that checker and passes without skips. Controls are repeated after test-source changes so the delivered identities include the explicit filler-token assertions.
+
+### Controls and review bounds
+
+`python3 -B tools/hybrid-proxy/template_controls.py --output .temp/hybrid-a-r21-261101/controls-03` exits 0. Identity survives all 43 source-free fixture/HTTP/guard/continued-turn/bench tests, exit 0. All 40 fault mutants exit 1 at their named intended assertions, with no errors/skips; the three declared equivalent mutants survive, exit 0. `controls-03/controls.json` contains the full table, commands, copied-module bindings, PID records, failure traces and source/test/fixture identities. Identity digests were rechecked against the delivered sources. The 30 existing r20 fault mutants retain their named tests and narrowing bounds from the preceding table and are all killed again. New controls:
+
+| Mutant | Narrows the gate to | Named failing test | Outcome |
+|---|---|---|---|
+| `bench-probe-duplicate` | an unmatched probe may appear at most once | `SyntheticToolTests.test_probe_preservation_guards` | killed, exit 1 |
+| `bench-matched-preservation` | fallback must retain exactly one matched probe | `SyntheticToolTests.test_probe_preservation_guards` | killed, exit 1 |
+| `bench-rejection-status` | only client rejections authorize matched fallback | `SyntheticToolTests.test_rejection_and_outage` | killed, exit 1 |
+| `bench-force-call` | preserving unmatched templates keep their old requests | `SyntheticToolTests.test_qwen_request_bytes` | killed, exit 1 |
+| `bench-never-call` | dropping templates need a matching call | `SyntheticToolTests.test_live_probe` | killed, exit 1 |
+| `bench-call-id` | the assistant call ID must match its tool response | `SyntheticToolTests.test_payload_and_matching_call` | killed, exit 1 |
+| `bench-payload` | matching-call framing must retain the measured payload | `SyntheticToolTests.test_payload_and_matching_call` | killed, exit 1 |
+| `bench-user-anchor` | a fresh user turn must preserve the sampled closing | `SyntheticToolTests.test_gemma_append_anchor` | killed, exit 1 |
+| `bench-row-verdict` | each call row records whether a call was actually inserted | `SyntheticToolTests.test_main_call_verdict` | killed, exit 1 |
+| `fixture-tools-schema` | a captured preamble cannot qualify a different tool schema | `CapturedR20Tests.test_uncaptured_tools` | killed, exit 1 |
+
+| Surviving mutant | Named suite | Bound stated by survival |
+|---|---|---|
+| `frame-nonassistant-count` | 43 source-free identity tests | non-assistant reasoning is absent; the unique-marker and duplicate-marker guards imply this count |
+| `bos-len` | 43 source-free identity tests | one extra piece plus exact bos_ids + plain_ids already implies one BOS ID |
+| `plain-equal-branch` | 43 source-free identity tests | when IDs agree, returned bytes come from the already checked plain pieces |
+
+Self-review covers scope, security, general and tests (`review-01.md`). All previous named reviewer tests remain present. The brief supplies no formal surface table or external landing property suite (declared gap); r6o R1-R8 remain mapped to exactness, continued frames, append boundaries, unchanged Qwen, hash-bound oracle, identity/mutants, tool ownership and redaction. Out of contract under the CPU-only brief: target GPU/native sampled stops and state identity, checkpoint/numerical equivalence, throughput, arbitrary schemas/multimodal and uncaptured model tokenizations. No changes outside the bench and its proxy fixture/test/documentation support, except the root unresolved-question update explaining the satisfied capture dependency.
+
+Parallel r6p report `hybrid-review-proto/llama.cpp/.temp/REVIEW-templates-rework-claude.md` was still absent at 2026-11-01 16:38:18 UTC. No r6p acceptance or unresolved finding closure is inferred. Delivery/source/PID checks are in `delivery-audit-01.log`; tracker and local no-board evidence are in `.temp/tasks.md` and `goal-01.log`.

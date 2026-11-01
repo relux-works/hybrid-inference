@@ -79,7 +79,43 @@ CONTROLS += [
      [('rendered.count(marker) > 1', 'False')]),
 ]
 
+CONTROLS += [
+    ("bench-probe-duplicate", "an unmatched probe may appear at most once", "SyntheticToolTests.test_probe_preservation_guards",
+     [("require(count <= 1, 'template duplicated the synthetic tool probe')", "pass")]),
+    ("bench-matched-preservation", "fallback must retain exactly one matched probe", "SyntheticToolTests.test_probe_preservation_guards",
+     [("require(render(True).count(marker) == 1, 'template did not preserve the matched synthetic tool probe')", "render(True)")]),
+    ("bench-rejection-status", "only client rejections authorize matched fallback", "SyntheticToolTests.test_rejection_and_outage",
+     [("if error.code not in (400, 422):", "if False:")]),
+    ("bench-force-call", "preserving unmatched templates keep their old requests", "SyntheticToolTests.test_qwen_request_bytes",
+     [("if count == 1:\n        return False", "if count == 1:\n        return True")]),
+    ("bench-never-call", "dropping templates need a matching call", "SyntheticToolTests.test_live_probe",
+     [("    return True\n\n\ndef verify_meter", "    return False\n\n\ndef verify_meter")]),
+    ("bench-call-id", "the assistant call ID must match its tool response", "SyntheticToolTests.test_payload_and_matching_call",
+     [("dict(id=call_id, type='function'", "dict(id='wrong-id', type='function'")]),
+    ("bench-payload", "matching-call framing must retain the measured payload", "SyntheticToolTests.test_payload_and_matching_call",
+     [("tool_call_id=call_id, content=content", "tool_call_id=call_id, content=''")]),
+    ("bench-user-anchor", "a fresh user turn must preserve the sampled closing", "SyntheticToolTests.test_gemma_append_anchor",
+     [("[dict(role='user', content='Read the synthetic tool result.'),", "[")]),
+    ("bench-row-verdict", "each call row records whether a call was actually inserted", "SyntheticToolTests.test_main_call_verdict",
+     [("tool_call_added=step['kind'] == 'tool' and add_tool_call", "tool_call_added=False")]),
+    ("fixture-tools-schema", "a captured preamble cannot qualify a different tool schema", "CapturedR20Tests.test_uncaptured_tools",
+     [('if body["tools"] != shape.get("tools"):', 'if False:')]),
+]
+
+CONTROL_MODULES = {name: "hybrid_bench.py" for name, _, _, _ in CONTROLS if name.startswith("bench-")}
+CONTROL_MODULES["fixture-tools-schema"] = "stub_server.py"
+
 EXPECTED_ASSERTIONS = {
+    "bench-probe-duplicate": "AssertionError: Refusal not raised",
+    "bench-matched-preservation": "AssertionError: Refusal not raised",
+    "bench-rejection-status": "AssertionError: HTTPError not raised",
+    "bench-force-call": "AssertionError: True is not false",
+    "bench-never-call": "AssertionError: False is not True",
+    "bench-call-id": "self.assertEqual(call['id'], incoming[2]['tool_call_id'])",
+    "bench-payload": "self.assertEqual(incoming[2]['content'], payload)",
+    "bench-user-anchor": "self.assertIn('A1<turn|>\\n<|turn>user', text)",
+    "bench-row-verdict": "[False, expected]",
+    "fixture-tools-schema": "AssertionError: ValueError not raised",
     "bos-bytes": "byte_offset",
     "gemma-tool-stop": "self.assertEqual(tail[0], end[0])",
     "continued-turn-frame": "AssertionError: supported Gemma continuation rejected:",
@@ -104,13 +140,20 @@ CONTROLS += [
 
 def worker(test, output):
     import journal
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hybrid-bench"))
     import test_templates
-    suite = (unittest.defaultTestLoader.loadTestsFromName("test_templates." + test) if test else
+    import test_bench
+    import hybrid_bench
+    import stub_server
+    module = hybrid_bench if test.startswith("SyntheticToolTests.") else stub_server if test == "CapturedR20Tests.test_uncaptured_tools" else journal
+    suite = (unittest.defaultTestLoader.loadTestsFromName(("test_bench." if test.startswith("SyntheticToolTests.") else "test_templates.") + test) if test else
              unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName("test_templates." + name) for name in
-                                ("TemplateTests", "TemplateHTTPTests", "TemplateGuardTests", "ContinuedTurnTests")))
+                                ("TemplateTests", "TemplateHTTPTests", "TemplateGuardTests", "ContinuedTurnTests", "CapturedR20Tests")))
+    if not test:
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromName("test_bench.SyntheticToolTests"))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    Path(output).write_text(json.dumps(dict(module=str(Path(journal.__file__).resolve()),
-        bound_namespace=test_templates.Renderer is journal.Renderer and journal.Renderer.layout.__globals__ is journal.__dict__,
+    Path(output).write_text(json.dumps(dict(module=str(Path(module.__file__).resolve()),
+        bound_namespace=test_templates.Renderer is journal.Renderer and journal.Renderer.layout.__globals__ is journal.__dict__ and test_bench.hybrid_bench is hybrid_bench and hybrid_bench.probe_tool_call.__globals__ is hybrid_bench.__dict__,
         tests=result.testsRun, skipped=[str(t) for t in result.skipped],
         failures=[dict(test=case.id(), traceback=trace) for case, trace in result.failures],
         errors=[dict(test=case.id(), traceback=trace) for case, trace in result.errors]), indent=2) + "\n")
@@ -125,6 +168,8 @@ def main():
     source = Path(__file__).resolve().parent
     identity = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in list(source.glob("*.py")) + list((source / "fixtures/templates").glob("*.json"))}
+    identity.update({"../hybrid-bench/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in (source.parent / "hybrid-bench").glob("*.py")})
     (args.output / "source-identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     rows = []
     for name, bound, test, replacements in CONTROLS:
@@ -136,10 +181,15 @@ def main():
             for path in source.glob("*.py"):
                 shutil.copyfile(path, copied / path.name)
             shutil.copytree(source / "fixtures", copied / "fixtures")
+            bench = copied.parent / "hybrid-bench"
+            bench.mkdir()
+            for path in (source.parent / "hybrid-bench").glob("*.py"):
+                shutil.copyfile(path, bench / path.name)
             vocab = Path(directory) / "src"
             vocab.mkdir()
             shutil.copyfile(source.parents[1] / "src/llama-vocab.cpp", vocab / "llama-vocab.cpp")
-            path = copied / "journal.py"
+            module_name = CONTROL_MODULES.get(name, "journal.py")
+            path = (bench if module_name == "hybrid_bench.py" else copied) / module_name
             data = path.read_text()
             valid_plant = True
             for old, new in replacements:
@@ -154,7 +204,7 @@ def main():
             path.write_text(data)
             result_path = (args.output / (name + ".json")).resolve()
             command = [sys.executable, "-B", str(copied / "template_controls.py"), "--worker", test, str(result_path)]
-            row.update(command=command, module=str((copied / "journal.py").resolve()))
+            row.update(command=command, module=str(path.resolve()))
             with (args.output / (name + ".log")).open("w") as log:
                 process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
                 row["pid"] = process.pid

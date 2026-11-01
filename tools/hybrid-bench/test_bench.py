@@ -637,7 +637,7 @@ class CleanupTests(unittest.TestCase):
                 if url != 'http://decoder':
                     return real_http(url, path, *args, **kwargs)
                 if path == '/apply-template':
-                    return dict(prompt='fixture')
+                    return dict(prompt=''.join(m.get('content', '') for m in args[1]['messages']))
                 if path == '/tokenize':
                     return dict(tokens=[1] * (len(args[1]['content']) // 2 if args[1]['content'].startswith(' x') else 3))
                 return dict(tokens=[1] * 132)
@@ -907,6 +907,180 @@ class ProcessControlTests(unittest.TestCase):
                     if child.poll() is None:
                         child.kill()
                         child.wait()
+
+
+
+class SyntheticToolTests(unittest.TestCase):
+    @staticmethod
+    def fixture(label):
+        from test_templates import FIXTURES
+        from stub_server import FixtureTemplate
+        return FixtureTemplate(json.loads((FIXTURES / (label + "-r20.json")).read_text()))
+
+    # Real-backed live probes request calls only when unmatched content disappears, independent of the advertised model name.
+    def test_live_probe(self):
+        for label, expected in (("qwen3.8-27b", False), ("gemma4-31b", True), ("muse-glimmer-30b", False)):
+            template = self.fixture(label)
+            def decode(path, body):
+                self.assertEqual(path, '/apply-template')
+                return dict(prompt=template.render(body))
+            self.assertIs(hybrid_bench.probe_tool_call(decode), expected)
+
+    # Only explicit client rejections trigger fallback; outages and authentication failures propagate without a second render.
+    def test_rejection_and_outage(self):
+        for status in (400, 422, 401, 403, 500, 503):
+            calls = []
+            def decode(path, body):
+                calls.append(body)
+                if len(calls) == 1:
+                    raise urllib.error.HTTPError('http://fixture', status, 'fixture', {}, None)
+                return dict(prompt=body['messages'][-2]['content'])
+            if status in (400, 422):
+                self.assertTrue(hybrid_bench.probe_tool_call(decode))
+                self.assertEqual(len(calls), 2)
+            else:
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    hybrid_bench.probe_tool_call(decode)
+                self.assertEqual(error.exception.code, status)
+                self.assertEqual(len(calls), 1)
+
+    # Duplicated unmatched probes are invalid; dropped/duplicated matched probes refuse instead of admitting an empty workload.
+    def test_probe_preservation_guards(self):
+        for unmatched, matched, reason in ((2, 1, 'duplicated'), (0, 0, 'matched synthetic'), (0, 2, 'matched synthetic')):
+            calls = []
+            def decode(path, body):
+                calls.append(body)
+                marker = body['messages'][-2]['content']
+                return dict(prompt=marker * (unmatched if len(calls) == 1 else matched))
+            with self.assertRaisesRegex(common.Refusal, reason):
+                hybrid_bench.probe_tool_call(decode)
+            self.assertEqual(len(calls), 1 if unmatched == 2 else 2)
+
+    # Both fixed and measured tool payloads keep their size/ID; matching calls never rewrite existing history.
+    def test_payload_and_matching_call(self):
+        for measured in (False, True):
+            for index, step in enumerate(schedule(7, measured)):
+                if step['kind'] != 'tool':
+                    continue
+                payload = ' x' * step['tokens']
+                incoming = hybrid_bench.tool_messages(index, payload, True)
+                self.assertEqual([m['role'] for m in incoming], ['user', 'assistant', 'tool', 'user'])
+                call, = incoming[1]['tool_calls']
+                self.assertEqual(call['id'], incoming[2]['tool_call_id'])
+                self.assertEqual(incoming[2]['content'], payload)
+                self.assertEqual(call['function'], dict(name='read', arguments='{}'))
+
+    # Actual main requests use the live verdict and persist it per tool/depth row, for both capability outcomes.
+    def test_main_call_verdict(self):
+        for label, expected in (("qwen3.8-27b", False), ("gemma4-31b", True)):
+            template = self.fixture(label)
+            config = dict(model_sha256='a' * 64, decode_url='decode', decode_token='fixture',
+                          prefill_url='prefill', client_credential='fixture', clients={'fixture': dict(prefill_token='fixture')})
+            info = dict(model_sha256='a' * 64, context=4096, backend='cpu', proxy_url='proxy')
+            def request(url, path, token='', body=None, **kwargs):
+                if path == '/apply-template':
+                    return dict(prompt=template.render(body))
+                if path == '/tokenize':
+                    text = body['content']
+                    return dict(tokens=[1] * (len(text) // 2 if text.startswith(' x') else 32))
+                return dict(model_sha256='a' * 64, sessions=0)
+            sent = []
+            def stream(url, token, body, mode, sid, timeout):
+                sent.append(body)
+                previous = (len(sent) - 1) * 64
+                trace = dict(prefilled=60, new_tokens=60, replayed_prefix=0, rollback_n=None,
+                             depth_before=previous, prompt_depth=previous + 60, depth_after=previous + 64,
+                             generated_tokens=4, mode=mode, remote_applied=0, path='local')
+                return sid, dict(role='assistant', content='A1'), trace, .1, .2
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'node-info.json').write_text(json.dumps(info))
+                argv = ['hybrid_bench.py', '--client-state', directory, '--output', directory, '--scratch', directory, '--modes', 'local']
+                workload = [dict(kind='depth', depth=128, output=4), dict(kind='tool', tokens=16, depth=128, output=4)]
+                with mock.patch('sys.argv', argv), mock.patch.object(hybrid_bench, 'read_private', side_effect=[config, info]), \
+                        mock.patch.object(hybrid_bench, 'validate_identity'), mock.patch.object(hybrid_bench, 'http', side_effect=request), \
+                        mock.patch.object(hybrid_bench, 'schedule', return_value=iter(workload)), \
+                        mock.patch.object(hybrid_bench, 'stream_chat', side_effect=stream), \
+                        mock.patch.object(hybrid_bench, 'release_session', return_value=True):
+                    self.assertEqual(hybrid_bench.main(), 0)
+                rows = [json.loads(line) for line in next(root.glob('hybrid-bench-*.jsonl')).read_text().splitlines()]
+                self.assertEqual([row['tool_call_added'] for row in rows if row['stage'] == 'call'], [False, expected])
+                self.assertEqual([row['tool_call_added'] for row in rows if row['stage'] == 'tool_probe'], [expected])
+                self.assertEqual(sent[1]['messages'][:-len(hybrid_bench.tool_messages(1, ' x' * 16, expected))],
+                                 sent[0]['messages'] + [dict(role='assistant', content='A1')])
+                self.assertEqual([m['tool_call_id'] for m in sent[1]['messages'] if m['role'] == 'tool'], ['synthetic-1'])
+                self.assertEqual(sum(bool(m.get('tool_calls')) for m in sent[1]['messages']), int(expected))
+
+    # Qwen keeps the old message list and exact serialized streaming request bytes across both complete schedules.
+    def test_qwen_request_bytes(self):
+        template = self.fixture('qwen3.8-27b')
+        add_call = hybrid_bench.probe_tool_call(lambda path, body: dict(prompt=template.render(body)))
+        self.assertFalse(add_call)
+        for measured in (False, True):
+            history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.')]
+            for index, step in enumerate(schedule(7, measured)):
+                if step['kind'] == 'depth':
+                    incoming = [dict(role='user', content=' x' * step['depth'])]
+                    legacy = incoming
+                else:
+                    incoming = hybrid_bench.tool_messages(index, ' x' * step['tokens'], add_call)
+                    legacy = [dict(role='tool', tool_call_id='synthetic-' + str(index), content=' x' * step['tokens']),
+                              dict(role='user', content='Continue with decimal digits.')]
+                body = dict(messages=history + incoming, max_tokens=step['output'], temperature=0, seed=7,
+                            ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
+                old = dict(messages=history + legacy, max_tokens=step['output'], temperature=0, seed=7,
+                           ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
+                self.assertEqual(body, old)
+                self.assertEqual(template.render(body), template.render(old))
+                response = io.BytesIO(b'data: {"hybrid_bench": {}}\n\ndata: [DONE]\n')
+                response.headers = {'X-Hybrid-Session': 'fixture'}
+                with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', return_value=response) as request:
+                    hybrid_bench.stream_chat('http://fixture', 'fixture', body, 'local', 'fixture')
+                self.assertEqual(request.call_args.args[0].data, json.dumps(dict(old, stream=True)).encode())
+                history += legacy + [dict(role='assistant', content='1234')]
+
+    # The inserted user preserves Gemma's prior sampled anchor, and all synthetic response bytes enter the append tail.
+    def test_gemma_append_anchor(self):
+        from test_templates import ProbeNode
+        from journal import Renderer
+        template = self.fixture('gemma4-31b')
+        node = ProbeNode(template.fixture)
+        self.addCleanup(node.state.close)
+        renderer = Renderer(node)
+        history = [dict(role='system', content='SYS'), dict(role='user', content='U1'), dict(role='assistant', content='A1')]
+        for size in (1, 16, 512):
+            payload = ' x' * size
+            body = dict(messages=history + hybrid_bench.tool_messages(1, payload, True), chat_template_kwargs=dict(enable_thinking=False))
+            text = renderer.render(body)
+            self.assertEqual(text.count(payload), 1)
+            self.assertIn('A1<turn|>\n<|turn>user', text)
+            tokens = renderer.encode(text, initial=True)
+            anchor = [71, 72] + renderer.encode('<turn|>')
+            prompt, _, _, tail = renderer.append(body, text, tokens, 3, anchor)
+            self.assertEqual(prompt[:len(anchor)], anchor)
+            start = len(tokens) - len(tail)
+            self.assertIn(payload, b''.join(renderer.token_bytes(text, tokens)[start:]).decode())
+            layout, _ = renderer.layout(body, text, tokens, start=3, token_base=start, anchor_base=len(anchor) - 1)
+            self.assertEqual([r['role'] for r in layout], ['user', 'assistant', 'tool', 'user'])
+
+
+class SyntheticToolOracleTests(unittest.TestCase):
+    # External sources agree with the capability probe and retain fixed/measured-size payloads in the matched Gemma path.
+    def test_real_template_payloads(self):
+        from template_oracle import TemplateOracle
+        for label, expected in (("qwen3.8-27b", False), ("gemma4-31b", True), ("muse-glimmer-30b", False)):
+            template = SyntheticToolTests.fixture(label)
+            oracle = TemplateOracle(template.fixture)
+            self.assertIs(hybrid_bench.probe_tool_call(lambda path, body: dict(prompt=oracle.render(body))), expected)
+            for count in (1, 16, 512, 2048, 10000, 11144):
+                body = dict(messages=[dict(role='system', content='SYS'), dict(role='user', content='U1'), dict(role='assistant', content='A1')] +
+                            hybrid_bench.tool_messages(1, ' x' * count, expected), chat_template_kwargs=dict(enable_thinking=False))
+                text = oracle.render(body)
+                self.assertEqual(text, template.render(body))
+                self.assertIn((' x' * count).strip(), text)
+                if expected:
+                    self.assertIn('A1<turn|>\n<|turn>user', text)
+                    self.assertIn(' x' * count, text)
 
 
 if __name__ == '__main__':

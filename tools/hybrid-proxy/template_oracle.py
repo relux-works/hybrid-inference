@@ -10,7 +10,7 @@ import unittest
 
 def source_fixture(fixture, root=None):
     root = Path(root or os.environ.get("HYBRID_TEMPLATE_FIXTURES", "/home/agent/lanes/hybrid/.temp/template-fixtures/"))
-    path = root / (fixture["label"] + ".json")
+    path = root / fixture.get("source_file", fixture["label"] + ".json")
     if not path.is_file():
         raise unittest.SkipTest("external template source absent: " + str(path) + "; set HYBRID_TEMPLATE_FIXTURES")
     external = json.loads(path.read_text())
@@ -48,11 +48,19 @@ class TemplateOracle:
                 if isinstance(call["function"].get("arguments"), str):
                     call["function"]["arguments"] = json.loads(call["function"]["arguments"])
         props = self.fixture["props"]
+        tools = copy.deepcopy(body.get("tools"))
+        if tools:
+            # The capture JSON sorts keys. Restore the observed server tool conversion and fixed schema order.
+            for index, tool in enumerate(tools):
+                function = tool["function"]
+                parameters = function["parameters"]
+                parameters = dict(type=parameters["type"], properties=parameters["properties"], required=parameters["required"])
+                tools[index] = dict(type="function", function=dict(name=function["name"], description=function["description"], parameters=parameters))
         kwargs = dict(enable_thinking=True)
         kwargs.update(body.get("chat_template_kwargs", {}))
         last_assistant = messages[-1]["role"] == "assistant"
         text = self.template.render(messages=messages, add_generation_prompt=False if last_assistant else body.get("add_generation_prompt", True),
-                                    bos_token=props.get("bos_token"), eos_token=props.get("eos_token"), tools=body.get("tools"), **kwargs)
+                                    bos_token=props.get("bos_token"), eos_token=props.get("eos_token"), tools=tools, **kwargs)
         bos = props.get("bos_token") or ""
         text = text[len(bos):] if bos and text.startswith(bos) else text
         if last_assistant:
