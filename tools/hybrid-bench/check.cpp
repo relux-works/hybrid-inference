@@ -2,7 +2,9 @@
 #include "llama-ext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -38,6 +40,23 @@ static double compare(const float * p, const float * q, int n) {
     return std::max(0.0, kl);
 }
 
+static double max_difference(const float * p, const float * q, int n) {
+    double result = 0;
+    for (int i = 0; i < n; ++i) {
+        require(std::isfinite(p[i]) && std::isfinite(q[i]), "nonfinite logits");
+        result = std::max(result, std::abs(double(p[i]) - q[i]));
+    }
+    return result;
+}
+
+static bool within_repeat_floor(bool exact, bool repeat_exact, double kl, double diff, double repeat_kl, double repeat_diff) {
+    return repeat_exact ? exact : diff <= repeat_diff && kl <= repeat_kl;
+}
+
+static double seconds_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
 static hybrid::context_ptr context(llama_model * model, int depth, bool gpu) {
     auto cp = llama_context_default_params();
     cp.n_ctx = depth;
@@ -47,6 +66,7 @@ static hybrid::context_ptr context(llama_model * model, int depth, bool gpu) {
     cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.offload_kqv = gpu;
+    cp.op_offload = gpu;
     hybrid::context_ptr ctx(llama_init_from_model(model, cp));
     require(bool(ctx), "cannot create check context");
     return ctx;
@@ -74,6 +94,10 @@ int main(int argc, char ** argv) {
         // Full-vocabulary KL must detect a changed distribution, including one with unchanged top-1.
         const float p[] = {2, -2}, q[] = {-2, 2}, near[] = {1, 0};
         require(compare(p, p, 2) < 1e-12 && compare(p, q, 2) > .01 && compare(p, near, 2) > .01, "KL control failed");
+        // The measured rule accepts its observed bound, rejects either excess, and keeps exact references bit-exact.
+        require(within_repeat_floor(true, true, 0, 0, 0, 0) && !within_repeat_floor(false, true, 0, 0, 0, 0) &&
+                within_repeat_floor(false, false, .01, .1, .01, .1) && !within_repeat_floor(false, false, .02, .1, .01, .1) &&
+                !within_repeat_floor(false, false, .01, .2, .01, .1), "measured floor control failed");
         const auto fixture = hybrid::json::parse(read_file(argv[2], 8 * 1024 * 1024), [](int depth, hybrid::json::parse_event_t, hybrid::json &) {
             require(depth <= 32, "check JSON nesting too deep");
             return true;
@@ -90,17 +114,31 @@ int main(int argc, char ** argv) {
         const auto model_hash = hybrid::file_hash(argv[1]);
         require(model_hash == fixture.at("model_sha256"), "check model mismatch");
         llama_backend_init();
+        require(gpu_layers == 0 || llama_supports_gpu_offload(), "GPU requested but checker has no GPU offload device");
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = gpu_layers;
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], mp));
         require(bool(model), "cannot load check model");
+        std::string backend = "cpu";
+        if (gpu_layers > 0) {
+            require(llama_model_n_devices(model.get()) > 0, "GPU requested but model has no offload device");
+            const std::string name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(llama_model_get_device(model.get(), 0)));
+            backend = name == "CUDA" ? "cuda" : name == "Metal" ? "metal" : name;
+            for (int i = 0; i < llama_model_n_devices(model.get()); ++i) {
+                require(name == ggml_backend_reg_name(ggml_backend_dev_backend_reg(llama_model_get_device(model.get(), i))), "mixed checker devices unsupported");
+            }
+        }
+        require(fixture.value("backend", backend) == backend, "checker backend label/device mismatch");
+        const bool gpu = backend != "cpu";
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         for (auto token : tokens) { require(token >= 0 && token < vocab, "invalid check token"); }
         const int ctx = ((tokens.size() + k + 257) / 256) * 256;
-        auto imported = context(model.get(), ctx, gpu_layers > 0);
-        auto split = context(model.get(), ctx, gpu_layers > 0);
-        auto whole = context(model.get(), ctx, gpu_layers > 0);
-        auto free_whole = context(model.get(), ctx, gpu_layers > 0);
+        auto imported = context(model.get(), ctx, gpu);
+        auto split = context(model.get(), ctx, gpu);
+        auto whole = context(model.get(), ctx, gpu);
+        auto free_whole = context(model.get(), ctx, gpu);
+        auto repeat = context(model.get(), ctx, gpu);
+        double repeat_seconds = 0;
         int64_t n = 0;
         std::vector<size_t> split_ends;
         std::vector<llama_token> continuation, free_continuation;
@@ -116,6 +154,9 @@ int main(int argc, char ** argv) {
             require(llama_state_seq_set_data_append(imported.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
                     delta.state.size(), 0, n, n1) == delta.state.size(), "check delta import failed");
             hybrid::prefill(split.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
+            const auto repeat_start = std::chrono::steady_clock::now();
+            hybrid::prefill(repeat.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
+            repeat_seconds += seconds_since(repeat_start);
             const auto ends = boundaries(n1, 256, n);
             split_ends.insert(split_ends.end(), ends.begin(), ends.end());
             n = n1;
@@ -124,12 +165,36 @@ int main(int argc, char ** argv) {
         split_ends.push_back(tokens.size());
         hybrid::prefill(imported.get(), {tokens.back()}, n);
         hybrid::prefill(split.get(), {tokens.back()}, n);
+        const auto repeat_start = std::chrono::steady_clock::now();
+        hybrid::prefill(repeat.get(), {tokens.back()}, n);
+        repeat_seconds += seconds_since(repeat_start);
         hybrid::prefill(whole.get(), tokens, 0);
         hybrid::prefill(free_whole.get(), tokens, 0);
-        double kl_sum = 0;
+        double kl_sum = 0, same_kl_sum = 0, same_diff = 0, repeat_kl_sum = 0, repeat_diff = 0;
+        bool same_exact = true, repeat_exact = true, within_floor = true;
+        auto positions = hybrid::json::array();
         int top1 = 0, same = 0, first_divergence = -1;
         for (int i = 0; i < k; ++i) {
             const auto token = hybrid::greedy(imported.get(), model.get());
+            const auto local_logits = llama_get_logits_ith(split.get(), -1);
+            const auto imported_logits = llama_get_logits_ith(imported.get(), -1);
+            const auto repeat_logits = llama_get_logits_ith(repeat.get(), -1);
+            const double diff = max_difference(imported_logits, local_logits, vocab);
+            const double floor = max_difference(repeat_logits, local_logits, vocab);
+            const bool exact = std::memcmp(imported_logits, local_logits, vocab * sizeof(float)) == 0;
+            const bool local_exact = std::memcmp(repeat_logits, local_logits, vocab * sizeof(float)) == 0;
+            const double same_kl = exact ? 0 : compare(imported_logits, local_logits, vocab);
+            const double local_kl = local_exact ? 0 : compare(repeat_logits, local_logits, vocab);
+            same_exact &= exact;
+            repeat_exact &= local_exact;
+            within_floor &= within_repeat_floor(exact, local_exact, same_kl, diff, local_kl, floor);
+            same_kl_sum += same_kl;
+            repeat_kl_sum += local_kl;
+            same_diff = std::max(same_diff, diff);
+            repeat_diff = std::max(repeat_diff, floor);
+            positions.push_back({{"position", tokens.size() + i}, {"same_partition_kl_nats", same_kl},
+                {"same_partition_max_abs_logit_diff", diff}, {"repeat_kl_nats", local_kl},
+                {"repeat_max_abs_logit_diff", floor}, {"exact", exact}, {"repeat_exact", local_exact}});
             same += token == hybrid::greedy(split.get(), model.get());
             top1 += token == hybrid::greedy(whole.get(), model.get());
             const auto free_token = hybrid::greedy(free_whole.get(), model.get());
@@ -140,6 +205,9 @@ int main(int argc, char ** argv) {
             // Teacher forcing uses the imported continuation for both numerical references.
             hybrid::prefill(imported.get(), {token}, tokens.size() + i);
             hybrid::prefill(split.get(), {token}, tokens.size() + i);
+            const auto step_start = std::chrono::steady_clock::now();
+            hybrid::prefill(repeat.get(), {token}, tokens.size() + i);
+            repeat_seconds += seconds_since(step_start);
             hybrid::prefill(whole.get(), {token}, tokens.size() + i);
             hybrid::prefill(free_whole.get(), {free_token}, tokens.size() + i);
         }
@@ -147,13 +215,19 @@ int main(int argc, char ** argv) {
         hybrid::json result = {{"stage", "equivalence"}, {"depth", tokens.size()}, {"k", k},
             {"same_partition_agreed", same}, {"top1_agreed", top1}, {"top1_agreement", agreement},
             {"mean_kl_nats", kl}, {"free_running_first_divergence", first_divergence},
-            {"kl_limit", .01}, {"top1_minimum", .95}, {"same_partition_exact", same == k},
+            {"kl_limit", .01}, {"top1_minimum", .95}, {"same_partition_exact", same_exact}, {"same_partition_within_floor", within_floor},
+            {"same_partition_kl_nats", same_kl_sum / k}, {"same_partition_max_abs_logit_diff", same_diff},
+            {"same_partition_repeat_exact", repeat_exact}, {"same_partition_repeat_kl_nats", repeat_kl_sum / k},
+            {"same_partition_repeat_max_abs_logit_diff", repeat_diff}, {"same_partition_positions", positions},
+            {"same_partition_repeat_seconds", repeat_seconds}, {"backend", backend},
             {"numerical_within_bounds", kl <= .01 && agreement >= .95}};
-        // Noise contexts run sequentially after the original measurement, preserving its decode order and peak context count.
+        // Run noise partitions after releasing the comparison contexts.
         imported.reset();
         split.reset();
         whole.reset();
         free_whole.reset();
+        repeat.reset();
+        const auto noise_start = std::chrono::steady_clock::now();
         const auto whole_ends = boundaries(tokens.size(), 256);
         std::vector<std::vector<size_t>> noise_ends;
         auto partitions = hybrid::json::array();
@@ -162,24 +236,25 @@ int main(int argc, char ** argv) {
         for (int requested : chunks) {
             size_t chunk = std::min<size_t>(requested, tokens.size() - 1);
             auto ends = boundaries(tokens.size(), chunk);
-            while (ends == whole_ends || ends == split_ends || std::find(noise_ends.begin(), noise_ends.end(), ends) != noise_ends.end()) {
+            while (ends[ends.size() - 2] == split_ends[split_ends.size() - 2] || ends == whole_ends || ends == split_ends || std::find(noise_ends.begin(), noise_ends.end(), ends) != noise_ends.end()) {
                 if (--chunk == 0) { break; }
                 ends = boundaries(tokens.size(), chunk);
             }
             if (chunk == 0) { continue; }
             noise_ends.push_back(ends);
-            auto reference = context(model.get(), ctx, gpu_layers > 0);
-            auto alternate = context(model.get(), ctx, gpu_layers > 0);
-            auto free_alternate = context(model.get(), ctx, gpu_layers > 0);
+            auto reference = context(model.get(), ctx, gpu);
+            auto alternate = context(model.get(), ctx, gpu);
+            auto free_alternate = context(model.get(), ctx, gpu);
             hybrid::prefill(reference.get(), tokens, 0);
             prefill_partition(alternate.get(), tokens, chunk);
-            prefill_partition(free_alternate.get(), tokens, chunk);
+            const auto first_free_token = hybrid::greedy(alternate.get(), model.get());
+            hybrid::load_state(free_alternate.get(), hybrid::save_state(alternate.get()));
             double noise_sum = 0;
             int noise_top1 = 0, divergence = -1;
             for (int i = 0; i < k; ++i) {
                 noise_sum += compare(llama_get_logits_ith(alternate.get(), -1), llama_get_logits_ith(reference.get(), -1), vocab);
                 noise_top1 += hybrid::greedy(alternate.get(), model.get()) == hybrid::greedy(reference.get(), model.get());
-                const auto free_token = hybrid::greedy(free_alternate.get(), model.get());
+                const auto free_token = i == 0 ? first_free_token : hybrid::greedy(free_alternate.get(), model.get());
                 if (divergence < 0 && free_token != free_continuation[i]) { divergence = i; }
                 hybrid::prefill(reference.get(), {continuation[i]}, tokens.size() + i);
                 hybrid::prefill(alternate.get(), {continuation[i]}, tokens.size() + i);
@@ -190,12 +265,15 @@ int main(int argc, char ** argv) {
             noise_max = std::max(noise_max, noise_kl);
             noise_top1_min = std::min(noise_top1_min, noise_top1);
             if (divergence >= 0 && (noise_divergence < 0 || divergence < noise_divergence)) { noise_divergence = divergence; }
-            partitions.push_back({{"requested_chunk_tokens", requested}, {"chunk_tokens", chunk}, {"batches", ends.size()},
+            partitions.push_back({{"requested_chunk_tokens", requested}, {"chunk_tokens", chunk}, {"batches", ends.size()}, {"last_prefill_boundary", ends[ends.size() - 2]},
                 {"noise_kl_nats", noise_kl}, {"noise_top1_agreed", noise_top1}, {"noise_top1_agreement", double(noise_top1) / k},
                 {"noise_free_running_first_divergence", divergence}});
         }
         require(!partitions.empty(), "no distinct local noise partition");
         result["noise_partitions"] = partitions;
+        result["noise_reference_seconds"] = seconds_since(noise_start);
+        result["noise_reference_variant"] = "alternate_state_snapshot";
+        result["hybrid_last_prefill_boundary"] = split_ends[split_ends.size() - 2];
         result["noise_kl_nats"] = result["noise_kl_nats_max"] = noise_max;
         result["noise_top1_agreed"] = noise_top1_min;
         result["noise_top1_agreement"] = double(noise_top1_min) / k;
@@ -203,8 +281,8 @@ int main(int argc, char ** argv) {
         result["kl_to_noise_ratio"] = noise_max > 0 ? hybrid::json(kl / noise_max) : hybrid::json(nullptr);
         result["kl_to_noise_ratio_status"] = noise_max > 0 ? "finite" : kl == 0 ? "both_zero" : "zero_noise_floor";
         const bool uncalibrated = fixture.value("uncalibrated", false);
-        const bool passed = same == k && (gpu_layers > 0 || result["numerical_within_bounds"].get<bool>());
-        result["status_rule"] = uncalibrated ? "uncalibrated_client_noise" : gpu_layers > 0 ? "same_backend_same_partition_exact" : "cpu_legacy_reference";
+        const bool passed = same == k && within_floor && (gpu || result["numerical_within_bounds"].get<bool>());
+        result["status_rule"] = uncalibrated ? "uncalibrated_client_noise" : repeat_exact ? "same_backend_same_partition_exact" : "same_backend_same_partition_measured_floor";
         result["status"] = uncalibrated ? "uncalibrated" : passed ? "passed" : "failed";
         result["exit_code"] = uncalibrated ? 5 : passed ? 0 : 3;
         std::ofstream target(argv[4]);

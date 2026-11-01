@@ -305,3 +305,125 @@ Stop the CUDA node on its host afterwards using its state path. Cross-backend ch
 ## Report verification
 
 `nice -n 10 python3 .temp/hybrid-a-r13-261101/report_check.py` exited 0 at 2026-11-01T11:48Z (report-check-02.log). It checked the exact persisted numerical strings, absence of private fixture credential values, syntax of every shell block via `bash -n`, and absence of session links. Attempt 01 exited 1 on an overly literal text assertion (`exit` versus the report's `exits`); the assertion was corrected without changing numerical evidence. Final whitespace check exited 0. Report-only changes followed the signed implementation; no measured source or binary changed.
+
+## r15 - logit-level same-partition rework (hybrid-a-r15-261101)
+
+Ready for review. This section supersedes the r13 top-1-only acceptance rule and its checksum-only corruption coverage. r14 was finished and signed on its separate `m2-fast-hash` branch at `41eb6ca445d77d907e21a981b8f82758f006c784` before r15 began. The clean `m2-noise-floor` branch continued from `c3d5c7fae4ca4565b30742e0909cc1cc0c72b41c` and rebased cleanly with `git rebase --gpg-sign` onto requested public main `7e1a477b2e8dfc8146744f4f81d73abca25e7d4a`. Rebased r13 commits are `15b33beb3e` and `2ea459cf7e`, both signature G; the r15 signed commit follows them. All carry the requested Codex co-author trailer. No push, PR, session link, model download, package install or GPU execution.
+
+The supplied r6f review was read from `/home/agent/Werkstatt/hybrid-review-proto/llama.cpp/.temp/REVIEW-noise-floor-claude.md`. Scope is the existing `tools/hybrid-bench` module. There is no active task-board in this checkout (`goal get` exit 1, `.task-board` missing); the existing `.temp/tasks.md` tracks the work. No board goal was changed or cleared.
+
+### F1: decisive logit rule
+
+For each of K teacher-forced continuation positions, the checker now compares every imported logit with the independent local computation of the identical delta-boundary partition. It reports mean `same_partition_kl_nats` (imported || local), `same_partition_max_abs_logit_diff` across all checked positions/vocabulary entries, and the individual position measurements. `same_partition_exact` is an actual byte comparison of finite float arrays. It no longer means argmax agreement. Equal finite bit patterns report KL zero directly, avoiding tiny cancellation residuals in the KL expression.
+
+A second fresh local context independently repeats that same partition and the same teacher-forced continuation. Its KL, maximum difference and exactness are reported, including per-position values. When the repeat is bit-identical, the decisive rule is `same_backend_same_partition_exact`. When it differs, the rule is `same_backend_same_partition_measured_floor`: at each position, imported/local KL AND maximum absolute difference must not exceed that position's observed repeat/local values. An exact repeat at an individual position still requires byte equality there. There is no epsilon, multiplier, alternate-partition tolerance or pooled maximum across positions. K/K argmax agreement remains an additional condition. CPU also retains the whole-prompt KL <=0.01 and top-1 >=0.95 reference bounds. CPU acceptance is intentionally strengthened: an argmax-preserving lossy delta that passed the old CPU rule now fails.
+
+On this CPU fixture, all eight independent-repeat logit arrays and imported/local arrays are bit-identical, with KL=0 and max difference=0. Exactness is therefore measured here, rather than inferred from greedy output. The nonzero-repeat branch has synthetic positive/negative startup controls for inclusive bounds, KL excess, max-difference excess and exact-reference rejection; Python tests cover propagation of a nonexact-but-within-floor verdict. No GPU nonreproducibility observation is claimed. One independent repeat is a bound for this run, not a statistical calibration of a backend or a proof about unobserved logits/native state.
+
+### F2 and N1-N3: rejection evidence
+
+Both mutations start after body byte 4096 and recompute canonical XXH3-128 and SHA-256 trailers using the existing proxy `stub_server.xxh128` test helper and hashlib. The original trailer is verified before mutation. The existing system libxxhash dependency is reused; no dependency was added. Native metrics/status exist for both cases, so neither a checksum failure nor import rejection accounts for their exit 3.
+
+| Delta / control | Same-partition argmax | Same-partition KL | Maximum absolute logit difference | Exit and reason |
+| --- | ---: | ---: | ---: | --- |
+| Clean | 8/8 | 0 | 0 | 0: passed, exact logits |
+| Checksum-valid corrupt: stride 1031, xor 0x40 | 0/8 | 7.18231430791 | 20.1812210083 | 3: failed, same-partition logit criterion |
+| Checksum-valid lossy: stride 4099, xor 0x01 | 8/8 | 0.00058444492864 | 0.418376684189 | 3: failed, same-partition logit criterion |
+| One body byte changed, old trailer | not evaluated | not evaluated | not evaluated | 2: delta checksum mismatch, no JSON metrics |
+| CPU build requested GPU layers=1 | not evaluated | not evaluated | not evaluated | 2: no GPU offload device, no JSON metrics |
+| CPU computation labelled CUDA | not evaluated | not evaluated | not evaluated | 2: backend label/device mismatch, no JSON metrics |
+
+The lossy row retains all eight argmax tokens and remains inside the old whole-prompt numerical bounds, yet fails. This directly narrows the F1 hole. GPU_LAYERS >0 on this CPU-only build now refuses early rather than simulating a GPU acceptance rule. Actual positive-layer GPU corruption runs remain unrun under the CPU-only instruction.
+
+N1: the checker verifies `llama_supports_gpu_offload()`, loaded model devices and their actual backend registration, refuses mixed device backends, and compares that backend with the client label. CPU contexts disable both KQV and operation offload. The Python classifier also refuses mismatches, including cross-backend measurements. N2: missing logit/noise fields give an explicit incompatible-checker/rebuild refusal immediately after reading metrics. The bundle entry point independently checks before writing JSONL. `test_checker_version_before_classification` proves refusal before classification and remote-session release; `test_old_checker_fields` proves no partial output. N3: noise partitions must have a different last boundary before the endpoint from the hybrid. At 132 tokens, requested chunks 128/255 select 128/130 with final prefill boundaries 128/130, rather than hybrid 131; the original 131 candidate is refused.
+
+Cross-backend and hetero-quant measurements remain uncalibrated, exit 5, with no acceptance threshold inferred from the measured noise.
+
+### N4: measured cost and snapshot variant
+
+Final short CPU fixture: 132 prompt tokens, K=8, two partitions. `noise_reference_seconds` was **2.744668 s**; independent-repeat prefill/decode calls added **0.591282 s**. The noise timer includes context construction, prefills, snapshot/restore, comparisons and all noise decode steps; the repeat timer excludes context construction and numerical comparison overhead. Timings vary with the shared host workload and are diagnostics, not test thresholds.
+
+The alternate free-running stream now loads a native state snapshot instead of prefilling the same prompt again. Its first greedy token is cached separately because sequence snapshots do not restore logits. A task-local comparison executable restoring the duplicate-prefill path produced exactly the same partition KL/top-1/divergence measurements (audit exit 0); its noise loop took 4.416972 s. This single, non-interleaved comparison is not a calibrated speedup measurement.
+
+Each noise partition now adds two prompt-prefill passes instead of three, with 3K decode steps. The new independent repeat adds one prompt-prefill pass and K decode steps. Two default partitions add four noise prefills plus the repeat; the original r13 noise added six. Peak comparison context count increases from four to five. During the later sequential noise loop there are three contexts plus one temporary native snapshot. The whole-prompt reference is still independently prefilled per partition. No 27B/128k GPU wall-clock estimate is presented as measured; that remains target-host qualification. `--noise-chunks 128` bounds expensive runs to one alternate partition.
+
+### Verification and narrowing controls
+
+31 benchmark unit tests and 68 proxy unit tests pass. The final full integrated suite passes with clean/valid-corrupt/valid-lossy/checksum/device controls, native defaults and bounded chunk slope, fresh and append-chain checked offloads with link disabled/enabled, exact LRU replay, and native budget refusal. Four actual equivalence rows preserve the new fields, per-position arrays and rules through JSONL, Markdown and sanitized archives. Three bundle manifests and sidecars verify, archive bytes match local public artifacts, and release rows report zero sessions/bytes. The retained M1 executable gives identical original numerical metrics and exit on the clean fixture; this does not claim legacy acceptance for corrupt inputs.
+
+| Mutant | Property narrowed | Named failing test | Result / surviving bound |
+| --- | --- | --- | --- |
+| Native `passed` drops `within_floor` | Lossy import cannot pass on 8/8 argmax and small whole-prompt KL | `test_equivalence_noise`, `valid-lossy` assertion | Killed: suite exit 1; mutant falsely exits 0 with same_partition_within_floor=false |
+| Python classifier drops `same_partition_within_floor` | GPU-label classification must retain native logit verdict | `test_gpu_noise_classification` | Killed: assertion failure, intended test exit 1 |
+| Cross-backend returns passed/0 | Cross-backend cannot inherit calibrated acceptance | `test_cross_backend_classification` | Killed: assertion failure, intended test exit 1 |
+| Ignore backend label | Label mismatch cannot select another device's rule | `test_checker_backend_mismatch` | Killed: expected Refusal absent, intended test exit 1 |
+
+No surviving code mutant is claimed in this bounded set. The duplicate-prefill executable is a positive equivalence/performance control, not a mutant of a forbidden behavior. These controls do not measure a nonreproducible GPU backend. The mutation compilation and native build use the shared `/home/agent/Werkstatt/hybrid-models/.build.lock`, nice 19, at most -j2 and an inside-lock >=26843545600-byte guard. The initial build also rebuilt the existing node/server. UI download and local UI build flags were OFF; the existing stale-assets warning is retained and no retrieval ran. Final checker build exit 0. The pre-existing signed/unsigned depth-comparison warning is retained.
+
+Self-review used the code-review skill's scope, security, general and tests checklists. Changed paths stay within `tools/hybrid-bench`; no src/include/ggml change or previous test removal/rename. Python syntax, ASCII/newline/trailing-space audit, the repository code-style workflow payload and whitespace checks pass. `ty` and `editorconfig-checker` are absent (readiness exit 1); type/editorconfig checks are unrun, with no install attempted. There is no separate external landing-property suite or normative surface table in this brief; the review's observational rows are mapped below. Independent acceptance/review and landing are pending; no hosted check or landing is claimed for a no-push run.
+
+| Review row / request | Evidence and finite limit |
+| --- | --- |
+| 1, N3: distinct partitions, same positions | `test_equivalence_noise`: 128/130 vs hybrid 131; per-position teacher forcing; short fixture only |
+| 2a, F1: decisive same-backend logits | Native lossy negative plus argmax-only mutant; real GPU execution unrun |
+| 2b: CPU behavior | Clean import/repeat bit-identical; retained M1 original numerical metrics match; corrupt acceptance deliberately strengthened |
+| 2c: uncalibrated | `test_cross_backend_classification` and calibrated-cross-backend mutant; actual cross-device run unrun |
+| 3, N1/N2: reporting/device/version | Bundle roundtrip/audit, device mismatch mutant, actual CPU refusals, old-checker tests; GPU-specific device registration execution unrun |
+| 4, F2: valid-checksum negatives | `test_equivalence_noise`: clean 0, both imported mutations 3, lossy still 8/8; native mutant killed |
+| 5, N4: extra references | Measured short CPU times and duplicate-prefill positive control; 27B/128k GPU timing is outside this CPU-only execution |
+
+No other requested row is treated as out of contract. Long-context, 27B, CUDA/Metal compilation/execution, cross-device numerics and nondeterministic-backend empirical calibration were not run. The native measured-floor startup controls cover its scalar decision rule, not GPU reproducibility. Testing is bounded to local 0.8B CPU fixtures.
+
+Failed/corrected attempts are preserved: `noise-01` exit 1 asserted exact-zero KL before the identical-array roundoff shortcut; `integrated-01` exit 1 still expected the old CPU Markdown rule name (corrected, then integrated-02/03 exit 0); `python-mutants-01` exit 1 detected two mutants but its device control used an incomplete fixture and hit KeyError. The fixture was completed and all three intended assertion failures are verified in python-mutants-02 (wrapper exit 0). Native argmax-mutant suites intentionally exit 1 and are never described as green product runs. Embedded budget benchmarks intentionally exit 2; their enclosing test asserts the precise budget reason and zero retained sessions.
+
+### Reproduction and private evidence
+
+All local evidence is under `.temp/hybrid-a-r15-261101/`. `commands.jsonl` records exact argv, PID, UTC start/end, free bytes and real exit code; each command ran directly with a separate numbered log, without tee. `tested-source.json` binds reviewed source, binaries, libllama and CMake configuration. `compile_variants.py` records compiler argv and PIDs for the task-only controls. `audit.py` validates the real negative exits, snapshot equivalence, bundle manifests, original test names and process closure; audit exit 0. At its observation time no recorded task PID was alive. Native delta fixtures remain private for reproduction; credentials are not public bundle members.
+
+Core reproduction commands (existing binaries, no build or download):
+
+```sh
+nice -n 19 python3 -m unittest discover -s tools/hybrid-bench -p test_bench.py -v
+nice -n 19 python3 -m unittest discover -s tools/hybrid-proxy -p 'test*.py' -v
+nice -n 19 python3 tools/hybrid-bench/test_integrated.py --case all --server-binary build/bin/llama-server --prefill-binary build/bin/llama-hybrid-prefill --checker-binary build/bin/llama-hybrid-bench-check --model "$HOME/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf" --artifacts .temp/r15-rerun
+```
+
+Command ledger through the review audit (logs contain complete output; compiler variants record nested PIDs/argv inside their build log):
+
+| Log | Exit | UTC start | UTC end |
+| --- | ---: | --- | --- |
+| unit-01.log | 0 | 2026-11-01T12:10:19.006003+00:00 | 2026-11-01T12:10:19.158465+00:00 |
+| build-01.log | 0 | 2026-11-01T12:10:19.193412+00:00 | 2026-11-01T12:10:31.265305+00:00 |
+| noise-01.log | 1 | 2026-11-01T12:10:43.890297+00:00 | 2026-11-01T12:10:52.099266+00:00 |
+| build-02.log | 0 | 2026-11-01T12:11:20.101238+00:00 | 2026-11-01T12:11:24.724733+00:00 |
+| noise-02.log | 0 | 2026-11-01T12:11:43.631366+00:00 | 2026-11-01T12:12:10.444810+00:00 |
+| unit-02.log | 0 | 2026-11-01T12:12:15.581033+00:00 | 2026-11-01T12:12:15.820646+00:00 |
+| integrated-01.log | 1 | 2026-11-01T12:12:21.953320+00:00 | 2026-11-01T12:13:11.232794+00:00 |
+| build-controls-01.log | 0 | 2026-11-01T12:13:22.815393+00:00 | 2026-11-01T12:13:32.094947+00:00 |
+| proxy-unit-01.log | 0 | 2026-11-01T12:12:21.957598+00:00 | 2026-11-01T12:13:48.149198+00:00 |
+| build-03.log | 0 | 2026-11-01T12:13:54.491885+00:00 | 2026-11-01T12:14:01.302141+00:00 |
+| argmax-mutant-01.log | 1 | 2026-11-01T12:13:55.635597+00:00 | 2026-11-01T12:14:20.484389+00:00 |
+| python-mutants-01.log | 1 | 2026-11-01T12:14:45.136308+00:00 | 2026-11-01T12:14:45.270733+00:00 |
+| snapshot-reference-01.log | 0 | 2026-11-01T12:14:45.312359+00:00 | 2026-11-01T12:14:53.591645+00:00 |
+| python-mutants-02.log | 0 | 2026-11-01T12:14:59.088078+00:00 | 2026-11-01T12:14:59.200598+00:00 |
+| unit-03.log | 0 | 2026-11-01T12:14:59.229761+00:00 | 2026-11-01T12:14:59.512893+00:00 |
+| integrated-02.log | 0 | 2026-11-01T12:14:46.476498+00:00 | 2026-11-01T12:16:12.303218+00:00 |
+| ty-readiness-01.log | 1 | 2026-11-01T12:16:15.403403+00:00 | 2026-11-01T12:16:15.406055+00:00 |
+| editorconfig-readiness-01.log | 1 | 2026-11-01T12:16:15.440469+00:00 | 2026-11-01T12:16:15.442857+00:00 |
+| build-04.log | 0 | 2026-11-01T12:16:14.250475+00:00 | 2026-11-01T12:16:20.222963+00:00 |
+| unit-04.log | 0 | 2026-11-01T12:16:53.050879+00:00 | 2026-11-01T12:16:53.335109+00:00 |
+| style-01.log | 0 | 2026-11-01T12:16:53.361292+00:00 | 2026-11-01T12:16:53.387065+00:00 |
+| build-controls-02.log | 0 | 2026-11-01T12:16:53.413404+00:00 | 2026-11-01T12:17:06.332450+00:00 |
+| snapshot-reference-02.log | 0 | 2026-11-01T12:17:39.230876+00:00 | 2026-11-01T12:17:48.448927+00:00 |
+| argmax-mutant-02.log | 1 | 2026-11-01T12:17:38.036677+00:00 | 2026-11-01T12:18:04.701212+00:00 |
+| integrated-03.log | 0 | 2026-11-01T12:16:54.201594+00:00 | 2026-11-01T12:18:19.971120+00:00 |
+| audit-01.log | 0 | 2026-11-01T12:19:00.715291+00:00 | 2026-11-01T12:19:00.807657+00:00 |
+
+After self-review, the clean M1 control was strengthened to compare every original M1 result field, not just the selected numerical metrics; its repeat in `noise-03` passes with exit 0. The final benchmark unit rerun has 31 passing tests. The final audit refreshes tested-source hashes and confirms no recorded PID remains alive. No runtime behavior changed during this assertion/comment cleanup.
+
+| Additional log | Exit | UTC start | UTC end |
+| --- | ---: | --- | --- |
+| whitespace-01.log | 0 | 2026-11-01T12:20:53.201394+00:00 | 2026-11-01T12:20:53.206352+00:00 |
+| unit-05.log | 0 | 2026-11-01T12:22:16.742866+00:00 | 2026-11-01T12:22:16.982214+00:00 |
+| noise-03.log | 0 | 2026-11-01T12:22:17.004517+00:00 | 2026-11-01T12:22:44.733059+00:00 |
+| audit-02.log | 0 | 2026-11-01T12:23:12.979822+00:00 | 2026-11-01T12:23:13.050937+00:00 |

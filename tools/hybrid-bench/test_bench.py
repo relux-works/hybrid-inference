@@ -210,21 +210,58 @@ class BenchmarkTests(unittest.TestCase):
 
     # Cross-backend metrics are uncalibrated with exit 5 on both sides of the reference threshold.
     def test_cross_backend_classification(self):
-        result = dict(same_partition_exact=False, numerical_within_bounds=True)
+        result = dict(same_partition_exact=False, same_partition_within_floor=False, same_partition_agreed=8, k=8, numerical_within_bounds=True, backend='cpu')
         self.assertEqual(classify_equivalence(result, False), ('failed', 3))
         self.assertEqual(classify_equivalence(result, True), ('uncalibrated', 5))
         self.assertEqual(classify_equivalence(dict(result, numerical_within_bounds=False), True), ('uncalibrated', 5))
-        self.assertEqual(classify_equivalence(dict(result, same_partition_exact=True), False), ('passed', 0))
+        self.assertEqual(classify_equivalence(dict(result, same_partition_exact=True, same_partition_within_floor=True), False), ('passed', 0))
 
-    # GPU acceptance requires same-partition equality even when KL is small, and CPU keeps its historical numerical gate.
+    # A logit mismatch fails despite unchanged argmax; measured-floor acceptance and the extra CPU numerical bound remain distinct.
     def test_gpu_noise_classification(self):
         for backend in ('cuda', 'metal'):
             for numerical in (False, True):
-                result = dict(same_partition_exact=True, numerical_within_bounds=numerical)
+                result = dict(same_partition_exact=True, same_partition_within_floor=True, same_partition_agreed=8, k=8, numerical_within_bounds=numerical, backend=backend)
                 self.assertEqual(classify_equivalence(result, False, backend), ('passed', 0))
-                self.assertEqual(classify_equivalence(dict(result, same_partition_exact=False), False, backend), ('failed', 3))
+                self.assertEqual(classify_equivalence(dict(result, same_partition_exact=False, same_partition_within_floor=False), False, backend), ('failed', 3))
+                self.assertEqual(classify_equivalence(dict(result, same_partition_exact=False), False, backend), ('passed', 0))
                 self.assertEqual(classify_equivalence(result, True, backend), ('uncalibrated', 5))
-                self.assertEqual(classify_equivalence(result, False, 'cpu'), ('passed', 0) if numerical else ('failed', 3))
+                self.assertEqual(classify_equivalence(dict(result, backend='cpu'), False, 'cpu'), ('passed', 0) if numerical else ('failed', 3))
+
+    # A CPU checker cannot accept a CUDA/Metal label, including uncalibrated measurements.
+    def test_checker_backend_mismatch(self):
+        for label in ('cuda', 'metal'):
+            for cross in (False, True):
+                with self.assertRaisesRegex(common.Refusal, 'backend label/device mismatch'):
+                    classify_equivalence(dict(backend='cpu', same_partition_within_floor=True, same_partition_agreed=8, k=8, numerical_within_bounds=True), cross, label)
+
+    # Old checker output refuses before any partial JSONL, Markdown or archive is written.
+    def test_old_checker_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = dict(stage='equivalence', same_partition_exact=True, numerical_within_bounds=True)
+            with self.assertRaisesRegex(common.Refusal, 'incompatible equivalence checker.*rebuild'):
+                bundle(root, 'old', [old], {}, {})
+            self.assertEqual(list(root.iterdir()), [])
+
+    # M1-shaped checker output is refused after reading, before classification; the isolated remote session is released.
+    def test_checker_version_before_classification(self):
+        from types import SimpleNamespace
+        config = dict(prefill_url='http://fixture', model_sha256='0' * 64, clients={'a': dict(prefill_token='fixture')})
+        client = dict(context=2048, build_dir='build', model_path='fixture.gguf', backend='cpu')
+        args = SimpleNamespace(check_tokens=8, noise_chunks=[128, 255], request_timeout=60)
+        def old_checker(command, scratch):
+            Path(command[4]).write_text(json.dumps(dict(same_partition_exact=True, numerical_within_bounds=True)))
+            return SimpleNamespace(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(hybrid_bench, 'http', side_effect=[dict(session_id='fixture'), b'fixture']), \
+                mock.patch.object(hybrid_bench, 'run_checker', side_effect=old_checker), \
+                mock.patch.object(hybrid_bench, 'classify_equivalence') as classify, \
+                mock.patch.object(hybrid_bench.urllib.request, 'urlopen') as release:
+            with self.assertRaisesRegex(common.Refusal, 'incompatible equivalence checker.*rebuild'):
+                hybrid_bench.equivalence(config, client, [1, 2, 3], args, Path(directory))
+            classify.assert_not_called()
+            release.assert_called_once()
+            self.assertEqual(release.call_args.args[0].method, 'DELETE')
 
     # Invalid noise plans refuse before loading private runtime state; valid plans still reach state loading.
     def test_noise_chunk_bounds(self):
@@ -245,7 +282,11 @@ class BenchmarkTests(unittest.TestCase):
                    status_rule='same_backend_same_partition_exact', mean_kl_nats=.03, top1_agreed=7,
                    free_running_first_divergence=2, noise_partitions=[noise], noise_kl_nats=.02,
                    noise_top1_agreed=7, noise_free_running_first_divergence=3, kl_to_noise_ratio=1.5,
-                   kl_to_noise_ratio_status='finite')
+                   kl_to_noise_ratio_status='finite', backend='cpu', same_partition_exact=True,
+                   same_partition_within_floor=True, same_partition_kl_nats=0, same_partition_max_abs_logit_diff=0,
+                   same_partition_repeat_exact=True, same_partition_repeat_kl_nats=0,
+                   same_partition_repeat_max_abs_logit_diff=0, same_partition_repeat_seconds=.2,
+                   same_partition_positions=[], noise_reference_seconds=.4)
         rows = [row, dict(status='passed', skipped=0, aborted=0, exit_code=0)]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -254,6 +295,8 @@ class BenchmarkTests(unittest.TestCase):
             markdown = (root / 'noise.md').read_text()
             self.assertIn('| Local chunks 128 / whole prompt | 0.02 | 7/8 | 3 |', markdown)
             self.assertIn('rule: same_backend_same_partition_exact', markdown)
+            self.assertIn('maximum absolute logit difference 0', markdown)
+            self.assertIn('repeat 0.200000 s; noise 0.400000 s', markdown)
             self.assertIn('1.5 (finite)', markdown)
             with tarfile.open(root / 'noise.tar.gz') as archive:
                 self.assertEqual(archive.extractfile('noise.jsonl').read(), (root / 'noise.jsonl').read_bytes())

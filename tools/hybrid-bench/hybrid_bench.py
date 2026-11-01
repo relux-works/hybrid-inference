@@ -187,12 +187,13 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
                                      deltas=paths, max_ctx=client['context'],
-                                     noise_chunks=args.noise_chunks, uncalibrated=cross_backend or config.get('hetero_quant', False)))
+                                     noise_chunks=args.noise_chunks, backend=client['backend'], uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
         process = run_checker([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
             '0' if client['backend'] == 'cpu' else '999'], scratch)
         require(result_path.is_file(), 'equivalence checker aborted before producing metrics')
         result = json.loads(result_path.read_text())
+        validate_checker_result(result)
         require(process.returncode in (0, 3, 5), 'equivalence checker failed before valid metrics')
         status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False), client['backend'])
         result.update(exit_code=code, checker_exit_code=process.returncode, status=status,
@@ -216,10 +217,21 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 raise
 
 
+def validate_checker_result(result):
+    fields = ('status_rule', 'backend', 'noise_partitions', 'noise_kl_nats', 'noise_reference_seconds',
+              'same_partition_exact', 'same_partition_within_floor', 'same_partition_kl_nats',
+              'same_partition_max_abs_logit_diff', 'same_partition_repeat_exact',
+              'same_partition_repeat_kl_nats', 'same_partition_repeat_max_abs_logit_diff',
+              'same_partition_repeat_seconds', 'same_partition_positions')
+    require(all(field in result for field in fields),
+            'incompatible equivalence checker: missing logit/noise fields; rebuild llama-hybrid-bench-check')
+
+
 def classify_equivalence(result, cross_backend, backend='cpu'):
+    require(result['backend'] == backend, 'checker backend label/device mismatch')
     if cross_backend:
         return ('uncalibrated', 5)
-    return ('passed', 0) if result['same_partition_exact'] and (backend != 'cpu' or result['numerical_within_bounds']) else ('failed', 3)
+    return ('passed', 0) if result['same_partition_within_floor'] and result['same_partition_agreed'] == result['k'] and (backend != 'cpu' or result['numerical_within_bounds']) else ('failed', 3)
 
 
 @contextlib.contextmanager
@@ -257,6 +269,9 @@ def sanitized_info(value):
 
 
 def bundle(root, name, rows, client, node):
+    for row in rows:
+        if row.get('stage') == 'equivalence':
+            validate_checker_result(row)
     path = root / (name + '.jsonl')
     path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
     summary = rows[-1]
@@ -281,6 +296,9 @@ def bundle(root, name, rows, client, node):
                 lines.append(f"| Local chunks {noise['chunk_tokens']} / whole prompt | {noise['noise_kl_nats']:.9g} | {noise['noise_top1_agreed']}/{row['k']} | {noise['noise_free_running_first_divergence']} |")
             lines += [f"| Noise maximum KL / minimum agreement / earliest divergence | {row['noise_kl_nats']:.9g} | {row['noise_top1_agreed']}/{row['k']} | {row['noise_free_running_first_divergence']} |",
                       '', f"Hybrid KL / maximum local noise KL: {row['kl_to_noise_ratio']} ({row['kl_to_noise_ratio_status']})."]
+            lines += ['', f"Same partition: KL {row['same_partition_kl_nats']:.9g}; maximum absolute logit difference {row['same_partition_max_abs_logit_diff']:.9g}; bit-exact {row['same_partition_exact']}; within measured floor {row['same_partition_within_floor']}.",
+                      f"Independent repeat: KL {row['same_partition_repeat_kl_nats']:.9g}; maximum absolute logit difference {row['same_partition_repeat_max_abs_logit_diff']:.9g}; bit-exact {row['same_partition_repeat_exact']}.",
+                      f"Extra reference wall time: repeat {row['same_partition_repeat_seconds']:.6f} s; noise {row['noise_reference_seconds']:.6f} s."]
             lines += ['', 'Equivalence: `' + json.dumps(row, sort_keys=True) + '`.']
         if row.get('stage') == 'error':
             lines += ['', 'Aborted: ' + row['reason'] + '.']
