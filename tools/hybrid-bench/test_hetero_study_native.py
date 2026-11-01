@@ -1,6 +1,8 @@
 """Opt-in real 0.8B CPU study test: D=3, N=64, M=16; no downloads."""
 import argparse
 import csv
+import contextlib
+import http.server
 import json
 import math
 import os
@@ -10,9 +12,93 @@ import statistics
 import random
 import sys
 import time
+import threading
 import urllib.error
+from unittest.mock import patch
 
 import hetero_study as study
+
+
+@contextlib.contextmanager
+def capture_proxy():
+    requests = []
+    class Capture(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(dict(method=self.command, authorization_present=bool(self.headers.get('Authorization'))))
+            self.send_response(502)
+            self.end_headers()
+        do_POST = do_DELETE = do_GET
+        def log_message(self, *unused):
+            pass
+    with http.server.ThreadingHTTPServer(('127.0.0.1', 0), Capture) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            yield 'http://127.0.0.1:' + str(server.server_port), requests
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def test_arm_proxy_isolation(cli, imported):
+    # An imported arm completes with hostile proxy settings and sends no request or bearer to the live capture endpoint.
+    with capture_proxy() as (proxy, requests):
+        opener = study.urllib.request.build_opener(study.urllib.request.ProxyHandler({'http': proxy}))
+        with patch.dict(os.environ, {'no_proxy': '', 'NO_PROXY': ''}):
+            try:
+                opener.open('http://127.0.0.1:1/control', timeout=2)
+            except urllib.error.HTTPError as error:
+                assert error.code == 502
+        assert requests == [dict(method='GET', authorization_present=False)], 'capture control did not receive the probe'
+        requests.clear()
+        with patch.dict(os.environ, dict(http_proxy=proxy, https_proxy=proxy, HTTP_PROXY=proxy, HTTPS_PROXY=proxy, no_proxy='', NO_PROXY='')):
+            try:
+                cli('imported', imported)
+            finally:
+                assert requests == [], 'proxy received an arm request or bearer'
+        print('PASS proxy-isolation: capture control 502; arm 0; captured requests 0', flush=True)
+
+
+def test_completed_binding_refused(cli, arm_args, report_args, prepared, root):
+    # A valid changed reference receipt or a changed completed binding refuses arm/report without new processes or output.
+    receipt_path = prepared / 'arms/imported/doc0.json'
+    ref_path = prepared / 'references/doc0.json'
+    original = receipt_path.read_bytes()
+    original_ref = ref_path.read_bytes()
+    before = {str(p): p.read_bytes() for p in prepared.rglob('*.process.json')}
+    for change in ('reference', 'binding'):
+        if change == 'reference':
+            ref = study.read(ref_path)
+            binary = Path(ref['outputs'][0]['path'])
+            payload = binary.read_bytes()
+            changed = bytearray(payload)
+            row_start = len(changed) - (44 + 2 * ref['header']['vocab'])
+            assert changed[-32:] == study.hashlib.sha256(changed[row_start:-32]).digest()
+            changed[row_start + 12] ^= 1
+            changed[-32:] = study.hashlib.sha256(changed[row_start:-32]).digest()
+            binary.write_bytes(changed)
+            ref['outputs'][0] = study.file_record(binary)
+            study.seal_receipt(ref)
+            study.save(ref_path, ref)
+        else:
+            record = study.read(receipt_path)
+            record['identity']['reference_sha256'] = '0' * 64
+            study.seal_receipt(record)
+            study.save(receipt_path, record)
+        try:
+            cli('stale-' + change + '-arm', arm_args, 2, 'stale resume identity')
+            output = root / ('stale-' + change + '-report')
+            command = list(report_args)
+            command[command.index('--output') + 1] = output
+            cli('stale-' + change + '-report', command, 2, 'stale resume identity')
+            assert not output.exists(), 'stale row published'
+            assert {str(p): p.read_bytes() for p in prepared.rglob('*.process.json')} == before
+            assert receipt_path.read_bytes() == (original if change == 'reference' else study.encoded(record))
+        finally:
+            receipt_path.write_bytes(original)
+            ref_path.write_bytes(original_ref)
+            if change == 'reference':
+                binary.write_bytes(payload)
 
 
 def test_client_schedule_floor(result):
@@ -103,8 +189,8 @@ def main():
     cli('self', arm_args + ['--kind', 'local', '--label', 'self', '--client-model', args.reference])
     cli('local', arm_args + ['--kind', 'local', '--label', 'local', '--client-model', args.client])
     imported = arm_args + ['--kind', 'imported', '--label', 'imported', '--client-model', args.client,
-                           '--node-model', args.reference, '--hetero-quant', '--chunk-tokens', '32', '--ram-budget-mib', '128']
-    cli('imported', imported)
+                           '--node-model', args.reference, '--hetero-quant', '--chunk-tokens', '256', '--ram-budget-mib', '128']
+    test_arm_proxy_isolation(cli, imported)
     spec_path = root / 'homogeneous.json'
     study.save(spec_path, dict(kind='imported', label='homogeneous', client_model=args.client, node_model=args.client))
     cli('homogeneous', arm_args + ['--spec', spec_path, '--chunk-tokens', '8192', '--ram-budget-mib', '128'])
@@ -203,13 +289,17 @@ def main():
     study.save(config_path, wrong_config)
     rejected_report('another-model-report', 'report reference model mismatch')
     config_path.write_bytes(original_config)
-    record = study.receipt(prepared / 'arms/imported/doc0.json')
-    delta = Path(record['outputs'][2]['path'])
-    backup = delta.with_suffix('.saved')
-    delta.rename(backup)
-    cli('missing-delta-resume', imported, 2, 'missing arm rows/delta')
-    rejected_report('missing-delta', 'missing arm rows/delta')
-    backup.rename(delta)
+    test_completed_binding_refused(cli, imported, report_args, prepared, root)
+    # Deleted delta bytes are no longer inputs; changing their recorded hashes invalidates the receipt chain.
+    record_path = prepared / 'arms/imported/doc0.json'
+    original_record = record_path.read_bytes()
+    record = study.receipt(record_path)
+    assert record['deltas'] and all(not Path(item['path']).exists() for item in record['deltas'])
+    record['deltas'][0]['sha256'] = '0' * 64
+    study.save(record_path, record)
+    cli('changed-delta-record-resume', imported, 2, 'stale receipt chain')
+    rejected_report('changed-delta-record', 'stale receipt chain')
+    record_path.write_bytes(original_record)
     fixture_path = Path(index['documents'][0]['fixture']['path'])
     original_fixture = fixture_path.read_bytes()
     changed = study.read(fixture_path)

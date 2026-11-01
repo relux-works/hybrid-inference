@@ -14,6 +14,7 @@ from pathlib import Path
 import random
 import re
 import secrets
+import shutil
 import signal
 import socket
 import statistics
@@ -30,6 +31,7 @@ from bench_common import Refusal, private_json, require, sha256
 from reference_logits import reference_header
 
 ACTIVE_LOCK_FD = None
+API_LIMIT = 514 * 1024**2
 
 
 def encoded(value):
@@ -131,18 +133,21 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Refusal('local API redirect refused')
 
 
-def api(base, path, data=None, token='', binary=False, timeout=3600):
+def api(base, path, data=None, token='', binary=False, timeout=3600, method=None):
     url = urllib.parse.urlsplit(base)
     require(url.scheme == 'http' and url.hostname in ('127.0.0.1', '::1') and not url.username
             and not url.query and not url.fragment and url.path in ('', '/'), 'API must use numeric loopback HTTP')
     headers = {'Content-Type': 'application/json'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
-    request = urllib.request.Request(base.rstrip('/') + path, None if data is None else encoded(data), headers)
+    request = urllib.request.Request(base.rstrip('/') + path, None if data is None else encoded(data), headers, method=method)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     with opener.open(request, timeout=timeout) as response:
-        payload = response.read(514 * 1024**2)
-        require(len(payload) < 514 * 1024**2, 'API response exceeds limit')
+        payload = response.read(API_LIMIT)
+        require(len(payload) < API_LIMIT, 'API response exceeds limit')
+        if method == 'DELETE':
+            require(response.status == 204, 'node session release failed')
+            return None
     return payload if binary else json.loads(payload)
 
 
@@ -226,14 +231,16 @@ def token_hash(fixture):
     return hashlib.sha256(b''.join(struct.pack('<i', t) for t in fixture['tokens'] + fixture['continuation'])).hexdigest()
 
 
-def load_study(root):
+def load_study(root, recorded=False):
     index = read(root / 'index.json')
     spec = index['specification']
-    verify(spec['manifest'], 'manifest')
+    if not recorded:
+        verify(spec['manifest'], 'manifest')
     require(len(index['documents']) == spec['d'], 'stale document index')
     fixtures = {}
     for doc in index['documents']:
-        verify(doc['source'], 'document')
+        if not recorded:
+            verify(doc['source'], 'document')
         fixture = read(verify(doc['fixture'], 'fixture'))
         require(len(fixture['tokens']) == spec['n'] and len(fixture['continuation']) == spec['m'], 'stale fixture N/M')
         fixtures[doc['id']] = fixture
@@ -247,16 +254,25 @@ def build_identity(build):
     return [file_record(p) for p in paths if p.is_file()]
 
 
-def receipt(path, identity=None):
+def seal_receipt(data):
+    data['chain_sha256'] = digest({key: value for key, value in data.items() if key != 'chain_sha256'})
+
+
+def receipt(path, identity=None, recorded=False):
     data = read(path)
     require(identity is None or data['identity'] == identity, 'stale resume identity: ' + str(path))
-    for output in data['outputs']:
+    require(data.get('chain_sha256') == digest({key: value for key, value in data.items() if key != 'chain_sha256'}), 'stale receipt chain: ' + str(path))
+    for i, output in enumerate(data['outputs']):
+        if recorded and data['kind'] == 'reference' and i == 0:
+            continue
         verify(output, data['kind'])
     return data
 
 
 def commit_receipt(path, kind, identity, paths, **extra):
-    save(path, dict(kind=kind, identity=identity, outputs=[file_record(p) for p in paths], **extra))
+    data = dict(kind=kind, identity=identity, outputs=[file_record(p) for p in paths], **extra)
+    seal_receipt(data)
+    save(path, data)
 
 
 def engine(args):
@@ -271,9 +287,10 @@ def base_identity(index, doc, fixture):
     return dict(index_sha256=digest(index), fixture=doc['fixture'], token_sha256=token_hash(fixture))
 
 
-def reference_check(record, fixture, model_hash):
-    path = verify(record['outputs'][0], 'reference')
-    header = reference_header(path, model_hash)
+def reference_check(record, fixture, model_hash, recorded=False):
+    path = Path(record['outputs'][0]['path'])
+    header = record['header'] if recorded else reference_header(path, model_hash)
+    require(header['model_sha256'] == model_hash, 'reference model hash mismatch')
     require(header['tokens'] == fixture['tokens'] and header['continuation'] == fixture['continuation'], 'reference document mismatch')
     require((header['n'], header['m']) == (len(fixture['tokens']), len(fixture['continuation'])), 'reference N/M mismatch')
     require(header['token_sha256'] == token_hash(fixture), 'reference token hash mismatch')
@@ -311,7 +328,8 @@ def reference(args):
         source = dict(fixture, model_sha256=model['sha256'], max_ctx=index['specification']['n'] + index['specification']['m'],
                       score_batch=args.score_batch, write_reference=str(output))
         result, _ = score(args, model['path'], source, attempt)
-        commit_receipt(path, 'reference', identity, [output, result])
+        header = reference_header(output, model['sha256'])
+        commit_receipt(path, 'reference', identity, [output, result], header=header)
 
 
 def arm_spec(args):
@@ -376,20 +394,38 @@ def deltas(args, spec, fixture, attempt, header):
                 atomic(path, body)
                 paths.append(path)
         finally:
-            request = urllib.request.Request(base + route, method='DELETE', headers={'Authorization': 'Bearer ' + token})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                require(response.status == 204, 'node session release failed')
+            failed = sys.exc_info()[0] is not None
+            try:
+                api(base, route, token=token, method='DELETE', timeout=30)
+            except Exception:
+                if not failed:
+                    raise
     # Exiting node() waits for the owned process before the client can start.
     return paths
 
 
+def arm_disk_budget(args, spec, pending, folder):
+    # Each response is bounded by API_LIMIT; default retention needs only one document's chain.
+    chains = [math.ceil((len(fixture['tokens']) - 1) / args.chunk_tokens) * API_LIMIT for _, fixture, *_ in pending]
+    delta_bytes = (sum(chains) if args.keep_deltas else max(chains, default=0)) if spec['kind'] == 'imported' else 0
+    rows_bytes = len(pending) * 100 * 1024**2
+    budget = delta_bytes + rows_bytes
+    margin = max(1024**3, math.ceil(budget / 10))
+    free = shutil.disk_usage(folder).free
+    print(json.dumps(dict(arm=spec['label'], pending_documents=len(pending), delta_bytes=delta_bytes,
+                          rows_logs_reserve_bytes=rows_bytes, budget_bytes=budget, margin_bytes=margin, free_bytes=free)), flush=True)
+    require(not pending or free >= budget + margin, 'insufficient free disk for arm budget plus margin')
+    return budget, margin
+
+
 def arm(args):
+    require(256 <= args.chunk_tokens <= 8192 and args.chunk_tokens % 256 == 0, 'chunk tokens must be a multiple of 256 (256..8192)')
     root = private_dir(args.study)
     index, fixtures = load_study(root)
     spec = arm_spec(args)
     reference_hash = args.reference_model_sha256
     settings = engine(args)
-    settings.update(chunk_tokens=args.chunk_tokens, ram_budget_mib=args.ram_budget_mib,
+    settings.update(chunk_tokens=args.chunk_tokens, ram_budget_mib=args.ram_budget_mib, keep_deltas=args.keep_deltas,
                     node_build=build_identity(args.node_build_dir or args.build_dir) if spec['kind'] == 'imported' else [])
     folder = private_dir(private_dir(root / 'arms') / spec['label'])
     identity = dict(spec=spec, engine=settings, reference_model_sha256=reference_hash, index_sha256=digest(index))
@@ -405,28 +441,37 @@ def arm(args):
         reference_path, header = reference_check(ref, fixture, reference_hash)
         require(ref['identity']['index_sha256'] == digest(index), 'reference study mismatch')
         require(header['score_batch'] == args.score_batch, 'reference scoring schedule mismatch')
-        binding = dict(base_identity(index, doc, fixture), arm=identity, reference_sha256=sha256(reference_path))
+        binding = dict(base_identity(index, doc, fixture), arm=identity, reference_sha256=ref['outputs'][0]['sha256'])
         path = folder / (doc['id'] + '.json')
         if path.exists():
             receipt(path, binding)
         else:
             pending.append((doc, fixture, path, binding, reference_path, header))
+    arm_disk_budget(args, spec, pending, folder)
     for doc, fixture, path, binding, reference_path, header in pending:
         attempt = Path(tempfile.mkdtemp(prefix=doc['id'] + '-', dir=folder))
-        paths = deltas(args, spec, fixture, attempt, header) if spec['kind'] == 'imported' else []
-        require(spec['kind'] != 'imported' or paths, 'missing delta chain')
-        source = dict(fixture, model_sha256=spec['client_model']['sha256'], max_ctx=index['specification']['n'] + index['specification']['m'],
-                      score_batch=args.score_batch, reference_logits=str(reference_path), reference_model_sha256=reference_hash)
-        if paths:
-            source.update(deltas=[str(p) for p in paths], hetero_quant=spec['hetero_quant'],
-                          node_model_sha256=spec['node_model']['sha256'], node_layout_fingerprint=header['layout_fingerprint'])
-        result, data = score(args, spec['client_model']['path'], source, attempt)
-        rows = attempt / 'rows.json'
-        prefix = 'hybrid' if paths else 'local'
-        values = [dict(position=p['position'], kl_nats=p[prefix + '_kl_nats'], top1_agreed=p[prefix + '_top1_agreed']) for p in data['positions']]
-        require(all(v['kl_nats'] is not None and v['top1_agreed'] is not None for v in values), 'missing imported score rows')
-        private_json(rows, values)
-        commit_receipt(path, 'arm rows/delta', binding, [rows, result] + paths)
+        committed = False
+        try:
+            paths = deltas(args, spec, fixture, attempt, header) if spec['kind'] == 'imported' else []
+            require(spec['kind'] != 'imported' or paths, 'missing delta chain')
+            delta_records = [file_record(p) for p in paths]
+            source = dict(fixture, model_sha256=spec['client_model']['sha256'], max_ctx=index['specification']['n'] + index['specification']['m'],
+                          score_batch=args.score_batch, reference_logits=str(reference_path), reference_model_sha256=reference_hash)
+            if paths:
+                source.update(deltas=[str(p) for p in paths], hetero_quant=spec['hetero_quant'],
+                              node_model_sha256=spec['node_model']['sha256'], node_layout_fingerprint=header['layout_fingerprint'])
+            result, data = score(args, spec['client_model']['path'], source, attempt)
+            rows = attempt / 'rows.json'
+            prefix = 'hybrid' if paths else 'local'
+            values = [dict(position=p['position'], kl_nats=p[prefix + '_kl_nats'], top1_agreed=p[prefix + '_top1_agreed']) for p in data['positions']]
+            require(all(v['kl_nats'] is not None and v['top1_agreed'] is not None for v in values), 'missing imported score rows')
+            private_json(rows, values)
+            commit_receipt(path, 'arm rows/delta', binding, [rows, result], deltas=delta_records)
+            committed = True
+        finally:
+            if not committed or not args.keep_deltas:
+                for delta in attempt.glob('*.delta'):
+                    delta.unlink()
 
 
 def quantile(values, probability):
@@ -445,35 +490,29 @@ def bootstrap(values, seed, resamples=10000):
 
 def report(args):
     root = private_dir(args.study)
-    index, fixtures = load_study(root)
+    index, fixtures = load_study(root, recorded=True)
     folders = [root / 'arms' / label for label in args.arms]
     require(len(set(args.arms)) == len(args.arms) and all(re.fullmatch(r'[A-Za-z0-9_-]+', label) for label in args.arms), 'invalid report arms')
     all_rows, means, top1_means, floors, batches = {}, {}, {}, {}, {}
     reference_hash = None
-    checked_files = set()
     for label, folder in zip(args.arms, folders):
         config = read(folder / 'arm.json')
         require(config['index_sha256'] == digest(index), 'stale report study')
         if reference_hash is None:
             reference_hash = config['reference_model_sha256']
         require(config['reference_model_sha256'] == reference_hash, 'report reference model mismatch')
-        dependencies = [config['spec']['client_model']] + config['engine']['build'] + config['engine']['node_build'] + config['engine']['helpers']
-        if config['spec']['node_model']:
-            dependencies.append(config['spec']['node_model'])
-        for item in dependencies:
-            key = (item['path'], item['sha256'])
-            if key not in checked_files:
-                verify(item, 'model/build')
-                checked_files.add(key)
         rows_by_doc = {}
         floor_rows = []
         for doc in index['documents']:
             fixture = fixtures[doc['id']]
-            ref = receipt(root / 'references' / (doc['id'] + '.json'))
-            refpath, _ = reference_check(ref, fixture, reference_hash)
-            binding = dict(base_identity(index, doc, fixture), arm=config, reference_sha256=sha256(refpath))
+            ref = receipt(root / 'references' / (doc['id'] + '.json'), recorded=True)
+            _, header = reference_check(ref, fixture, reference_hash, recorded=True)
+            require(all(ref['identity'][key] == value for key, value in base_identity(index, doc, fixture).items()), 'reference study mismatch')
+            require(header['score_batch'] == config['engine']['score_batch'], 'reference scoring schedule mismatch')
+            binding = dict(base_identity(index, doc, fixture), arm=config, reference_sha256=ref['outputs'][0]['sha256'])
             record = receipt(folder / (doc['id'] + '.json'), binding)
-            require(config['spec']['kind'] != 'imported' or len(record['outputs']) > 2, 'missing delta chain')
+            expected_deltas = math.ceil((len(fixture['tokens']) - 1) / config['engine']['chunk_tokens']) if config['spec']['kind'] == 'imported' else 0
+            require(len(record['deltas']) == expected_deltas, 'missing delta chain')
             rows = read(record['outputs'][0]['path'])
             measured = read(record['outputs'][1]['path'])
             require(measured['schedule_floor']['kind'] == 'fresh-prefix-spots-v1', 'score schedule controls missing')
@@ -512,7 +551,8 @@ def report(args):
     output = private_dir(args.output)
     for row in table:
         row['score_batch'] = batches[row['arm']]
-    settings = dict(seed=args.seed, resamples=10000, index_sha256=digest(index), arms=args.arms)
+    settings = dict(seed=args.seed, resamples=10000, index_sha256=digest(index), arms=args.arms,
+                    verification='fixture and row/result file hashes; receipt checksums and recorded index/arm/reference/delta bindings; no large input revalidation')
     csv_text = io.StringIO(newline='')
     writer = csv.DictWriter(csv_text, fieldnames=columns, lineterminator='\n')
     writer.writeheader()
@@ -557,6 +597,7 @@ def parser():
             command.add_argument('--hetero-quant', action='store_true')
             command.add_argument('--chunk-tokens', type=int, default=4096)
             command.add_argument('--ram-budget-mib', type=int, default=4096)
+            command.add_argument('--keep-deltas', action='store_true', help='retain successful imported delta files for debugging')
     command = commands.add_parser('report')
     command.add_argument('--study', required=True)
     command.add_argument('--arms', nargs='+', required=True)
@@ -570,7 +611,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)
     try:
-        require(getattr(args, 'chunk_tokens', 1) in range(1, 8193), 'chunk tokens out of bounds (1..8192)')
+        require(not hasattr(args, 'chunk_tokens') or 256 <= args.chunk_tokens <= 8192 and args.chunk_tokens % 256 == 0,
+                'chunk tokens must be a multiple of 256 (256..8192)')
         require(0 <= getattr(args, 'gpu_layers', 0) <= 999 and 1 <= getattr(args, 'score_batch', 1) <= 256, 'invalid GPU layers/score batch')
         with locked(args.lock) as lock_fd:
             ACTIVE_LOCK_FD = lock_fd
