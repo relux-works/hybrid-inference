@@ -344,7 +344,9 @@ def process_identity(pid):
         if platform.system() == 'Linux':
             fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
             return None if fields[0] == 'Z' else fields[19]
-        return output(['ps', '-p', str(pid), '-o', 'lstart=']) or None
+        # macOS ps still reports a zombie with its start time; treat it as stopped like Linux state Z.
+        fields = output(['ps', '-p', str(pid), '-o', 'stat=,lstart=']).split(None, 1)
+        return fields[1] if len(fields) == 2 and not fields[0].startswith('Z') else None
     except (OSError, subprocess.CalledProcessError):
         return None
 
@@ -371,17 +373,31 @@ def control(state, stop=False):
         results[name] = 'running' if same else 'stopped'
         if stop and same:
             os.kill(pid, signal.SIGTERM)
-            deadline = time.monotonic() + 15
-            while process_identity(pid) == record['identity'] and time.monotonic() < deadline:
-                time.sleep(.1)
-            if process_identity(pid) == record['identity']:
+            if not wait_gone(pid, record['identity'], 15):
                 os.kill(pid, signal.SIGKILL)
-                deadline = time.monotonic() + 5
-                while process_identity(pid) == record['identity'] and time.monotonic() < deadline:
-                    time.sleep(.1)
-                require(process_identity(pid) != record['identity'], f'PID {pid} has not stopped')
+                require(wait_gone(pid, record['identity'], 5), f'PID {pid} has not stopped')
             results[name] = 'stopped'
     return results
+
+
+def reap(pid):
+    # collect our own exited child, so it does not stay a zombie with the old identity
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+
+def wait_gone(pid, identity, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        reap(pid)
+        if process_identity(pid) != identity:
+            reap(pid)  # it may have exited between the two calls
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(.1)
 
 
 def wait_health(url, path, process, timeout=180, token=''):

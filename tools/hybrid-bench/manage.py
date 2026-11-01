@@ -114,6 +114,7 @@ def parser():
     p.add_argument('--ctx', type=int)
     p.add_argument('--ram-budget-mib', type=int, help='node retained-session cap, at most the derived host budget')
     p.add_argument('--request-timeout', type=int, default=180, help='proxy node/decoder HTTP timeout in seconds')
+    p.add_argument('--startup-timeout', type=int, default=600, help='seconds to wait for each launched process to become healthy')
     p.add_argument('--cuda', action='store_true')
     p.add_argument('--ref', default='HEAD')
     p.add_argument('--build-dir')
@@ -148,6 +149,7 @@ def preserve_startup_logs(state):
 def main():
     args = parser().parse_args()
     require(1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
+    require(1 <= args.startup_timeout <= 86400, '--startup-timeout must be in 1..86400')
     state = Path(args.state).expanduser().resolve()
     if args.status or args.stop:
         result = control(state, args.stop)
@@ -232,7 +234,7 @@ def main():
             health_host = '127.0.0.1' if args.bind == '0.0.0.0' else '::1' if args.bind == '::' else args.bind
             if ':' in health_host:
                 health_host = '[' + health_host + ']'
-            health = wait_health(f'http://{health_host}:{port}', '/v1/health', process)
+            health = wait_health(f'http://{health_host}:{port}', '/v1/health', process, timeout=args.startup_timeout)
             require(health['model_sha256'] == digest, 'launched node model hash mismatch')
             if 'layout_fingerprint' in health:
                 require(health['layout_fingerprint'] == identity['layout_fingerprint'], 'native/GGUF layout fingerprint mismatch')
@@ -280,10 +282,10 @@ def main():
             created_state = True
             temporary = None
             process = start_process(command, state, 'decode')
-            wait_health(config['decode_url'], '/health', process, token=decode_token)
+            wait_health(config['decode_url'], '/health', process, timeout=args.startup_timeout, token=decode_token)
             proxy = start_process([sys.executable, Path(record['source_path']) / 'tools/hybrid-proxy/proxy.py', '--config',
                 state / 'proxy-config.json', '--database', state / 'proxy.sqlite', '--port', port], state, 'proxy')
-            wait_health(info['proxy_url'], '/health', proxy, token=credential)
+            wait_health(info['proxy_url'], '/health', proxy, timeout=args.startup_timeout, token=credential)
             print(str(state / 'proxy-config.json'))
         return 0
     except BaseException as error:

@@ -317,5 +317,46 @@ class BenchmarkTests(unittest.TestCase):
             self.assertNotIn(b'/private', data['client-info.json'])
 
 
+class ProcessControlTests(unittest.TestCase):
+    # The startup deadline is opt-in per launch and bounded; bad values refuse before any state change.
+    def test_startup_timeout_bounds(self):
+        self.assertEqual(manage.parser().parse_args(['client', '--state', 'fixture']).startup_timeout, 600)
+        self.assertEqual(manage.parser().parse_args(['node', '--state', 'fixture', '--startup-timeout', '1200']).startup_timeout, 1200)
+        for value in ('0', '-1', '86401'):
+            with mock.patch('sys.argv', ['manage.py', 'client', '--state', 'fixture', '--startup-timeout', value]), mock.patch.object(manage, 'preflight') as preflight:
+                with self.assertRaisesRegex(common.Refusal, 'startup-timeout'):
+                    manage.main()
+                preflight.assert_not_called()
+
+    # On macOS a zombie keeps its start time in ps; it must count as stopped, a live process keeps its identity.
+    def test_macos_zombie_identity(self):
+        with mock.patch.object(common.platform, 'system', return_value='Darwin'):
+            with mock.patch.object(common, 'output', return_value='Z    Sat Nov  1 10:00:00 2026'):
+                self.assertIsNone(common.process_identity(1234))
+            with mock.patch.object(common, 'output', return_value='Ss   Sat Nov  1 10:00:00 2026'):
+                self.assertEqual(common.process_identity(1234), 'Sat Nov  1 10:00:00 2026')
+            with mock.patch.object(common, 'output', side_effect=common.subprocess.CalledProcessError(1, 'ps')):
+                self.assertIsNone(common.process_identity(1234))
+
+    # Stopping an owned child reaps it, on the Linux path and on the ps path used on macOS (exercised here with this
+    # host's ps); before the fix the ps path saw the zombie as still running and refused with "has not stopped".
+    def test_control_reaps_owned_child(self):
+        for system in ('Linux', 'Darwin'):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(common.platform, 'system', return_value=system):
+                child = common.subprocess.Popen(['python3', '-c', 'import time; time.sleep(60)'])
+                try:
+                    identity = common.process_identity(child.pid)
+                    self.assertTrue(identity)
+                    common.private_json(Path(directory) / 'decode.pid', dict(pid=child.pid, identity=identity))
+                    self.assertEqual(common.control(directory, stop=True), {'decode': 'stopped'})
+                    with self.assertRaises(ChildProcessError):
+                        common.os.waitpid(child.pid, common.os.WNOHANG)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+
+
 if __name__ == '__main__':
     unittest.main()
