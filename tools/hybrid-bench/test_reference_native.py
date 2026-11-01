@@ -94,10 +94,17 @@ def main():
     reverse_repeat = run('q4-to-q8-repeat', args.reference, reverse_fixture)
     assert reverse['positions'] == reverse_repeat['positions'] and reverse['local']['kl_nats']['mean'] > 1e-6
 
-    # Independent single-token batching exercises every target at the same position, including batch boundaries.
-    scalar = run('scalar-batches', args.reference, dict(compare, model_sha256=reference_hash, score_batch=1))
+    # A schedule change requires its own reference; unbound continuation schedules must refuse before output.
+    run('wrong-score-batch', args.reference, dict(compare, model_sha256=reference_hash, score_batch=1), 2, 'reference scoring schedule mismatch')
+    scalar_path = root / 'scalar-reference.bin'
+    run('scalar-reference', args.reference, dict(base, score_batch=1, model_sha256=reference_hash, write_reference=str(scalar_path)))
+    scalar = run('scalar-batches', args.reference, dict(compare, reference_logits=str(scalar_path), model_sha256=reference_hash, score_batch=1))
     assert scalar['local']['kl_nats']['max'] < 1e-4
     assert all(p['local_top1_agreed'] for p in scalar['positions'])
+    # Q4 fresh-prefix probes expose client batch-shape variation rather than borrowing the Q8 float16 floor.
+    assert local['identity']['context_prefill'] == 'split-last-v1'
+    assert local['schedule_floor']['kind'] == 'fresh-prefix-spots-v1'
+    assert local['schedule_floor']['local']['max'] > 1e-5, 'Q4 schedule variation was not reported'
 
     # Each malformed identity/file must name its rejection and leave no result or partial output.
     run('wrong-model-file', args.client, dict(compare, model_sha256=client_hash, reference_logits=str(client_reference)), 2, 'reference model hash mismatch')

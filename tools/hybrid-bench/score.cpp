@@ -133,6 +133,8 @@ struct reference_reader {
         const auto expected = fixture.at("reference_model_sha256").get<std::string>();
         require(valid_hash(expected) && header.at("model_sha256") == expected, "reference model hash mismatch");
         require(header.at("n") == n && header.at("m") == m, "reference N/M mismatch");
+        require(header.at("score_batch") == fixture.value("score_batch", int64_t(32)) &&
+                header.value("context_prefill", "") == "split-last-v1", "reference scoring schedule mismatch");
         std::vector<llama_token> all = tokens;
         all.insert(all.end(), next.begin(), next.end());
         require(header.at("token_sha256") == hybrid::prefix_hash(all) && header.at("tokens") == tokens &&
@@ -190,6 +192,31 @@ static hybrid::context_ptr context(llama_model * model, uint32_t depth, bool gpu
     hybrid::context_ptr result(llama_init_from_model(model, cp));
     require(bool(result), "cannot create score context");
     return result;
+}
+
+static void prefill_arm(llama_context * ctx, const std::vector<llama_token> & tokens,
+                        const std::vector<std::string> & paths, const std::string & source_hash) {
+    const size_t n = tokens.size();
+    if (paths.empty()) {
+        hybrid::prefill(ctx, {tokens.begin(), tokens.end() - 1}, 0);
+    } else {
+        int64_t end = 0;
+        for (const auto & path : paths) {
+            const auto size = std::filesystem::file_size(path);
+            require(size <= 513 * 1024 * 1024 + 52, "score delta exceeds limit");
+            std::ifstream delta_input(path, std::ios::binary);
+            const auto delta = hybrid::read_delta(read_bytes(delta_input, size), source_hash, end);
+            const int64_t n1 = delta.header.at("n1");
+            require(n1 <= int64_t(n - 1), "score delta endpoint mismatch");
+            require(delta.header.at("tokens") == std::vector<llama_token>(tokens.begin() + end, tokens.begin() + n1) &&
+                    delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "score delta tokens mismatch");
+            require(llama_state_seq_set_data_append(ctx, reinterpret_cast<const uint8_t *>(delta.state.data()), delta.state.size(), 0, end, n1) == delta.state.size(), "score delta import failed");
+            end = n1;
+        }
+        require(end == int64_t(n - 1), "incomplete score delta chain");
+    }
+    // Both arms evaluate the last context token in a one-token decode.
+    hybrid::prefill(ctx, {tokens.back()}, n - 1);
 }
 
 static void self_test() {
@@ -262,30 +289,17 @@ int main(int argc, char ** argv) {
         hybrid::context_ptr imported;
         if (!paths.empty()) {
             imported = context(model.get(), depth, gpu_layers > 0);
-            int64_t end = 0;
-            for (const auto & path : paths) {
-                const auto size = std::filesystem::file_size(path);
-                require(size <= 513 * 1024 * 1024 + 52, "score delta exceeds limit");
-                std::ifstream delta_input(path, std::ios::binary);
-                const auto delta = hybrid::read_delta(read_bytes(delta_input, size), source_hash, end);
-                const int64_t n1 = delta.header.at("n1");
-                require(n1 <= int64_t(n - 1), "score delta endpoint mismatch");
-                require(delta.header.at("tokens") == std::vector<llama_token>(tokens.begin() + end, tokens.begin() + n1) &&
-                        delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "score delta tokens mismatch");
-                require(llama_state_seq_set_data_append(imported.get(), reinterpret_cast<const uint8_t *>(delta.state.data()), delta.state.size(), 0, end, n1) == delta.state.size(), "score delta import failed");
-                end = n1;
-            }
-            require(end == int64_t(n - 1), "incomplete score delta chain");
-            hybrid::prefill(imported.get(), {tokens.back()}, n - 1);
+            prefill_arm(imported.get(), tokens, paths, source_hash);
         }
-        hybrid::prefill(local.get(), tokens, 0);
+        prefill_arm(local.get(), tokens, {}, source_hash);
         std::vector<llama_token> all = tokens;
         all.insert(all.end(), next.begin(), next.end());
         json header = {{"format", "f16-logsoftmax-le-v1"}, {"model_sha256", model_hash},
             {"token_sha256", hybrid::prefix_hash(all)}, {"n", n}, {"m", m}, {"vocab", vocab},
             {"tokens", tokens}, {"continuation", next}, {"vocab_sha256", layout.at("vocab_sha256")},
             {"layout_fingerprint", hybrid::layout_fingerprint(layout)}, {"gpu_layers", gpu_layers},
-            {"score_batch", batch_size}, {"kv_type", "q8_0"}, {"threads", 2}};
+            {"score_batch", batch_size}, {"context_prefill", "split-last-v1"},
+            {"schedule_probe", "fresh-prefix-spots-v1"}, {"kv_type", "q8_0"}, {"threads", 2}};
         std::unique_ptr<pending_file> target;
         std::string destination;
         if (writing) {
@@ -300,9 +314,16 @@ int main(int argc, char ** argv) {
         int local_agreed = 0, hybrid_agreed = 0, own_agreed = 0, encoding_agreed = 0;
         double encoding_error = 0;
         auto positions = json::array();
+        std::vector<size_t> probes = {0, m / 2, m - 1};
+        probes.erase(std::unique(probes.begin(), probes.end()), probes.end());
+        std::vector<std::vector<double>> local_probes, hybrid_probes;
         auto emit = [&](size_t i, int index) {
             const auto p = log_probs(llama_get_logits_ith(local.get(), index), vocab);
             const auto arm = imported ? log_probs(llama_get_logits_ith(imported.get(), index), vocab) : p;
+            if (std::binary_search(probes.begin(), probes.end(), i)) {
+                local_probes.push_back(p);
+                if (imported) { hybrid_probes.push_back(arm); }
+            }
             auto row = little32(n + i) + little32(next[i]) + little32(top1(p)) + encode(p);
             const auto encoded = decode(row, vocab);
             encoding_kls.push_back(kl(p, encoded));
@@ -347,6 +368,37 @@ int main(int argc, char ** argv) {
             for (size_t j = 0; j < count; ++j) { emit(offset + j + 1, j); }
             offset += count;
         }
+        const bool has_imported = bool(imported);
+        local.reset();
+        imported.reset();
+        std::vector<double> local_floor, hybrid_floor;
+        json floor_positions = json::array();
+        // Fresh-prefix probes measure schedule variation only at these positions, with no float16 encoding.
+        for (size_t j = 0; j < probes.size(); ++j) {
+            const size_t i = probes[j];
+            auto probe = context(model.get(), depth, gpu_layers > 0);
+            std::vector<llama_token> prefix = tokens;
+            prefix.insert(prefix.end(), next.begin(), next.begin() + i);
+            hybrid::prefill(probe.get(), prefix, 0);
+            const double a = kl(local_probes[j], log_probs(llama_get_logits_ith(probe.get(), -1), vocab));
+            const bool agreed = top1(local_probes[j]) == top1(log_probs(llama_get_logits_ith(probe.get(), -1), vocab));
+            probe.reset();
+            double b = 0;
+            bool bagreed = true;
+            if (has_imported) {
+                probe = context(model.get(), depth, gpu_layers > 0);
+                prefill_arm(probe.get(), tokens, paths, source_hash);
+                if (i) { hybrid::prefill(probe.get(), {next.begin(), next.begin() + i}, n); }
+                const auto q = log_probs(llama_get_logits_ith(probe.get(), -1), vocab);
+                b = kl(hybrid_probes[j], q);
+                bagreed = top1(hybrid_probes[j]) == top1(q);
+            }
+            local_floor.push_back(a);
+            if (has_imported) { hybrid_floor.push_back(b); }
+            floor_positions.push_back({{"position", n + i}, {"local_kl_nats", a}, {"local_top1_agreed", agreed},
+                {"hybrid_kl_nats", has_imported ? json(b) : json(nullptr)},
+                {"hybrid_top1_agreed", has_imported ? json(bagreed) : json(nullptr)}});
+        }
         auto summary = [&](const std::vector<double> & values, int agreed) {
             return json{{"kl_nats", spread(values)}, {"top1_agreed", agreed}, {"top1_agreement", double(agreed) / m}};
         };
@@ -356,8 +408,10 @@ int main(int argc, char ** argv) {
         json result = {{"stage", "reference_scoring"}, {"status", "measured"}, {"identity", identity},
             {"reference_model_sha256", reference ? reference->header.at("model_sha256") : json(model_hash)},
             {"node_model_sha256", source_hash}, {"positions", positions}, {"local", summary(local_kls, local_agreed)},
-            {"hybrid", imported ? summary(hybrid_kls, hybrid_agreed) : json(nullptr)},
-            {"local_to_hybrid", imported ? summary(own_kls, own_agreed) : json(nullptr)},
+            {"hybrid", has_imported ? summary(hybrid_kls, hybrid_agreed) : json(nullptr)},
+            {"local_to_hybrid", has_imported ? summary(own_kls, own_agreed) : json(nullptr)},
+            {"schedule_floor", {{"kind", "fresh-prefix-spots-v1"}, {"positions", floor_positions},
+                                {"local", spread(local_floor)}, {"hybrid", has_imported ? spread(hybrid_floor) : json(nullptr)}}},
             {"encoding", {{"kl_nats", spread(encoding_kls)}, {"max_abs_log_probability_error", encoding_error},
                           {"top1_agreed", encoding_agreed}, {"bytes_per_position", 2 * vocab + 44}}}};
         pending_file output(argv[3]);

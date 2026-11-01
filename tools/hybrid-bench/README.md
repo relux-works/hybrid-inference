@@ -249,3 +249,28 @@ python3 -m unittest discover -s tools/hybrid-bench -p test_reference.py -v
 ```
 
 Native logs, exact commands/exits, reference files, PID records, CPU measurements and a sanitized orchestration archive go under the artifact directory. The optional integration launches and stops its own loopback Q8 prefill node.
+
+## Natural-text hetero-quant study
+
+`python3 tools/hybrid-bench/hetero_study.py --help` lists the standard-library study driver. `tools/hybrid-bench/fetch --manifest tools/hybrid-bench/gutenberg_sources.json --output /private/books` invokes curl only on the GPU host and writes a pinned `manifest.json`. The source list is unpinned until that first fetch; retain the resulting pins with the study. A repeated fetch checks both the local books and fresh downloaded bytes against those pins. No downloads were used to develop or test the driver.
+
+`prepare` verifies local document hashes and sizes before using a numeric-loopback llama-server `/props` and `/tokenize`. It adds model special tokens, disables special-string parsing, and takes the first N context plus M continuation IDs without chat framing, normalization, header removal or sampling. Each model family/rung needs its own prepared study and D reference. All fixture, reference, delta, result, PID and report artifacts stay under private directories with mode 0600 files. See [the GPU runbook](RESULTS-hybrid-b-r27-261101.md) for exact commands, manifest schema and disk budgets.
+
+`reference` locally prefills D. `arm` accepts `--kind local|imported --label LABEL --client-model PATH [--node-model PATH]` or `--spec FILE` containing those four fields with underscores. Cross-hash imports require `--hetero-quant`. Imported arms run an owned prefill node per document, export an original bounded delta chain through N-1, stop and reap the node, then run the client scorer; the client evaluates the final context token itself. `--build-dir` selects the client/scorer build; `--node-build-dir` optionally selects a different node build. No proxy, envelope SHA rewriting or network service outside loopback is used.
+
+The host-wide advisory `--lock` (before the subcommand) serializes cooperating invocations across study directories. Stop an externally started tokenizer before reference/arm. The driver cannot reserve the GPU against unrelated programs. It records every owned native PID and exit, handles TERM/interrupt with terminate/wait/kill of that Popen child only, and never kills PIDs recovered from disk. Successful per-document receipts bind index, fixture, model/build/settings and output hashes. Repeating a command skips matching receipts; changed inputs, missing deltas or damaged outputs refuse. Interrupted attempts are retained for diagnosis; a new attempt can run because only an atomically published receipt admits reuse. Existing valid reports are preserved if a later input check fails; no new report is written.
+
+`report --arms local imported --seed 42` writes numeric CSV, Markdown and JSON. Position rows contain KL(D || arm) in nats and D top-1 agreement. Quantiles interpolate at `(count-1)*p`. Document rows list means; the `documents` aggregate bootstraps those means over whole documents, 10,000 seeded samples and percentile 95% intervals. Paired rows give later-listed arm minus earlier-listed arm on the exact same documents, including top-1 differences. Individual document rows have no within-document interval. No token-level independence is assumed.
+
+The r6q findings are addressed in the native scorer: all local prefills split N-1 plus one token, matching the imported arm's final decode; references bind that context schedule and continuation `score_batch`. Every run also compares primary full-precision client distributions with fresh-prefix probes at continuation indices 0, M/2 and M-1, for each available arm. The report's `schedule_probes` rows summarize these arm-side KL/top-1 observations separately from D || arm and float16 encoding error. Probes bound only sampled positions and schedules. Primary contexts are freed before probes, so imported scoring retains at most two contexts at once. References predating this schedule contract must be regenerated. D uses BF16 weights with q8_0 KV, f32 recurrent state and flash attention.
+
+CPU checks, with local 0.8B GGUF files and disk-backed TMPDIR:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/hybrid-bench -p test_hetero_study.py -v
+PYTHONDONTWRITEBYTECODE=1 nice -n 10 python3 tools/hybrid-bench/test_hetero_study_native.py \
+  --client /local/Qwen3.5-0.8B-Q4_0.gguf --reference /local/Qwen3.5-0.8B-Q8_0-requant.gguf \
+  --build-dir build --artifacts .temp/study-cpu
+```
+
+The existing CMake target `llama-hybrid-score` builds the scorer; `llama-hybrid-prefill` and `llama-server` provide import and tokenization. curl is used only by fetch. Native logs, commands, exit codes and numeric witnesses live under `--artifacts`; model-free unit tests use their private temporary fixtures. No new Python packages or test framework are required.
