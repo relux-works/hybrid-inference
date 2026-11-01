@@ -191,12 +191,18 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         paths = []
         import struct
         for endpoint in ends:
+            transfer_n0 = n0
+            transfer_id = uuid.uuid4().hex
+            chunk_count = (endpoint - n0 + chunk - 1) // chunk
+            index = 0
             while n0 < endpoint:
                 n1 = min(endpoint, n0 + chunk)
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
-                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True),
+                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2,
+                             transfer_id=transfer_id, transfer_n0=transfer_n0, transfer_n1=endpoint,
+                             chunk_index=index, chunk_count=chunk_count),
                         timeout=args.request_timeout or 120, binary=True)
                 except urllib.error.HTTPError as error:
                     if error.code == 503:
@@ -218,6 +224,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 delta_path.write_bytes(data)
                 paths.append(str(delta_path))
                 n0 = n1
+                index += 1
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,

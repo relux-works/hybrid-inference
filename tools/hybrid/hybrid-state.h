@@ -15,7 +15,7 @@ std::string file_hash(const std::string & path);
 void require_supported_architecture(const llama_model * model);
 json model_layout(const llama_model * model);
 std::string layout_fingerprint(const json & layout);
-std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1);
+std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1, bool fixed_state = true);
 constexpr size_t max_delta_header_bytes = 1024 * 1024;
 constexpr size_t max_delta_body_bytes = 512 * 1024 * 1024;
 std::string encode_delta_header(json header, size_t state_bytes);
@@ -25,6 +25,19 @@ struct delta {
     std::string state;
 };
 delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0);
+
+// A pending import owns only host bytes. The live slot changes in apply(), after the final chunk.
+class delta_import {
+    std::vector<delta> chunks;
+    std::vector<llama_token> prefix;
+    std::vector<llama_token> tokens;
+public:
+    void clear();
+    bool stage(llama_context * ctx, llama_seq_id seq_id, const std::string & wire, const std::string & model_hash, const std::string & session_id,
+               const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab);
+    const std::vector<llama_token> & imported_tokens() const { return tokens; }
+    void apply(llama_context * ctx, llama_seq_id seq_id);
+};
 
 struct model_deleter { void operator()(llama_model * p) const { llama_model_free(p); } };
 struct context_deleter { void operator()(llama_context * p) const { llama_free(p); } };

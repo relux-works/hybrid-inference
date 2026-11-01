@@ -1,5 +1,6 @@
 #include "llama-context.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -3474,7 +3475,7 @@ static constexpr uint32_t io_magic = 0xaf143cd8;
 size_t llama_context::state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) {
     try {
         if (!memory || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max || p0 < 0 || p1 <= p0 ||
-            p1 != memory->seq_pos_max(seq_id) + 1 || flags != 0) {
+            p1 != memory->seq_pos_max(seq_id) + 1 || (flags != 0 && flags != LLAMA_STATE_SEQ_FLAGS_KV_ONLY)) {
             throw std::runtime_error("invalid range export arguments");
         }
         synchronize();
@@ -3522,6 +3523,93 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_set_data_chunks(llama_seq_id seq_id, const std::vector<llama_state_seq_chunk> & chunks, llama_pos n0, bool validate_only, bool final) {
+    if (!memory || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max) { return 0; }
+    synchronize();
+    return llama_memory_seq_read_chunks(memory.get(), model.hparams, chunks, seq_id, n0, cparams.n_ctx, validate_only, final);
+}
+
+size_t llama_memory_seq_read_chunks(llama_memory_t memory, const llama_hparams & hp, const std::vector<llama_state_seq_chunk> & chunks, llama_seq_id seq_id, llama_pos n0, uint32_t n_ctx, bool validate_only, bool final) {
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory);
+    auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory);
+    if ((!hybrid && !iswa) || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || chunks.empty() || n0 < 0 || (!validate_only && !final)) {
+        return 0;
+    }
+    auto * base = hybrid ? hybrid->get_mem_attn() : iswa->get_base();
+    if ((uint32_t) seq_id >= base->get_n_seq_max() || (!validate_only && (int64_t) memory->seq_pos_max(seq_id) + 1 != n0)) {
+        return 0;
+    }
+    auto * fixed = iswa ? iswa->get_swa() : nullptr;
+    auto * recr = hybrid ? hybrid->get_mem_recr() : nullptr;
+    std::vector<std::unique_ptr<llama_io_read_host>> readers;
+    auto read = [&](bool validate) {
+        llama_pos at = n0;
+        size_t total = 0;
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            const auto & chunk = chunks[i];
+            if (!chunk.data || chunk.size < 8 || chunk.n1 <= at || chunk.n1 > (int64_t) n_ctx || chunk.size > SIZE_MAX - total) {
+                throw std::runtime_error("invalid native chunk range");
+            }
+            readers.push_back(std::make_unique<llama_io_read_host>(chunk.data, chunk.size, validate));
+            auto & io = *readers.back();
+            uint32_t magic;
+            llama_seq_id source_seq;
+            io.read(&magic, sizeof(magic));
+            io.read(&source_seq, sizeof(source_seq));
+            if (magic != io_magic || source_seq < 0 || source_seq >= LLAMA_MAX_SEQ) {
+                throw std::runtime_error("invalid native chunk header");
+            }
+            const std::pair<llama_pos, llama_pos> range {at, chunk.n1};
+            base->state_read_sinfo(io, seq_id, validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : LLAMA_STATE_SEQ_FLAGS_APPEND,
+                                  nullptr, nullptr, &range);
+            if (final && i + 1 == chunks.size()) {
+                if (recr) {
+                    recr->state_read(io, seq_id, validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0);
+                } else {
+                    if (hp.swa_type != LLAMA_SWA_TYPE_STANDARD || hp.n_swa == 0) {
+                        throw std::runtime_error("unsupported chunk window");
+                    }
+                    const std::pair<llama_pos, llama_pos> window {(llama_pos) std::max<int64_t>(0, (int64_t) chunk.n1 - hp.n_swa), chunk.n1};
+                    fixed->state_read_sinfo(io, seq_id, validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0, nullptr, nullptr, &window);
+                }
+                if (!validate && (base->seq_pos_max(seq_id) != chunk.n1 - 1 ||
+                        (recr ? recr->seq_pos_max(seq_id) : fixed->seq_pos_max(seq_id)) != chunk.n1 - 1)) {
+                    throw std::runtime_error("native chunk endpoint mismatch");
+                }
+            }
+            if (io.n_bytes() != chunk.size) {
+                throw std::runtime_error("native chunk has trailing bytes or early fixed state");
+            }
+            total += chunk.size;
+            at = chunk.n1;
+        }
+        return total;
+    };
+    try {
+        const size_t bytes = read(true);
+        readers.clear();
+        if (validate_only) { return bytes; }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: rejected chunks: %s\n", __func__, err.what());
+        readers.clear();
+        return 0;
+    }
+    const auto restore_base = base->state_meta_restore();
+    const auto restore_fixed = recr ? recr->state_meta_restore() : fixed->state_meta_restore();
+    try {
+        const size_t total = read(false);
+        // Every reader retains its tensor writes until the complete transaction passes.
+        readers.clear();
+        return total;
+    } catch (const std::exception & err) {
+        for (auto & reader : readers) { reader->discard(); }
+        restore_base();
+        restore_fixed();
+        LLAMA_LOG_ERROR("%s: rejected chunks: %s\n", __func__, err.what());
         return 0;
     }
 }
@@ -4740,6 +4828,14 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_validate_chunk(llama_context * ctx, const llama_state_seq_chunk & chunk, llama_seq_id seq_id, llama_pos n0, bool fixed_state) {
+    return ctx->state_seq_set_data_chunks(seq_id, {chunk}, n0, true, fixed_state);
+}
+
+size_t llama_state_seq_set_data_chunks(llama_context * ctx, const std::vector<llama_state_seq_chunk> & chunks, llama_seq_id seq_id, llama_pos n0) {
+    return ctx->state_seq_set_data_chunks(seq_id, chunks, n0);
 }
 
 size_t llama_state_seq_set_data_append(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_pos n0, llama_pos n1) {

@@ -145,15 +145,22 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> continuation, free_continuation;
         const auto paths = fixture.value("deltas", std::vector<std::string>{argv[3]});
         require(!paths.empty(), "missing check deltas");
+        hybrid::delta_import pending;
+        std::vector<llama_token> committed;
         for (const auto & path : paths) {
-            const auto delta = hybrid::read_delta(read_file(path.c_str()), model_hash, n);
+            const auto wire = read_file(path.c_str());
+            const auto delta = hybrid::read_delta(wire, model_hash, n);
             const int64_t n1 = delta.header.at("n1");
             require(n1 <= int64_t(tokens.size() - 1), "check delta endpoint mismatch");
             require(delta.header.at("tokens").get<std::vector<llama_token>>() ==
                     std::vector<llama_token>(tokens.begin() + n, tokens.begin() + n1), "check delta tokens mismatch");
             require(delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "check prefix mismatch");
-            require(llama_state_seq_set_data_append(imported.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
-                    delta.state.size(), 0, n, n1) == delta.state.size(), "check delta import failed");
+            const bool final = pending.stage(imported.get(), 0, wire, model_hash, delta.header.at("session_id").get<std::string>(), committed, ctx, vocab);
+            if (final) {
+                pending.apply(imported.get(), 0);
+                committed = pending.imported_tokens();
+                pending.clear();
+            }
             hybrid::prefill(split.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
             const auto repeat_start = std::chrono::steady_clock::now();
             hybrid::prefill(repeat.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
@@ -162,6 +169,7 @@ int main(int argc, char ** argv) {
             split_ends.insert(split_ends.end(), ends.begin(), ends.end());
             n = n1;
         }
+        require(committed.size() == size_t(n), "missing final check chunk");
         require(n == int64_t(tokens.size() - 1), "incomplete check chain");
         split_ends.push_back(tokens.size());
         hybrid::prefill(imported.get(), {tokens.back()}, n);

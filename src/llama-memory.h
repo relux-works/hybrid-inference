@@ -167,3 +167,11 @@ struct llama_memory_i {
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
+
+struct llama_state_seq_chunk;
+struct llama_hparams;
+
+// Shared native transaction for context imports and allocated-cache checks.
+LLAMA_API size_t llama_memory_seq_read_chunks(
+        llama_memory_t memory, const llama_hparams & hp, const std::vector<llama_state_seq_chunk> & chunks,
+        llama_seq_id seq_id, llama_pos n0, uint32_t n_ctx, bool validate_only = false, bool final = true);

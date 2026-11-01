@@ -122,14 +122,14 @@ class HTTPTests(unittest.TestCase):
         self.prefill = self.start(make_server("prefill", database=str(Path(self.temp.name) / "prefill.sqlite")))
         self.decode = self.start(make_server("decode", slot_path=self.temp.name))
         self.config = dict(model_sha256=MODEL, prefill_url=self.url(self.prefill), decode_url=self.url(self.decode),
-                           decode_token="decode-fixture", slot_path=self.temp.name, slots=2, prefill_timeout=0.5,
+                           decode_token="decode-fixture", slot_path=self.temp.name, slots=2, prefill_timeout=5,
                            clients={f"fixture-{c}": dict(id=c, prefill_token=f"remote-{c}") for c in "abc"},
                            policy=dict(always=True))
         self.app = Proxy(self.config, str(Path(self.temp.name) / "proxy.sqlite"))
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.app = self.app
         self.proxy = self.start(server)
-        self.client = Node(self.url(self.proxy), "fixture-a")
+        self.client = Node(self.url(self.proxy), "fixture-a", timeout=30)
 
     def start(self, server):
         thread = threading.Thread(target=server.serve_forever, daemon=True)

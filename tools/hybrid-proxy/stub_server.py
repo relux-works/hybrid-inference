@@ -28,13 +28,16 @@ def xxh128(body):
     return struct.pack(">QQ", value.high, value.low)
 
 
-def encode_delta(model, sid, before, suffix):
+def encode_delta(model, sid, before, suffix, transfer=None):
     body = json.dumps(suffix).encode()
-    header = dict(magic="HYBD", version=1, model_sha256=model, session_id=sid,
+    header = dict(magic="HYBD", version=2, model_sha256=model, session_id=sid,
                   n0=len(before), n1=len(before) + len(suffix), tokens=suffix,
                   prefix_hash_n1=prefix_hash(before + suffix), kv_type="q8_0", state_dtype="f32",
                   body_format="synthetic-token-state-v1",
                   sections=[dict(name="synthetic_tokens", offset=0, bytes=len(body))])
+    header.update(transfer or dict(transfer_id=sid, transfer_n0=len(before), transfer_n1=len(before) + len(suffix),
+                                   chunk_index=0, chunk_count=1))
+    header["fixed_state"] = header["chunk_index"] + 1 == header["chunk_count"]
     raw = json.dumps(header).encode()
     return struct.pack("<I", len(raw)) + raw + body + xxh128(body) + hashlib.sha256(body).digest()
 
@@ -47,7 +50,7 @@ def decode_delta(raw, model, before):
         raise ValueError("truncated delta")
     header = json.loads(raw[4:4 + size])
     body = raw[4 + size:-48]
-    if header["magic"] != "HYBD" or header["version"] != 1:
+    if header["magic"] != "HYBD" or header["version"] != 2:
         raise ValueError("bad magic/version")
     if header["model_sha256"] != model:
         raise ValueError("wrong model hash")
@@ -259,6 +262,7 @@ class State:
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, client TEXT, tokens TEXT)")
         self.slots = {i: [] for i in range(2)}
         self.saved = {}
+        self.pending = {}
         self.available = True
         self.conflict_once = False
         self.lose_ack_once = False
@@ -276,7 +280,7 @@ class State:
         if not self.available:
             return 503, {"error": "offline"}
         if self.role == "prefill" and path == "/v1/health":
-            return 200, dict(model_sha256=self.model, layout_fingerprint=self.layout_fingerprint)
+            return 200, dict(delta_version=2, model_sha256=self.model, layout_fingerprint=self.layout_fingerprint)
         if self.role == "prefill":
             if path in ("/v1/health", "/metrics"):
                 return 200, {"ok": True}
@@ -320,7 +324,8 @@ class State:
             if self.lose_ack_once:
                 self.lose_ack_once = False
                 return 503, {"error": "ack lost after durable apply"}
-            return (200, encode_delta(self.model, sid, tokens, body["tokens"])) if body["return_delta"] else (202, None)
+            return (200, encode_delta(self.model, sid, tokens, body["tokens"],
+                {key: body[key] for key in ("transfer_id", "transfer_n0", "transfer_n1", "chunk_index", "chunk_count")} if "transfer_id" in body else None)) if body["return_delta"] else (202, None)
         if self.template_fixture and path in ("/apply-template", "/props", "/tokenize"):
             if path == "/props":
                 return 200, self.template_fixture.props
@@ -377,9 +382,29 @@ class State:
                         self.slots[slot] = snapshot["tokens"]
                     except FileNotFoundError:
                         return 400, {"error": "missing snapshot"}
+            elif action == "abort_delta":
+                self.pending.pop(slot, None)
             elif action == "import_delta":
-                self.slots[slot] = decode_delta(body, self.model, tokens)
-                self.imports += 1
+                size, = struct.unpack("<I", body[:4])
+                header = json.loads(body[4:4 + size])
+                index = header["chunk_index"]
+                previous, staged, first, count = self.pending.get(slot, (tokens, tokens, header, 0))
+                try:
+                    if previous != tokens or index != count or any(header[key] != first[key] for key in
+                            ("transfer_id", "transfer_n0", "transfer_n1", "chunk_count")):
+                        raise ValueError("chunk order or identity")
+                    staged = decode_delta(body, self.model, staged)
+                    if header["fixed_state"]:
+                        if index + 1 != header["chunk_count"] or len(staged) != header["transfer_n1"]:
+                            raise ValueError("chunk final boundary")
+                        self.slots[slot] = staged
+                        self.pending.pop(slot, None)
+                    else:
+                        self.pending[slot] = (previous, staged, first, count + 1)
+                    self.imports += 1
+                except Exception:
+                    self.pending.pop(slot, None)
+                    raise
             else:
                 return 400, {"error": "action"}
             return 200, self.info(self.slots[slot])

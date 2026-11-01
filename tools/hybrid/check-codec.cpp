@@ -11,6 +11,46 @@ static json header(const std::string & hash, size_t n0, size_t n1, const std::ve
     return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"tokens", std::vector<llama_token>(tokens.begin() + n0, tokens.begin() + n1)}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
 }
 
+static void wire_size_tests() {
+    // Layout arithmetic, without a 27B allocation, accounts for exactly three omitted native fixed-state records.
+    const uint64_t kv_row = 16 * 4 * (256 + 256) * 34 / 32;
+    const uint64_t recurrent = 48ull * 4 * (128 * 6144 + 3 * (6144 + 2 * 16 * 128));
+    const uint64_t fixed_record = recurrent + 12 + 8 + 2 * 48 * 12;
+    const uint64_t kv_header = 8 + 8 + 16 + 2 * 16 * 12;
+    const int count = 40000, width = 10871;
+    const int chunks = (count + width - 1) / width;
+    uint64_t old_wire = 0, new_wire = 0, old_body = 0, new_body = 0;
+    const std::vector<llama_token> synthetic(count, 100);
+    for (int i = 0, n0 = 0; n0 < count; ++i, n0 += width) {
+        const int n1 = std::min(count, n0 + width);
+        auto h = header(std::string(64, 'a'), n0, n1, synthetic);
+        h["session_id"] = std::string(32, 'a');
+        const uint64_t kv = kv_header + (kv_row + 24) * (n1 - n0);
+        const uint64_t before = kv + fixed_record, after = kv + (i + 1 == chunks ? fixed_record : 0);
+        auto legacy = h;
+        legacy["magic"] = "HYBD";
+        legacy["version"] = 1;
+        legacy["body_format"] = "llama-native-seq-v1";
+        legacy["kv_type"] = "q8_0";
+        legacy["state_dtype"] = "f32";
+        legacy["sections"] = json::array({{{"name", "llama_seq_state"}, {"offset", 0}, {"bytes", before}}});
+        h["transfer_id"] = std::string(32, 'b');
+        h["transfer_n0"] = 0; h["transfer_n1"] = count;
+        h["chunk_index"] = i; h["chunk_count"] = chunks; h["fixed_state"] = i + 1 == chunks;
+        const auto text = hybrid::encode_delta_header(h, after);
+        require(after <= hybrid::max_delta_body_bytes && before <= hybrid::max_delta_body_bytes, "synthetic body over cap");
+        old_wire += 4 + legacy.dump().size() + before + 48;
+        new_wire += 4 + text.size() + after + 48;
+        old_body += before; new_body += after;
+    }
+    require(kv_row == 34816 && recurrent == 156893184 && chunks == 4, "wrong 27B geometry");
+    require(old_body - new_body == 3 * fixed_record, "three fixed records not removed");
+    std::cout << "PASS wire_size_27b_40000 old_body=" << old_body << " new_body=" << new_body
+              << " old_wire=" << old_wire << " new_wire=" << new_wire << " saved_wire=" << old_wire - new_wire
+              << " recurrent_tensor=" << recurrent << " fixed_record=" << fixed_record << '\n';
+
+}
+
 static void codec_tests(size_t max_ctx) {
     // Round trips accept the valid control; corrupt, truncated and incompatible envelopes are rejected before engine mutation.
     const json layout = {{"architecture", "qwen35"}, {"layer_count", 24}, {"embedding_size", 1024},
@@ -29,6 +69,7 @@ static void codec_tests(size_t max_ctx) {
     }
     require(hybrid::layout_fingerprint(layout) == fingerprint, "layout fingerprint unstable");
     std::cout << "PASS layout fingerprint structural mutation controls\n";
+    wire_size_tests();
     const std::string hash(64, 'a');
     auto h = header(hash, 0, 1, {1});
     // The writer admits the inclusive body cap and rejects one byte more before allocating a body.

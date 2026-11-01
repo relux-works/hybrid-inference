@@ -132,3 +132,9 @@ HYBRID_SWA_CHECKER="$PWD/build/bin/llama-hybrid-check-swa" python3 tools/hybrid-
 ```
 
 The second command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. The native checker covers server architecture admission and rollback after a failed context post-check. These tests do not establish real-model or GPU logit equivalence. [The r17 section of the r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md#r17-rebase-and-review-notes) contains pinned rented-GPU commands and offline nextn/MTP inspection; no SWA model is available on this CPU host. Read the nextn/MTP limitations and proposed follow-up in [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) before provisioning a real file.
+
+### Final-state chunk protocol
+
+Node, proxy and decoder must all use HYBD protocol 2. Intermediate deltas contain full KV only; recurrent state or the final SWA window travels once in the last chunk. Slot info stays at the original prefix until that chunk commits. See [NODE-STATE-DESIGN.md](NODE-STATE-DESIGN.md#chunk-transaction-protocol-2).
+
+`build/bin/llama-hybrid-check-append MODEL --chunks` checks four-chunk byte equivalence, interrupted-prefix cells/state/logits and malformed chunk refusals on an existing CPU model. `build/bin/llama-hybrid-check-codec` prints exact synthetic 27B/40k wire arithmetic without loading a large model. `build/bin/llama-hybrid-check-swa` exercises the same chunk transaction on allocated Gemma/Glimmer window fixtures. HTTP and proxy checks are documented in [RESULTS-hybrid-a-r24-261101.md](RESULTS-hybrid-a-r24-261101.md); logs and scratch outputs belong in `.temp/hybrid-a-r24-261101/`.

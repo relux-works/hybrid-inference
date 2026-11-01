@@ -191,7 +191,7 @@ int main(int argc, char ** argv) {
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
             auto owner = owners.find(req.get_header_value("Authorization"));
             if (req.path == "/v1/health") {
-                json health = {{"status", "ok"}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
+                json health = {{"status", "ok"}, {"delta_version", 2}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
                                    {"model_layout", layout}, {"max_ctx", max_ctx}, {"n_ctx", n_ctx},
                                    {"ram_budget_bytes", ram_budget}, {"max_request_bytes", max_request}};
                 if (!public_node || owner != owners.end()) {
@@ -316,8 +316,23 @@ int main(int argc, char ** argv) {
                     all.insert(all.end(), tokens.begin(), tokens.end());
                     const bool return_delta = body.at("return_delta").get<bool>();
                     json header;
+                    bool fixed_state = true;
+                    if (body.contains("delta_version") && body.at("delta_version") != 2) {
+                        respond(res, 400, {{"error", "unsupported delta version; require 2"}}); return;
+                    }
                     if (return_delta) {
                         header = {{"model_sha256", model_hash}, {"session_id", id}, {"n0", n0}, {"n1", all.size()}, {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(all)}};
+                        if (body.contains("transfer_id")) {
+                            for (const auto * key : {"transfer_id", "transfer_n0", "transfer_n1", "chunk_index", "chunk_count"}) {
+                                header[key] = body.at(key);
+                            }
+                            if (!body.at("chunk_index").is_number_integer() || !body.at("chunk_count").is_number_integer()) {
+                                throw std::runtime_error("invalid chunk metadata");
+                            }
+                            const auto count = body.at("chunk_count").get<int64_t>();
+                            fixed_state = count > 0 && body.at("chunk_index").get<int64_t>() == count - 1;
+                            header["fixed_state"] = fixed_state;
+                        }
                         // Use the largest body length so the header budget is checked before inference.
                         hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
                     }
@@ -328,7 +343,7 @@ int main(int argc, char ** argv) {
                     res.set_header("X-Hybrid-Prefill-Ms", std::to_string(ms));
                     std::string wire;
                     if (return_delta) {
-                        wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size()));
+                        wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size(), fixed_state));
                     }
                     std::string state = hybrid::save_state(ctx.get());
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);

@@ -1,5 +1,6 @@
 #include "hybrid-state.h"
 #include "llama-io.h"
+#include "llama-ext.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-model.h"
 
@@ -146,6 +147,41 @@ static void run(llm_arch arch, bool unified) {
         cache.state_read(input, seq, 0);
     }
     const auto before = snapshot(cache);
+    // Invalid destination sequences and a non-final apply cannot write cache cells.
+    require(llama_memory_seq_read_chunks(&cache, hp, {}, 0, 8, 512) == 0, "empty chunk transaction accepted");
+    // The production chunk transaction stages full KV only, replaces one final window, and preserves the neighbor on rejection.
+    auto framed = [&](const std::string & bytes) {
+        writer out;
+        out.scalar<uint32_t>(0xaf143cd8);
+        out.scalar<int32_t>(0);
+        return out.data + bytes;
+    };
+    const auto early = framed(cache_record(cache.get_base(), hp, {8}));
+    const auto final = framed(record({9, 10}, {9, 10, 7, 8}));
+    std::vector<llama_state_seq_chunk> chunks {{(const uint8_t *) early.data(), early.size(), 9},
+                                              {(const uint8_t *) final.data(), final.size(), 11}};
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 2, 8, 512) == 0, "SWA out-of-range sequence accepted");
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 8, 512, false, false) == 0, "SWA non-final apply accepted");
+    require(llama_memory_seq_read_chunks(&cache, hp, {chunks[0]}, 0, 8, 512, true, false) == early.size(), "SWA early validation failed");
+    require(snapshot(cache) == before, "SWA early chunk changed cache");
+    require(llama_memory_seq_read_chunks(&cache, hp, {chunks[0]}, 0, 8, 512) == 0, "SWA missing final window accepted");
+    const auto early_fixed = framed(record({8}, {5, 6, 7, 8}));
+    require(llama_memory_seq_read_chunks(&cache, hp, {{(const uint8_t *) early_fixed.data(), early_fixed.size(), 9}}, 0, 8, 512, true, false) == 0,
+            "SWA early fixed state accepted");
+    const auto bad_window = framed(record({9, 10}, {6, 7, 8, 9}));
+    auto bad_chunks = chunks;
+    bad_chunks[1] = {(const uint8_t *) bad_window.data(), bad_window.size(), 11};
+    require(llama_memory_seq_read_chunks(&cache, hp, bad_chunks, 0, 8, 512) == 0, "SWA invalid final window accepted");
+    require(snapshot(cache) == before, "SWA rejected chunks changed cells or state");
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 8, 512) == early.size() + final.size(), "SWA chunk transaction failed");
+    const auto chunked_state = snapshot(cache);
+    { reader input(prefix); cache.state_read(input, 0, 0); }
+    { const auto one = record({8, 9, 10}, {9, 10, 7, 8}); reader input(one); cache.state_read_append(input, 0, 8, 11, false); }
+    require(snapshot(cache) == chunked_state, "SWA chunk/single bytes differ");
+    { reader input(prefix); cache.state_read(input, 0, 0); }
+    require(snapshot(cache) == before, "SWA fixture restore failed");
+    std::cout << "PASS swa_chunk_transaction_equivalence_and_refusals\n";
+
     const auto neighbor = snapshot(cache, 1);
     const auto good = record({8, 9, 10}, {9, 10, 7, 8});
     auto reject = [&](const char * name, const std::string & bytes, int end, bool validate, int fail_tensor = -1) {
@@ -233,6 +269,10 @@ static void run(llm_arch arch, bool unified) {
     const auto exported = cache_record(cache.get_base(), hp, {8, 9, 10}, cache.get_base()->get_n_stream()) +
                           cache_record(cache.get_swa(), hp, {9, 10, 7, 8}, cache.get_swa()->get_n_stream());
     require(delta.data == exported, "export did not preserve full range plus wrapped whole window");
+    // The non-final exporter omits the entire window, including wrapped positions preceding p0.
+    writer kv_only;
+    cache.state_write_range(kv_only, 0, 8, 11, LLAMA_STATE_SEQ_FLAGS_KV_ONLY);
+    require(kv_only.data == cache_record(cache.get_base(), hp, {8, 9, 10}, cache.get_base()->get_n_stream()), "SWA early export carried window state");
     std::cout << "PASS full_append_whole_window_replace_export " << model->arch_name() << " unified=" << unified << '\n';
     // An initial import must include a shorter-than-window prefix and both allocated cache types.
     llama_kv_cache_iswa fresh(*model, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,

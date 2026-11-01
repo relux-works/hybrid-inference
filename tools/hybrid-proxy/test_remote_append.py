@@ -17,6 +17,85 @@ from proxy import Handler, HTTPError, Node, Proxy
 from store import prefix_hash
 
 
+def test_chunk_transaction(remote, decode, slots, model_hash):
+    from test_decode import envelope, unpack
+    sid = remote.request('POST', '/v1/sessions', dict(model_sha256=model_hash))['session_id']
+    path = '/v1/sessions/' + sid + '/extend'
+    headers = {'Content-Type': 'application/octet-stream', 'X-Hybrid-Session': sid}
+    slot = '/slots/2'
+    tokens = [100] * 4
+    first = remote.request('POST', path, dict(n0=0, prefix_hash_n0=prefix_hash([]), tokens=tokens, return_delta=True), binary=True)
+    decode.request('POST', slot + '?action=import_delta', first, headers)
+    decode.request('POST', slot + '?action=save', dict(filename='chunks-before.bin'))
+    before = (slots / 'chunks-before.bin').read_bytes()
+    # Unsupported protocol and extreme chunk metadata refuse on the producer before session state changes.
+    saved = remote.request('GET', '/v1/sessions/' + sid + '/snapshot', binary=True)
+    for extra in (dict(delta_version=1), dict(delta_version=2, transfer_id='bad-index', transfer_n0=4,
+                  transfer_n1=20, chunk_index=2**63 - 1, chunk_count=4)):
+        candidate = dict(n0=4, prefix_hash_n0=prefix_hash(tokens), tokens=[101] * 4, return_delta=True, **extra)
+        try:
+            remote.request('POST', path, candidate, binary=True)
+        except HTTPError as error:
+            require(error.status == 400, 'wrong producer protocol/chunk refusal')
+            if extra.get('delta_version') == 1:
+                require('unsupported delta version' in error.body.decode(), 'unclear producer protocol refusal')
+        else:
+            raise AssertionError('producer accepted invalid protocol/chunk metadata')
+        require(remote.request('GET', '/v1/sessions/' + sid + '/snapshot', binary=True) == saved, 'producer refusal mutated state')
+    wires = []
+    for index in range(4):
+        n0 = len(tokens)
+        wires.append(remote.request('POST', path, dict(n0=n0, prefix_hash_n0=prefix_hash(tokens), tokens=[101 + index] * 4,
+            return_delta=True, delta_version=2, transfer_id='http-chunks', transfer_n0=4, transfer_n1=20,
+            chunk_index=index, chunk_count=4), binary=True))
+        tokens += [101 + index] * 4
+    def unchanged():
+        decode.request('POST', slot + '?action=save', dict(filename='chunks-after.bin'))
+        require((slots / 'chunks-after.bin').read_bytes() == before, 'HTTP chunks changed original slot bytes')
+        require(decode.request('GET', slot + '/info')['tokens'] == tokens[:4], 'HTTP chunks exposed staged tokens')
+    # Several interrupted prefixes preserve the complete saved slot before abort and before any fallback.
+    for k in (1, 2, 3):
+        for wire in wires[:k]:
+            decode.request('POST', slot + '?action=import_delta', wire, headers)
+            unchanged()
+        decode.request('POST', slot + '?action=abort_delta', {})
+        unchanged()
+        print(f'PASS HTTP chunk interruption k={k}, original slot byte-exact', flush=True)
+    h0, b0 = unpack(wires[0])
+    hf, bf = unpack(wires[-1])
+    fixed_bytes = len(unpack(first)[1]) - len(b0)
+    require(fixed_bytes > 0, 'node did not omit early fixed state')
+    bad = dict(h0, fixed_state=True)
+    old = dict(h0, version=1)
+    cases = {'early-state-flag': [envelope(bad, b0)], 'early-native-state': [envelope(h0, b0 + bf[-fixed_bytes:])],
+             'final-no-state': wires[:-1] + [envelope(hf, bf[:-fixed_bytes])],
+             'out-of-order': [wires[1]], 'duplicate': [wires[0], wires[0]], 'missing': [wires[0], wires[2]],
+             'mixed-version': [envelope(old, b0)]}
+    # Each invalid transfer returns HTTP 400 and preserves the original file, including cases with valid recomputed checksums.
+    for name, candidates in cases.items():
+        refused = False
+        for wire in candidates:
+            try:
+                decode.request('POST', slot + '?action=import_delta', wire, headers)
+            except HTTPError as error:
+                require(error.status == 400, 'wrong HTTP chunk refusal')
+                refused = True
+                break
+        require(refused, 'HTTP chunk accepted ' + name)
+        unchanged()
+        decode.request('POST', slot + '?action=abort_delta', {})
+        print('PASS HTTP chunk refusal ' + name, flush=True)
+    # The same valid producer chunks still commit all tokens at the final boundary after every negative control.
+    for index, wire in enumerate(wires):
+        decode.request('POST', slot + '?action=import_delta', wire, headers)
+        if index != 3:
+            unchanged()
+    require(decode.request('GET', slot + '/info')['tokens'] == tokens, 'HTTP final did not commit the whole range')
+    decode.request('POST', slot + '?action=erase', {})
+    remote.request('DELETE', '/v1/sessions/' + sid)
+    print('PASS HTTP final state once, final-only commit, checksum-preserving refusals', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
@@ -51,6 +130,7 @@ def main():
                     require(time.monotonic() < deadline, "prefill readiness timeout")
                     time.sleep(0.1)
             with native_server(args.binary, args.model, root / "decode") as (decode, slots):
+                test_chunk_transaction(remote, decode, slots, hashlib.sha256(Path(args.model).read_bytes()).hexdigest())
                 app = Proxy(dict(model_sha256=hashlib.sha256(Path(args.model).read_bytes()).hexdigest(),
                     prefill_url=remote.url, prefill_timeout=120, decode_url=decode.url, decode_timeout=120,
                     slots=2, slot_path=str(slots), clients={"fixture-a": dict(id="a", prefill_token="fixture-remote-a")},
@@ -141,7 +221,7 @@ def main():
                     appended=appended, child=child), indent=2))
                 print("PASS real fallback: explicit409/native bytes unchanged; inferred child uses fresh remote", flush=True)
 
-                # A budget rejection on the second chunk retains the first native import and permits exact replay recovery.
+                # A budget rejection on the second chunk discards staging; local fallback evaluates the original range and replay agrees.
                 original_remote_factory = app.remote
                 failures = []
                 class FaultNode(Node):
@@ -157,10 +237,10 @@ def main():
                     result = client.request("POST", "/v1/chat/completions", dict(body, max_tokens=4),
                         {"X-Hybrid-Session": "fault-chain", "X-Hybrid-Bench-Mode": "offload"})
                     trace = result["hybrid_bench"]
-                    require(len(failures) == 2 and trace["chunks"][0]["status"] == "imported" and
+                    require(len(failures) == 2 and trace["chunks"][0]["status"] == "staged" and
                             trace["fallback_reason"] == "ram_budget", "middle-chunk control did not reach the intended refusal")
-                    require(trace["remote_applied"] == 8 and trace["prefilled"] == trace["new_tokens"],
-                            "middle-chunk fallback lost or re-prefilled its native prefix")
+                    require(trace["remote_applied"] == 0 and trace["prefilled"] == trace["new_tokens"],
+                            "middle-chunk fallback counted staged KV as applied")
                 finally:
                     app.remote = original_remote_factory
                 with app.reserve("fault-chain"):
@@ -170,7 +250,7 @@ def main():
                 recovered, current = replayed(recovered)
                 require(current["prefix_hash"] == prefix_hash(recovered["tokens"]), "middle-chunk remote replay lost token identity")
                 (root / "fault-results.json").write_text(json.dumps(dict(trace=trace, recovered=recovered), indent=2))
-                print("PASS real middle-chunk budget refusal: first8 imported, local continuation and remote replay agree", flush=True)
+                print("PASS real middle-chunk budget refusal: staged KV discarded, local continuation and remote replay agree", flush=True)
         finally:
             if server:
                 server.shutdown()
