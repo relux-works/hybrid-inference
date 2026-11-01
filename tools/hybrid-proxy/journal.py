@@ -1,4 +1,4 @@
-"""Message identity and checked incremental rendering for ChatML-style templates."""
+"""Message identity and checked incremental rendering for verified template families."""
 import copy
 import bisect
 import hashlib
@@ -72,33 +72,112 @@ class Renderer:
         data = {key: props.get(key) for key in ("chat_template", "chat_template_tool_use", "bos_token", "eos_token")}
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
+    def family(self, body):
+        props = self.node.request("GET", "/props")
+        marker, answer, next_user = ["hybrid" + uuid.uuid4().hex for _ in range(3)]
+        probe = dict(body, messages=[dict(role="user", content=marker),
+            dict(role="assistant", content=answer), dict(role="user", content=next_user)],
+            add_generation_prompt=False)
+        rendered = self.render(probe)
+        if any(rendered.count(value) != 1 for value in (marker, answer, next_user)):
+            raise JournalConflict("unknown template family")
+        before, after = rendered.split(marker)
+        families = (("<|im_start|>", "user\n", "<|im_end|>\n", None, None),
+                    ("<|turn>", "user\n", "<turn|>\n", "<bos>", "<turn|>"),
+                    ("<|start|>", "user<|message|>", "<|eot|>", "<|begin_of_text|>", "<|end_of_text|>"))
+        for opening, user, closing, bos, eos in families:
+            if before.endswith(opening + user) and after.startswith(closing):
+                if bos and (props.get("bos_token") != bos or props.get("eos_token") != eos or
+                            opening not in props.get("chat_template", "") or
+                            closing.strip() not in props.get("chat_template", "")):
+                    continue
+                assistant = "model" if opening == "<|turn>" else "assistant"
+                between = rendered.split(marker)[1].split(answer)[0]
+                after_answer = rendered.split(answer)[1]
+                if (not between.startswith(closing + opening + assistant) or
+                        not after_answer.startswith(closing + opening + user) or
+                        rendered.split(next_user)[1] != closing):
+                    continue
+                generated = self.render(dict(probe, add_generation_prompt=True))
+                if not generated.startswith(rendered):
+                    raise JournalConflict("generation prompt changed previous messages")
+                if not generated[len(rendered):].startswith(opening + assistant):
+                    continue
+                return opening, closing
+        raise JournalConflict("unknown template family")
+
+    def token_bytes(self, text, tokens):
+        def pieces(initial):
+            return self.node.request("POST", "/tokenize",
+                dict(content=text, add_special=initial, with_pieces=True))["tokens"]
+
+        plain, special = pieces(False), pieces(True)
+        raw = [p["piece"].encode() if isinstance(p["piece"], str) else bytes(p["piece"]) for p in plain]
+        plain_ids = [p["id"] for p in plain]
+        special_ids = [p["id"] for p in special]
+        if b"".join(raw) != text.encode() or special_ids != tokens:
+            raise JournalConflict("template token pieces do not preserve rendered bytes")
+        if special_ids == plain_ids:
+            if special != plain:
+                raise JournalConflict("template token pieces do not preserve rendered bytes")
+            return raw
+        bos = self.node.request("GET", "/props").get("bos_token")
+        bos_ids = self.encode(bos) if isinstance(bos, str) and bos else []
+        if (len(bos_ids) != 1 or bos in text or special_ids != bos_ids + plain_ids or
+                special[0]["piece"] != bos or special[1:] != plain):
+            raise JournalConflict("template has unsupported leading tokenizer specials")
+        return [b""] + raw
+
+    def message_frame(self, body, text, index, family):
+        opening, _ = family
+        marker, reasoning = "hybrid" + uuid.uuid4().hex, "hybrid" + uuid.uuid4().hex
+        probe = copy.deepcopy(body)
+        message = probe["messages"][index]
+        message["content"] = marker
+        role = message["role"]
+        if role == "assistant":
+            message["reasoning_content"] = reasoning
+        rendered = self.render(probe)
+        markers = [rendered.index(value) for value in (marker, reasoning) if rendered.count(value) == 1]
+        if not markers or (role != "assistant" and rendered.count(marker) != 1):
+            raise JournalConflict("template did not preserve a message boundary probe")
+        prefix = rendered[:min(markers)]
+        if role == "tool" and opening == "<|turn>":
+            begin = prefix.rfind("<|tool_response>")
+        elif role == "tool" and opening == "<|im_start|>" and "\n<tool_response>\n" in prefix:
+            begin = prefix.rfind("\n<tool_response>\n")
+            user = opening + "user"
+            if prefix[:begin].endswith(user):
+                begin -= len(user)
+        else:
+            begin = prefix.rfind(opening)
+        if begin < 0:
+            raise JournalConflict("template message frame is not supported")
+        preceding, header = prefix[:begin], prefix[begin:]
+        if not text.startswith(preceding):
+            raise JournalConflict("message probe changed its preceding template context")
+        return preceding, header
+
+    def user_header(self, body, text, index):
+        _, header = self.message_frame(body, text, index, self.family(body))
+        return self.encode(header)
+
     def user_boundaries(self, body, text, tokens, start=0):
+        family = self.family(body)
         result = []
         for index, message in enumerate(body["messages"]):
             if index < start or message.get("role") != "user":
                 continue
-            marker = "hybrid" + uuid.uuid4().hex
-            probe = copy.deepcopy(body)
-            probe["messages"][index]["content"] = marker
-            rendered = self.render(probe)
-            header = "<|im_start|>user\n"
-            if rendered.count(marker) != 1:
-                continue
-            prefix = rendered[:rendered.index(marker)]
-            if not prefix.endswith(header):
-                continue
-            prefix = prefix[:-len(header)]
+            prefix, header = self.message_frame(body, text, index, family)
             ids = self.encode(prefix, initial=True)
-            # This checks the actual render and token boundary; a marker in user content is never searched.
-            if text.startswith(prefix) and tokens[:len(ids)] == ids:
+            # The live render and real token prefix locate the header, never a marker in user text.
+            if text.startswith(prefix + header) and tokens[:len(ids)] == ids:
                 result.append(dict(message_index=index, n=len(ids)))
         return result
 
     def layout(self, body, text, tokens, start=0, token_base=0, anchor_base=0):
-        pieces = self.node.request("POST", "/tokenize", dict(content=text, add_special=True, with_pieces=True))["tokens"]
-        raw = [piece["piece"].encode() if isinstance(piece["piece"], str) else bytes(piece["piece"]) for piece in pieces]
-        if [piece["id"] for piece in pieces] != tokens or b"".join(raw) != text.encode():
-            raise JournalConflict("template token pieces do not preserve rendered bytes")
+        family = self.family(body)
+        raw = self.token_bytes(text, tokens)
         offsets = [0]
         for piece in raw:
             offsets.append(offsets[-1] + len(piece))
@@ -109,43 +188,19 @@ class Renderer:
 
         starts = []
         for index in range(start, len(body["messages"])):
-            marker, reasoning = "hybrid" + uuid.uuid4().hex, "hybrid" + uuid.uuid4().hex
-            probe = copy.deepcopy(body)
-            message = probe["messages"][index]
-            message["content"] = marker
-            role = message["role"]
-            if role == "assistant":
-                message["reasoning_content"] = reasoning
-            rendered = self.render(probe)
-            if rendered.count(marker) != 1:
-                raise JournalConflict("template did not preserve a message boundary probe")
-            prefix = rendered[:rendered.index(marker)]
-            if role == "system" and index == 0 and text.startswith("<|im_start|>system\n"):
-                starts.append((index, role, 0))
-                continue
-            frame = "<|im_start|>" + role + "\n"
-            if role == "assistant" and reasoning in prefix:
-                prefix = prefix[:prefix.index(reasoning)]
-                frame += "<think>\n"
-            elif role == "tool":
-                frame = "\n<tool_response>\n"
-            if not prefix.endswith(frame):
-                raise JournalConflict("template message frame is not supported")
-            prefix = prefix[:-len(frame)]
-            if role == "tool" and prefix.endswith("<|im_start|>user"):
-                prefix = prefix[:-len("<|im_start|>user")]
-            if not text.startswith(prefix):
-                raise JournalConflict("message probe changed its preceding template context")
-            starts.append((index, role, len(prefix.encode())))
+            prefix, _ = self.message_frame(body, text, index, family)
+            starts.append((index, body["messages"][index]["role"], len(prefix.encode())))
         end = len(text.encode())
+        without_generation = self.render(dict(body, add_generation_prompt=False))
+        if not text.startswith(without_generation):
+            raise JournalConflict("generation prompt changed previous messages")
         if body["messages"][-1]["role"] != "assistant":
-            without_generation = self.render(dict(body, add_generation_prompt=False))
-            if not text.startswith(without_generation):
-                raise JournalConflict("generation prompt changed previous messages")
             end = len(without_generation.encode())
         result = []
         for item, (index, role, byte) in enumerate(starts):
             stop = starts[item + 1][2] if item + 1 < len(starts) else end
+            if byte > stop:
+                raise JournalConflict("template message boundaries overlap")
             result.append(dict(message_index=index, role=role, start=position(byte), end=position(stop)))
         return result, position(end)
 
@@ -155,18 +210,48 @@ class Renderer:
         marker = "hybrid" + uuid.uuid4().hex
         probe = copy.deepcopy(body)
         assistant = probe["messages"][past_count - 1]
-        assistant["content"] = marker
-        assistant.pop("tool_calls", None)
+        opening, closing_text = self.family(body)
+        calls = assistant.get("tool_calls")
+        tool_boundary = opening == "<|turn>" and bool(calls)
+        if tool_boundary:
+            # Gemma emits responses inside the model turn, after the sampled response opener.
+            function = calls[-1]["function"]
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(arguments, dict):
+                raise JournalConflict("tool boundary arguments are not a mapping")
+            function["arguments"] = {marker: marker}
+            closing_text = "<|tool_response>"
+        else:
+            assistant["content"] = marker
+            calls = assistant.pop("tool_calls", None)
+            # Glimmer resolves response names from calls that this content probe removes.
+            if calls:
+                names = {call.get("id"): call["function"]["name"] for call in calls}
+                for message in probe["messages"][past_count:]:
+                    if message.get("role") != "tool":
+                        break
+                    if message.get("tool_call_id") in names:
+                        message.setdefault("name", names[message["tool_call_id"]])
         marked = self.render(probe)
-        if marked.count(marker) != 1:
-            raise JournalConflict("template did not preserve the boundary probe")
-        suffix = marked.split(marker, 1)[1]
+        if tool_boundary:
+            if marked.count(marker) != 2:
+                raise JournalConflict("template did not preserve the tool boundary probe")
+            after = marked.rsplit(marker, 1)[1]
+            if not after.startswith('<|"|>}<tool_call|><|tool_response>'):
+                raise JournalConflict("template tool call closing is not supported")
+            suffix = after[len('<|"|>}<tool_call|>'):]
+        else:
+            if marked.count(marker) != 1:
+                raise JournalConflict("template did not preserve the boundary probe")
+            suffix = marked.split(marker, 1)[1]
         tail = self.encode(suffix)
-        closing = self.encode("<|im_end|>\n")
-        end = self.encode("<|im_end|>")
+        closing = self.encode(closing_text)
+        end = self.encode(closing_text.rstrip("\n"))
         if (not tail or not closing or len(end) != 1 or tail[:len(closing)] != closing
                 or not full_text.endswith(suffix) or full_tokens[-len(tail):] != tail):
-            raise JournalConflict("template suffix is not an exact ChatML message boundary")
+            raise JournalConflict("template suffix is not an exact end-of-turn message boundary")
         overlap = int(bool(anchor) and anchor[-1] == end[0])
         base = len(full_tokens) - len(tail)
         boundaries = []

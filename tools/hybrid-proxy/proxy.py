@@ -611,12 +611,12 @@ class Proxy:
                         raise JournalConflict("rewritten prefix cannot retain the checkpoint")
                     prompt = full_tokens
                     token_base, anchor_base = 0, 0
-                header = self.renderer.encode("<|im_start|>user\n")
+                backup = session["id"] + "-rewrite-backup.bin"
+                self.decode.request("POST", f"/slots/{session['slot']}?action=save", {"filename": backup})
+                header = self.renderer.user_header(body, text, index)
                 trial = prompt[:rollback_n + len(header)]
                 if trial[rollback_n:] != header:
                     raise JournalConflict("checkpoint is not at a user boundary")
-                backup = session["id"] + "-rewrite-backup.bin"
-                self.decode.request("POST", f"/slots/{session['slot']}?action=save", {"filename": backup})
                 result = self.decode.request("POST", "/v1/chat/completions", dict(body,
                     prompt_tokens=trial, id_slot=session["slot"], n_predict=0, stream=False,
                     cache_prompt=True, return_tokens=True, verbose=True))
