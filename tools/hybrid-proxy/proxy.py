@@ -710,7 +710,10 @@ class Proxy:
             except (OSError, HTTPError, ValueError):
                 LOG.warning("delta staging cleanup unavailable session=%s", session["id"])
             if state["backup"]:
-                (self.slot_path / state["backup"]).unlink(missing_ok=True)
+                try:
+                    (self.slot_path / state["backup"]).unlink(missing_ok=True)
+                except OSError:
+                    LOG.warning("delta recovery file retained session=%s", session["id"])
 
     def prepare_session(self, client, body, session, tokens):
         slot = session["slot"]

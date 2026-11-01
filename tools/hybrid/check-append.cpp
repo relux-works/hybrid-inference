@@ -161,21 +161,25 @@ static void run(llama_model * model, const std::string & model_hash, const std::
     std::cout << "PASS " << stem << " incremental append + held token greedy=64/64\n";
 }
 
-static void chunk_tests(llama_model * model, const std::string & hash) {
+static void chunk_tests(llama_model * model, const std::string & hash, bool fresh) {
     auto source = hybrid::make_context(model, 512);
     auto single = hybrid::make_context(model, 512);
     auto dest = hybrid::make_context(model, 512);
-    const std::vector<llama_token> prefix {100, 101, 102, 103};
+    const std::vector<llama_token> prefix = fresh ? std::vector<llama_token>{} : std::vector<llama_token>{100, 101, 102, 103};
     hybrid::prefill(source.get(), prefix, 0);
     hybrid::prefill(single.get(), prefix, 0);
     hybrid::prefill(dest.get(), prefix, 0);
     const auto before = hybrid::save_state(dest.get());
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const auto * logits_ptr = llama_get_logits_ith(dest.get(), -1);
-    const std::vector<float> logits(logits_ptr, logits_ptr + vocab);
+    std::vector<float> logits;
+    if (!fresh) {
+        const auto * ptr = llama_get_logits_ith(dest.get(), -1);
+        logits.assign(ptr, ptr + vocab);
+    }
+    std::cout << "RUN chunks fresh=" << fresh << '\n';
     auto unchanged = [&] {
         require(hybrid::save_state(dest.get()) == before, "chunk failure changed cells or state");
-        require(memcmp(logits.data(), llama_get_logits_ith(dest.get(), -1), vocab * sizeof(float)) == 0, "chunk failure changed next-token logits");
+        require(fresh || memcmp(logits.data(), llama_get_logits_ith(dest.get(), -1), vocab * sizeof(float)) == 0, "chunk failure changed next-token logits");
     };
     std::vector<llama_token> all = prefix;
     std::vector<std::string> wires, bodies, full_bodies;
@@ -229,12 +233,12 @@ static void chunk_tests(llama_model * model, const std::string & hash) {
     parsed["fixed_state"] = true;
     reject("chunk_early_state_flag", {replace_header(wires[0], parsed)}, "fixed state must occur only");
     reject("chunk_early_native_state", {hybrid::encode_delta(headers[0], full_bodies[0])}, "invalid native chunk");
-    parsed = hybrid::read_delta(wires[3], hash, 16).header;
+    parsed = hybrid::read_delta(wires[3], hash, prefix.size() + 12).header;
     parsed["fixed_state"] = false;
     reject("chunk_final_state_flag_missing", {wires[0], wires[1], wires[2], replace_header(wires[3], parsed)}, "fixed state must occur only");
-    const auto no_state = hybrid::export_range(source.get(), 16, 20, false);
+    const auto no_state = hybrid::export_range(source.get(), prefix.size() + 12, all.size(), false);
     reject("chunk_final_native_state_missing", {wires[0], wires[1], wires[2], hybrid::encode_delta(headers[3], no_state)}, "invalid native chunk");
-    parsed = hybrid::read_delta(wires[1], hash, 8).header; parsed["version"] = 1;
+    parsed = hybrid::read_delta(wires[1], hash, prefix.size() + 4).header; parsed["version"] = 1;
     reject("chunk_mixed_version", {wires[0], replace_header(wires[1], parsed)}, "unsupported delta version");
     h = headers[1]; h["transfer_id"] = "other";
     reject("chunk_mixed_transfer", {wires[0], hybrid::encode_delta(h, bodies[1])}, "chunk transfer mismatch");
@@ -243,7 +247,7 @@ static void chunk_tests(llama_model * model, const std::string & hash) {
     // A final recurrent endpoint mismatch reaches apply after all KV metadata changes; rollback also preserves logits.
     auto late = bodies[3];
     const size_t fixed_offset = no_state.size();
-    const int32_t wrong_pos = 20;
+    const int32_t wrong_pos = all.size();
     require(fixed_offset + 8 < late.size(), "no recurrent fixture");
     memcpy(&late[fixed_offset + 4], &wrong_pos, sizeof(wrong_pos));
     reject("chunk_late_endpoint_rollback", {wires[0], wires[1], wires[2], hybrid::encode_delta(headers[3], late)}, "Native delta chunks rejected", true);
@@ -272,7 +276,7 @@ int main(int argc, char ** argv) {
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], params));
         require(bool(model), "cannot load model");
         const auto hash = hybrid::file_hash(argv[1]);
-        if (argc == 3 && std::string(argv[2]) == "--chunks") { chunk_tests(model.get(), hash); return 0; }
+        if (argc == 3 && std::string(argv[2]) == "--chunks") { chunk_tests(model.get(), hash, true); chunk_tests(model.get(), hash, false); return 0; }
         for (int i = 2; i < argc; ++i) { run(model.get(), hash, argv[i]); }
         return 0;
     } catch (const std::exception & error) {

@@ -154,6 +154,23 @@ class ChunkAndLifecycleTests(unittest.TestCase):
         fixture.app.acquire_slot(session)
         self.assertEqual(dispatch('GET', f"/slots/{session['slot']}/info")['tokens'], [])
 
+    # Recovery-file cleanup failure cannot turn an acknowledged final import into a reported transfer failure.
+    def test_committed_delta_cleanup_error_keeps_success(self):
+        from pathlib import Path
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        session = fixture.app.store.get(sid)
+        unlink = Path.unlink
+        def retain_backup(path, *args, **kwargs):
+            if path.name.endswith('-delta-backup.bin'):
+                raise OSError('cleanup unavailable')
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', retain_backup):
+            fixture.app.prepare_session(fixture.config['clients']['fixture-a'], {}, session, session['tokens'] + [20, 21, 22])
+        self.assertGreater(session['_remote_applied'], 0)
+        self.assertIsNone(session['_bench']['fallback_reason'])
+        self.assertTrue((fixture.app.slot_path / (sid + '-delta-backup.bin')).is_file())
+
     # An old node is refused before session creation or delta production; the original slot remains usable.
     def test_mixed_node_version_refuses_before_extend(self):
         fixture = self.fixture
