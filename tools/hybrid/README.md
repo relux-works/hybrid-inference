@@ -21,9 +21,23 @@ flock "$LOCK" "$CMAKE" -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_U
 df -B1 --output=avail .
 du -sb build
 # JOBS=2 keeps a shared host responsive; use JOBS=$(nproc) on a dedicated one.
-flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-server
+flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-hash llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-server
 du -sb build
 ```
+
+### Model identity hash checks
+
+Native startup always computes SHA-256 over the entire model file. macOS uses system CommonCrypto for file hashing; other platforms use the vendored SHA-256 with direct whole-block updates. No cached or launcher-supplied digest is trusted. Both paths retain the same 64 KiB read buffer and read-error checks.
+
+`llama-hybrid-check-hash FILE [UPDATE_BYTES]` prints JSON with the digest, file size, elapsed hash time and decimal MB/s. Without `UPDATE_BYTES` it calls the actual startup hash function. The optional chunk size (1..1048576) exercises the portable vendor streaming path with unaligned input and empty updates, also on macOS. `test_file_hash.py` uses Python hashlib and the `sha256sum` CLI as independent references; its optional model stays read-only. Fixtures are temporary files under `.temp/`, removed after each test. Redirect results into a task-scoped `.temp/` directory when retaining measurements.
+
+```sh
+mkdir -p .temp/hash-check
+nice -n 10 build/bin/llama-hybrid-check-hash "$MODEL" > .temp/hash-check/measurement-01.json
+nice -n 10 python3 tools/hybrid/test_file_hash.py --model "$MODEL" -v > .temp/hash-check/tests-01.log 2>&1
+```
+
+The [r14 hash report](../hybrid-bench/RESULTS-hybrid-a-r14-261101.md) records Linux before/after measurements and the remaining macOS qualification.
 
 Create a mode-0600 JSON credentials file mapping client IDs to distinct bearer tokens (16-256 characters). Keep it under `.temp/`; do not commit it. The node reads this file without logging credentials. Every authenticated extend reports `X-Hybrid-Prefill-Ms`, measured around native prefill only; `--bench` enables only the authenticated link probe.
 

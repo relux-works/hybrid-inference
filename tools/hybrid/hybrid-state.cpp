@@ -8,6 +8,9 @@ extern "C" {
 #include <algorithm>
 #include <fstream>
 #include <stdexcept>
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#endif
 
 namespace hybrid {
 static void require(bool ok, const char * message) {
@@ -73,15 +76,28 @@ json model_layout(const llama_model * model) {
 std::string file_hash(const std::string & path) {
     std::ifstream file(path, std::ios::binary);
     require(file.good(), "cannot open model");
+#ifdef __APPLE__
+    CC_SHA256_CTX hash;
+    require(CC_SHA256_Init(&hash) == 1, "cannot initialize model hash");
+#else
     sha256_t hash;
     sha256_init(&hash);
+#endif
     char buffer[65536];
     while (file.read(buffer, sizeof(buffer)) || file.gcount()) {
+#ifdef __APPLE__
+        require(CC_SHA256_Update(&hash, buffer, static_cast<CC_LONG>(file.gcount())) == 1, "cannot update model hash");
+#else
         sha256_update(&hash, reinterpret_cast<const unsigned char *>(buffer), file.gcount());
+#endif
     }
     require(file.eof(), "cannot read model");
     unsigned char digest[32];
+#ifdef __APPLE__
+    require(CC_SHA256_Final(digest, &hash) == 1, "cannot finalize model hash");
+#else
     sha256_final(&hash, digest);
+#endif
     return hex(digest, sizeof(digest));
 }
 

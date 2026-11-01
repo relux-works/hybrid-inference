@@ -103,6 +103,7 @@ patches = {
 
 # local changes too large for the replacements above, kept as diffs and applied with git apply
 patch_files = [
+    "vendor/hash/sha256/sha256-blocks.patch",
     # backport of the fix for the stack overflow on deeply nested values (nlohmann/json#5387)
     # TODO: remove once nlohmann/json releases a version newer than 3.12.0
     "vendor/nlohmann/json-deep-nesting.patch",

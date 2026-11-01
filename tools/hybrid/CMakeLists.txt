@@ -11,6 +11,9 @@ target_include_directories(llama-hybrid-prefill PRIVATE ${PROJECT_SOURCE_DIR}/ve
 add_executable(llama-hybrid-check check.cpp)
 target_link_libraries(llama-hybrid-check PRIVATE hybrid-state)
 
+add_executable(llama-hybrid-check-hash check-hash.cpp)
+target_link_libraries(llama-hybrid-check-hash PRIVATE hybrid-state)
+
 add_executable(llama-hybrid-check-append check-append.cpp)
 target_link_libraries(llama-hybrid-check-append PRIVATE hybrid-state)
 
