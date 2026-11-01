@@ -42,9 +42,11 @@ def quantile_sample(rng, values):
     return max(1, round(points[-1][1]))
 
 
-def schedule(seed, measured=False, smoke=False):
+def schedule(seed, measured=False, smoke=False, depths=None):
     rng = random.Random(seed)
-    ladder = [128, 512] if smoke else [16384, 50000, 100000, 150000, 200000, 256000]
+    require(depths is None or (depths and all(2 <= n <= 1048576 for n in depths) and
+            all(a < b for a, b in zip(depths, depths[1:]))), 'depths must increase strictly within 2..1048576')
+    ladder = depths if depths is not None else [128, 512] if smoke else [16384, 50000, 100000, 150000, 200000, 256000]
     for depth in ladder:
         yield dict(kind='depth', depth=depth, output=4 if smoke else 64)
         for fixed in ([16, 32, 64] if smoke else [512, 2048, 10000]):
@@ -70,7 +72,7 @@ def verify_meter(trace, previous, mode):
         require(trace['server_prefill_ms'] is not None and trace['wire_bytes'] > 0, 'prefill trace missing on offloaded call')
 
 
-def stream_chat(url, token, body, mode, sid):
+def stream_chat(url, token, body, mode, sid, timeout=300):
     headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'X-Hybrid-Bench-Mode': mode}
     if sid:
         headers['X-Hybrid-Session'] = sid
@@ -80,7 +82,7 @@ def stream_chat(url, token, body, mode, sid):
     message = dict(role='assistant', content='')
     trace = None
     done = False
-    with urllib.request.urlopen(request, timeout=300) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         sid = response.headers['X-Hybrid-Session']
         for line in response:
             if not line.startswith(b'data: '):
@@ -155,7 +157,8 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
-                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True), binary=True)
+                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True),
+                        timeout=args.request_timeout or 120, binary=True)
                 except urllib.error.HTTPError as error:
                     if error.code == 503:
                         try:
@@ -229,7 +232,10 @@ def mode_session(config, client, sid, rows, mode):
             except urllib.error.HTTPError as error:
                 if error.code != 404:
                     raise
-            rows.append(dict(stage='release', mode=mode, status='released'))
+            health = http(config['prefill_url'], '/v1/health', timeout=5)
+            rows.append(dict(stage='release', mode=mode, status='released',
+                             node_sessions=health.get('sessions'), node_ram_bytes=health.get('ram_bytes'),
+                             node_evictions=health.get('evictions')))
         except Exception as error:
             rows.append(dict(stage='release', mode=mode, status='failed', reason=type(error).__name__))
             if not active_error:
@@ -293,10 +299,13 @@ def main():
     p.add_argument('--schedule', choices=['fixed', 'measured'], default='fixed')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--smoke', action='store_true')
+    p.add_argument('--depths', type=int, nargs='+', help='override the depth ladder; smoke still controls tool/output sizes')
+    p.add_argument('--request-timeout', type=int, help='HTTP response timeout in seconds for long CPU runs')
     p.add_argument('--check', action='store_true')
     p.add_argument('--check-tokens', type=int, default=64)
     p.add_argument('--check-depths', type=int, nargs='+', help='check first completed call at or above each depth')
     args = p.parse_args()
+    require(args.request_timeout is None or 1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
     require(re.fullmatch('[a-zA-Z0-9_-]{1,64}', args.label), 'label must contain 1-64 letters, digits, underscores or hyphens')
     require(1 <= args.check_tokens <= 256, '--check-tokens must be in 1..256')
     state, root, scratch = Path(args.client_state), Path(args.output), Path(args.scratch)
@@ -306,7 +315,7 @@ def main():
     node = json.loads(Path(args.node_info or state / 'node-info.json').read_text())
     name = 'hybrid-bench-' + args.label + '-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     rows = [dict(stage='run', seed=args.seed, schedule=args.schedule, smoke=args.smoke, check_requested=args.check,
-                 provenance=PROVENANCE, workload=list(schedule(args.seed, args.schedule == 'measured', args.smoke)))]
+                 provenance=PROVENANCE, workload=list(schedule(args.seed, args.schedule == 'measured', args.smoke, args.depths)))]
     code, skipped, aborted = 0, 0, 0
     checks = 0
     interrupted = False
@@ -358,7 +367,7 @@ def main():
                     require(health['model_sha256'] == config.get('node_model_sha256', config['model_sha256']), 'node identity changed during run')
                     body = dict(messages=messages, max_tokens=step['output'], temperature=0, seed=args.seed,
                                 ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
-                    sid, message, trace, first, total = stream_chat(client['proxy_url'], credential, body, mode, sid)
+                    sid, message, trace, first, total = stream_chat(client['proxy_url'], credential, body, mode, sid, args.request_timeout or 300)
                     verify_meter(trace, previous, mode)
                     row = dict(stage='call', mode=mode, schedule_index=index, requested=step, ttft_seconds=first,
                                total_seconds=total, decode_tokens_per_second=(trace['generated_tokens'] * 1000 / trace['decode_ms']) if trace.get('decode_ms') else None,

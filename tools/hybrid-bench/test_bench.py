@@ -65,6 +65,30 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(common.control(directory, stop=True), {'prefill': 'stopped'})
                 kill.assert_not_called()
 
+    # Explicit long-depth ladders keep short tool/output sizes; invalid ordering and bounds cannot run.
+    def test_explicit_depth_ladder(self):
+        steps = list(schedule(0, smoke=True, depths=[39500, 40000]))
+        self.assertEqual([s['depth'] for s in steps if s['kind'] == 'depth'], [39500, 40000])
+        self.assertEqual([s['tokens'] for s in steps if s['kind'] == 'tool'], [16, 32, 64] * 2)
+        self.assertTrue(all(s['output'] == 4 for s in steps))
+        self.assertEqual([s['depth'] for s in schedule(0, smoke=True) if s['kind'] == 'depth'], [128, 512])
+        for depths in ([], [1], [1048577], [40000, 39500], [40000, 40000]):
+            with self.assertRaisesRegex(common.Refusal, 'depths must increase'):
+                list(schedule(0, depths=depths))
+
+    # A long-run timeout is opt-in; zero, negative and excessive values refuse before state changes.
+    def test_request_timeout_bounds(self):
+        self.assertEqual(manage.parser().parse_args(['client', '--state', 'fixture']).request_timeout, 180)
+        for value in ('0', '-1', '86401'):
+            with mock.patch('sys.argv', ['manage.py', 'client', '--state', 'fixture', '--request-timeout', value]), mock.patch.object(manage, 'preflight') as preflight:
+                with self.assertRaisesRegex(common.Refusal, 'request-timeout'):
+                    manage.main()
+                preflight.assert_not_called()
+            with mock.patch('sys.argv', ['hybrid_bench.py', '--client-state', 'fixture', '--scratch', 'fixture', '--request-timeout', value]), mock.patch.object(hybrid_bench, 'read_private') as read:
+                with self.assertRaisesRegex(common.Refusal, 'request-timeout'):
+                    hybrid_bench.main()
+                read.assert_not_called()
+
     # The memory planner accepts a bounded positive case and refuses both RAM overflow and the prototype cap.
     def test_context_bounds(self):
         metadata = {'general.architecture': 'qwen35'}
@@ -103,6 +127,18 @@ class BenchmarkTests(unittest.TestCase):
             verify_meter(dict(trace, fallback_reason='ram_budget'), 128, 'offload')
         with self.assertRaisesRegex(common.Refusal, 'http_503'):
             verify_meter(dict(trace, fallback_reason='http_503'), 128, 'offload')
+
+    # Successful mode cleanup records live store counters after DELETE, without requiring an otherwise idle node.
+    def test_mode_release_metrics(self):
+        rows = []
+        config = dict(client_credential='fixture', prefill_url='http://node')
+        response = mock.MagicMock()
+        with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', return_value=response) as delete, mock.patch.object(hybrid_bench, 'http', return_value=dict(sessions=0, ram_bytes=0, evictions=2)) as health:
+            with hybrid_bench.mode_session(config, dict(proxy_url='http://proxy'), 'fixture', rows, 'offload'):
+                self.assertFalse(rows)
+            self.assertEqual(delete.call_args.args[0].method, 'DELETE')
+            health.assert_called_once_with('http://node', '/v1/health', timeout=5)
+        self.assertEqual(rows, [dict(stage='release', mode='offload', status='released', node_sessions=0, node_ram_bytes=0, node_evictions=2)])
 
     # Cross-backend metrics are uncalibrated with exit 5 on both sides of the reference threshold.
     def test_cross_backend_classification(self):
@@ -177,15 +213,24 @@ class BenchmarkTests(unittest.TestCase):
             record = dict(commit='a' * 40, flags=[], binaries={})
             for bench_link in (False, True):
                 state = root / str(bench_link)
-                argv = ['manage.py', 'node', '--state', str(state), '--model', 'fixture'] + (['--bench-link'] if bench_link else [])
-                with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={}), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(root / 'model', 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=plan), mock.patch.object(manage, 'model_identity', return_value=identity), mock.patch.object(manage, 'build', return_value=(root / 'build', record)), mock.patch.object(manage, 'start_process') as start, mock.patch.object(manage, 'wait_health', return_value=dict(model_sha256='a' * 64, **identity)):
+                argv = ['manage.py', 'node', '--state', str(state), '--model', 'fixture', '--ram-budget-mib', '560'] + (['--bench-link'] if bench_link else [])
+                with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={}), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(root / 'model', 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=dict(plan)), mock.patch.object(manage, 'model_identity', return_value=identity), mock.patch.object(manage, 'build', return_value=(root / 'build', record)), mock.patch.object(manage, 'start_process') as start, mock.patch.object(manage, 'wait_health', return_value=dict(model_sha256='a' * 64, **identity)):
                     self.assertEqual(manage.main(), 0)
                 command = start.call_args.args[0]
-                for flag, value in (('--max-ctx', 65536), ('--ram-budget-mib', 4096), ('--max-request-mib', 2)):
+                for flag, value in (('--max-ctx', 65536), ('--ram-budget-mib', 560), ('--max-request-mib', 2)):
                     self.assertEqual(command[command.index(flag) + 1], value)
                 self.assertEqual('--bench' in command, bench_link)
                 info = common.read_private(state / 'node-info.json')
                 self.assertEqual(info['sizing']['sessions_held'], 2)
+
+    # Operator store caps cannot exceed host admission or apply to the decoder; rejection creates no state/build.
+    def test_node_budget_cap_refusal(self):
+        for role, cap in (('node', '0'), ('node', '-1'), ('node', '4097'), ('client', '560')):
+            argv = ['manage.py', role, '--state', '/absent-fixture/state', '--model', 'fixture', '--ram-budget-mib', cap]
+            with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={}), mock.patch.object(manage.Path, 'is_dir', return_value=True), mock.patch.object(manage.Path, 'exists', return_value=False), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(Path('fixture'), 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=dict(ram_budget_mib=4096)), mock.patch.object(manage, 'build') as build:
+                with self.assertRaisesRegex(common.Refusal, 'ram-budget-mib'):
+                    manage.main()
+                build.assert_not_called()
 
     # Interrupting a checker stops only its recorded child and rethrows so the run can emit exit 130.
     def test_checker_interrupt_cleanup(self):

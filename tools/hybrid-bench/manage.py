@@ -111,6 +111,8 @@ def parser():
     p.add_argument('--source-url', help='file:// or loopback HTTP for download tests; HTTPS otherwise')
     p.add_argument('--model-cache', default='.')
     p.add_argument('--ctx', type=int)
+    p.add_argument('--ram-budget-mib', type=int, help='node retained-session cap, at most the derived host budget')
+    p.add_argument('--request-timeout', type=int, default=180, help='proxy node/decoder HTTP timeout in seconds')
     p.add_argument('--cuda', action='store_true')
     p.add_argument('--ref', default='HEAD')
     p.add_argument('--build-dir')
@@ -143,6 +145,7 @@ def preserve_startup_logs(state):
 
 def main():
     args = parser().parse_args()
+    require(1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
     state = Path(args.state).expanduser().resolve()
     if args.status or args.stop:
         result = control(state, args.stop)
@@ -173,6 +176,11 @@ def main():
     try:
         model, digest, downloaded = obtain_model(args, args.model_cache)
         plan = context_plan(model, info, args.ctx, args.role == 'client')
+        if args.ram_budget_mib is not None:
+            require(args.role == 'node' and 1 <= args.ram_budget_mib <= plan['ram_budget_mib'],
+                    '--ram-budget-mib must be positive, node-only and no greater than the derived budget')
+            plan['derived_ram_budget_mib'] = plan['ram_budget_mib']
+            plan['ram_budget_mib'] = args.ram_budget_mib
         identity = model_identity(model)
         node = json.loads(Path(args.node_info).read_text()) if args.node_info else None
         if args.role == 'client':
@@ -237,7 +245,7 @@ def main():
             config = dict(benchmark=True, model_sha256=digest, prefill_url=args.prefill_url,
                 decode_url=f'http://127.0.0.1:{args.decode_port}', decode_token=decode_token,
                 node_token_file=str(Path(args.token_file).resolve()), client_credential=credential,
-                slot_path=str(state / 'slots'), slots=1, prefill_timeout=180, decode_timeout=180,
+                slot_path=str(state / 'slots'), slots=1, prefill_timeout=args.request_timeout, decode_timeout=args.request_timeout,
                 clients={credential: dict(id=next(iter(tokens)), prefill_token=next(iter(tokens.values())))},
                 policy=dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes']))
             config.update(hetero_quant=args.hetero_quant, node_model_sha256=expected,
