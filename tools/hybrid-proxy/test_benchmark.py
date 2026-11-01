@@ -1,5 +1,6 @@
 """Opt-in benchmark switches retain the production default."""
 import json
+import urllib.error
 from unittest import mock
 import unittest
 
@@ -143,6 +144,45 @@ class ChunkAndLifecycleTests(unittest.TestCase):
             fixture.app.store.db.execute("UPDATE sessions SET benchmark_mode=NULL WHERE id=?", ('interrupted',))
         with mock.patch.object(fixture.app, 'remote', side_effect=AssertionError('closed or legacy-local replay contacted node')):
             fixture.app.replay()
+
+    # Node transport release retries are bounded; HTTP refusals are terminal, and successful recovery emits no failure body.
+    def test_release_retry_and_leftovers(self):
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        for fault, expected_attempts in (('transient', 2), ('permanent', 3), ('unauthorized', 1), ('refused', 1)):
+            with self.subTest(fault=fault):
+                sid, _ = fixture.chat([1, 2, 3, len(fixture.app.store.pending())])
+                session = fixture.app.store.get(sid)
+                remote = fixture.app.remote(fixture.config['clients']['fixture-a'])
+                original = remote.request
+                calls = []
+                def request(method, path, *args, **kwargs):
+                    if method == 'DELETE':
+                        calls.append(path)
+                        if fault == 'permanent' or fault == 'transient' and len(calls) == 1:
+                            raise urllib.error.URLError('disconnected remote-a fixture-a http://user:secret@node')
+                        if fault in ('unauthorized', 'refused'):
+                            raise HTTPError(401 if fault == 'unauthorized' else 503)
+                    return original(method, path, *args, **kwargs)
+                with mock.patch.object(fixture.app, 'remote', return_value=remote), \
+                        mock.patch.object(remote, 'request', side_effect=request), mock.patch('release.time.sleep') as sleep:
+                    if fault == 'transient':
+                        self.assertEqual(fixture.client.request('DELETE', '/v1/sessions/' + sid), dict(status='released'))
+                        self.assertEqual(sleep.call_args_list, [mock.call(.5)])
+                    else:
+                        with self.assertRaises(HTTPError) as raised:
+                            fixture.client.request('DELETE', '/v1/sessions/' + sid)
+                        body = json.loads(raised.exception.body)
+                        self.assertEqual(raised.exception.status, 401 if fault == 'unauthorized' else 503)
+                        self.assertEqual(body['node_session_ids'], [session['remote_id']])
+                        self.assertEqual(body['exception_type'], 'URLError' if fault == 'permanent' else 'HTTPError')
+                        for secret in ('remote-a', 'fixture-a', 'user:secret'):
+                            self.assertNotIn(secret, body['message'])
+                        self.assertEqual(sleep.call_count, 2 if fault == 'permanent' else 0)
+                self.assertEqual(len(calls), expected_attempts)
+                self.assertEqual(fixture.app.store.get(sid)['benchmark_mode'], 'closed')
+                if fault != 'transient':
+                    remote.request('DELETE', '/v1/sessions/' + session['remote_id'])
 
     # Different model bytes require explicit matching layout admission; mismatches never reach native import.
     def test_heterogeneous_identity_bridge(self):

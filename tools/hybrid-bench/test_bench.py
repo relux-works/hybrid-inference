@@ -1,6 +1,12 @@
 """Bounded benchmark contracts; native integration is a separate opt-in test."""
 import argparse
 import hashlib
+import http.server
+import io
+import socket
+import threading
+import urllib.error
+from types import SimpleNamespace
 import json
 from pathlib import Path
 import tarfile
@@ -433,6 +439,252 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(digest, hashlib.sha256(data[name]).hexdigest())
             self.assertNotIn(b'forbidden', data['client-info.json'])
             self.assertNotIn(b'/private', data['client-info.json'])
+
+
+class CleanupTests(unittest.TestCase):
+    @staticmethod
+    def checker_result(code=0):
+        return dict(stage='equivalence', depth=132, k=8, status_rule='same_backend_same_partition_exact',
+            backend='cpu', mean_kl_nats=.001, top1_agreed=8, free_running_first_divergence=-1,
+            noise_partitions=[], noise_kl_nats=0, noise_top1_agreed=8, noise_free_running_first_divergence=-1,
+            noise_reference_seconds=.1, kl_to_noise_ratio=None, kl_to_noise_ratio_status='zero_noise',
+            same_partition_exact=code == 0, same_partition_within_floor=code == 0, same_partition_agreed=8,
+            numerical_within_bounds=True, same_partition_kl_nats=0, same_partition_max_abs_logit_diff=0,
+            same_partition_repeat_exact=True, same_partition_repeat_kl_nats=0,
+            same_partition_repeat_max_abs_logit_diff=0, same_partition_repeat_seconds=.1,
+            same_partition_positions=[])
+
+    def run_fake_node(self, failure, checker_code=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions, attempts, before_delete = set(), {}, []
+            test = self
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *_):
+                    pass
+
+                def reply(self, body, code=200):
+                    body = json.dumps(body).encode() if not isinstance(body, bytes) else body
+                    self.send_response(code)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def do_GET(self):
+                    self.reply(dict(model_sha256='a' * 64, sessions=len(sessions), ram_bytes=0, evictions=0))
+
+                def do_POST(self):
+                    self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                    if self.path == '/v1/sessions':
+                        sid = 'checker-' + str(len(attempts) + 1)
+                        sessions.add(sid)
+                        self.reply(dict(session_id=sid))
+                    else:
+                        self.reply(b'fixture delta')
+
+                def do_DELETE(self):
+                    sid = self.path.rsplit('/', 1)[-1]
+                    if sid.startswith('checker-'):
+                        journal = next(root.glob('hybrid-bench-*.jsonl'))
+                        saved = [json.loads(line) for line in journal.read_text().splitlines()]
+                        # Both rows must already be on disk at the first cleanup call, not only at bundle time.
+                        test.assertEqual(saved[-2]['stage'], 'checker')
+                        test.assertEqual(saved[-2]['checker_exit_code'], checker_code)
+                        test.assertEqual(json.loads(saved[-2]['result_json']), test.checker_result(checker_code))
+                        test.assertEqual(saved[-1]['stage'], 'equivalence')
+                        test.assertEqual(saved[-1]['checker_exit_code'], checker_code)
+                        before_delete.append(sid)
+                        attempts[sid] = attempts.get(sid, 0) + 1
+                        if sid == 'checker-2' and (failure == 'permanent' or failure == 'transient' and attempts[sid] == 1):
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                            self.connection.close()
+                            return
+                        if sid == 'checker-2' and failure == 'lost_ack':
+                            if attempts[sid] == 1:
+                                sessions.discard(sid)
+                                self.connection.shutdown(socket.SHUT_RDWR)
+                                self.connection.close()
+                            else:
+                                self.reply(dict(error='already released'), 404)
+                            return
+                        if sid == 'checker-2' and failure == 'unauthorized':
+                            self.reply(dict(error='unauthorized'), 401)
+                            return
+                        sessions.discard(sid)
+                    self.reply({})
+
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = 'http://127.0.0.1:' + str(server.server_port)
+            config = dict(model_sha256='a' * 64, prefill_url=base, decode_url='http://decoder',
+                decode_token='decode-secret', client_credential='client-secret', clients={'client-secret': dict(prefill_token='node-secret')})
+            info = dict(model_sha256='a' * 64, context=2048, backend='cpu', proxy_url=base,
+                        build_dir='fixture', model_path='fixture.gguf')
+            for name, value in (('proxy-config', config), ('client-info', info), ('node-info', info)):
+                common.private_json(root / (name + '.json'), value)
+            real_http = hybrid_bench.http
+            def request(url, path, *args, **kwargs):
+                if url != 'http://decoder':
+                    return real_http(url, path, *args, **kwargs)
+                if path == '/apply-template':
+                    return dict(prompt='fixture')
+                if path == '/tokenize':
+                    return dict(tokens=[1] * (len(args[1]['content']) // 2 if args[1]['content'].startswith(' x') else 3))
+                return dict(tokens=[1] * 132)
+            def checker(command, scratch):
+                Path(command[4]).write_text(json.dumps(self.checker_result(checker_code)))
+                return SimpleNamespace(returncode=checker_code)
+            trace = dict(prefilled=132, new_tokens=132, replayed_prefix=0, rollback_n=None,
+                depth_before=0, prompt_depth=132, depth_after=136, generated_tokens=4, mode='offload',
+                path='offload', remote_applied=131, server_prefill_ms=1, wire_bytes=10, slot=0, chunks=[])
+            argv = ['hybrid_bench.py', '--client-state', str(root), '--scratch', str(root), '--output', str(root),
+                    '--modes', 'offload', '--smoke', '--check', '--check-tokens', '8']
+            try:
+                with mock.patch('sys.argv', argv), mock.patch.object(hybrid_bench, 'http', side_effect=request), \
+                        mock.patch.object(hybrid_bench, 'run_checker', side_effect=checker), \
+                        mock.patch.object(hybrid_bench, 'schedule', return_value=iter([dict(kind='depth', depth=128, output=4)])), \
+                        mock.patch.object(hybrid_bench, 'stream_chat', return_value=('mode-session', {}, trace, .1, .2)), \
+                        mock.patch('release.time.sleep') as sleep:
+                    code = hybrid_bench.main()
+                path = next(root.glob('hybrid-bench-*.jsonl'))
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                markdown = path.with_suffix('.md').read_text()
+                with tarfile.open(path.with_suffix('.tar.gz')) as archive:
+                    archived = archive.extractfile(path.name).read()
+                    self.assertEqual(archived, path.read_bytes())
+                    self.assertEqual(archive.extractfile(path.with_suffix('.md').name).read().decode(), markdown)
+                    for member in archive.getmembers():
+                        data = archive.extractfile(member).read()
+                        for secret in (b'decode-secret', b'client-secret', b'node-secret', b'fixture delta'):
+                            self.assertNotIn(secret, data)
+                self.assertFalse(list(root.glob('equivalence-*')))
+                return code, rows, markdown, attempts, list(sessions), before_delete, sleep.call_args_list
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    # A real socket drop during the final checker DELETE preserves both verdicts in the journal/archive and reports the leftover ID; passing cleanup has no error.
+    def test_checker_result_survives_final_delete(self):
+        for failure, checker_code in ((None, 0), ('permanent', 0), ('permanent', 3)):
+            with self.subTest(failure=failure, checker_code=checker_code):
+                code, rows, markdown, attempts, sessions, before, sleeps = self.run_fake_node(failure, checker_code)
+                checks = [row for row in rows if row['stage'] == 'equivalence']
+                self.assertEqual(len(checks), 2)
+                self.assertEqual([row['checker_exit_code'] for row in checks], [checker_code] * 2)
+                self.assertEqual([row['status'] for row in checks], ['failed' if checker_code else 'passed'] * 2)
+                self.assertEqual(len([row for row in rows if row['stage'] == 'checker']), 2)
+                errors = [row for row in rows if row['stage'] == 'release_error']
+                self.assertEqual(code, 2 if failure else 0)
+                self.assertEqual(len(errors), 1 if failure else 0)
+                self.assertEqual(sessions, ['checker-2'] if failure else [])
+                self.assertEqual(attempts['checker-2'], 3 if failure else 1)
+                self.assertTrue(before)
+                self.assertEqual(rows[-1]['release_failed'], bool(failure))
+                self.assertEqual(rows[-1]['checker_exit_codes'], [checker_code] * 2)
+                if failure:
+                    self.assertEqual(errors[0]['exception_type'], 'RemoteDisconnected')
+                    self.assertIn('Remote end closed connection', errors[0]['message'])
+                    self.assertEqual(errors[0]['node_session_ids'], ['checker-2'])
+                    self.assertIn('Release failed (checker, append_chain)', markdown)
+                    self.assertIn('Node sessions that may remain: checker-2', markdown)
+                    self.assertEqual(sleeps, [mock.call(.5), mock.call(1.0)])
+
+    # A dropped connection retries once; success or 404 after a lost acknowledgement leaves no release-error row or failure exit.
+    def test_transient_delete_recovers(self):
+        for failure in ('transient', 'lost_ack'):
+            with self.subTest(failure=failure):
+                code, rows, _, attempts, sessions, _, sleeps = self.run_fake_node(failure)
+                self.assertEqual(code, 0)
+                self.assertEqual(attempts['checker-2'], 2)
+                self.assertEqual(sessions, [])
+                self.assertFalse(any(row['stage'] == 'release_error' for row in rows))
+                self.assertEqual(sleeps, [mock.call(.5)])
+
+    # An actual HTTP 401 is terminal after one DELETE and retains the checker metrics plus its unreleased session.
+    def test_unauthorized_delete_not_retried(self):
+        code, rows, _, attempts, sessions, _, sleeps = self.run_fake_node('unauthorized')
+        self.assertEqual(code, 2)
+        self.assertEqual(attempts['checker-2'], 1)
+        self.assertEqual(sessions, ['checker-2'])
+        self.assertEqual(sleeps, [])
+        error = next(row for row in rows if row['stage'] == 'release_error')
+        self.assertEqual(error['exception_type'], 'HTTPError')
+        self.assertIn('401', error['message'])
+
+    # A partial final JSONL write cannot truncate an already durable checker journal.
+    def test_bundle_failure_keeps_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'fixture.jsonl'
+            saved = json.dumps(dict(stage='checker', checker_exit_code=3, result_json='{}')) + '\n'
+            path.write_text(saved)
+            original_open = Path.open
+            class FailedWrite:
+                def __init__(self, target):
+                    self.target = target
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_):
+                    self.target.close()
+                def write(self, data):
+                    self.target.write(data[:3])
+                    self.target.flush()
+                    raise OSError('injected partial write')
+            def opened(target, mode='r', *args, **kwargs):
+                stream = original_open(target, mode, *args, **kwargs)
+                if target.name in ('fixture.jsonl', 'fixture.jsonl.tmp') and mode == 'w':
+                    return FailedWrite(stream)
+                return stream
+            with mock.patch.object(Path, 'open', opened):
+                with self.assertRaisesRegex(OSError, 'injected partial write'):
+                    bundle(root, 'fixture', [dict(stage='summary', status='passed', skipped=0, aborted=0, exit_code=0)], {}, {})
+            self.assertEqual(path.read_text(), saved)
+            self.assertFalse((root / 'fixture.tar.gz').exists())
+
+    # Proxy release diagnostics retain known node IDs; malformed responses fall back to the HTTP error without hiding the checker result.
+    def test_mode_release_error_details(self):
+        config = dict(client_credential='client-secret', clients={'a': dict(prefill_token='node-secret')})
+        for body in (dict(node_session_ids=['node-current', 'node-retired'], exception_type='URLError',
+                          message='lost node-secret'), [], dict(node_session_ids=1)):
+            rows = []
+            error = urllib.error.HTTPError('http://proxy', 503, 'Service Unavailable', {}, io.BytesIO(json.dumps(body).encode()))
+            with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', side_effect=error) as delete, mock.patch('release.time.sleep') as sleep:
+                with self.assertRaisesRegex(common.Refusal, 'mode release failed'):
+                    with hybrid_bench.mode_session(config, dict(proxy_url='http://proxy'), 'mode-session', rows, 'offload'):
+                        pass
+            delete.assert_called_once()
+            sleep.assert_not_called()
+            row, = rows
+            self.assertEqual(row['stage'], 'release_error')
+            if isinstance(body, dict) and isinstance(body.get('node_session_ids'), list):
+                self.assertEqual(row['node_session_ids'], ['node-current', 'node-retired'])
+                self.assertEqual(row['exception_type'], 'URLError')
+                self.assertFalse(row['node_sessions_unknown'])
+                self.assertNotIn('node-secret', row['message'])
+            else:
+                self.assertEqual(row['node_session_ids'], [])
+                self.assertEqual(row['exception_type'], 'HTTPError')
+                self.assertTrue(row['node_sessions_unknown'])
+
+    # Failed mode cleanup cannot suppress an in-flight exception/interrupt, and its diagnostic redacts credentials and URL userinfo.
+    def test_release_preserves_original_error_and_redacts(self):
+        config = dict(client_credential='client-secret', decode_token='decode-secret',
+            clients={'client-secret': dict(prefill_token='node-secret')})
+        error = urllib.error.URLError('lost node-secret client-secret decode-secret http://user:password@node/path')
+        for original in (common.Refusal('original failure'), KeyboardInterrupt()):
+            rows = []
+            with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', side_effect=error), mock.patch('release.time.sleep'):
+                with self.assertRaises(type(original)) as raised:
+                    with hybrid_bench.mode_session(config, dict(proxy_url='http://proxy'), 'mode-session', rows, 'offload'):
+                        raise original
+            self.assertIs(raised.exception, original)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['stage'], 'release_error')
+            self.assertTrue(rows[0]['node_sessions_unknown'])
+            for secret in ('node-secret', 'client-secret', 'decode-secret', 'user:password'):
+                self.assertNotIn(secret, json.dumps(rows))
 
 
 class ProcessControlTests(unittest.TestCase):

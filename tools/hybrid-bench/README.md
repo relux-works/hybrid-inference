@@ -41,10 +41,10 @@ tools/hybrid-bench/deploy-prefill-node.sh --state .temp/bench/node \
 For a client partition experiment, `setup-client.sh --batch 64 --ubatch 64 ...` sets the decoder's logical and physical batch sizes and records them in client-info. Defaults remain 256/256; require `1 <= ubatch <= batch <= 65536`. The native node remains fixed at 256/256 and refuses other launcher values. A second client needs distinct `--decode-port`, `--port` and `--state`; see the [task evaluator](../hybrid-eval/README.md) for the identical-token control and aggregate memory requirements.
 
 ```sh
-ssh -N -L 8091:127.0.0.1:8091 prefill-host
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -L 8091:127.0.0.1:8091 prefill-host
 ```
 
-Use your normal SSH host alias and authentication. Keep the tunnel running. No public HTTP listener is needed.
+Use your normal SSH host alias and authentication. For an unstable link such as 5G, use `ServerAliveInterval 15` and `ServerAliveCountMax 8`, and run this SSH command under a supervisor that reopens the tunnel after it exits (for example, an existing service manager with restart enabled). Keepalives detect a dead connection; they do not reconnect it. A supervisor can restore connectivity for later cleanup attempts, but cannot resume an interrupted benchmark call. No public HTTP listener is needed.
 
 ## 3. Set up the client (macOS Metal, Linux CUDA or CPU)
 
@@ -88,7 +88,11 @@ The fixed ladder is 16,384 / 50,000 / 100,000 / 150,000 / 200,000 / 256,000 toke
 
 The measured schedule uses seeded piecewise-linear inverse-quantile sampling of aggregate tool-result/output counts at p10/p25/p50/p75/p90/p99; the tails clamp to p10/p99. `hybrid_bench.py` embeds these aggregates and their source hash/provenance from a 2026-10-30 measurement export. It never reads original conversations. This sampling does not reproduce the source means: a 200k-draw review simulation found about 1,233 tool tokens and 580 output tokens versus source means 1,077.6 and 511.9 (about 14% and 13% higher). Measured smoke limits generated sizes to eight tokens; the full schedule uses the sampled sizes.
 
-Each mode starts a distinct explicit session and releases its remote session and retired sessions on exit, including failures. Closed sessions cannot be recreated by background replay. Each release trace records live node session, retained-byte and eviction counters after DELETE. Each checker session is deleted in `finally`; at most two remote sessions (one mode plus one sequential check) are held by a run. Restart the node between independent operator runs when old external sessions may remain. A changed generated-token count or depth across modes makes the comparison partial. The client fills KV/recurrent byte estimates from the GGUF. The hybrid policy uses the configured existing proxy cost model; defaults are estimates, not calibration for the current machine. Configure its `policy` rates using measured data before drawing a capacity or purchase conclusion.
+Each mode starts a distinct explicit session and releases its remote session and retired sessions on exit, including failures. Closed sessions cannot be recreated by background replay. Each release trace records live node session, retained-byte and eviction counters after DELETE. Each checker session is deleted in `finally`; normally at most two remote sessions (one mode plus one sequential check) are held by a run. Failed releases can leave more sessions. A changed generated-token count or depth across modes makes the comparison partial. The client fills KV/recurrent byte estimates from the GGUF. The hybrid policy uses the configured existing proxy cost model; defaults are estimates, not calibration for the current machine. Configure its `policy` rates using measured data before drawing a capacity or purchase conclusion.
+
+As soon as a checker returns, its exit code and raw result JSON are saved in a `checker` JSONL row, followed by the validated `equivalence` row, with both flushed to disk before any DELETE or scratch removal. The final bundle includes these rows. A failed release adds a separate `release_error` row with the exception type, sanitized message and node session IDs that may remain. The Markdown and summary report the release failure; the benchmark exits 2 even if equivalence passed (an interrupted run retains exit 130). Original checker exit codes and metrics remain available. Malformed or missing checker output still preserves its exit code/raw output, but cannot produce a validated equivalence row. Cleanup failure also preserves an earlier benchmark exception.
+
+Checker DELETE, client-to-proxy release and proxy-to-node DELETE each make at most three attempts for connection errors, with 0.5 s and 1 s backoff. HTTP refusals, including 401/403/503, are terminal and are not retried; 404 means already released. An error response from the proxy lists unreleased current/retired node IDs. If the proxy cannot be reached, those IDs are unknown and the row explicitly requires node reconciliation.
 
 `--check-depths N ...` selects the first forced-offload call at or above each chosen depth; defaults are 128 for smoke and 4,096/32,768/131,072 otherwise. Two checks run sequentially: `fresh` recomputes the exact observed prompt; `append_chain` replays the run's recorded successful critical boundaries and intervening shadow spans into a new remote session. Both import the resulting sequence of bounded deltas and evaluate the held final token locally. The append replay exercises node save/load and client nonzero-n0 imports; it is a replay of observed tokens/boundaries, not a capture of the measured session's native bytes. The checker compares local same-partition and whole-prompt contexts over the same K continuation IDs (`--check-tokens`, default 64), then measures the client's own batch-boundary noise. The decisive same-partition comparison uses every logit over those checked positions; greedy continuation agreement is also reported.
 
@@ -129,6 +133,33 @@ These are memory estimates, not qualification evidence. The launcher derives `--
 
 Send only `hybrid-bench-LABEL-TIME.tar.gz` and its `.sha256` sidecar. The archive contains JSONL, Markdown, sanitized node/client info and `SHA256SUMS`. Verify each member against that manifest after extraction. Never send runtime configs, credentials, database, slots, checker token files or native state.
 
+After a release failure, restore the tunnel or run on the node host. List sessions with authenticated `GET /v1/sessions`, then `DELETE /v1/sessions/SESSION_ID` for each leftover session using the same client token. The list is scoped to that client; do not delete another run's active sessions. IDs in `release_error.node_session_ids` can identify the affected sessions. If IDs are unknown, reconcile the list with other active runs first. A lost DELETE response may mean deletion succeeded already; 404 is safe to treat as released. Verify with GET again. Read the token from its private JSON file rather than placing it on a command line. Run the command below first without IDs to list sessions, then repeat with the leftover IDs after the URL:
+
+```sh
+python3 - /secure/copied/node-token.json http://127.0.0.1:8091 <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+token = json.load(open(sys.argv[1]))['bench']  # Use this client's configured key.
+base = sys.argv[2].rstrip('/')
+headers = {'Authorization': 'Bearer ' + token}
+def request(path, method='GET'):
+    with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers, method=method), timeout=15) as response:
+        return response.read()
+print(request('/v1/sessions').decode())
+for sid in sys.argv[3:]:
+    try:
+        request('/v1/sessions/' + urllib.parse.quote(sid, safe=''), 'DELETE')
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+print(request('/v1/sessions').decode())
+PY
+```
+
 ```sh
 tools/hybrid-bench/setup-client.sh --state .temp/bench/client --status
 tools/hybrid-bench/setup-client.sh --state .temp/bench/client --stop
@@ -150,7 +181,7 @@ Run node control on the node host. PID files include process start identity; sta
 | `test_integrated.py` | `python3 tools/hybrid-bench/test_integrated.py --server-binary build/bin/llama-server --prefill-binary build/bin/llama-hybrid-prefill --model /local/small-qwen35.gguf --artifacts .temp/integrated-negatives`; CPU noise/corruption, checked fresh/append benchmarks, native defaults, real LRU replay and budget-refusal classification; requires an existing bench checker, no builds | private logs, PID files, snapshots and aborted benchmark bundle |
 | `test_native.py` | `python3 tools/hybrid-bench/test_native.py --help`; disposable live node/client required, kills its node | command ledger, refusal logs and aborted control bundles |
 
-Proxy `benchmark=true` is an operator opt-in. Requests then accept `X-Hybrid-Bench-Mode: local|hybrid|offload`; absent this header, default policy behavior is unchanged. Local mode suppresses remote prefill and shadow replay for its sessions; offload attempts every transferable suffix. With a header, the final SSE object is `{"hybrid_bench":{...}}`, after durable reconciliation and before `[DONE]`. Non-streaming responses carry the same field. No trace includes token IDs, messages, session IDs or credentials. Interrupted streams without committed trace/DONE are failures.
+Proxy `benchmark=true` is an operator opt-in. Requests then accept `X-Hybrid-Bench-Mode: local|hybrid|offload`; absent this header, default policy behavior is unchanged. Local mode suppresses remote prefill and shadow replay for its sessions; offload attempts every transferable suffix. With a header, the final SSE object is `{"hybrid_bench":{...}}`, after durable reconciliation and before `[DONE]`. Non-streaming responses carry the same field. Call traces omit token IDs, messages, session IDs and credentials. Release-error rows include session IDs for operator cleanup. Interrupted streams without committed trace/DONE are failures.
 
 Trace fields include authoritative before/prompt/after depths, new/generated counts, local/remote prompt work, path, critical `server_prefill_ms`, awaited `server_shadow_ms`, `wire_bytes` (delta envelope body only), body-read `transfer_ms`, import HTTP `import_ms` and inclusive `remote_prepare_ms`, a `chunks` array with boundaries/status/bytes/timings, and a content-free `fallback_reason` (`ram_budget`, HTTP status class, transport or invalid delta). Budget refusal is reported explicitly rather than as generic offload unavailability. HTTP/TCP/TLS/SSH overhead and asynchronous shadows are excluded from the critical byte/time fields. RTT and link download throughput include request overhead. TTFT is client-observed first nonempty streamed content/reasoning; decode rate uses native generation timing. Native prompt counters must equal only new tokens; a lost prior boundary or repeated prefix aborts the run. A telemetry control plant demonstrates that detector without claiming an actual engine regression.
 
