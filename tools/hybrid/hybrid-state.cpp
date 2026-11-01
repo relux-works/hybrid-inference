@@ -1,6 +1,7 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
 #include "llama-model.h"
+#include "llama-memory.h"
 #include "hash/xxhash/xxhash.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
@@ -168,7 +169,7 @@ std::string encode_delta_header(json header, size_t state_bytes) {
         header["chunk_count"] = 1;
         header["fixed_state"] = true;
     }
-    header["body_format"] = "llama-native-chunks-v2";
+    header["body_format"] = "llama-native-chunks-v3";
     header["kv_type"] = "q8_0";
     header["state_dtype"] = "f32";
     header["sections"] = json::array({{{"name", "llama_seq_state"}, {"offset", 0}, {"bytes", state_bytes}}});
@@ -199,7 +200,7 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
     uint32_t size;
     json h = read_delta_header(wire, size);
     require(h.is_object() && h.at("magic") == "HYBD" && h.at("version").is_number_integer() && h.at("version") == 2, "unsupported delta version");
-    require(h.at("body_format") == "llama-native-chunks-v2" && h.at("kv_type") == "q8_0" && h.at("state_dtype") == "f32", "unsupported delta layout");
+    require(h.at("body_format") == "llama-native-chunks-v3" && h.at("kv_type") == "q8_0" && h.at("state_dtype") == "f32", "unsupported delta layout");
     require(h.at("model_sha256").is_string() && h.at("model_sha256") == model_sha256, "model hash mismatch");
     require(h.at("session_id").is_string() && !h.at("session_id").get<std::string>().empty(), "invalid session id");
     require(h.at("n0").is_number_integer() && h.at("n1").is_number_integer(), "invalid positions");
@@ -328,8 +329,9 @@ void prefill(llama_context * ctx, const std::vector<llama_token> & tokens, size_
 }
 
 std::string save_state(llama_context * ctx) {
-    std::string state(llama_state_seq_get_size(ctx, 0), '\0');
-    require(!state.empty() && llama_state_seq_get_data(ctx, reinterpret_cast<uint8_t *>(&state[0]), state.size(), 0) == state.size(), "cannot save state");
+    const auto flags = llama_get_model(ctx)->hparams.swa_type == LLAMA_SWA_TYPE_STANDARD ? LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT : 0;
+    std::string state(llama_state_seq_get_size_ext(ctx, 0, flags), '\0');
+    require(!state.empty() && llama_state_seq_get_data_ext(ctx, reinterpret_cast<uint8_t *>(&state[0]), state.size(), 0, flags) == state.size(), "cannot save state");
     return state;
 }
 
@@ -337,7 +339,8 @@ void load_state(llama_context * ctx, const std::string & state) {
     if (state.empty()) {
         llama_memory_clear(llama_get_memory(ctx), true);
     } else {
-        require(llama_state_seq_set_data(ctx, reinterpret_cast<const uint8_t *>(state.data()), state.size(), 0) == state.size(), "cannot load state");
+        const auto flags = llama_get_model(ctx)->hparams.swa_type == LLAMA_SWA_TYPE_STANDARD ? LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT : 0;
+        require(llama_state_seq_set_data_ext(ctx, reinterpret_cast<const uint8_t *>(state.data()), state.size(), 0, flags) == state.size(), "cannot load state");
     }
 }
 

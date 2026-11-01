@@ -128,6 +128,9 @@ Model-free allocated CPU-cache tests (positive, malformed positions, truncation,
 
 ```sh
 nice -n 19 build/bin/llama-hybrid-check-swa
+# Generate a tiny local GGUF, run CPU attention across window/ring boundaries, then remove the GGUF.
+mkdir -p .temp/swa-check
+nice -n 19 build/bin/llama-hybrid-check-swa .temp/swa-check/tiny.gguf
 HYBRID_SWA_CHECKER="$PWD/build/bin/llama-hybrid-check-swa" python3 tools/hybrid-bench/test_bench.py
 ```
 
@@ -140,3 +143,10 @@ Node, proxy and decoder must all use HYBD protocol 2. Intermediate deltas contai
 `build/bin/llama-hybrid-check-append MODEL --chunks` checks four-chunk byte equivalence, interrupted-prefix cells/state/logits and malformed chunk refusals on an existing CPU model. `build/bin/llama-hybrid-check-codec` prints exact synthetic 27B/40k wire arithmetic without loading a large model. `build/bin/llama-hybrid-check-swa` exercises the same chunk transaction on allocated Gemma/Glimmer window fixtures. HTTP and proxy checks are documented in [RESULTS-hybrid-a-r24-261101.md](RESULTS-hybrid-a-r24-261101.md); logs and scratch outputs belong in `.temp/hybrid-a-r24-261101/`.
 
 The [r25 follow-up](RESULTS-hybrid-a-r24-261101.md#r25---r7g-follow-ups) adds fresh-reader staging/checkpoint checks, apply-time SWA rollback controls and first-request recovery from abandoned staging. It also quantifies recovery disk writes and client staging RAM. Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/hybrid-proxy -p 'test_*.py'` for the proxy suite; r25 logs and measurements are under `.temp/hybrid-a-r25-261101/`.
+The Python command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. The native checker covers server architecture admission and rollback after a failed context post-check. The optional tiny GGUF test checks CPU same-partition bit-exact logits; production-model and GPU equivalence remain unverified. [The r17 section of the r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md#r17-rebase-and-review-notes) contains pinned rented-GPU commands and offline nextn/MTP inspection; no production SWA GGUF is available on this CPU host. Read the nextn/MTP limitations and proposed follow-up in [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) before provisioning a real file.
+
+SWA ring-placement and reuse-threshold regression evidence, native-record compatibility and the exact GPU block are recorded in [RESULTS-hybrid-b-r33-261101.md](RESULTS-hybrid-b-r33-261101.md). Rebuild node, decoder and checker together; marked physical records fail closed on older decoders.
+
+SWA record version 2 carries metadata for masked ring rows and K/V only for the retained window. Hybrid imports refuse legacy compacted and version-1 full-payload window records. Rebuild node, decoder and checker together. HYBD envelope version 1 is unchanged. See [the r6 report](RESULTS-hybrid-c-r6-261101.md) for CPU regressions, production size budgets and the unrun GPU block.
+
+The combined SWA/chunk branch uses HYBD 2 with `body_format=llama-native-chunks-v3`. Final SWA windows require physical record v2; earlier chunk-state-only envelopes are refused. See [r27 merge qualification](RESULTS-hybrid-a-r27-261101.md) for resolutions, CPU evidence and unrun combined-head GPU commands.

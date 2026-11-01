@@ -265,9 +265,10 @@ def swa_context_plan(model, meta, info, requested, client):
         else:
             full += row
     window = layout['sliding_window']
-    window_bytes = window * (window_rows + 24)
     # Include a 256-token microbatch and pad256 capacity in allocation sizing.
-    allocation = ((window + 256 + 255) // 256) * 256 * window_rows
+    window_cells = ((window + 256 + 255) // 256) * 256
+    window_bytes = window * window_rows + window_cells * 28 + 16
+    allocation = window_cells * window_rows
     weights = Path(model).stat().st_size
     capacity = info.get('available_vram_bytes', info['available_memory_bytes'])
     memory_ctx = ((int(capacity * .8) - weights - 2 * GIB - allocation) // full // 256) * 256

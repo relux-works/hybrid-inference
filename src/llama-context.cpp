@@ -3574,7 +3574,7 @@ size_t llama_memory_seq_read_chunks(llama_memory_t memory, const llama_hparams &
                         throw std::runtime_error("unsupported chunk window");
                     }
                     const std::pair<llama_pos, llama_pos> window {(llama_pos) std::max<int64_t>(0, (int64_t) chunk.n1 - hp.n_swa), chunk.n1};
-                    fixed->state_read_sinfo(io, seq_id, validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0, nullptr, nullptr, &window);
+                    fixed->state_read_sinfo(io, seq_id, LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT | (validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0), nullptr, nullptr, &window);
                 }
                 if (!validate && (base->seq_pos_max(seq_id) != chunk.n1 - 1 ||
                         (recr ? recr->seq_pos_max(seq_id) : fixed->seq_pos_max(seq_id)) != chunk.n1 - 1)) {

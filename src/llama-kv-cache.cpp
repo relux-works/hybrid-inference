@@ -2061,7 +2061,10 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
         return;
     }
 
-    io.write(&n_stream, sizeof(n_stream));
+    const bool layout = (flags & LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT) && seq_id >= 0;
+    // Version 2 stores masked cells as metadata only.
+    const uint32_t streams = n_stream | (layout ? 0xc0000000u : 0);
+    io.write(&streams, sizeof(streams));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         cell_ranges_t cr { s, {} };
@@ -2083,7 +2086,7 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
             add_cell = add_cell && (p1 < 0 || cells.pos_get(i) <  p1);
 
             // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
+            if (add_cell && seq_id != -1 && !layout) {
                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
@@ -2120,8 +2123,34 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
             continue;
         }
 
+        if (layout) {
+            const uint32_t capacity = cells.size();
+            io.write(&capacity, sizeof(capacity));
+            io.write(&v_heads[s], sizeof(v_heads[s]));
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) {
+                    io.write(&i, sizeof(i));
+                }
+            }
+        }
         state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
+        if (layout) {
+            cell_ranges_t payload {s, {}};
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) {
+                    if (!llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id))) {
+                        if (!payload.data.empty() && payload.data.back().second == i) {
+                            ++payload.data.back().second;
+                        } else {
+                            payload.data.emplace_back(i, i + 1);
+                        }
+                    }
+                }
+            }
+            state_write_data(io, payload);
+        } else {
+            state_write_data(io, cr);
+        }
     }
 }
 
@@ -2165,6 +2194,15 @@ const std::pair<llama_pos, llama_pos> * range) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
+    const uint32_t version = n_stream_cur & 0xc0000000u;
+    const bool layout = version == 0xc0000000u;
+    if ((version != 0 && !layout) || ((flags & LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT) && !layout)) {
+        throw std::runtime_error("unsupported sliding-window record version");
+    }
+    n_stream_cur &= 0x3fffffffu;
+    if (layout && (swa_type != LLAMA_SWA_TYPE_STANDARD || seq_id < 0)) {
+        throw std::runtime_error("invalid sliding-window layout record");
+    }
     const bool append = flags & LLAMA_STATE_SEQ_FLAGS_APPEND;
     const bool validate = flags & LLAMA_STATE_SEQ_FLAGS_VALIDATE;
     if (append && swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2203,12 +2241,61 @@ const std::pair<llama_pos, llama_pos> * range) {
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
+        slot_info saved_layout;
+        uint32_t saved_head = 0;
+        std::pair<llama_pos, llama_pos> saved_range;
+        const auto * effective_range = range;
+        const auto * effective_layout = sinfos_in ? &(*sinfos_in)[s] : nullptr;
+        if (layout) {
+            uint32_t capacity;
+            io.read(&capacity, sizeof(capacity));
+            io.read(&saved_head, sizeof(saved_head));
+            const auto & cells = v_cells[strm];
+            if (capacity == 0 || cell_count > capacity || cell_count > cells.size() ||
+                    saved_head > capacity || saved_head > cells.size()) {
+                throw std::runtime_error("invalid sliding-window layout size");
+            }
+            saved_layout.resize(1);
+            saved_layout.s0 = saved_layout.s1 = strm;
+            saved_layout.strm[0] = strm;
+            std::vector<bool> seen(cells.size(), false);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                uint32_t idx;
+                io.read(&idx, sizeof(idx));
+                if (idx >= capacity || idx >= cells.size() || seen[idx]) {
+                    throw std::runtime_error("invalid sliding-window cell index");
+                }
+                seen[idx] = true;
+                saved_layout.idxs[0].push_back(idx);
+            }
+            if (range) {
+                if (cell_count < uint32_t(range->second - range->first) || cell_count > uint32_t(range->second)) {
+                    throw std::runtime_error("incomplete sliding-window layout");
+                }
+                saved_range = {range->second - (llama_pos) cell_count, range->second};
+                effective_range = &saved_range;
+            }
+            if (effective_layout && effective_layout->idxs != saved_layout.idxs) {
+                throw std::runtime_error("sliding-window mirrored layout mismatch");
+            }
+            effective_layout = &saved_layout;
+        }
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append, validate, range);
+        std::vector<uint32_t> payload_rows;
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, effective_layout, append, validate, effective_range,
+                                    layout ? &payload_rows : nullptr);
+        slot_info payload = sinfo;
+        if (layout && res) {
+            payload.idxs[0].clear();
+            for (uint32_t row : payload_rows) {
+                payload.idxs[0].push_back(sinfo.idxs[0][row]);
+            }
+        }
 
         try {
-            res = res && state_read_data(io, strm, cell_count, sinfo);
+            // Masked rows keep finite initialized or stale K/V; only their physical metadata is restored.
+            res = res && state_read_data(io, strm, layout ? payload_rows.size() : cell_count, payload);
         } catch (...) {
             res = false;
         }
@@ -2219,6 +2306,10 @@ const std::pair<llama_pos, llama_pos> * range) {
                 state_clear(seq_id, strm, sinfo);
             }
             throw std::runtime_error("failed to restore kv cache");
+        }
+
+        if (layout && !validate) {
+            v_heads[strm] = saved_head;
         }
 
         if (sinfos_out) {
@@ -2364,7 +2455,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append, bool validate, const std::pair<llama_pos, llama_pos> * range) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append, bool validate, const std::pair<llama_pos, llama_pos> * range, std::vector<uint32_t> * payload_rows) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2405,6 +2496,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
 
+            if (payload_rows && pos < 0) {
+                throw std::runtime_error("invalid sliding-window position");
+            }
             if (range) {
                 if (pos < range->first || pos >= range->second || seen[pos - range->first]) {
                     throw std::runtime_error("cache range position mismatch");
@@ -2449,6 +2543,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.pos[i]      = pos;
             ubatch.n_seq_id[i] = n_seq_id;
             ubatch.seq_id[i]   = &dest_seq_id;
+        }
+
+        if (payload_rows) {
+            const llama_pos last = *std::max_element(ubatch.pos, ubatch.pos + cell_count);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                if (!llama_hparams::is_masked_swa(n_swa, swa_type, ubatch.pos[i], last)) {
+                    payload_rows->push_back(i);
+                }
+            }
         }
 
         if (validate) {
