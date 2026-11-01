@@ -34,7 +34,7 @@ def envelope(header, state):
     return struct.pack("<I", len(text)) + text + state + xxh128(state) + hashlib.sha256(state).digest()
 
 
-def run(node, golden, slots):
+def run(node, golden, slots, reference_slot=None):
     metadata = json.loads(Path(str(golden) + ".tokens.json").read_text())
     tokens, n0, n1 = metadata["tokens"], metadata["n0"], metadata["n1"]
     wire = Path(str(golden) + ".delta").read_bytes()
@@ -104,7 +104,11 @@ def run(node, golden, slots):
             require(b"message" in error.body, f"{name}: missing rejection message")
         else:
             raise AssertionError(f"{name}: invalid delta accepted")
-        require(node.request("GET", "/slots/0/info") == before, f"{name}: slot info changed")
+        try:
+            after = node.request("GET", "/slots/0/info")
+        except HTTPError as error:
+            raise AssertionError(f"{name}: post-refusal slot unreadable: HTTP {error.status}") from error
+        require(after == before, f"{name}: slot info changed")
         require(node.request("GET", "/slots/1/info") == restored, f"{name}: another slot changed")
         node.request("POST", "/slots/0?action=save", {"filename": "after.bin"})
         require((slots / "after.bin").read_bytes() == before_bytes, f"{name}: native slot bytes changed")
@@ -117,7 +121,12 @@ def run(node, golden, slots):
     require(info["prefix_hash"] == metadata["prefix_hash_n1"], "valid delta hash mismatch")
     # This digest covers the actual HTTP-imported slot file, including tokens, KV rows and recurrent tensors.
     node.request("POST", "/slots/0?action=save", {"filename": "imported.bin"})
-    print("HTTP_IMPORT_STATE " + hashlib.sha256((slots / "imported.bin").read_bytes()).hexdigest(), flush=True)
+    imported_bytes = (slots / "imported.bin").read_bytes()
+    print("HTTP_IMPORT_STATE " + hashlib.sha256(imported_bytes).hexdigest(), flush=True)
+    # A separate reference build must apply the same verified bytes on the HTTP path, including unused tensor rows.
+    if reference_slot is not None:
+        require(imported_bytes == reference_slot.read_bytes(), "test_http_import_matches_reference_slot: applied slot bytes differ")
+        print("PASS test_http_import_matches_reference_slot", flush=True)
     node.request("POST", "/slots/1?action=save", {"filename": "neighbor-after-valid.bin"})
     require((slots / "neighbor-after-valid.bin").read_bytes() == neighbor_bytes, "valid append changed neighbor native bytes")
     # Slot 0 imports a real prefix+delta; slot 1 prefills locally on the same CPU backend.
@@ -337,7 +346,10 @@ def main():
     parser.add_argument("--distribution-checker", help="Defaults to llama-hybrid-check-distributions beside --binary")
     parser.add_argument("--golden", required=True, help="Golden filename stem, e.g. .../prompt-512")
     parser.add_argument("--artifacts", required=True)
+    parser.add_argument("--reference-slot", type=Path, help="Compare imported native bytes with a separate reference build's imported.bin")
     args = parser.parse_args()
+    if args.reference_slot is not None:
+        require(args.reference_slot.is_file(), "reference slot file missing")
     directory = Path(args.artifacts).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     slots = directory / "slots"
@@ -367,7 +379,7 @@ def main():
                     time.sleep(0.1)
             else:
                 raise AssertionError("server startup timed out")
-            run(node, Path(args.golden), slots)
+            run(node, Path(args.golden), slots, args.reference_slot)
             if args.prefill_binary:
                 checker = args.distribution_checker or str(Path(args.binary).resolve().with_name("llama-hybrid-check-distributions"))
                 require(Path(checker).is_file(), "build llama-hybrid-check-distributions for the real proxy checks")
