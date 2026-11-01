@@ -118,6 +118,20 @@ static void run(llm_arch arch, bool unified) {
     catch (const std::runtime_error & error) { refused = std::string(error.what()) == "unsupported hybrid architecture"; }
     require(refused, "unknown native architecture accepted");
     model->arch = arch;
+    // Server import admission uses the same gate, including for otherwise valid standard-SWA models.
+    for (auto admitted : {LLM_ARCH_QWEN35, LLM_ARCH_GEMMA4, LLM_ARCH_MUSE_GLIMMER}) {
+        model->arch = admitted;
+        hybrid::require_supported_architecture(model.get());
+    }
+    for (auto denied : {LLM_ARCH_UNKNOWN, LLM_ARCH_LLAMA, LLM_ARCH_GEMMA2, LLM_ARCH_GEMMA3, LLM_ARCH_OPENAI_MOE, LLM_ARCH_COHERE2, LLM_ARCH_QWEN35MOE}) {
+        model->arch = denied;
+        refused = false;
+        try { hybrid::require_supported_architecture(model.get()); }
+        catch (const std::runtime_error & error) { refused = std::string(error.what()) == "unsupported hybrid architecture"; }
+        require(refused, "server_import_architecture_admission: unsupported architecture accepted");
+    }
+    model->arch = arch;
+    std::cout << "PASS server_import_architecture_admission\n";
     const auto layout = hybrid::model_layout(model.get());
     std::cout << "LAYOUT " << hybrid::json({{"layout_fingerprint", hybrid::layout_fingerprint(layout)}, {"model_layout", layout}}).dump() << '\n';
     llama_kv_cache_iswa cache(*model, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
@@ -168,16 +182,48 @@ static void run(llm_arch arch, bool unified) {
     // Inject after all full-cache writes are queued and window metadata is replaced; discard must preserve physical state.
     reject("failed_apply_restores_both_caches_exactly", good, 11, false, 2 * cache.get_base()->get_layer_ids().size() + 1);
     reject("failed_apply_truncation_restores_exactly", good.substr(0, good.size() - 1), 11, false);
+    // A post-check failure after both caches change must discard tensor writes and restore both sequences.
+    for (bool bad_length : {false, true}) {
+        const char * name = bad_length ? "postcheck_length_rollback" : "postcheck_endpoint_rollback";
+        const auto bytes = good + (bad_length ? "x" : "");
+        bool checked = false;
+        bool rejected = false;
+        {
+            reader input(bytes);
+            try {
+                cache.state_read_append(input, 0, 8, 11, false, [&] {
+                    checked = true;
+                    require(cache.get_base()->seq_pos_max(0) == 10 && cache.get_swa()->seq_pos_min(0) == 7,
+                            "post-check did not run after both cache updates");
+                    if (input.n_bytes() != bytes.size() || cache.seq_pos_max(0) != (bad_length ? 10 : 11)) {
+                        throw std::runtime_error("append length does not match the declared range");
+                    }
+                });
+            } catch (const std::runtime_error & error) {
+                rejected = std::string(error.what()) == "append length does not match the declared range";
+            }
+        }
+        require(checked && rejected, "post-check did not reject the injected mismatch");
+        require(snapshot(cache) == before && snapshot(cache, 1) == neighbor, name);
+        std::cout << "PASS " << name << '\n';
+    }
     // Validation is read-only; the positive append replaces the complete window, including positions before p0.
     {
         reader input(good, true);
-        cache.state_read_append(input, 0, 8, 11, true);
+        bool checked = false;
+        cache.state_read_append(input, 0, 8, 11, true, [&] { checked = true; });
+        require(!checked, "validation invoked the apply post-check");
         require(input.n_bytes() == good.size(), "validation did not consume both caches");
     }
     require(snapshot(cache) == before, "validation changed state");
     {
         reader input(good);
-        cache.state_read_append(input, 0, 8, 11, false);
+        bool checked = false;
+        cache.state_read_append(input, 0, 8, 11, false, [&] {
+            checked = true;
+            require(input.n_bytes() == good.size() && cache.seq_pos_max(0) == 10, "valid post-check failed");
+        });
+        require(checked, "valid append skipped post-check");
     }
     require(cache.get_base()->seq_pos_min(0) == 0 && cache.get_base()->seq_pos_max(0) == 10, "full prefix lost");
     require(cache.get_swa()->seq_pos_min(0) == 7 && cache.get_swa()->seq_pos_max(0) == 10, "wrong window");

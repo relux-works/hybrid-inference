@@ -3535,10 +3535,18 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
     synchronize();
     auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
     auto read_append = [&](llama_io_read_i & io, bool validate) {
+        auto post_check = [&] {
+            if (io.n_bytes() != size || memory->seq_pos_max(seq_id) != n1 - 1) {
+                throw std::runtime_error("append length does not match the declared range");
+            }
+        };
         if (iswa) {
-            iswa->state_read_append(io, seq_id, n0, n1, validate);
+            iswa->state_read_append(io, seq_id, n0, n1, validate, post_check);
         } else {
             state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_APPEND | (validate ? LLAMA_STATE_SEQ_FLAGS_VALIDATE : 0));
+            if (!validate) {
+                post_check();
+            }
         }
     };
 
@@ -3578,9 +3586,6 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
             throw std::runtime_error("wrong sequence state magic");
         }
         read_append(io, false);
-        if (io.n_bytes() != size || memory->seq_pos_max(seq_id) != n1 - 1) {
-            throw std::runtime_error("append length does not match the declared range");
-        }
         return size;
     } catch (const std::exception & err) {
         io.discard();

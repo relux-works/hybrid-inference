@@ -274,7 +274,7 @@ void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id 
     kv_swa->state_write_range(io, seq_id, std::max<int64_t>(0, (int64_t) p1 - n_swa), p1, flags);
 }
 
-void llama_kv_cache_iswa::state_read_append(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, bool validate) {
+void llama_kv_cache_iswa::state_read_append(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, bool validate, const std::function<void()> & post_check) {
     if (swa_type != LLAMA_SWA_TYPE_STANDARD || n_swa == 0 || seq_id < 0 || p0 < 0 || p1 <= p0 ||
             (int64_t) kv_base->seq_pos_max(seq_id) + 1 != p0 ||
             kv_base->seq_pos_max(seq_id) != kv_swa->seq_pos_max(seq_id)) {
@@ -288,6 +288,9 @@ void llama_kv_cache_iswa::state_read_append(llama_io_read_i & io, llama_seq_id s
     try {
         kv_base->state_read_sinfo(io, seq_id, flags | LLAMA_STATE_SEQ_FLAGS_APPEND, nullptr, nullptr, &base_range);
         kv_swa ->state_read_sinfo(io, seq_id, flags, nullptr, nullptr, &swa_range);
+        if (!validate && post_check) {
+            post_check();
+        }
     } catch (...) {
         io.discard();
         if (!validate) {

@@ -3253,6 +3253,7 @@ private:
                             throw std::runtime_error("Slot token and memory positions differ; context shifting is unsupported");
                         }
                         if (task.type == SERVER_TASK_TYPE_SLOT_IMPORT_DELTA) {
+                            hybrid::require_supported_architecture(llama_get_model(ctx_tgt));
                             if (hybrid_model_hash.empty()) {
                                 throw std::runtime_error("Hybrid model hash was not initialized at startup");
                             }

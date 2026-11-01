@@ -40,10 +40,15 @@ std::string layout_fingerprint(const json & layout) {
     return hex(digest, sizeof(digest));
 }
 
+void require_supported_architecture(const llama_model * model) {
+    require(model->arch == LLM_ARCH_QWEN35 || model->arch == LLM_ARCH_GEMMA4 || model->arch == LLM_ARCH_MUSE_GLIMMER,
+            "unsupported hybrid architecture");
+}
+
 json model_layout(const llama_model * model) {
+    require_supported_architecture(model);
     const auto & hp = model->hparams;
     const bool swa = model->arch == LLM_ARCH_GEMMA4 || model->arch == LLM_ARCH_MUSE_GLIMMER;
-    require(swa || model->arch == LLM_ARCH_QWEN35, "unsupported hybrid architecture");
     const auto & vocab = model->vocab;
     sha256_t hash;
     sha256_init(&hash);
