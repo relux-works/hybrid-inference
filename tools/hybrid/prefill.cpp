@@ -95,7 +95,7 @@ static std::string snapshot(const session & s, const std::string & empty_state) 
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        std::cerr << "usage: llama-hybrid-prefill MODEL.gguf CLIENTS.json [PORT=8091] [N_CTX=8448] [--host ADDRESS] [--gpu-layers N] [--bench] [--max-ctx N=16384] [--ram-budget-mib N=512] [--max-request-mib N=1]\n";
+        std::cerr << "usage: llama-hybrid-prefill MODEL.gguf CLIENTS.json [PORT=8091] [N_CTX=8448] [--host ADDRESS] [--public] [--gpu-layers N] [--bench] [--max-ctx N=16384] [--ram-budget-mib N=512] [--max-request-mib N=1]\n";
         return 2;
     }
     try {
@@ -107,6 +107,7 @@ int main(int argc, char ** argv) {
         std::string host = "127.0.0.1";
         int gpu_layers = 0;
         bool bench = false;
+        bool public_node = false;
         bool context_given = false;
         bool max_ctx_given = false;
         auto number = [](const std::string & text, uint64_t maximum) {
@@ -124,6 +125,7 @@ int main(int argc, char ** argv) {
         for (int i = first_option; i < argc; ++i) {
             const std::string arg(argv[i]);
             if (arg == "--bench") { bench = true; }
+            else if (arg == "--public") { public_node = true; }
             else if (arg == "--host" && i + 1 < argc) { host = argv[++i]; }
             else if (arg == "--gpu-layers" && i + 1 < argc) { gpu_layers = number(argv[++i], 999); }
             else if (arg == "--max-ctx" && i + 1 < argc) {
@@ -137,6 +139,7 @@ int main(int argc, char ** argv) {
             } else { throw std::runtime_error("unknown option"); }
         }
         if (max_ctx_given && !context_given) { n_ctx = max_ctx; }
+        public_node = public_node || (host != "127.0.0.1" && host != "localhost" && host != "::1");
         if (port < 1 || n_ctx < 256 || n_ctx > max_ctx) { throw std::runtime_error("invalid port or context size"); }
         std::ifstream credentials(argv[2]);
         std::string text((std::istreambuf_iterator<char>(credentials)), {});
@@ -185,12 +188,22 @@ int main(int argc, char ** argv) {
         http.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
+            auto owner = owners.find(req.get_header_value("Authorization"));
             if (req.path == "/v1/health") {
-                respond(res, 200, {{"status", "ok"}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
+                json health = {{"status", "ok"}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
                                    {"model_layout", layout}, {"max_ctx", max_ctx}, {"n_ctx", n_ctx},
-                                   {"ram_budget_bytes", ram_budget}, {"ram_bytes", ram_bytes.load()},
-                                   {"sessions", session_count.load()}, {"evictions", evictions.load()},
-                                   {"max_request_bytes", max_request}});
+                                   {"ram_budget_bytes", ram_budget}, {"max_request_bytes", max_request}};
+                if (!public_node || owner != owners.end()) {
+                    health["ram_bytes"] = ram_bytes.load();
+                    health["sessions"] = session_count.load();
+                    health["evictions"] = evictions.load();
+                }
+                respond(res, 200, health);
+                return;
+            }
+            if (owner == owners.end() && (public_node || req.path != "/metrics")) {
+                res.set_header("WWW-Authenticate", "Bearer");
+                respond(res, 401, {{"error", "unauthorized"}});
                 return;
             }
             if (req.path == "/metrics") {
@@ -202,12 +215,6 @@ int main(int argc, char ** argv) {
                                 "\nhybrid_evictions " + std::to_string(evictions.load()) +
                                 "\nhybrid_max_request_bytes " + std::to_string(max_request) +
                                 "\nhybrid_model_info{model_sha256=\"" + model_hash + "\",layout_fingerprint=\"" + fingerprint + "\"} 1\n", "text/plain");
-                return;
-            }
-            auto owner = owners.find(req.get_header_value("Authorization"));
-            if (owner == owners.end()) {
-                res.set_header("WWW-Authenticate", "Bearer");
-                respond(res, 401, {{"error", "unauthorized"}});
                 return;
             }
             if (bench && req.path == "/v1/bench/link") {
@@ -316,10 +323,8 @@ int main(int argc, char ** argv) {
                     hybrid::load_state(ctx.get(), s.state);
                     const auto prefill_started = std::chrono::steady_clock::now();
                     hybrid::prefill(ctx.get(), tokens, n0);
-                    if (bench && req.get_header_value("X-Hybrid-Bench") == "1") {
-                        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefill_started).count();
-                        res.set_header("X-Hybrid-Prefill-Ms", std::to_string(ms));
-                    }
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefill_started).count();
+                    res.set_header("X-Hybrid-Prefill-Ms", std::to_string(ms));
                     std::string wire;
                     if (return_delta) {
                         wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size()));

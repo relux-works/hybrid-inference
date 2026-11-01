@@ -2,6 +2,7 @@
 #include "hybrid-state.h"
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 using hybrid::json;
 static void require(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
@@ -30,6 +31,25 @@ static void codec_tests(size_t max_ctx) {
     std::cout << "PASS layout fingerprint structural mutation controls\n";
     const std::string hash(64, 'a');
     auto h = header(hash, 0, 1, {1});
+    // The writer admits the inclusive body cap and rejects one byte more before allocating a body.
+    hybrid::encode_delta_header(h, hybrid::max_delta_body_bytes);
+    bool oversized_body_rejected = false;
+    try { hybrid::encode_delta_header(h, hybrid::max_delta_body_bytes + 1); }
+    catch (const std::exception & e) { oversized_body_rejected = std::string(e.what()) == "invalid delta size"; }
+    require(oversized_body_rejected, "one-over body accepted");
+    std::cout << "PASS native body cap inclusive and one-over rejection\n";
+    // The 0.8B and 27B reserved chunk maxima pass the node's size gate; one more token exceeds the bound including reserve.
+    for (const auto & geometry : {std::make_pair(size_t(6528), size_t(20201472)), std::make_pair(size_t(34816), size_t(157000000))}) {
+        const size_t slope = geometry.first + 24;
+        const size_t fixed = geometry.second + 1024 * 1024;
+        const size_t chunk = (hybrid::max_delta_body_bytes - fixed) / slope;
+        hybrid::encode_delta_header(h, fixed + chunk * slope);
+        bool one_more_rejected = false;
+        try { hybrid::encode_delta_header(h, fixed + (chunk + 1) * slope); }
+        catch (const std::exception & e) { one_more_rejected = std::string(e.what()) == "invalid delta size"; }
+        require(one_more_rejected, "one-more reserved chunk accepted");
+        std::cout << "PASS reserved chunk boundary: kv=" << geometry.first << " tokens=" << chunk << '\n';
+    }
     auto wire = hybrid::encode_delta(h, "abc");
     require(hybrid::read_delta(wire, hash, 0).state == "abc", "codec positive control");
     require(hybrid::prefix_hash({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty prefix hash");

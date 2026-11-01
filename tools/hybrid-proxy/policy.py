@@ -5,6 +5,15 @@ import math
 from dataclasses import dataclass
 
 
+def extend_chunk_limit(kv_bytes=34816, state_bytes=157_000_000):
+    # One sequence has 24 bytes of native cell metadata per token; reserve 1 MiB for fixed serialization.
+    if (type(kv_bytes) is not int or type(state_bytes) is not int
+            or kv_bytes <= 0 or not 0 <= state_bytes < 511 * 1024**2):
+        raise ValueError("invalid native delta geometry")
+    return min((1024**2 - 4096) // 11,
+               (512 * 1024**2 - state_bytes - 1024**2) // (kv_bytes + 24))
+
+
 @dataclass(frozen=True)
 class Policy:
     local_rates: tuple = ((0, 100.0),)

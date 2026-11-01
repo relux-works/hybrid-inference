@@ -67,8 +67,10 @@ class Node:
 
     def request(self, method, path, body=None, client="a", expected=200, raw=None):
         data = raw if raw is not None else None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"Authorization": "Bearer " + self.clients[client], "Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        if client is not None:
+            headers["Authorization"] = "Bearer " + self.clients.get(client, "invalid-test-credential")
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             response = urllib.request.urlopen(req, timeout=3600)
         except urllib.error.HTTPError as error:
@@ -278,13 +280,33 @@ def test_deep_context(args):
         print(f"PASS test_deep_http: 39999-token delta={len(wire)} bytes, ram_bytes={health['ram_bytes']}; over-context=400", flush=True)
 
 
+def test_public_metrics(args):
+    # Explicit public mode and a non-loopback bind both hide activity from absent/wrong tokens; a valid token still reads it.
+    for name, flags in (("public", ("--public",)), ("public-bind", ("--host", "0.0.0.0"))):
+        with Node(args, name, flags, context="2048") as node:
+            session = node.create()
+            node.extend(session, [100])
+            for client in (None, "wrong"):
+                health = node.request("GET", "/v1/health", client=client)
+                assert health["status"] == "ok" and health["model_sha256"] == node.health["model_sha256"]
+                assert health["layout_fingerprint"] == node.health["layout_fingerprint"]
+                assert not {"sessions", "ram_bytes", "evictions"}.intersection(health)
+                assert node.request("GET", "/metrics", client=client, expected=401) == {"error": "unauthorized"}
+            health = node.request("GET", "/v1/health")
+            assert health["sessions"] == 1 and health["ram_bytes"] > 0
+            metrics = node.request("GET", "/metrics")
+            assert b"hybrid_sessions 1\n" in metrics and b"hybrid_ram_bytes " in metrics
+            node.request("DELETE", session, expected=204)
+            print(f"PASS {name}: public identity only, metrics401 absent/wrong token, authenticated activity available", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--artifacts", required=True)
     parser.add_argument("--requantized")
-    parser.add_argument("--case", choices=("limits", "identity", "deep", "pinned", "requests"), default="limits")
+    parser.add_argument("--case", choices=("limits", "identity", "deep", "pinned", "requests", "public"), default="limits")
     args = parser.parse_args()
     if args.case == "identity":
         test_model_identity(args)
@@ -295,11 +317,14 @@ def main():
     elif args.case == "requests":
         test_request_caps_and_metrics(args)
         test_invalid_limits(args)
+    elif args.case == "public":
+        test_public_metrics(args)
     else:
         test_lru_replay_and_atomic_refusal(args)
         test_pinned_read_and_extend(args)
         test_request_caps_and_metrics(args)
         test_invalid_limits(args)
+        test_public_metrics(args)
 
 
 if __name__ == "__main__":

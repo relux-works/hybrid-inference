@@ -13,7 +13,7 @@ This is research code, not a production service. What has and has not been verif
 ## Branches
 
 `main` is the pinned upstream base `e0f142d5` (llama.cpp, 2026-10-29) plus the prototype: M0 and M0.1 from pull
-request #1, and M0.2, append-only sessions, from pull request #2. Other branches are historical producer branches.
+request #1, and M0.2, append-only sessions, from pull request #2. The local `m1-integrated` branch contains M1 node limits, chunked extends and benchmark integration under review. Other branches are historical producer branches.
 
 ## Components
 
@@ -22,9 +22,20 @@ request #1, and M0.2, append-only sessions, from pull request #2. Other branches
 | `src/` (small patch) | `llama_state_seq_get_data_range` exports the attention KV of positions [p0, p1) plus the recurrent state. `llama_state_seq_set_data_append` validates a delta completely before changing anything, appends it and, on failure, restores only the recurrent state and removes the new positions. |
 | `tools/hybrid/` | Delta codec (section 6 of the specification), prefill node `llama-hybrid-prefill`, native checkers |
 | `tools/server/` (small patch) | `llama-server` endpoints to import a delta into a slot and to read slot state |
+| `tools/hybrid-bench/` | Locked offline-capable launchers, seeded three-mode benchmark, fresh and append-chain numerical checks, sanitized result bundles |
 | `tools/hybrid-proxy/` | Client proxy: maps conversations to server sessions, decides when to offload, keeps a journal for recovery and replay |
 
-## Status (2026-10-30, after M0.2)
+## Status (2026-11-01, M1 prototype under review)
+
+Use the [M1 operator guide](tools/hybrid-bench/README.md) for node deployment, token files, SSH tunneling, client setup, benchmark collection and PID-safe shutdown. Builds always disable both UI sources; use `--offline --model LOCAL.gguf` to prevent model downloads as well. Public listeners require `--public --token-file`; `/metrics` and health activity counters require authentication on public nodes.
+
+M1 adds `--max-ctx` (default 16,384), `--ram-budget-mib` (512), and `--max-request-mib` (1). The launcher derives limits from the chosen context and memory; these limits bound retained state and request bodies, not RSS or transient inference buffers. The node evicts globally least-recently-used idle sessions, pins active responses, and returns `503` with need/budget when an append cannot fit. Rejection is after inference/serialization and preserves existing sessions. An evicted ID returns `404`; the proxy recreates and replays its exact token journal.
+
+Critical chunks use `(512 MiB - recurrent_bytes - 1 MiB) // (kv_bytes_per_token + 24)`, also limited by `(1 MiB - 4096) // 11` for the JSON header. The 24 bytes are native per-cell metadata for one sequence; the 1 MiB reserve covers fixed serialization overhead. The boundary includes this reserve: one more token violates the reserved planning bound, although it can still fit the raw body cap. The launcher writes separate `delta_geometry` values from GGUF metadata; policy cost estimates do not control this safety bound. Without launcher geometry the proxy and benchmark use a conservative 27B bound (34,816 KV bytes/token, 157,000,000 recurrent bytes), safe also for 0.8B (6,528 KV bytes/token, 20,201,472 recurrent bytes). Explicit chunk sizes above the planning bound refuse startup. These are the supported 0.8B/27B geometries; other geometry needs verified `delta_geometry` before use.
+
+The benchmark runs identical seeded schedules in local, hybrid and offload modes, records timing and chunk imports, releases sessions and checks fresh plus append-chain state. Native prefill timing is available without `--bench-link`; that flag controls only the optional link probe. The prior CPU 0.8B run near 40k matched 64/64 in both checks, with mean KL 0.00004021 (fresh) and 0.00011765 (append chain), within section 11. See [r11 evidence](tools/hybrid-bench/RESULTS-hybrid-a-r11-261101.md); r12 revalidation is reported separately. This does not qualify CUDA/Metal or 27B execution.
+
+Exact model SHA-256 is required by default. Experimental `--hetero-quant` (`hetero_quant=true` in the proxy) admits a different SHA only after a matching layout fingerprint; the proxy then rewrites the delta envelope SHA, bypassing the native SHA guard. A layout match establishes shapes only, not base-weight identity or numerical equivalence. Quality is unverified and uncalibrated: the CPU Q4_0 node / Q8_0 client measurement gave mean KL 0.0145 nats/token (above the 0.01 reference) and top-1 62/64. The Q8 file was a requantization of Q4 weights, not an independent higher-precision source. Heterogeneous benchmark results remain uncalibrated even when their measured values meet the reference.
 
 Verified on CPU, same backend, with Qwen3.5-0.8B (arch `qwen35`, the layout of Qwen3.8-27B). Three rounds of
 cross-review between the two producers; the reports are in `tools/hybrid/*.md` and `tools/hybrid-proxy/*.md`.

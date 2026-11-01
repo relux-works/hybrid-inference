@@ -31,9 +31,8 @@ def build(args, targets, info):
             'tracked source changes prevent an exact-ref build; commit them or use a clean checkout')
     build_dir = Path(args.build_dir or source / 'build').expanduser().resolve()
     flags = ['-DCMAKE_BUILD_TYPE=Release', '-DGGML_CUDA=' + ('ON' if args.cuda else 'OFF'),
-             '-DGGML_METAL=' + ('ON' if info['os'] == 'Darwin' else 'OFF'), '-DLLAMA_CURL=OFF']
-    if getattr(args, 'offline', False):
-        flags += ['-DLLAMA_BUILD_UI=OFF', '-DLLAMA_USE_PREBUILT_UI=OFF']
+             '-DGGML_METAL=' + ('ON' if info['os'] == 'Darwin' else 'OFF'), '-DLLAMA_CURL=OFF',
+             '-DLLAMA_BUILD_UI=OFF', '-DLLAMA_USE_PREBUILT_UI=OFF']
     stamp = build_dir / 'hybrid-bench-build.json'
     if args.skip_build:
         require(stamp.is_file(), '--skip-build requires a previous successful benchmark build record')
@@ -120,7 +119,7 @@ def parser():
     p.add_argument('--build-dir')
     p.add_argument('--build-lock')
     p.add_argument('--skip-build', action='store_true')
-    p.add_argument('--offline', action='store_true', help='require a local model and disable UI build/downloads')
+    p.add_argument('--offline', action='store_true', help='require a local model; model downloads are disabled')
     p.add_argument('--port', type=int, default=None)
     p.add_argument('--bind', default='127.0.0.1')
     p.add_argument('--public', action='store_true')
@@ -224,6 +223,8 @@ def main():
                        '--max-request-mib', plan['max_request_mib']]
             if args.bench_link:
                 command.append('--bench')
+            if args.public:
+                command.append('--public')
             os.replace(temporary, state)
             created_state = True
             temporary = None
@@ -252,6 +253,7 @@ def main():
                 slot_path=str(state / 'slots'), slots=1, prefill_timeout=args.request_timeout, decode_timeout=args.request_timeout,
                 clients={credential: dict(id=next(iter(tokens)), prefill_token=next(iter(tokens.values())))},
                 policy=dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes']))
+            config['delta_geometry'] = dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes'])
             config.update(hetero_quant=args.hetero_quant, node_model_sha256=expected,
                           layout_fingerprint=identity['layout_fingerprint'],
                           node_layout_fingerprint=(node or {}).get('layout_fingerprint'))

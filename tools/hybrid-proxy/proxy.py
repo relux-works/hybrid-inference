@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from policy import Policy
+from policy import Policy, extend_chunk_limit
 from concurrency import SessionQueue
 from journal import Capture, JournalConflict, Renderer, matching_messages, segment_range, settings_identity
 from store import Store, prefix_hash
@@ -110,8 +110,7 @@ class Proxy:
         self.decode = Node(config["decode_url"], config.get("decode_token", ""), config.get("decode_timeout", 120))
         self.store = Store(database, self.model)
         self.policy = Policy(**config.get("policy", {}))
-        body_tokens = int((512 * 1024**2 - self.policy.state_bytes - 1024**2) // max(1, self.policy.kv_bytes))
-        safe_chunk = min((1024**2 - 4096) // 11, body_tokens)
+        safe_chunk = extend_chunk_limit(**config.get("delta_geometry", {}))
         self.extend_chunk_tokens = config.get("extend_chunk_tokens", safe_chunk)
         if type(self.extend_chunk_tokens) is not int or not 1 <= self.extend_chunk_tokens <= safe_chunk:
             raise ValueError("extend_chunk_tokens exceeds delta body/header bound")

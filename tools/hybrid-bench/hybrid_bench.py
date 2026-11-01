@@ -21,6 +21,9 @@ import uuid
 
 from bench_common import (Refusal, http, private_json, read_private, require, sha256, validate_identity, start_process)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
+from policy import extend_chunk_limit
+
 # Measurement export v0.10, generated 2026-10-30, stats.json, agents.all.
 # Source SHA-256 binds the copied aggregates; no original conversations are used or read at runtime.
 PROVENANCE = dict(source='measurement export v0.10 / 2026-10-30 / stats.json / agents.all',
@@ -146,8 +149,9 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
     try:
         # Replay the run's append endpoints, including intervening shadow tokens, into an isolated session.
         ends = sorted(set([n for n in (boundaries or []) if 0 < n < len(tokens)] + [len(tokens) - 1]))
-        chunk = config.get('extend_chunk_tokens', max(1, min((1024**2 - 4096) // 11,
-            int((512 * 1024**2 - client['sizing']['recurrent_state_bytes'] - 1024**2) // client['sizing']['kv_bytes_per_token']))))
+        safe_chunk = extend_chunk_limit(**config.get('delta_geometry', {}))
+        chunk = config.get('extend_chunk_tokens', safe_chunk)
+        require(type(chunk) is int and 1 <= chunk <= safe_chunk, 'extend chunk exceeds native delta bound')
         n0 = 0
         paths = []
         import struct
@@ -232,7 +236,8 @@ def mode_session(config, client, sid, rows, mode):
             except urllib.error.HTTPError as error:
                 if error.code != 404:
                     raise
-            health = http(config['prefill_url'], '/v1/health', timeout=5)
+            token = next(iter(config['clients'].values()))['prefill_token']
+            health = http(config['prefill_url'], '/v1/health', token, timeout=5)
             rows.append(dict(stage='release', mode=mode, status='released',
                              node_sessions=health.get('sessions'), node_ram_bytes=health.get('ram_bytes'),
                              node_evictions=health.get('evictions')))
@@ -326,7 +331,6 @@ def main():
             rows.append(link_probe(config))
         else:
             rows.append(dict(stage='link', status='skipped', reason='node launcher --bench-link not enabled'))
-            skipped += 1
         limit = min(client['context'], node['context'])
         credential = config['client_credential']
         def decode(path, data=None):

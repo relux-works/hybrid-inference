@@ -5,6 +5,7 @@ import unittest
 
 import test_proxy
 from proxy import HTTPError, Node, Proxy
+from policy import extend_chunk_limit
 from store import prefix_hash
 
 
@@ -15,6 +16,28 @@ class BenchmarkProxyTests(unittest.TestCase):
 
     def tearDown(self):
         self.fixture.tearDown()
+
+    # A direct proxy uses the 27B-safe bound independently of cost estimates; explicit geometry admits its maximum and rejects one more.
+    def test_native_chunk_startup_bound(self):
+        import tempfile
+        from pathlib import Path
+        config = dict(self.fixture.config)
+        config['policy'] = dict(kv_bytes=1, state_bytes=0)
+        for geometry in ({}, dict(kv_bytes=6528, state_bytes=20201472)):
+            safe = extend_chunk_limit(**geometry)
+            config['delta_geometry'] = geometry
+            with tempfile.TemporaryDirectory() as directory:
+                config.pop('extend_chunk_tokens', None)
+                app = Proxy(config, str(Path(directory) / 'default.sqlite'))
+                self.assertEqual(app.extend_chunk_tokens, safe)
+                app.store.close()
+                config['extend_chunk_tokens'] = safe
+                app = Proxy(config, str(Path(directory) / 'maximum.sqlite'))
+                self.assertEqual(app.extend_chunk_tokens, safe)
+                app.store.close()
+                config['extend_chunk_tokens'] = safe + 1
+                with self.assertRaisesRegex(ValueError, 'delta body/header bound'):
+                    Proxy(config, str(Path(directory) / 'over.sqlite'))
 
     # Benchmark headers have no authority unless the operator enables them; invalid modes also refuse.
     def test_switch_requires_opt_in(self):

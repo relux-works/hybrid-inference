@@ -16,6 +16,7 @@ sys.path[:0] = [str(ROOT / 'tools/hybrid'), str(ROOT / 'tools/hybrid-proxy')]
 from bench_common import context_plan, host_info, model_identity, private_json, sha256
 from native_fixture import native_server
 from proxy import Handler, Node, Proxy
+from policy import extend_chunk_limit
 from store import prefix_hash
 from test_limits import Node as PrefillNode
 
@@ -52,6 +53,72 @@ def test_native_defaults(args):
         assert health['sessions'] == health['ram_bytes'] == health['evictions'] == 0
         (Path(args.artifacts) / 'default-node/result.json').write_text(json.dumps(health, indent=2))
         print('PASS native defaults: allocation8448, max_ctx16384, retained512MiB, request1MiB, empty store', flush=True)
+
+
+def test_prefill_timing(args, decode, slots):
+    # A complete forced-offload benchmark has real timing with and without the optional link endpoint, with no fallback or leaked session.
+    for enabled in (False, True):
+        name = 'timing-link' if enabled else 'timing-no-link'
+        with PrefillNode(args, name, ('--bench',) if enabled else (), context='2048') as prefill:
+            root = Path(args.artifacts) / (name + '-proxy')
+            root.mkdir()
+            with proxy_server(args, root, prefill, decode, slots) as (app, client, config):
+                identity = model_identity(args.model)
+                info = dict(model_sha256=config['model_sha256'], context=2048, backend='cpu', bench_link=enabled, **identity)
+                private_json(root / 'proxy-config.json', config)
+                private_json(root / 'client-info.json', dict(info, proxy_url=client.url))
+                private_json(root / 'node-info.json', info)
+                command = [sys.executable, str(ROOT / 'tools/hybrid-bench/hybrid_bench.py'), '--client-state', str(root),
+                    '--scratch', str(root), '--output', str(root), '--label', name, '--smoke', '--depths', '128', '--modes', 'offload']
+                with (root / 'benchmark.log').open('wb') as log:
+                    process = subprocess.Popen(command, stdout=log, stderr=log)
+                    (root / 'benchmark.pid').write_text(str(process.pid))
+                    try:
+                        code = process.wait(timeout=180)
+                    finally:
+                        if process.poll() is None:
+                            process.terminate()
+                            process.wait(timeout=15)
+                rows = [json.loads(line) for line in next(root.glob('hybrid-bench-*.jsonl')).read_text().splitlines()]
+                (root / 'result.json').write_text(json.dumps(dict(command=command, exit_code=code, rows=rows), indent=2))
+                assert code == 0, (name, code, rows[-1])
+                calls = [row for row in rows if row.get('stage') == 'call']
+                assert len(calls) == 4 and all(row['path'] == 'offload' and row['server_prefill_ms'] is not None for row in calls)
+                link = next(row for row in rows if row.get('stage') == 'link')
+                assert link['status'] == ('passed' if enabled else 'skipped')
+                assert rows[-1]['status'] == 'passed' and rows[-1]['aborted'] == rows[-1]['skipped'] == 0
+                release = next(row for row in rows if row.get('stage') == 'release')
+                assert release['node_sessions'] == release['node_ram_bytes'] == 0
+                print(f'PASS {name}: benchmark exit0, four timed offloads, link={link["status"]}, zero retained sessions', flush=True)
+
+
+def test_native_chunk_slope(args):
+    # Two actual delta bodies establish the 0.8B affine size; extrapolation admits the reserved maximum and exposes the old cap overflow.
+    with PrefillNode(args, 'chunk-slope', context='2048') as prefill:
+        session = prefill.create()
+        sizes = []
+        previous = []
+        for count in (256, 1024):
+            wire = prefill.extend(session, [100] * count, previous, delta=True)
+            header_size, = struct.unpack_from('<I', wire)
+            sizes.append(len(wire) - header_size - 52)
+            previous += [100] * count
+        slope = (sizes[1] - sizes[0]) // (1024 - 256)
+        assert sizes[1] - sizes[0] == slope * (1024 - 256) and slope == 6552
+        fixed = sizes[0] - slope * 256
+        plan = context_plan(args.model, host_info(), 2048, True)
+        state = plan['recurrent_state_bytes']
+        chunk = extend_chunk_limit(plan['kv_bytes_per_token'], state)
+        cap, reserve = 512 * 1024**2, 1024**2
+        assert fixed - state < reserve and fixed + slope * chunk <= cap
+        assert state + reserve + slope * chunk <= cap < state + reserve + slope * (chunk + 1)
+        old = (cap - state - reserve) // plan['kv_bytes_per_token']
+        assert fixed + slope * old > cap
+        result = dict(sizes=sizes, slope=slope, fixed=fixed, planned_chunk=chunk, planned_body=fixed + slope * chunk,
+                      old_chunk=old, old_body=fixed + slope * old, cap=cap, reserve=reserve,
+                      limit='maximum extrapolated from real short deltas; no 79k-token prefill')
+        (Path(args.artifacts) / 'chunk-slope/result.json').write_text(json.dumps(result, indent=2))
+        print('PASS native chunk slope: ' + json.dumps(result), flush=True)
 
 
 def test_eviction_replay(args, decode, slots):
@@ -148,16 +215,24 @@ def main():
     parser.add_argument('--server-binary', required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--artifacts', required=True)
+    parser.add_argument('--case', choices=('all', 'timing', 'chunk'), default='all')
     args = parser.parse_args()
     args.model = str(Path(args.model).resolve())
     args.binary = str(Path(args.prefill_binary).resolve())
     root = Path(args.artifacts).resolve()
     root.mkdir(parents=True, exist_ok=False)
     args.artifacts = str(root)
-    test_native_defaults(args)
+    if args.case == 'chunk':
+        test_native_chunk_slope(args)
+        return
+    if args.case == 'all':
+        test_native_defaults(args)
+        test_native_chunk_slope(args)
     with native_server(args.server_binary, args.model, root / 'decoder') as (decode, slots):
-        test_eviction_replay(args, decode, slots)
-        test_budget_benchmark(args, decode, slots)
+        test_prefill_timing(args, decode, slots)
+        if args.case == 'all':
+            test_eviction_replay(args, decode, slots)
+            test_budget_benchmark(args, decode, slots)
 
 
 if __name__ == '__main__':

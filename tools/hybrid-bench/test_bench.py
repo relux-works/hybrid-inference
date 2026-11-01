@@ -12,6 +12,7 @@ import bench_common as common
 import manage
 import hybrid_bench
 from hybrid_bench import classify_equivalence, PROVENANCE, bundle, quantile_sample, schedule, verify_meter
+from policy import extend_chunk_limit
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -23,16 +24,18 @@ class BenchmarkTests(unittest.TestCase):
                 manage.build(args, ['llama-hybrid-prefill'], {})
             run.assert_not_called()
 
-    # Offline builds explicitly disable both UI sources; an offline download request never reaches preflight.
+    # Both build modes disable UI downloads; offline model-download requests refuse before preflight.
     def test_offline_build_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = argparse.Namespace(ref='HEAD', state=str(root / 'state'), build_dir=str(root / 'build'), build_lock=str(root / 'build.lock'), cuda=False, skip_build=False, offline=True)
             (root / 'build').mkdir()
-            with mock.patch.object(manage, 'output', side_effect=['a' * 40, 'a' * 40, '']), mock.patch.object(manage, 'compile_targets', return_value={}) as compile:
-                manage.build(args, [], dict(os='Linux'))
-            self.assertIn('-DLLAMA_BUILD_UI=OFF', compile.call_args.args[3])
-            self.assertIn('-DLLAMA_USE_PREBUILT_UI=OFF', compile.call_args.args[3])
+            for offline in (True, False):
+                args.offline = offline
+                with mock.patch.object(manage, 'output', side_effect=['a' * 40, 'a' * 40, '']), mock.patch.object(manage, 'compile_targets', return_value={}) as compile:
+                    manage.build(args, [], dict(os='Linux'))
+                self.assertIn('-DLLAMA_BUILD_UI=OFF', compile.call_args.args[3])
+                self.assertIn('-DLLAMA_USE_PREBUILT_UI=OFF', compile.call_args.args[3])
         with mock.patch('sys.argv', ['manage.py', 'node', '--state', 'fixture', '--offline', '--hf-repo', 'fixture']), mock.patch.object(manage, 'preflight') as preflight:
             with self.assertRaisesRegex(common.Refusal, 'offline requires --model'):
                 manage.main()
@@ -150,14 +153,28 @@ class BenchmarkTests(unittest.TestCase):
     # Successful mode cleanup records live store counters after DELETE, without requiring an otherwise idle node.
     def test_mode_release_metrics(self):
         rows = []
-        config = dict(client_credential='fixture', prefill_url='http://node')
+        config = dict(client_credential='fixture', prefill_url='http://node', clients={'fixture': dict(prefill_token='fixture')})
         response = mock.MagicMock()
         with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', return_value=response) as delete, mock.patch.object(hybrid_bench, 'http', return_value=dict(sessions=0, ram_bytes=0, evictions=2)) as health:
             with hybrid_bench.mode_session(config, dict(proxy_url='http://proxy'), 'fixture', rows, 'offload'):
                 self.assertFalse(rows)
             self.assertEqual(delete.call_args.args[0].method, 'DELETE')
-            health.assert_called_once_with('http://node', '/v1/health', timeout=5)
+            health.assert_called_once_with('http://node', '/v1/health', 'fixture', timeout=5)
         self.assertEqual(rows, [dict(stage='release', mode='offload', status='released', node_sessions=0, node_ram_bytes=0, node_evictions=2)])
+
+    # Each geometry fits with the 1 MiB reserve; one more token violates that reserved bound. Old divisors exceed even the raw cap.
+    def test_native_chunk_boundaries(self):
+        cap, reserve = 512 * 1024**2, 1024**2
+        for kv, state in ((6528, 20201472), (34816, 157000000)):
+            chunk = extend_chunk_limit(kv, state)
+            self.assertLessEqual(state + reserve + chunk * (kv + 24), cap)
+            self.assertGreater(state + reserve + (chunk + 1) * (kv + 24), cap)
+            old_chunk = (cap - state - reserve) // (6528 if kv == 6528 else 32768)
+            self.assertGreater(state + old_chunk * (kv + 24), cap)
+        self.assertEqual(extend_chunk_limit(), extend_chunk_limit(34816, 157000000))
+        for kv, state in ((0, 0), (1, -1), (1.5, 0), (1, cap)):
+            with self.assertRaisesRegex(ValueError, 'native delta geometry'):
+                extend_chunk_limit(kv, state)
 
     # Cross-backend metrics are uncalibrated with exit 5 on both sides of the reference threshold.
     def test_cross_backend_classification(self):
