@@ -135,7 +135,7 @@ def preflight(cuda=False, node=False):
     return info
 
 
-def model_metadata(path):
+def model_metadata(path, tensor_info=False):
     """Read bounded GGUF metadata, skipping tokenizer arrays without retaining their content."""
     formats = {0: 'B', 1: 'b', 2: 'H', 3: 'h', 4: 'I', 5: 'i', 6: 'f', 7: '?', 10: 'Q', 11: 'q', 12: 'd'}
     size = Path(path).stat().st_size
@@ -175,13 +175,13 @@ def model_metadata(path):
                     result.append(item)
             return result if keep else None
         require(raw(4) == b'GGUF' and scalar('I') == 3, 'GGUF v3 model required')
-        scalar('Q')
+        tensor_count = scalar('Q')
         count = scalar('Q')
         require(count <= 100_000, 'GGUF metadata count too large')
         metadata = {}
         for _ in range(count):
             key, kind = string(), scalar('I')
-            keep = key in ('general.architecture', 'general.file_type') or key.startswith(('qwen35.', 'qwen35moe.'))
+            keep = key in ('general.architecture', 'general.file_type', 'mirai.version') or key.startswith(('qwen35.', 'qwen35moe.'))
             if key == 'tokenizer.ggml.tokens':
                 require(kind == 9 and scalar('I') == 8, 'invalid GGUF token array')
                 token_count = scalar('Q')
@@ -197,23 +197,126 @@ def model_metadata(path):
             item = value(kind, keep)
             if keep:
                 metadata[key] = item
+        if tensor_info and (metadata.get('qwen35.nextn_predict_layers', 0) or 'mirai.version' in metadata):
+            require(tensor_count <= 100_000, 'GGUF tensor count too large')
+            tensors = {}
+            for _ in range(tensor_count):
+                name, dims = string(), scalar('I')
+                require(name not in tensors and 1 <= dims <= 4, 'invalid GGUF tensor descriptor')
+                shape = [scalar('Q') for _ in range(dims)]
+                kind, offset = scalar('I'), scalar('Q')
+                require(all(0 < n <= 2**31 for n in shape), 'invalid GGUF tensor shape')
+                tensors[name] = (shape, kind)
+            metadata['_tensors'] = tensors
     return metadata
 
 
+def qwen_trunk(meta):
+    raw = meta.get('qwen35.block_count')
+    nextn = meta.get('qwen35.nextn_predict_layers', 0)
+    require(type(raw) is int and 0 < raw <= 512, 'invalid layout layer count')
+    require(type(nextn) is int and 0 <= nextn < raw, 'invalid nextn layer count')
+    for key in ('attention.head_count', 'attention.head_count_kv', 'attention.key_length',
+                'attention.value_length', 'feed_forward_length'):
+        if 'qwen35.' + key not in meta and not nextn:
+            continue
+        value = meta['qwen35.' + key]
+        values = value if isinstance(value, list) else [value]
+        require(not isinstance(value, list) or len(value) == raw, 'invalid raw layer array: ' + key)
+        require(all(type(v) is int and v > 0 for v in values), 'invalid layout key: ' + key)
+    recurrent = meta.get('qwen35.attention.recurrent_layers')
+    if recurrent is None:
+        interval = meta.get('qwen35.full_attention_interval', 4)
+        require(type(interval) is int and interval > 0, 'invalid attention interval')
+        recurrent = [i < raw - nextn and (i + 1) % interval != 0 for i in range(raw)]
+    require(isinstance(recurrent, list) and len(recurrent) == raw and
+            all(type(v) is bool for v in recurrent), 'invalid recurrent layout')
+    require(not any(recurrent[raw - nextn:]), 'recurrent MTP layer is unsupported')
+    if nextn or 'mirai.version' in meta:
+        validate_qwen_nextn_tensors(meta, raw - nextn, recurrent)
+    return raw - nextn, recurrent[:raw - nextn]
+
+
+def validate_qwen_nextn_tensors(meta, trunk, recurrent):
+    tensors = dict(meta['_tensors'])
+    def value(key, i=0):
+        v = meta['qwen35.' + key]
+        return v[i] if isinstance(v, list) else v
+    def tensor(name, shape, optional=False):
+        item = tensors.pop(name, None)
+        require(item is not None or optional, 'missing trunk/MTP tensor: ' + name)
+        if item is None:
+            return
+        dims, kind = item
+        require(dims == shape, 'wrong tensor shape: ' + name)
+        if kind in (90, 91, 92, 93):
+            require(len(shape) == 2 and shape[1] % 32 == 0, 'invalid Mirai row group: ' + name)
+            scale = tensors.pop(name.removesuffix('.weight') + '.scale', None)
+            require(scale == ([shape[1]], 0), 'invalid Mirai row scale: ' + name)
+        elif name.endswith('.weight'):
+            scale = tensors.pop(name.removesuffix('.weight') + '.scale', None)
+            require(scale is None or scale == ([1], 0), 'invalid tensor scale: ' + name)
+    embd = value('embedding_length')
+    vocab = meta['vocab_size']
+    tensor('token_embd.weight', [embd, vocab])
+    tensor('output_norm.weight', [embd])
+    tensor('output.weight', [embd, vocab], True)
+    for i in range(len(recurrent)):
+        prefix = f'blk.{i}.'
+        mtp = i >= trunk
+        if mtp and not any(name.startswith(prefix) for name in tensors):
+            continue
+        ff = value('feed_forward_length', i)
+        for name in ('attn_norm', 'post_attention_norm'):
+            tensor(prefix + name + '.weight', [embd])
+        for name, shape in (('ffn_gate', [embd, ff]), ('ffn_up', [embd, ff]), ('ffn_down', [ff, embd])):
+            tensor(prefix + name + '.weight', shape)
+        if not recurrent[i]:
+            head_k, head_v = value('attention.key_length', i), value('attention.value_length', i)
+            q = head_k * value('attention.head_count', i)
+            k = head_k * value('attention.head_count_kv', i)
+            v = head_v * value('attention.head_count_kv', i)
+            split = not mtp and prefix + 'attn_gate.weight' in tensors
+            if prefix + 'attn_qkv.weight' in tensors:
+                tensor(prefix + 'attn_qkv.weight', [embd, q * (1 if split else 2) + k + v])
+            else:
+                for name, width in (('attn_q', q * (1 if split else 2)), ('attn_k', k), ('attn_v', v)):
+                    tensor(prefix + name + '.weight', [embd, width])
+            if split:
+                tensor(prefix + 'attn_gate.weight', [embd, q])
+            tensor(prefix + 'attn_output.weight', [head_v * value('attention.head_count', i), embd])
+            tensor(prefix + 'attn_q_norm.weight', [head_k])
+            tensor(prefix + 'attn_k_norm.weight', [head_k])
+        else:
+            state, groups, rank = value('ssm.state_size'), value('ssm.group_count'), value('ssm.time_step_rank')
+            conv = state * (2 * groups + rank)
+            for name, shape in (('attn_qkv.weight', [embd, conv]), ('attn_gate.weight', [embd, state * rank]),
+                                ('ssm_conv1d.weight', [value('ssm.conv_kernel'), conv]), ('ssm_dt.bias', [rank]),
+                                ('ssm_a', [rank]), ('ssm_beta.weight', [embd, rank]), ('ssm_alpha.weight', [embd, rank]),
+                                ('ssm_norm.weight', [state]), ('ssm_out.weight', [state * rank, embd])):
+                tensor(prefix + name, shape)
+        if mtp:
+            for name, shape in (('eh_proj', [2 * embd, embd]), ('enorm', [embd]), ('hnorm', [embd])):
+                tensor(prefix + 'nextn.' + name + '.weight', shape)
+            for name, shape in (('shared_head_norm', [embd]), ('embed_tokens', [embd, vocab]), ('shared_head_head', [embd, vocab])):
+                tensor(prefix + 'nextn.' + name + '.weight', shape, True)
+    if meta.get('mirai.version') is not None:
+        for width, order in ((5120, 5), (6144, 3), (17408, 17)):
+            require(tensors.pop(f'mirai.rot.{width}', None) == ([width + order * order], 0), 'invalid Mirai rotation')
+        require(tensors.pop('mirai.head_aux', None) == ([embd + 16], 0), 'invalid Mirai head auxiliary tensor')
+    require(not tensors, 'unknown extra tensors: ' + ', '.join(sorted(tensors)[:3]))
+
+
 def model_identity(path):
-    meta = model_metadata(path)
+    return model_identity_from_metadata(model_metadata(path, tensor_info=True))
+
+
+def model_identity_from_metadata(meta):
     arch = meta['general.architecture']
     require(arch == 'qwen35', 'layout identity supports dense qwen35 only')
     def get(key):
         return meta[arch + '.' + key]
-    count = get('block_count')
-    require(type(count) is int and 0 < count <= 1024, 'invalid layout layer count')
-    recurrent = meta.get(arch + '.attention.recurrent_layers')
-    if recurrent is None:
-        interval = meta.get(arch + '.full_attention_interval', 4)
-        require(type(interval) is int and interval > 0, 'invalid attention interval')
-        recurrent = [(i + 1) % interval != 0 for i in range(count)]
-    require(isinstance(recurrent, list) and len(recurrent) == count, 'invalid recurrent layout')
+    count, recurrent = qwen_trunk(meta)
     def layer_value(key, i):
         value = get(key)
         return value[i] if isinstance(value, list) else value
@@ -241,22 +344,16 @@ def validate_identity(digest, identity, expected, node_identity, hetero=False):
 
 
 def context_plan(model, info, requested=None, client=False):
-    meta = model_metadata(model)
+    meta = model_metadata(model, tensor_info=True)
     arch = meta.get('general.architecture')
     require(arch == 'qwen35', 'automatic sizing currently supports qwen35 dense hybrid GGUF only')
     def get(name):
         value = meta.get(arch + '.' + name)
         require(isinstance(value, int) and value > 0, 'missing or invalid GGUF sizing key: ' + name)
         return value
-    layers, inner, state = get('block_count'), get('ssm.inner_size'), get('ssm.state_size')
-    recurrent = meta.get(arch + '.attention.recurrent_layers')
-    if recurrent is None:
-        interval = meta.get(arch + '.full_attention_interval', 4)
-        require(isinstance(interval, int) and interval > 0, 'invalid full attention interval')
-        attn = layers // interval
-    else:
-        require(isinstance(recurrent, list) and len(recurrent) == layers, 'invalid recurrent layer table')
-        attn = sum(not v for v in recurrent)
+    layers, recurrent = qwen_trunk(meta)
+    inner, state = get('ssm.inner_size'), get('ssm.state_size')
+    attn = sum(not v for v in recurrent)
     head_k, head_v, heads = get('attention.key_length'), get('attention.value_length'), get('attention.head_count_kv')
     require(head_k % 32 == 0 and head_v % 32 == 0 and attn > 0, 'unsupported q8_0 cache geometry')
     kv = attn * heads * (head_k + head_v) * 34 // 32

@@ -49,7 +49,7 @@ class BenchmarkTests(unittest.TestCase):
                 with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={'backend': 'cpu'}), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(root / 'model', 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=dict(plan)), mock.patch.object(manage, 'model_identity', return_value=identity), mock.patch.object(manage, 'http', return_value=dict(model_sha256='a' * 64)), mock.patch.object(manage, 'build', return_value=(root / 'build', record)), mock.patch.object(manage, 'start_process') as start, mock.patch.object(manage, 'wait_health'):
                     self.assertEqual(manage.main(), 0)
                 command = start.call_args_list[0].args[0]
-                for flag, expected in (('-b', batch), ('-ub', ubatch), ('-ngl', 0), ('-np', 1), ('-ctk', 'q8_0')):
+                for flag, expected in (('-b', batch), ('-ub', ubatch), ('-ngl', 0), ('-np', 1), ('-ctk', 'q8_0'), ('--spec-type', 'none')):
                     self.assertEqual(command[command.index(flag) + 1], expected)
                 info = common.read_private(state / 'client-info.json')
                 self.assertEqual((info['batch'], info['ubatch']), (batch, ubatch))

@@ -7,3 +7,4 @@
 - The synthetic ladder is one growing conversation per mode, not the section-11 50-prompt matrix, multi-client contention, realistic networks or a production security audit.
 - The default proxy policy uses estimated prefill/link rates. Operator calibration is required before performance/economic conclusions. Report the active policy with any comparative analysis.
 - The capacity table uses explicit packing assumptions, not downloaded model sizes. Actual GGUF metadata and available memory take precedence.
+- Mirai S port r1 has CPU kernel/header-fixture evidence only. CUDA compilation and moderate-context greedy-token parity against alesha-pro fdb1e815db remain GPU-host gates; no quality ranking, real 27B state import or heterogeneous quality result is claimed. The unrelated source-fork FA/GDN/text-cache optimizations were omitted. See RESULTS-hybrid-c-r1-261101.md.

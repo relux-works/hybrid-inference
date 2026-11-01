@@ -3,6 +3,20 @@
 
 Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF`, then build the named targets listed in the [node guide](tools/hybrid/README.md). The [M1 operator guide](tools/hybrid-bench/README.md) provides deployment, client setup and benchmark commands; its launchers always disable the unused UI download.
 
+Mirai S trellis support is ported from [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s); see [format and provenance](tools/mirai-s/README.md). CPU and CUDA kernels are included; Metal is unsupported.
+
+Mirai prototype tools (CPU checks use existing local headers and never download weights):
+
+| Tool | Command | Output |
+|---|---|---|
+| CMake and C++ compiler | `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF -DGGML_CUDA=OFF` then `cmake --build build --target test-backend-ops llama-hybrid-check-identity -j 2` | `build/bin/` |
+| Backend tests | `OMP_NUM_THREADS=2 nice -n 10 build/bin/test-backend-ops test -b CPU -o MIRAI_MUL_MAT` | Terminal |
+| Python identity fixtures | `python3 tools/hybrid-bench/test_mirai_identity.py` | Terminal; native cases skipped without local headers |
+| Native header fixtures (glibc) | `python3 tools/hybrid-bench/test_mirai_identity.py --binary build/bin/llama-hybrid-check-identity --headers /path/to/headers --artifacts .temp/mirai-identity` | `.temp/mirai-identity/` |
+| Native model identity | `build/bin/llama-hybrid-check-identity /path/to/model.gguf` | JSON layout and fingerprint, no weight allocation |
+
+Set `TMPDIR` to an existing disk directory for builds and tests. The header hashes and metadata-only fixtures are recorded in `tools/hybrid-bench/fixtures/mirai-s-headers.json`.
+
 Everything below is the upstream llama.cpp README.
 
 # llama.cpp
