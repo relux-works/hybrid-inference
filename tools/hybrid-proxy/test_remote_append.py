@@ -105,6 +105,7 @@ def main():
 
                 # Offloaded append applies only the new suffix: remote N-1, local held token 1, exact token/hash journal.
                 app.policy = Policy(always=True)
+                app.extend_chunk_tokens = 8
                 history = copy.deepcopy(rewritten["journal"]["messages"])
                 history.append(dict(role="user", content="Continue counting decimal integers from 200 to 300."))
                 appended = chat(dict(body, messages=history), initial["id"])
@@ -139,6 +140,37 @@ def main():
                 (root / "results.json").write_text(json.dumps(dict(initial=initial, rewritten=rewritten,
                     appended=appended, child=child), indent=2))
                 print("PASS real fallback: explicit409/native bytes unchanged; inferred child uses fresh remote", flush=True)
+
+                # A budget rejection on the second chunk retains the first native import and permits exact replay recovery.
+                original_remote_factory = app.remote
+                failures = []
+                class FaultNode(Node):
+                    def request(self, method, path, data=None, headers=None, binary=False):
+                        if method == "POST" and path.endswith("/extend") and data.get("return_delta"):
+                            failures.append(data["n0"])
+                            if len(failures) == 2:
+                                raise HTTPError(503, b'{"error":"ram budget","need":100,"budget":50}')
+                        return super().request(method, path, data, headers, binary)
+                app.remote = lambda c: FaultNode(app.prefill, c["prefill_token"], app.timeout)
+                app.benchmark = True
+                try:
+                    result = client.request("POST", "/v1/chat/completions", dict(body, max_tokens=4),
+                        {"X-Hybrid-Session": "fault-chain", "X-Hybrid-Bench-Mode": "offload"})
+                    trace = result["hybrid_bench"]
+                    require(len(failures) == 2 and trace["chunks"][0]["status"] == "imported" and
+                            trace["fallback_reason"] == "ram_budget", "middle-chunk control did not reach the intended refusal")
+                    require(trace["remote_applied"] == 8 and trace["prefilled"] == trace["new_tokens"],
+                            "middle-chunk fallback lost or re-prefilled its native prefix")
+                finally:
+                    app.remote = original_remote_factory
+                with app.reserve("fault-chain"):
+                    recovered = app.store.get("fault-chain")
+                current = decode.request("GET", f"/slots/{recovered['slot']}/info")
+                require(current["tokens"] == recovered["tokens"], "middle-chunk local fallback lost token identity")
+                recovered, current = replayed(recovered)
+                require(current["prefix_hash"] == prefix_hash(recovered["tokens"]), "middle-chunk remote replay lost token identity")
+                (root / "fault-results.json").write_text(json.dumps(dict(trace=trace, recovered=recovered), indent=2))
+                print("PASS real middle-chunk budget refusal: first8 imported, local continuation and remote replay agree", flush=True)
         finally:
             if server:
                 server.shutdown()

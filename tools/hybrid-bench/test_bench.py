@@ -10,7 +10,8 @@ from unittest import mock
 
 import bench_common as common
 import manage
-from hybrid_bench import PROVENANCE, bundle, quantile_sample, schedule, verify_meter
+import hybrid_bench
+from hybrid_bench import classify_equivalence, PROVENANCE, bundle, quantile_sample, schedule, verify_meter
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -91,6 +92,115 @@ class BenchmarkTests(unittest.TestCase):
             verify_meter(dict(trace, depth_before=0), 128, 'local')
         with self.assertRaisesRegex(common.Refusal, 'fell back locally'):
             verify_meter(dict(trace, mode='offload'), 128, 'offload')
+
+    # Budget refusals remain distinguishable from transport fallback, including a partially imported chain.
+    def test_budget_refusal_reason(self):
+        trace = dict(prefilled=32, new_tokens=32, replayed_prefix=0, rollback_n=None, depth_before=128,
+            depth_after=164, prompt_depth=160, generated_tokens=4, mode='offload', path='offload', remote_applied=31,
+            server_prefill_ms=1, wire_bytes=123)
+        verify_meter(trace, 128, 'offload')
+        with self.assertRaisesRegex(common.Refusal, 'ram budget refusal'):
+            verify_meter(dict(trace, fallback_reason='ram_budget'), 128, 'offload')
+        with self.assertRaisesRegex(common.Refusal, 'http_503'):
+            verify_meter(dict(trace, fallback_reason='http_503'), 128, 'offload')
+
+    # Cross-backend metrics are uncalibrated with exit 5 on both sides of the reference threshold.
+    def test_cross_backend_classification(self):
+        result = dict(same_partition_exact=False, numerical_within_bounds=True)
+        self.assertEqual(classify_equivalence(result, False), ('failed', 3))
+        self.assertEqual(classify_equivalence(result, True), ('uncalibrated', 5))
+        self.assertEqual(classify_equivalence(dict(result, numerical_within_bounds=False), True), ('uncalibrated_outside_reference', 5))
+        self.assertEqual(classify_equivalence(dict(result, same_partition_exact=True), False), ('passed', 0))
+
+    # Startup cleanup preserves readable private logs while credentials stay in the removable state directory.
+    def test_startup_log_preservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state'
+            state.mkdir()
+            (state / 'prefill.log').write_text('synthetic driver failure')
+            common.private_json(state / 'client-tokens.json', {'fixture': 'private'})
+            kept = manage.preserve_startup_logs(state)
+            self.assertEqual(kept.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((kept / 'prefill.log').read_text(), 'synthetic driver failure')
+            self.assertEqual([v.name for v in kept.iterdir()], ['prefill.log'])
+            self.assertTrue((state / 'client-tokens.json').exists())
+
+    # Hash equality stays the default; hetero explicitly requires the same nonempty layout fingerprint.
+    def test_heterogeneous_setup_admission(self):
+        identity = dict(layout_fingerprint='1' * 64)
+        common.validate_identity('a' * 64, identity, 'a' * 64, identity)
+        with self.assertRaisesRegex(common.Refusal, 'sha256 mismatch'):
+            common.validate_identity('a' * 64, identity, 'b' * 64, identity)
+        common.validate_identity('a' * 64, identity, 'b' * 64, identity, True)
+        for other in ({}, dict(layout_fingerprint='2' * 64)):
+            with self.assertRaisesRegex(common.Refusal, 'fingerprint mismatch'):
+                common.validate_identity('a' * 64, identity, 'b' * 64, other, True)
+
+    # Once run metadata is valid, malformed runtime traces and interrupts still produce honest bundles.
+    def test_error_and_interrupt_bundles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(model_sha256='a' * 64)
+            info = dict(model_sha256='a' * 64, backend='cpu', bench_link=True)
+            common.private_json(root / 'proxy-config.json', config)
+            common.private_json(root / 'client-info.json', info)
+            common.private_json(root / 'node-info.json', info)
+            for error, code, status in ((TypeError('malformed fixture'), 2, 'aborted'), (KeyboardInterrupt(), 130, 'interrupted')):
+                argv = ['hybrid_bench.py', '--client-state', str(root), '--output', str(root), '--scratch', str(root)]
+                with mock.patch('sys.argv', argv), mock.patch.object(hybrid_bench, 'link_probe', side_effect=error):
+                    self.assertEqual(hybrid_bench.main(), code)
+                latest = max(root.glob('hybrid-bench-*.jsonl'), key=lambda p: p.stat().st_mtime_ns)
+                summary = json.loads(latest.read_text().splitlines()[-1])
+                self.assertEqual((summary['status'], summary['exit_code']), (status, code))
+
+    # A non-HEAD source defaults to its own build tree and a lock beside state, avoiding an incompatible CMake cache.
+    def test_ref_build_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / ('source-' + 'b' * 12)
+            (source / 'build').mkdir(parents=True)
+            args = argparse.Namespace(ref='other', state=str(root / 'state'), build_dir=None, build_lock=None,
+                                      cuda=False, skip_build=False)
+            record = dict(commit='b' * 40)
+            with mock.patch.object(manage, 'output', side_effect=['b' * 40, 'a' * 40, 'b' * 40, '']), mock.patch.object(manage, 'compile_targets', return_value=record) as compile:
+                selected, _ = manage.build(args, ['fixture'], dict(os='Linux'))
+            self.assertEqual(selected, source / 'build')
+            self.assertEqual(compile.call_args.args[:2], (source, source / 'build'))
+            self.assertTrue((root / 'build.lock').exists())
+
+    # The launcher passes derived limits and exposes the download endpoint only with an explicit opt-in.
+    def test_node_limit_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = dict(context=65536, max_ctx=65536, ram_budget_mib=4096, max_request_mib=2, sessions_held=2)
+            identity = dict(layout_fingerprint='1' * 64, quantization_type='Q8_0')
+            record = dict(commit='a' * 40, flags=[], binaries={})
+            for bench_link in (False, True):
+                state = root / str(bench_link)
+                argv = ['manage.py', 'node', '--state', str(state), '--model', 'fixture'] + (['--bench-link'] if bench_link else [])
+                with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={}), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(root / 'model', 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=plan), mock.patch.object(manage, 'model_identity', return_value=identity), mock.patch.object(manage, 'build', return_value=(root / 'build', record)), mock.patch.object(manage, 'start_process') as start, mock.patch.object(manage, 'wait_health', return_value=dict(model_sha256='a' * 64, **identity)):
+                    self.assertEqual(manage.main(), 0)
+                command = start.call_args.args[0]
+                for flag, value in (('--max-ctx', 65536), ('--ram-budget-mib', 4096), ('--max-request-mib', 2)):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+                self.assertEqual('--bench' in command, bench_link)
+                info = common.read_private(state / 'node-info.json')
+                self.assertEqual(info['sizing']['sessions_held'], 2)
+
+    # Interrupting a checker stops only its recorded child and rethrows so the run can emit exit 130.
+    def test_checker_interrupt_cleanup(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [KeyboardInterrupt(), -15]
+        with mock.patch.object(hybrid_bench, 'start_process', return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                hybrid_bench.run_checker(['fixture'], Path('.'))
+        process.terminate.assert_called_once_with()
+        process.kill.assert_not_called()
+        process.wait.side_effect = None
+        process.returncode = 0
+        with mock.patch.object(hybrid_bench, 'start_process', return_value=process):
+            self.assertEqual(hybrid_bench.run_checker(['fixture'], Path('.')).returncode, 0)
 
     # Seeded schedules reproduce aggregates without reading private conversations; tails are explicitly clamped.
     def test_schedule_and_quantiles(self):

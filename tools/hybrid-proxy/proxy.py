@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import os
+import struct
 from pathlib import Path
 import threading
 import time
@@ -22,7 +23,7 @@ from store import Store, prefix_hash
 
 LOG = logging.getLogger("hybrid")
 MAX_JSON = 8 * 1024 * 1024
-MAX_DELTA = 512 * 1024 * 1024
+MAX_DELTA = 512 * 1024 * 1024 + 1024 * 1024 + 52
 SLOT_WAIT_SECONDS = 30
 
 
@@ -87,6 +88,16 @@ class Node:
 class Proxy:
     def __init__(self, config, database):
         self.model = config["model_sha256"]
+        self.node_model = config.get("node_model_sha256", self.model)
+        self.hetero_quant = config.get("hetero_quant", False)
+        self.layout_fingerprint = config.get("layout_fingerprint")
+        if self.hetero_quant:
+            if (not isinstance(self.layout_fingerprint, str) or len(self.layout_fingerprint) != 64
+                    or any(c not in "0123456789abcdef" for c in self.layout_fingerprint)
+                    or self.layout_fingerprint != config.get("node_layout_fingerprint")):
+                raise ValueError("heterogeneous layout fingerprint mismatch")
+        elif self.node_model != self.model:
+            raise ValueError("node/client model sha256 mismatch")
         self.benchmark = config.get("benchmark", False)
         self.clients = config["clients"]  # incoming bearer -> {id, prefill_token}
         if (not self.clients or len({c["id"] for c in self.clients.values()}) != len(self.clients)
@@ -99,6 +110,11 @@ class Proxy:
         self.decode = Node(config["decode_url"], config.get("decode_token", ""), config.get("decode_timeout", 120))
         self.store = Store(database, self.model)
         self.policy = Policy(**config.get("policy", {}))
+        body_tokens = int((512 * 1024**2 - self.policy.state_bytes - 1024**2) // max(1, self.policy.kv_bytes))
+        safe_chunk = min((1024**2 - 4096) // 11, body_tokens)
+        self.extend_chunk_tokens = config.get("extend_chunk_tokens", safe_chunk)
+        if type(self.extend_chunk_tokens) is not int or not 1 <= self.extend_chunk_tokens <= safe_chunk:
+            raise ValueError("extend_chunk_tokens exceeds delta body/header bound")
         self.slots = config.get("slots", 1)
         if self.slots < 1:
             raise ValueError("slots must be positive")
@@ -112,6 +128,24 @@ class Proxy:
         self.stop = threading.Event()
         self.renderer = Renderer(self.decode)
         self.inflight = {}
+
+    def client_delta(self, delta):
+        if not self.hetero_quant:
+            return delta
+        if len(delta) < 4:
+            raise ValueError("truncated heterogeneous envelope")
+        size, = struct.unpack("<I", delta[:4])
+        if not 0 < size <= 1024**2 or 4 + size + 48 > len(delta):
+            raise ValueError("invalid heterogeneous envelope")
+        header = json.loads(delta[4:4 + size])
+        if header.get("model_sha256") != self.node_model:
+            raise ValueError("heterogeneous delta source mismatch")
+        # Rebind only the envelope identity after live layout admission. Native import verifies state and checksums.
+        header["model_sha256"] = self.model
+        encoded = json.dumps(header, separators=(",", ":")).encode()
+        if len(encoded) > 1024**2:
+            raise ValueError("heterogeneous header too large")
+        return struct.pack("<I", len(encoded)) + encoded + delta[4 + size:]
 
     def client(self, authorization):
         value = self.clients.get(authorization.removeprefix("Bearer ")) if authorization.startswith("Bearer ") else None
@@ -139,8 +173,12 @@ class Proxy:
     def sync(self, session, client, recreate=True):
         """202 is an acknowledgement of queuing, never proof that tokens were applied."""
         node = self.remote(client)
+        if self.hetero_quant:
+            health = node.request("GET", "/v1/health")
+            if health.get("model_sha256") != self.node_model or health.get("layout_fingerprint") != self.layout_fingerprint:
+                raise HTTPError(412)
         if not session["remote_id"]:
-            session["remote_id"] = node.request("POST", "/v1/sessions", {"model_sha256": self.model})["session_id"]
+            session["remote_id"] = node.request("POST", "/v1/sessions", {"model_sha256": self.node_model})["session_id"]
             session["remote_n"] = 0
             self.store.save(session)
         path = "/v1/sessions/" + urllib.parse.quote(session["remote_id"], safe="")
@@ -155,7 +193,7 @@ class Proxy:
             self.store.save(session)
             return self.sync(session, client, recreate=False)
         n = info["n"]
-        if (info["model_sha256"] != self.model or n < 0 or n > len(session["tokens"])
+        if (info["model_sha256"] != self.node_model or n < 0 or n > len(session["tokens"])
                 or info["prefix_hash"] != prefix_hash(session["tokens"][:n])):
             LOG.error("divergence session=%s local_hash=%s remote_hash=%s", session["id"],
                       prefix_hash(session["tokens"]), info.get("prefix_hash"))
@@ -195,7 +233,7 @@ class Proxy:
         info = node.request("GET", path)
         LOG.warning("resync session=%s local_hash=%s remote_hash=%s", session["id"],
                     prefix_hash(session["tokens"]), info.get("prefix_hash"))
-        if info["model_sha256"] != self.model:
+        if info["model_sha256"] != self.node_model:
             raise HTTPError(409)
         if (0 <= info["n"] <= len(session["tokens"])
                 and info["prefix_hash"] == prefix_hash(session["tokens"][:info["n"]])):
@@ -204,6 +242,9 @@ class Proxy:
         n = info["n"]
         if not 0 <= n <= len(prompt) or info["prefix_hash"] != prefix_hash(prompt[:n]):
             raise HTTPError(409)
+        if self.hetero_quant:
+            # Whole snapshots carry the node identity; recover this ahead prefix by local continuation.
+            raise HTTPError(503)
         snapshot = node.request("GET", path + "/snapshot", binary=True)
         filename = session["id"] + "-resync.bin"
         backup = session["id"] + "-resync-backup.bin"
@@ -268,7 +309,7 @@ class Proxy:
                 try:
                     with ticket:
                         current = self.store.get(pending["id"])
-                        if (current.get("journal") or {}).get("last_meter", {}).get("benchmark_mode") != "local":
+                        if (current.get("benchmark_mode") or (current.get("journal") or {}).get("last_meter", {}).get("benchmark_mode")) not in ("local", "closed"):
                             self.sync(current, client)
                 except (OSError, HTTPError, ValueError):
                     pass
@@ -632,6 +673,7 @@ class Proxy:
 
     def prepare_session(self, client, body, session, tokens):
         slot = session["slot"]
+        self.store.benchmark_mode(session["id"], client.get("benchmark_mode"))
         info = self.decode.request("GET", f"/slots/{slot}/info")
         local_n = info["n"]
         if local_n > len(tokens) or info["prefix_hash"] != prefix_hash(tokens[:local_n]):
@@ -650,7 +692,7 @@ class Proxy:
         mode = client.get("benchmark_mode")
         session["_bench"] = dict(mode=mode, path="local", depth_before=local_n,
             prompt_depth=len(tokens), server_prefill_ms=None, wire_bytes=0,
-            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0)
+            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None)
         if mode == "offload":
             decision["offload"] = len(target) > local_n
         elif mode == "local":
@@ -665,36 +707,55 @@ class Proxy:
                 if session["remote_n"] < local_n:
                     self.sync(session, client)
                 remote = self.remote(client)
-                delta = remote.request("POST", path + "/extend", {
-                    "n0": local_n, "prefix_hash_n0": prefix_hash(tokens[:local_n]),
-                    "tokens": target[local_n:], "return_delta": True},
-                    headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
-                session["_bench"].update(wire_bytes=remote.last_bytes,
-                    transfer_ms=remote.last_transfer_seconds * 1000,
-                    server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None)
-                if remote.last_transfer_rate:
-                    with self.lock:
-                        self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
-                session["tokens"] = target
-                self.store.save(session)
-                import_started = time.monotonic()
-                self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
-                                    {"Content-Type": "application/octet-stream",
-                                     "X-Hybrid-Session": session["remote_id"]})
-                session["_bench"].update(path="offload", import_ms=(time.monotonic() - import_started) * 1000)
-                actual = self.decode.request("GET", f"/slots/{slot}/info")
-                if actual["n"] != len(target) or actual["prefix_hash"] != prefix_hash(target):
-                    self.decode.request("POST", f"/slots/{slot}?action=erase", {})
-                    raise ValueError("import prefix mismatch")
-                session["offload"] = True
-                session["tokens"] = target
-                session["remote_n"] = len(target)
-                session["_remote_applied"] = len(target) - local_n
-                LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], local_n, len(target))
-                if "_turn" in session:
-                    session["_turn"]["checkpoints"] = []  # Native import clears the slot's checkpoints.
-                self.store.save(session)
+                for n0 in range(local_n, len(target), self.extend_chunk_tokens):
+                    n1 = min(n0 + self.extend_chunk_tokens, len(target))
+                    chunk = dict(n0=n0, n1=n1, status="requested", wire_bytes=0, import_ms=0)
+                    session["_bench"]["chunks"].append(chunk)
+                    delta = remote.request("POST", path + "/extend", {
+                        "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
+                        "tokens": target[n0:n1], "return_delta": True},
+                        headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
+                    chunk.update(status="received", wire_bytes=remote.last_bytes,
+                        transfer_ms=remote.last_transfer_seconds * 1000,
+                        server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None)
+                    meter = session["_bench"]
+                    meter["wire_bytes"] += chunk["wire_bytes"]
+                    meter["transfer_ms"] += chunk["transfer_ms"]
+                    if chunk["server_prefill_ms"] is not None:
+                        meter["server_prefill_ms"] = (meter["server_prefill_ms"] or 0) + chunk["server_prefill_ms"]
+                    if remote.last_transfer_rate:
+                        with self.lock:
+                            self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
+                    delta = self.client_delta(delta)
+                    import_started = time.monotonic()
+                    self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
+                                        {"Content-Type": "application/octet-stream",
+                                         "X-Hybrid-Session": session["remote_id"]})
+                    chunk["import_ms"] = (time.monotonic() - import_started) * 1000
+                    meter["import_ms"] += chunk["import_ms"]
+                    actual = self.decode.request("GET", f"/slots/{slot}/info")
+                    if (actual["n"] != n1 or actual["prefix_hash"] != prefix_hash(tokens[:n1])
+                            or actual["tokens"] != tokens[:n1]):
+                        self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+                        session["_remote_applied"] = 0
+                        raise ValueError("import prefix mismatch")
+                    chunk["status"] = "imported"
+                    session.update(offload=True, tokens=tokens[:n1], remote_n=n1)
+                    session["_remote_applied"] = n1 - local_n
+                    LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
+                    if "_turn" in session:
+                        session["_turn"]["checkpoints"] = []
+                    self.store.save(session)
         except HTTPError as error:
+            reason = f"http_{error.status}"
+            if error.status == 503:
+                try:
+                    payload = json.loads(error.body)
+                    if payload.get("error") in ("ram budget", "RAM session budget exceeded"):
+                        reason = "ram_budget"
+                except (ValueError, AttributeError):
+                    pass
+            session["_bench"]["fallback_reason"] = reason
             if error.status == 409:
                 LOG.warning("409 resync session=%s", session["id"])
                 # GET validates the acknowledged prefix; replay uses its exact boundary.
@@ -703,10 +764,12 @@ class Proxy:
                 raise
             session["offload"] = False
         except ValueError:
+            session["_bench"]["fallback_reason"] = "invalid_delta"
             if session["remote_id"]:
                 self.recover(session, client, tokens)
             session["offload"] = False
         except OSError:
+            session["_bench"]["fallback_reason"] = "transport"
             session["offload"] = False
         session["_bench"]["remote_prepare_ms"] = (time.monotonic() - remote_started) * 1000
         session["_bench"]["path"] = "offload" if session["_remote_applied"] else "local"
@@ -809,7 +872,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # Do not log credentials, request bodies, or token content.
 
+    def do_DELETE(self):
+        app = self.server.app
+        try:
+            client = app.client(self.headers.get("Authorization", ""))
+            if not app.benchmark or not self.path.startswith("/v1/sessions/"):
+                raise HTTPError(404)
+            sid = urllib.parse.unquote(self.path[len("/v1/sessions/"):])
+            with app.reserve(sid):
+                session = app.store.get(sid, client["id"])
+                app.store.benchmark_mode(sid, "closed")
+                ids = [session["remote_id"]] + (session.get("journal") or {}).get("retired_remote_ids", [])
+                for remote_id in dict.fromkeys(ids):
+                    if remote_id:
+                        try:
+                            app.remote(client).request("DELETE", "/v1/sessions/" + urllib.parse.quote(remote_id, safe=""))
+                        except HTTPError as error:
+                            if error.status != 404:
+                                raise
+                self.json_response(200, {"status": "released"})
+        except KeyError:
+            self.json_response(404, {"error": "session not found"})
+        except (HTTPError, OSError) as error:
+            self.json_response(error.status if isinstance(error, HTTPError) else 503, {"error": "release failed"})
+
     def do_GET(self):
+        if not self.server.app.benchmark:
+            self.send_error(501, "Unsupported method ('GET')")
+            return
         try:
             self.server.app.client(self.headers.get("Authorization", ""))
             if self.path != "/health" or not self.server.app.benchmark:

@@ -55,6 +55,8 @@ class Store:
         """)
         if "journal" not in {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}:
             self.db.execute("ALTER TABLE sessions ADD COLUMN journal TEXT")
+        if "benchmark_mode" not in {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN benchmark_mode TEXT")
         row = self.db.execute("SELECT model FROM meta").fetchone()
         if row and row[0] != model:
             self.db.close()
@@ -92,6 +94,11 @@ class Store:
                 json.dumps(tokens), json.dumps(block_hashes(tokens)), session["remote_id"],
                 session["remote_n"], time.time(), int(session["offload"]),
                 json.dumps(session.get("journal")) if session.get("journal") else None, session["id"]))
+
+    @locked
+    def benchmark_mode(self, sid, mode):
+        with self.db:
+            self.db.execute("UPDATE sessions SET benchmark_mode=? WHERE id=?", (mode or "default", sid))
 
     @locked
     def set_slot(self, sid, slot):

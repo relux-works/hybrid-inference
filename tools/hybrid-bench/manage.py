@@ -13,7 +13,7 @@ import urllib.error
 
 from bench_common import (FLOOR, ROOT, Refusal, check_ports, context_plan, control, http, obtain_model,
                           output, preflight, private_json, read_private, require, run, sha256,
-                          start_process, wait_health)
+                          start_process, wait_health, model_identity, validate_identity)
 
 
 def build(args, targets, info):
@@ -29,7 +29,7 @@ def build(args, targets, info):
             run(['git', '-C', ROOT, 'worktree', 'add', '--detach', source, commit])
     require(not output(['git', '-C', source, 'status', '--porcelain', '--untracked-files=no']),
             'tracked source changes prevent an exact-ref build; commit them or use a clean checkout')
-    build_dir = Path(args.build_dir).expanduser().resolve()
+    build_dir = Path(args.build_dir or source / 'build').expanduser().resolve()
     flags = ['-DCMAKE_BUILD_TYPE=Release', '-DGGML_CUDA=' + ('ON' if args.cuda else 'OFF'),
              '-DGGML_METAL=' + ('ON' if info['os'] == 'Darwin' else 'OFF'), '-DLLAMA_CURL=OFF']
     stamp = build_dir / 'hybrid-bench-build.json'
@@ -40,7 +40,7 @@ def build(args, targets, info):
         for name in targets:
             require(record['binaries'].get(name) == sha256(build_dir / 'bin' / name), 'binary hash mismatch: ' + name)
         return build_dir, record
-    lock = Path(args.build_lock).expanduser()
+    lock = Path(args.build_lock or Path(args.state).expanduser().resolve().parent / 'build.lock').expanduser()
     require(lock.parent.is_dir(), 'build lock parent must exist: ' + str(lock.parent))
     if info['os'] == 'Linux':
         import fcntl
@@ -113,18 +113,32 @@ def parser():
     p.add_argument('--ctx', type=int)
     p.add_argument('--cuda', action='store_true')
     p.add_argument('--ref', default='HEAD')
-    p.add_argument('--build-dir', default=str(ROOT / 'build'))
-    p.add_argument('--build-lock', default=str(Path.home() / 'Werkstatt/hybrid-models/.build.lock'))
+    p.add_argument('--build-dir')
+    p.add_argument('--build-lock')
     p.add_argument('--skip-build', action='store_true')
     p.add_argument('--port', type=int, default=None)
     p.add_argument('--bind', default='127.0.0.1')
     p.add_argument('--public', action='store_true')
     p.add_argument('--token-file', help='0600 id-to-token JSON shared with node operator')
+    p.add_argument('--bench-link', action='store_true', help='enable authenticated node download probe')
+    p.add_argument('--extend-chunk-tokens', type=int)
+    p.add_argument('--hetero-quant', action='store_true')
     p.add_argument('--node-info')
     p.add_argument('--node-sha256')
     p.add_argument('--prefill-url', default='http://127.0.0.1:8091')
     p.add_argument('--decode-port', type=int, default=8090)
     return p
+
+
+def preserve_startup_logs(state):
+    logs = list(state.glob('*.log'))
+    if not logs:
+        return None
+    destination = Path(tempfile.mkdtemp(prefix=state.name + '.failed-', dir=state.parent))
+    os.chmod(destination, 0o700)
+    for log in logs:
+        shutil.move(str(log), destination / log.name)
+    return destination
 
 
 def main():
@@ -159,17 +173,19 @@ def main():
     try:
         model, digest, downloaded = obtain_model(args, args.model_cache)
         plan = context_plan(model, info, args.ctx, args.role == 'client')
+        identity = model_identity(model)
         node = json.loads(Path(args.node_info).read_text()) if args.node_info else None
         if args.role == 'client':
             expected = node['model_sha256'] if node else args.node_sha256
-            require(expected and digest == expected, 'client/node model sha256 mismatch; no process started')
-            require(not args.node_sha256 or args.node_sha256 == digest, '--node-sha256 disagrees with model')
+            validate_identity(digest, identity, expected, node or {}, args.hetero_quant)
+            require(not args.node_sha256 or args.node_sha256 == expected, '--node-sha256 disagrees with model')
             require(tokens is not None, 'client requires --token-file from node operator')
             try:
                 health = http(args.prefill_url, '/v1/health', timeout=3)
             except (OSError, ValueError):
                 raise Refusal('prefill node unreachable or unhealthy at configured URL') from None
-            require(health['model_sha256'] == digest, 'live node model sha256 mismatch')
+            require(health['model_sha256'] == expected, 'live node model sha256 mismatch')
+            validate_identity(digest, identity, health['model_sha256'], health, args.hetero_quant)
             # An authenticated read detects a missing/wrong token before any build or local state.
             try:
                 http(args.prefill_url, '/v1/sessions', next(iter(tokens.values())), timeout=3)
@@ -186,12 +202,16 @@ def main():
             if tokens is None:
                 tokens = {'bench': secrets.token_urlsafe(32)}
             private_json(temporary / 'client-tokens.json', tokens)
-            info.update(commit=record['commit'], flags=record['flags'], binaries=record['binaries'],
+            info.update(threads=2, threads_batch=2, batch=256, ubatch=256, **identity, commit=record['commit'], flags=record['flags'], binaries=record['binaries'],
                         model_file=model.name, model_sha256=digest, context=plan['context'], port=port,
                         sizing=plan, build_record=record, driver=info.get('driver'), cuda=info.get('cuda'))
             private_json(temporary / 'node-info.json', info)
             command = [build_dir / 'bin/llama-hybrid-prefill', model, state / 'client-tokens.json', port,
-                       plan['context'], '--host', args.bind, '--gpu-layers', 999 if args.cuda else 0, '--bench']
+                       plan['context'], '--host', args.bind, '--gpu-layers', 999 if args.cuda else 0,
+                       '--max-ctx', plan['max_ctx'], '--ram-budget-mib', plan['ram_budget_mib'],
+                       '--max-request-mib', plan['max_request_mib']]
+            if args.bench_link:
+                command.append('--bench')
             os.replace(temporary, state)
             created_state = True
             temporary = None
@@ -199,7 +219,13 @@ def main():
             health_host = '127.0.0.1' if args.bind == '0.0.0.0' else '::1' if args.bind == '::' else args.bind
             if ':' in health_host:
                 health_host = '[' + health_host + ']'
-            wait_health(f'http://{health_host}:{port}', '/v1/health', process)
+            health = wait_health(f'http://{health_host}:{port}', '/v1/health', process)
+            require(health['model_sha256'] == digest, 'launched node model hash mismatch')
+            if 'layout_fingerprint' in health:
+                require(health['layout_fingerprint'] == identity['layout_fingerprint'], 'native/GGUF layout fingerprint mismatch')
+            info.update(node_limits={key: health[key] for key in
+                ('max_ctx', 'ram_budget_bytes', 'max_request_bytes') if key in health}, bench_link=args.bench_link)
+            (state / 'node-info.json').write_text(json.dumps(info, indent=2) + '\n')
             if args.public:
                 print('WARNING: HTTP traffic is unencrypted; use an SSH tunnel or a trusted TLS terminator.', file=sys.stderr)
             print(str(state / 'client-tokens.json'))
@@ -214,10 +240,17 @@ def main():
                 slot_path=str(state / 'slots'), slots=1, prefill_timeout=180, decode_timeout=180,
                 clients={credential: dict(id=next(iter(tokens)), prefill_token=next(iter(tokens.values())))},
                 policy=dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes']))
+            config.update(hetero_quant=args.hetero_quant, node_model_sha256=expected,
+                          layout_fingerprint=identity['layout_fingerprint'],
+                          node_layout_fingerprint=(node or {}).get('layout_fingerprint'))
+            if args.extend_chunk_tokens is not None:
+                config['extend_chunk_tokens'] = args.extend_chunk_tokens
             private_json(temporary / 'proxy-config.json', config)
-            info.update(commit=record['commit'], flags=record['flags'], binaries=record['binaries'],
+            info.update(threads=2, threads_batch=2, batch=256, ubatch=256, **identity, commit=record['commit'], flags=record['flags'], binaries=record['binaries'],
                         model_file=model.name, model_sha256=digest, context=plan['context'],
                         benchmark_context=plan.get('benchmark_context', plan['context']), sizing=plan,
+                        hetero_quant=args.hetero_quant, node_model_sha256=expected,
+                        node_quantization_type=(node or {}).get('quantization_type'),
                         proxy_url=f'http://127.0.0.1:{port}', model_path=str(model), build_dir=str(build_dir),
                         build_record=record, policy=config['policy'])
             private_json(temporary / 'client-info.json', info)
@@ -239,14 +272,18 @@ def main():
             wait_health(info['proxy_url'], '/health', proxy, token=credential)
             print(str(state / 'proxy-config.json'))
         return 0
-    except BaseException:
+    except BaseException as error:
+        failed_logs = None
         if created_state:
             control(state, stop=True)
+            failed_logs = preserve_startup_logs(state)
             shutil.rmtree(state)
         if temporary is not None:
             shutil.rmtree(temporary)
         if downloaded:
             model.unlink(missing_ok=True)
+        if failed_logs is not None:
+            raise Refusal('startup failed (' + type(error).__name__ + '); private logs: ' + str(failed_logs)) from None
         raise
 
 

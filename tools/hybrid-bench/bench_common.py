@@ -181,11 +181,63 @@ def model_metadata(path):
         metadata = {}
         for _ in range(count):
             key, kind = string(), scalar('I')
-            keep = key == 'general.architecture' or key.startswith(('qwen35.', 'qwen35moe.'))
+            keep = key in ('general.architecture', 'general.file_type') or key.startswith(('qwen35.', 'qwen35moe.'))
+            if key == 'tokenizer.ggml.tokens':
+                require(kind == 9 and scalar('I') == 8, 'invalid GGUF token array')
+                token_count = scalar('Q')
+                require(0 < token_count <= 2_000_000, 'invalid vocabulary size')
+                digest = hashlib.sha256()
+                for _ in range(token_count):
+                    token = string().encode('utf-8')
+                    digest.update(struct.pack('<Q', len(token)))
+                    digest.update(token)
+                metadata['vocab_size'] = token_count
+                metadata['vocab_sha256'] = digest.hexdigest()
+                continue
             item = value(kind, keep)
             if keep:
                 metadata[key] = item
     return metadata
+
+
+def model_identity(path):
+    meta = model_metadata(path)
+    arch = meta['general.architecture']
+    require(arch == 'qwen35', 'layout identity supports dense qwen35 only')
+    def get(key):
+        return meta[arch + '.' + key]
+    count = get('block_count')
+    require(type(count) is int and 0 < count <= 1024, 'invalid layout layer count')
+    recurrent = meta.get(arch + '.attention.recurrent_layers')
+    if recurrent is None:
+        interval = meta.get(arch + '.full_attention_interval', 4)
+        require(type(interval) is int and interval > 0, 'invalid attention interval')
+        recurrent = [(i + 1) % interval != 0 for i in range(count)]
+    require(isinstance(recurrent, list) and len(recurrent) == count, 'invalid recurrent layout')
+    def layer_value(key, i):
+        value = get(key)
+        return value[i] if isinstance(value, list) else value
+    layout = dict(version=1, architecture=arch, layer_count=count, embedding_size=get('embedding_length'),
+        layers=[dict(heads=layer_value('attention.head_count', i), kv_heads=layer_value('attention.head_count_kv', i),
+                     key_dim=layer_value('attention.key_length', i), value_dim=layer_value('attention.value_length', i),
+                     recurrent=bool(recurrent[i])) for i in range(count)],
+        recurrent_layout={name: get('ssm.' + key) for name, key in
+            [('conv', 'conv_kernel'), ('inner', 'inner_size'), ('state', 'state_size'), ('rank', 'time_step_rank'), ('groups', 'group_count')]},
+        vocab_size=meta['vocab_size'], vocab_sha256=meta['vocab_sha256'])
+    fingerprint = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    kind = meta.get('general.file_type')
+    quant = {0: 'F32', 1: 'F16', 2: 'Q4_0', 7: 'Q8_0', 15: 'Q4_K_M', 32: 'BF16'}.get(kind, str(kind))
+    return dict(layout_fingerprint=fingerprint, model_layout=layout, quantization_type=quant)
+
+
+def validate_identity(digest, identity, expected, node_identity, hetero=False):
+    require(bool(expected), 'node model identity required')
+    if not hetero:
+        require(digest == expected, 'client/node model sha256 mismatch; no process started')
+        return
+    fingerprint = identity.get('layout_fingerprint')
+    require(isinstance(fingerprint, str) and len(fingerprint) == 64 and
+            fingerprint == node_identity.get('layout_fingerprint'), 'client/node layout fingerprint mismatch')
 
 
 def context_plan(model, info, requested=None, client=False):
@@ -214,13 +266,20 @@ def context_plan(model, info, requested=None, client=False):
     # Host RAM holds saved sessions and wire buffers even with a GPU backend.
     budget = int(capacity * 0.80) - weights - 2 * GIB - recurrent_bytes
     memory_ctx = (budget // kv // 256) * 256
-    store_ctx = ((512 * 1024**2 - recurrent_bytes - 1024**2) // (kv + 32) // 256) * 256
+    # One mode session plus one sequential checker session can coexist.
+    sessions_held = 2
+    host_available = int(info['available_memory_bytes'] * .8) - 2 * GIB
+    store_budget = max(0, host_available // 3)
+    store_ctx = ((store_budget // sessions_held - recurrent_bytes - 1024**2) // (kv + 32) // 256) * 256
     host_ctx = ((int(info['available_memory_bytes'] * 0.8) - 2 * GIB - 4 * recurrent_bytes) // (4 * kv) // 256) * 256
-    limit = min(memory_ctx, host_ctx, store_ctx, 16384, get('context_length'))
+    limit = min(memory_ctx, host_ctx, store_ctx, get('context_length'))
     ctx = requested if requested is not None else limit
     require(isinstance(ctx, int) and 256 <= ctx <= limit,
-            f'context {ctx} cannot fit: maximum {limit}; memory={memory_ctx}, host staging={host_ctx}, 512MiB store={store_ctx}, protocol=16384')
-    return dict(context=ctx, maximum_context=limit, kv_bytes_per_token=kv, recurrent_state_bytes=recurrent_bytes,
+            f'context {ctx} cannot fit: maximum {limit}; memory={memory_ctx}, host staging={host_ctx}, session store={store_ctx}')
+    ram_budget = sessions_held * (recurrent_bytes + ctx * (kv + 32) + 1024**2)
+    return dict(context=ctx, maximum_context=limit, sessions_held=sessions_held,
+                max_ctx=ctx, ram_budget_mib=(ram_budget + 1024**2 - 1) // 1024**2,
+                max_request_mib=max(1, (4096 + 11 * ctx + 1024**2 - 1) // 1024**2), kv_bytes_per_token=kv, recurrent_state_bytes=recurrent_bytes,
                 weights_bytes=weights, margin_fraction=0.20, compute_reserve_bytes=2 * GIB,
                 memory_limit=memory_ctx, store_limit=store_ctx, protocol_limit=16384,
                 checkpoint_count=0 if client else None)
