@@ -36,6 +36,20 @@ def check_config(runner, target):
     require(list(hf.layer_types) == ["full_attention" if i in ATTENTION else "linear_attention" for i in range(64)], "wrong source layer order")
 
 
+def write_attention_pages(output, cache, blocks, block, n0, n1):
+    import torch
+
+    require(cache.ndim == 4 and cache.shape[1] == 4 and cache.shape[3] == 512, "unsupported attention tensor layout")
+    kernel = cache.shape[2]
+    require(kernel > 0 and block % kernel == 0, "wrong kernel block size")
+    ratio = block // kernel
+    for logical in range(n0 // block, n1 // block):
+        physical = blocks[logical]
+        require(physical > 0 and (physical + 1) * ratio <= cache.shape[0], "invalid attention block ownership")
+        page = cache[physical * ratio:(physical + 1) * ratio].permute(1, 0, 2, 3).reshape(4, block, 512)
+        output.write(page.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+
+
 def export_snapshot(runner, scheduler_output, config, n0):
     import torch
     import vllm
@@ -86,10 +100,6 @@ def export_snapshot(runner, scheduler_output, config, n0):
                     require(type(spec) is FullAttentionSpec and spec.sliding_window is None and spec.attention_chunk_size is None, "unsupported attention cache spec")
                     require(spec.num_kv_heads == 4 and spec.head_size == spec.head_size_v == 256, "wrong head geometry")
                     cache = layer.kv_cache
-                    require(cache.ndim == 4 and cache.shape[1] == 4 and cache.shape[3] == 512, "unsupported attention tensor layout")
-                    kernel = cache.shape[2]
-                    require(kernel > 0 and block % kernel == 0, "wrong kernel block size")
-                    ratio = block // kernel
                     dtype = str(cache.dtype).removeprefix("torch.")
                     mode = runner.cache_config.cache_dtype
                     if mode in ("fp8", "fp8_e4m3", "fp8_e5m2"):
@@ -101,11 +111,7 @@ def export_snapshot(runner, scheduler_output, config, n0):
                         scales = [1.0, 1.0]
                     filename = "%02d-kv.bin" % i
                     with (folder / filename).open("xb") as output:
-                        for logical in range(n0 // block, n1 // block):
-                            physical = blocks[logical]
-                            require(physical > 0 and (physical + 1) * ratio <= cache.shape[0], "invalid attention block ownership")
-                            page = cache[physical * ratio:(physical + 1) * ratio].permute(1, 0, 2, 3).reshape(4, block, 512)
-                            output.write(page.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+                        write_attention_pages(output, cache, blocks, block, n0, n1)
                     row.update(kv=dict(file=filename, shape=[(n1 - n0) // block, 4, block, 512], dtype=dtype), scales=scales)
                 else:
                     require(i in RECURRENT and type(spec) is MambaSpec and spec.mamba_cache_mode == "align"

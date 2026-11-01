@@ -46,214 +46,48 @@ Native references at the requested base: `src/llama-context.cpp:3471-3491` adds 
 
 ## GPU-host procedure for the orchestrator
 
-Use the existing GPU host's environment (`vllm==0.32.0`, `torch==2.13.0`, `transformers==5.19.0`, `flashinfer-python==0.7.0.post1`). No install or model download is part of this procedure. Run the following blocks in one Bash shell from this branch's repository root. Reserve exclusive use of this vLLM environment while its runner is patched. Start with one aligned block, then two; only then try the depth ladder. Use a fresh RUN_DIR for each capture attempt or depth.
+Run the script from the reviewed `m3-vllm-bridge` checkout. Reserve exclusive use of the GPU and vLLM environment while its runner is patched. No installation or model download is performed. Every command first runs `gather_test.py` with real torch CPU tensors and CUDA hidden. **STOP if this test fails.** Do not skip it: GPU logits cannot detect a joint K/V page or token permutation.
 
 ```sh
-set -eu
-export PYTHONDONTWRITEBYTECODE=1
-export RUN_DIR="$PWD/.temp/hybrid-d-r1-261101-gpu"
-mkdir -m 700 "$RUN_DIR"
-mkdir "$RUN_DIR/tmp"
-export TMPDIR="$RUN_DIR/tmp"
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export HF_MODEL=/existing/Qwen3.8-27B-FP8
-export BF16_GGUF=/existing/Qwen3.8-27B-BF16.gguf
-export Q4_K_M_GGUF=/existing/Qwen3.8-27B-Q4_K_M.gguf
-export TOKEN_FILE=/existing/prompt-token-ids.json
-export EXPORT_N=1568
-export CONTEXT_SIZE=32768
-export PROBE_TOKEN=1
-export PYTHONPATH="$PWD/tools/hybrid-vllm:$PWD/tools/hybrid-bench${PYTHONPATH:+:$PYTHONPATH}"
-
-wait_health() {
-    local pid="$1" url="$2" deadline=$((SECONDS + ${3:-1800}))
-    while kill -0 "$pid" 2>/dev/null; do
-        if curl --fail --silent --max-time 5 "$url" > /dev/null; then return 0; fi
-        if (( SECONDS >= deadline )); then
-            printf 'Health timeout: %s\n' "$url" >&2
-            return 1
-        fi
-        sleep 5
-    done
-    printf 'Server exited before health: PID %s\n' "$pid" >&2
-    return 1
-}
-stop_pid() {
-    local pid="$1" status=0
-    if kill -0 "$pid" 2>/dev/null; then kill "$pid"; fi
-    wait "$pid" || status=$?
-    printf 'PID %s wait exit: %s\n' "$pid" "$status"
-    case "$status" in 0|143) return 0 ;; *) return "$status" ;; esac
-}
-
-(
-set -eu
-VLLM_BRIDGE_PID=
-VLLM_RUNNER=$(python3 - <<'PY'
-import importlib.util
-from pathlib import Path
-print(Path(importlib.util.find_spec('vllm').origin).parent / 'v1/worker/gpu_model_runner.py')
-PY
-)
-python3 - "$VLLM_RUNNER" <<'PY'
-import hashlib, sys
-from pathlib import Path
-from patch_vllm import RUNNER_SHA256
-assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == RUNNER_SHA256, 'require original pinned runner'
-PY
-cp -p "$VLLM_RUNNER" "$RUN_DIR/gpu_model_runner.py.original"
-cleanup_capture() {
-    local status=$?
-    trap - EXIT
-    if [ -n "$VLLM_BRIDGE_PID" ]; then stop_pid "$VLLM_BRIDGE_PID" || status=1; fi
-    cp -p "$RUN_DIR/gpu_model_runner.py.original" "$VLLM_RUNNER" || status=1
-    cmp "$RUN_DIR/gpu_model_runner.py.original" "$VLLM_RUNNER" || status=1
-    unset HYBRID_VLLM_CONFIG
-    exit "$status"
-}
-trap cleanup_capture EXIT
-python3 tools/hybrid-vllm/patch_vllm.py "$VLLM_RUNNER"
-python3 - <<'PY'
-import json, os
-from pathlib import Path
-from bench_common import model_identity, sha256
-root = Path(os.environ['RUN_DIR'])
-model = Path(os.environ['BF16_GGUF'])
-target = dict(model_identity(model), model_sha256=sha256(model))
-tokens = json.loads(Path(os.environ['TOKEN_FILE']).read_text())
-if isinstance(tokens, dict):
-    tokens = tokens['tokens']
-n = int(os.environ['EXPORT_N'])
-assert len(tokens) >= n
-config = dict(target=target, tokens=tokens[:n], output=str(root/'captures'), rotations=[256,64])
-(root/'bridge.json').write_text(json.dumps(config))
-(root/'request.json').write_text(json.dumps(dict(model='bridge', prompt=tokens[:n], max_tokens=1, temperature=0, ignore_eos=True)))
-PY
-export HYBRID_VLLM_CONFIG="$RUN_DIR/bridge.json"
-export VLLM_USE_V2_MODEL_RUNNER=0
-vllm serve "$HF_MODEL" --served-model-name bridge --host 127.0.0.1 --port 8100 \
-  --tensor-parallel-size 1 --pipeline-parallel-size 1 --max-num-seqs 1 \
-  --dtype bfloat16 --kv-cache-dtype auto --enable-prefix-caching --mamba-cache-mode align \
-  --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype float32 \
-  --max-model-len "$CONTEXT_SIZE" --max-num-batched-tokens 7840 --enable-chunked-prefill \
-  --no-async-scheduling --enforce-eager > "$RUN_DIR/vllm-01.log" 2>&1 &
-VLLM_BRIDGE_PID=$!
-printf '%s\n' "$VLLM_BRIDGE_PID" > "$RUN_DIR/vllm.pid"
-wait_health "$VLLM_BRIDGE_PID" http://127.0.0.1:8100/health 1800
-curl --fail --max-time 1800 -H 'Content-Type: application/json' \
-  --data-binary "@$RUN_DIR/request.json" http://127.0.0.1:8100/v1/completions > "$RUN_DIR/response.json"
-# Release vLLM's GPU reservation before conversion, checker or client startup.
-stop_pid "$VLLM_BRIDGE_PID"
-VLLM_BRIDGE_PID=
-)
+EXPECTED_REF=FULL_REVIEWED_R2_SHA bash tools/hybrid-vllm/gpu-run.sh gather
 ```
 
-The capture subshell restores and byte-compares the original runner on success, request refusal, health timeout or server failure. Its hook environment also ends with the subshell. A matching hook is a no-op for `patch_vllm.py`, but the runbook deliberately starts from the original hash. SIGKILL or host failure cannot run a trap: use the saved runner backup to restore that exact path before restarting vLLM. Export refusals remove the private staging directory; only fully validated manifests and tensors are renamed to `capture-N/`. Existing captures refuse replacement.
-
-Inspect the log's resolved block sizes. The observed BF16-KV/FP32-SSM geometry is expected to align at 784; it is not hardcoded. If it differs, choose N and chunk size as multiples of the actual size, regenerate the config in a fresh RUN_DIR, and restart. A request with max_tokens=1 samples one token but never forwards it before capture. Require a final manifest with n1=N; no manifest means no successful export.
-
-Create a target-parameterized converter. It computes a fresh GGUF identity and hash for each leg, never reuses `bridge.json`'s BF16 target for Q4_K_M, and refuses a discontinuous chain or layout mismatch:
+Use the full head SHA delivered with r2 for `EXPECTED_REF`, and run the following command with the same value. Each invocation is a child Bash process: failure returns to the operator's shell. Do not source the script or set interactive `errexit`.
 
 ```sh
-cat > "$RUN_DIR/convert.py" <<'PY'
-import json, os, sys
-from pathlib import Path
-from bench_common import model_identity, sha256
-from bridge import convert
-root = Path(os.environ['RUN_DIR'])
-quant, model = sys.argv[1], Path(sys.argv[2])
-assert quant in ('bf16', 'q4_k_m')
-target = dict(model_identity(model), model_sha256=sha256(model))
-config = json.loads((root/'bridge.json').read_text())
-paths = sorted((root/'captures').glob('capture-*/snapshot.json'))
-assert paths
-out = root/('deltas-' + quant)
-out.mkdir(exist_ok=False)
-(root/('target-' + quant + '.json')).write_text(json.dumps(target))
-deltas, n = [], 0
-for snapshot in paths:
-    raw = json.loads(snapshot.read_text())
-    assert raw['n0'] == n
-    dest = out/('%08d.delta' % raw['n1'])
-    header = convert(snapshot, target, dest)
-    assert header['model_sha256'] == target['model_sha256']
-    deltas.append(str(dest))
-    n = raw['n1']
-assert n == len(config['tokens']) == int(os.environ['EXPORT_N'])
-fixture = dict(tokens=config['tokens']+[int(os.environ['PROBE_TOKEN'])], k=64,
-               max_ctx=int(os.environ['CONTEXT_SIZE']), model_sha256=target['model_sha256'],
-               deltas=deltas, backend='cuda', uncalibrated=True)
-(root/('check-' + quant + '.json')).write_text(json.dumps(fixture))
-print(quant, target['model_sha256'], deltas[0])
-PY
-python3 "$RUN_DIR/convert.py" bf16 "$BF16_GGUF" > "$RUN_DIR/convert-bf16.log" 2>&1
-python3 "$RUN_DIR/convert.py" q4_k_m "$Q4_K_M_GGUF" > "$RUN_DIR/convert-q4_k_m.log" 2>&1
-
-check_target() {
-    local quant="$1" model="$2" first status=0
-    first=$(python3 - "$RUN_DIR/check-$quant.json" <<'PY'
-import json, sys
-from pathlib import Path
-print(json.loads(Path(sys.argv[1]).read_text())['deltas'][0])
-PY
-) || return $?
-    build/bin/llama-hybrid-bench-check "$model" "$RUN_DIR/check-$quant.json" \
-      "$first" "$RUN_DIR/logits-$quant.json" 999 || status=$?
-    printf '%s checker exit: %s\n' "$quant" "$status" > "$RUN_DIR/check-$quant.exit"
-    case "$status" in 0|5) return 0 ;; *) return "$status" ;; esac
-}
-check_target bf16 "$BF16_GGUF"
-check_target q4_k_m "$Q4_K_M_GGUF"
+EXPECTED_REF=FULL_REVIEWED_R2_SHA bash tools/hybrid-vllm/gpu-run.sh all /root/proto/runs/hybrid-d-r2-smoke
 ```
 
-Each conversion leg has its own `target-<quant>.json`, `deltas-<quant>/` and `check-<quant>.json`. Preserve the printed target hashes and the exact checker exits. The checker deliberately exits 5 for `uncalibrated=true`; the wrapper permits evidence collection, and does not label 5 passing. The provisional KL <=0.01 and top-1 >=95% references are context, not calibrated acceptance. The checker compares N+1 after an identical probe, not the vLLM boundary logits at N. It can need five simultaneous contexts: at long depth prefer the scorer on `m3-reference-logits` after verifying that branch's actual CLI, or measure shorter depths first. No unverified scorer command is supplied here.
+`all` runs `gather`, `build`, `capture`, `convert`, `check`, then `import`, stopping at the first failure. Individual subcommands support inspection between steps; pass the same `RUN_DIR` argument or environment each time. Parents are created with `mkdir -p`, including on a fresh clone without `.temp`. The default is `$PWD/.temp/hybrid-d-r2-261101-gpu`. Capture attempts and build directories refuse reuse; use a fresh run directory on retry. Partial conversion output is retained for diagnosis; a retry needs a fresh conversion directory and must not mix chains.
 
-Import both chains through the actual client HTTP path, one server/model at a time. The subshell stops the recorded client PID on success or failure:
+The first gate checks contiguous and strided BF16/uint8 cache views, manager/kernel ratios 1, 2 and 3, non-monotonic block tables and append intervals against independently enumerated little-endian bytes. It calls the same `write_attention_pages` used by `export_snapshot`, without vLLM doubles. It does not qualify CUDA views, scheduler ownership or recurrent endpoints.
 
-```sh
-import_target() (
-set -eu
-quant="$1"
-model="$2"
-mkdir "$RUN_DIR/slots-$quant"
-LLAMA_BRIDGE_PID=
-cleanup_client() {
-    local status=$?
-    trap - EXIT
-    if [ -n "$LLAMA_BRIDGE_PID" ]; then stop_pid "$LLAMA_BRIDGE_PID" || status=1; fi
-    exit "$status"
-}
-trap cleanup_client EXIT
-build/bin/llama-server -m "$model" -ngl 999 -c "$CONTEXT_SIZE" -np 1 \
-  -ctk q8_0 -ctv q8_0 -fa on --host 127.0.0.1 --port 8101 \
-  --slots --slot-save-path "$RUN_DIR/slots-$quant/" > "$RUN_DIR/client-$quant.log" 2>&1 &
-LLAMA_BRIDGE_PID=$!
-printf '%s\n' "$LLAMA_BRIDGE_PID" > "$RUN_DIR/client-$quant.pid"
-wait_health "$LLAMA_BRIDGE_PID" http://127.0.0.1:8101/health 1800
-python3 - "$quant" <<'PY'
-import json, os, sys, urllib.request
-from pathlib import Path
-root = Path(os.environ['RUN_DIR'])
-quant = sys.argv[1]
-fixture = json.loads((root/('check-' + quant + '.json')).read_text())
-for path in fixture['deltas']:
-    request = urllib.request.Request('http://127.0.0.1:8101/slots/0?action=import_delta',
-        data=Path(path).read_bytes(), method='POST',
-        headers={'Content-Type':'application/octet-stream','X-Hybrid-Session':'vllm-prototype'})
-    with urllib.request.urlopen(request, timeout=1800) as response:
-        print(response.read().decode())
-with urllib.request.urlopen('http://127.0.0.1:8101/slots/0/info', timeout=30) as response:
-    info = json.load(response)
-assert info['tokens'] == fixture['tokens'][:-1]
-(root/('import-info-' + quant + '.json')).write_text(json.dumps(info))
-PY
-)
-import_target bf16 "$BF16_GGUF"
-import_target q4_k_m "$Q4_K_M_GGUF"
-```
+The build subcommand checks `HEAD == EXPECTED_REF` (full 40-character SHA) and rejects tracked modifications before and after the build. It requires a fresh build directory. It runs `nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF`, then `nice -n 10 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS" --target llama-server llama-hybrid-bench-check`. Use the script's `build` subcommand to retain its gates and logs.
 
-For the Mac leg, build this base's `llama-server` and `llama-hybrid-bench-check` with Metal; copy each target identity, fixture and matching delta directory, then correct fixture paths/backend to `metal`. Run the same checker and import functions with each receiver GGUF. The receiver must match that leg's target hash. Record source checkpoint provenance, target hashes, tokenizer identity, N, block sizes, dtype/scales, runtime versions, conversion time, peak RSS, import time, KL, top-1 and max logit difference. For FP8 KV, restart with `--kv-cache-dtype fp8_e4m3`; recalculate the block multiple (expected 1568), N and prefill chunk size. Never reuse a capture directory or include the sampled token in the captured prefix.
+`source.ref`, `build.ref` and `binaries.sha256` bind both receiver binaries to the checked ref. Capture, check and import verify these before use. Log files contain traced commands, stderr and exit status; failures print the failing command, exit, log path and its last 30 lines to the terminal. Server output stays in `vllm-01.log` or `client-<quant>.log`, with the PID and wait exit in the command log. Signals exit 130/143/129 and run PID cleanup plus runner restore. SIGKILL or host failure cannot run traps: restore the saved `gpu_model_runner.py.original` at the logged runner path before restarting vLLM.
+
+| Environment | Default / meaning |
+|---|---|
+| `VLLM_VENV`, `PYTHON` | `/root/kit161/gpu/work/vllm-venv`, its `bin/python` |
+| `HF_HOME` | `/root/kit161/gpu/work/hf`; offline mode is always enabled |
+| `HF_MODEL` | Auto-select the unique cached Qwen35 64-layer, 5120-embedding FP8 snapshot. Ambiguity or no match refuses. Override with a cached snapshot directory or repo id (resolved with `local_files_only=True`). |
+| `BF16_GGUF`, `Q4_K_M_GGUF` | `/root/proto/models/Qwen3.8-27B-BF16.gguf`, `/root/proto/models/Qwen3.8-27B-Q4_K_M.gguf` |
+| `CUDA_HOME`, `CUDACXX`, `CUDA_ARCH` | `/usr/local/cuda-12.8`, its `bin/nvcc`, `120a-real` for RTX PRO 6000 sm_120a |
+| `BUILD_DIR`, `BUILD_JOBS` | `RUN_DIR/build`, 4 (accepted range 1..4) |
+| `TMPDIR` | `RUN_DIR/tmp`, on disk; override with another disk directory. `PYTHONDONTWRITEBYTECODE=1`. |
+| `TOKEN_FILE` | `RUN_DIR/tokens.json`; if absent, generate deterministic synthetic IDs within the target vocabulary. An explicit external file must exist. Token IDs are passed directly to both engines. |
+| `EXPORT_N`, `CONTEXT_SIZE`, `PROBE_TOKEN` | 784 (one expected BF16-KV block), 32768, 1 |
+| `KV_CACHE_DTYPE`, `PREFILL_CHUNK` | `auto` (BF16 KV), 7840 |
+| `HEALTH_TIMEOUT`, `REQUEST_TIMEOUT` | 1800 seconds each; raise request timeout for larger depths |
+| `VLLM_PORT`, `LLAMA_PORT` | 8100, 8101 on localhost |
+
+The capture records installed vLLM, torch, transformers and flashinfer-python versions, the resolved HF snapshot, target identity and source ref. Expected environment: vLLM 0.32.0, torch 2.13.0, transformers 5.19.0, flashinfer 0.7.0.post1. The runner's exact original hash is still mandatory. A version or source refusal requires inspection; do not weaken it. After capture the script stops and waits for its recorded vLLM PID, restores and byte-compares the runner, then requires `nvidia-smi` to show no compute processes before proceeding. A surviving EngineCore process stops the run; ask its owner to release it, then continue from the appropriate subcommand.
+
+Inspect the log's resolved block sizes. The expected BF16-KV/FP32-SSM block is 784; the live cache specs remain authoritative. If it differs, choose aligned N and chunk size in a fresh RUN_DIR. Require a final manifest at n1=N. After the one-block smoke succeeds, use EXPORT_N=1568 in a new directory for two blocks. A request with max_tokens=1 samples one token but never forwards it before capture.
+
+Each target leg recomputes its GGUF identity/hash and writes separate `target-<quant>.json`, `deltas-<quant>/` and `check-<quant>.json`. Both chains are checked and imported over HTTP with one receiver/model at a time. The checker writes the real exit to `check-<quant>.exit`: 5 means uncalibrated evidence, never a passing quality gate. Only that expected 5 is permitted to continue evidence collection; other nonzero exits stop. It compares N+1 after a common probe, not the vLLM boundary logits at N. Provisional KL <=0.01 and top-1 >=95% references remain uncalibrated. Five simultaneous checker contexts can exhaust memory at depth; verify `m3-reference-logits` and its CLI before substituting it, or stay at measured shorter depths.
+
+For the Mac leg, build this base's `llama-server` and `llama-hybrid-bench-check` with Metal; copy each target identity, fixture and matching delta directory, then correct fixture paths/backend to `metal`. Run the corresponding checker and HTTP import with each receiver GGUF; gpu-run.sh itself selects CUDA, so do not use its CUDA launch unchanged on the Mac. The receiver must match that leg's target hash. Record source checkpoint provenance, target hashes, tokenizer identity, N, block sizes, dtype/scales, runtime versions, conversion time, peak RSS, import time, KL, top-1 and max logit difference. For FP8 KV, restart with `KV_CACHE_DTYPE=fp8_e4m3`; recalculate the block multiple (expected 1568), N and prefill chunk size. Never reuse a capture directory or include the sampled token in the captured prefix.
 
 Depth ladder after the smoke: aligned N=15680, 65072 and 249312 for block 784. Increase CONTEXT_SIZE for the source, both clients and both checker fixtures; use chunks <=7840. Run warm-prefix deltas only after cold export and ownership are verified. Large prefix hits exceeding the wire limit refuse; they need a new capture at intermediate boundaries.
 

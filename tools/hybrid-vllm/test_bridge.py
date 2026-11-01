@@ -210,6 +210,26 @@ class BridgeTests(unittest.TestCase):
                                 expected.extend([decoded * scale] * 128)
                         self.assertEqual(rows[page * 16 + token], reference_q8(expected))
 
+    # Non-unit FP8 K/V scales precede rotation; every q8_0 byte uses an independent decode and matrix.
+    def test_fp8_rotated_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = bytes((8 + (i * 17 + i // 512) % 96) for i in range(4 * 16 * 512))
+            (root / "kv").write_bytes(raw)
+            layer = dict(kv=dict(file="kv", shape=[1, 4, 16, 512], dtype="float8_e4m3fn"), scales=[2.0, 3.0])
+            for value, size, scale in ((False, 256, 2), (True, 64, 3)):
+                matrix = reference_hadamard(size)
+                rows = list(bridge.kv_rows(root, layer, 16, value, size))
+                self.assertEqual(len(rows), 16)
+                for token in range(16):
+                    row = []
+                    for head in range(4):
+                        at = (head * 16 + token) * 512 + int(value) * 256
+                        for start in range(at, at + 256, size):
+                            decoded = [(1 + (byte & 7) / 8) * 2 ** ((byte >> 3) - 7) * scale for byte in raw[start:start + size]]
+                            row.extend(sum(a * b for a, b in zip(weights, decoded)) for weights in matrix)
+                    self.assertEqual(rows[token], reference_q8(row), (value, token))
+
     # Every serialized BF16 KV row and f32 recurrent byte matches an independent source-layout reference.
     def test_serialized_layout_reference(self):
         with tempfile.TemporaryDirectory() as directory:
