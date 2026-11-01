@@ -1,0 +1,10 @@
+# Unresolved GPU qualification
+
+- Does the pinned live GPU runner expose the manager/kernel page mapping and align endpoint ownership exactly as inspected? Record actual block sizes, typed shapes, scales and final capture endpoint. A source-hash or shape refusal requires inspecting that implementation, not weakening the guard.
+- Do conv chronology, post-RoPE attention keys, GDN [V,K] state and grouped-to-tiled head mapping reproduce the client's continuation? Native synthetic import proves serialization only.
+- What KL/top-1/max-logit-difference bounds are appropriate for server FP8 weights -> BF16 or Q4_K_M clients across CUDA/Metal? Existing same-engine exactness is not an acceptance threshold for this experiment.
+- What target/source checkpoint and vocabulary evidence is sufficient for admission beyond this supervised prototype? A target layout fingerprint does not authenticate source weights or tokenizer semantics.
+- The existing checker begins comparison after a common probe token at N+1. Comparing already-produced logits at N needs a logits capture/reference protocol or a state boundary before the last prompt token; the current whole-block bridge does not claim that comparison.
+- Long-depth reference scoring may exceed device/Mac memory because the current checker holds five contexts. The orchestrator must verify `m3-reference-logits` and its CLI before substituting it, or stay within measured shorter-depth capacity.
+
+These are experiment gates, not claims of a blocked CPU implementation. No formal surface table or independent review was supplied with the brief. Scope remains `tools/hybrid-vllm/` plus the root README link; existing native readers, server code and reviewer tests are preserved.

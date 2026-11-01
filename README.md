@@ -3,6 +3,10 @@
 
 Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF`, then build the named targets listed in the [node guide](tools/hybrid/README.md). The [M1 operator guide](tools/hybrid-bench/README.md) provides deployment, client setup and benchmark commands; its launchers always disable the unused UI download.
 
+## Prototype tools
+
+The [vLLM bridge guide](tools/hybrid-vllm/README.md) lists the Python exporter/converter, native CPU reader test, exact entry points and `.temp/` artifact locations. Its [design](tools/hybrid-vllm/DESIGN.md) contains the GPU-host plan; only CPU conversion and synthetic native import are qualified here.
+
 Everything below is the upstream llama.cpp README.
 
 # llama.cpp
