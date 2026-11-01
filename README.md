@@ -3,6 +3,24 @@
 
 Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF`, then build the named targets listed in the [node guide](tools/hybrid/README.md). The [M1 operator guide](tools/hybrid-bench/README.md) provides deployment, client setup and benchmark commands; its launchers always disable the unused UI download.
 
+Mirai S trellis support is ported from [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s); see [format and provenance](tools/mirai-s/README.md). CPU and CUDA kernels are included; Metal is unsupported.
+
+Mirai prototype tools (CPU checks use existing local headers and never download weights):
+
+| Tool | Command | Output |
+|---|---|---|
+| CMake and C++ compiler | `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF -DGGML_CUDA=OFF` then `cmake --build build --target test-backend-ops llama-hybrid-check-identity -j 2` | `build/bin/` |
+| Backend tests | `OMP_NUM_THREADS=2 nice -n 10 build/bin/test-backend-ops test -b CPU -o MIRAI_MUL_MAT` | Terminal |
+| Fork/port parity | `python3 tools/mirai-s/parity.py collect --help`; `python3 tools/mirai-s/parity.py compare --a .temp/mirai-parity/fork.json --b .temp/mirai-parity/port.json` | JSON and logs under `.temp/mirai-parity/`; full GPU gate in the [r2 report](tools/hybrid-bench/RESULTS-hybrid-c-r2-261101.md#gpu-host-mirai-study-commands-unrun) |
+| Parity gate CPU tests | `python3 -m unittest discover -s tools/mirai-s -p test_parity.py -v` | Terminal; no GPU or model |
+| Python identity fixtures | `python3 tools/hybrid-bench/test_mirai_identity.py` | Terminal; native cases skipped without local headers |
+| Native header fixtures (glibc) | `python3 tools/hybrid-bench/test_mirai_identity.py --binary build/bin/llama-hybrid-check-identity --headers /path/to/headers --artifacts .temp/mirai-identity` | `.temp/mirai-identity/` |
+| Native model identity | `build/bin/llama-hybrid-check-identity /path/to/model.gguf` | JSON layout and fingerprint, no weight allocation |
+
+Set `TMPDIR` to an existing disk directory for builds and tests. The header hashes and metadata-only fixtures are recorded in `tools/hybrid-bench/fixtures/mirai-s-headers.json`.
+
+Local-kept hybrid latency: `python3 tools/hybrid-proxy/bench_local.py --help` uses existing binaries and models, writes paired timing/token/replay evidence under the supplied `--artifacts` directory, and stops its recorded server PIDs. See the [CPU measurements and GPU commands](tools/hybrid-proxy/RESULTS-hybrid-d-r4-261101.md).
+
 Everything below is the upstream llama.cpp README.
 
 # llama.cpp
@@ -147,3 +165,5 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 The local CPU prefill node, shared state-delta codec, correctness checker, and HTTP isolation tests are documented in [tools/hybrid/README.md](tools/hybrid/README.md), including exact CMake, flock, Python and run commands. Binaries go to `build/bin/`; logs and task-local tools go to `.temp/`; golden state fixtures go to `~/Werkstatt/hybrid-models/golden/`.
 
 Sliding-window transfer for Gemma 4 and Muse Glimmer is described in [SWA-STATE-DESIGN.md](tools/hybrid/SWA-STATE-DESIGN.md). Build `llama-hybrid-check-swa` with the locked named-target command in the node guide, then run `nice -n 19 build/bin/llama-hybrid-check-swa` for model-free allocated-cache tests. Logs belong under `.temp/`; real-model GPU qualification commands are in the [r16 report](tools/hybrid-bench/RESULTS-hybrid-a-r16-261101.md).
+
+Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.

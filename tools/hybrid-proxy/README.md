@@ -75,6 +75,8 @@ python3 -m py_compile tools/hybrid-proxy/*.py
 
 The tests use ephemeral localhost ports and temporary SQLite/slot fixtures. They cover policy decisions, explicit and inferred mapping, shared-prefix forks, restart persistence, streaming, offline/lost-ack replay, 409/snapshot recovery, foreign-client 404s on all prefill session operations, 3 clients x 4 interleaved sessions, and atomic synthetic corruption rejection. See `RESULTS.md` for exact run evidence and engine limitations. Runtime databases, slots, diagnostics and test logs belong under `.temp/hybrid-b-r1-261030/`.
 
+`test_benchmark.BenchmarkProxyTests.test_burst_node_restart_then_offload` checks simulated node RAM loss after a local-kept call: offload rechecks the prefix, recreates and replays before importing from the replacement session. The [restart regression report](RESULTS-hybrid-a-r26-261101.md) records its R2 mutant control and suite results in `.temp/hybrid-a-r26-261101/`.
+
 Build the four named correctness targets listed below under the shared flock, with CPU-only settings and `-j2`. Check exact free bytes and retain the 25 GiB start/abort floor. Do not start a build while the orchestrator's disk hold is active.
 
 ```sh
@@ -106,6 +108,7 @@ build/bin/llama-hybrid-check-distributions ~/Werkstatt/hybrid-models/Qwen3.5-0.8
 | CMake and C++ compiler | CPU engine and the four named targets, under the shared flock | `build/`; monitor/build logs under `.temp/` |
 | Native checkers | Append, recurrent rejection, SWA guard and distribution commands above | stdout/stderr logs under `.temp/` |
 | Git | Scoped signed local commits (`git commit -S`), no pushes | Local feature-branch history |
+| Local-kept latency trace | `python3 tools/hybrid-proxy/bench_local.py --help`; existing binaries/model, no builds/downloads | `--artifacts` directory: `pairs.json`, source/binary hashes, server logs and PID cleanup receipts |
 
 ## Second fix round controls
 
@@ -161,3 +164,5 @@ TMPDIR="$PWD/.temp/template-tests/tmp" nice -n 10 python3 -B tools/hybrid-proxy/
 ```
 
 The controls output directory must be new. It contains copied-source identities, owned process IDs, exact commands, logs, assertion records and `controls.json`. Identity must survive; setup errors, skipped tests and wrong assertion failures receive no kill credit. Results and finite GPU qualification gaps are in [the r19 report](RESULTS-hybrid-a-r19-templates-261101.md). The bench now probes unmatched tool preservation and inserts a matching call, preceded by a fresh user request, only when required. Qwen request bytes are regression-tested unchanged. `tool_call_added` records the verdict in probe and call rows. Controls also copy the adjacent bench Python modules and run the source-free bench contracts; external oracle tests remain optional.
+
+Policy-kept local turns leave shadow synchronization to the existing replay worker. Synchronous synchronization and prefix validation still precede every critical offload. The durable token/message commit, replay acknowledgement checks and fallback remain in place. A request can still wait behind a replay already holding its session ticket. The [local-kept latency report](RESULTS-hybrid-d-r4-261101.md) includes three CPU pairs, trace definitions, negative controls, and GPU commands.

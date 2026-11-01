@@ -210,7 +210,7 @@ def main():
                 raise Refusal(f'node authentication refused (HTTP {error.code})') from None
             if node:
                 plan['benchmark_context'] = min(plan['context'], node['context'])
-        targets = ['llama-hybrid-prefill'] if args.role == 'node' else ['llama-server', 'llama-hybrid-bench-check']
+        targets = ['llama-hybrid-prefill'] if args.role == 'node' else ['llama-server', 'llama-hybrid-bench-check', 'llama-hybrid-score']
         build_dir, record = build(args, targets, info)
         temporary = Path(tempfile.mkdtemp(prefix='.' + state.name + '-', dir=state.parent))
         os.chmod(temporary, 0o700)
@@ -280,7 +280,7 @@ def main():
                 private_json(temporary / 'node-info.json', node)
             command = [build_dir / 'bin/llama-server', '-m', model, '--host', '127.0.0.1', '--port', args.decode_port,
                 '-ngl', 999 if (args.cuda or info['backend'] == 'metal') else 0, '-t', 2, '-tb', 2,
-                '-c', plan['context'], '-np', 1, '-b', args.batch, '-ub', args.ubatch, '-ctk', 'q8_0', '-ctv', 'q8_0',
+                '-c', plan['context'], '-np', 1, '--spec-type', 'none', '-b', args.batch, '-ub', args.ubatch, '-ctk', 'q8_0', '-ctv', 'q8_0',
                 '-fa', 'on', '--jinja', '--slots', '--no-context-shift', '--cache-ram', 0, '--no-cache-idle-slots',
                 '--ctx-checkpoints', 0, '--checkpoint-min-step', 0, '--slot-save-path', str(state / 'slots') + '/',
                 '--api-key-file', state / 'decode-token']
