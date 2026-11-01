@@ -43,6 +43,17 @@ def proxy_server(args, root, prefill, decode, slots):
         app.store.close()
 
 
+def test_native_defaults(args):
+    # Without optional flags or positional context, the native allocation and all three documented limits stay unchanged.
+    with PrefillNode(args, 'default-node', context=None) as prefill:
+        health = prefill.health
+        assert health['n_ctx'] == 8448 and health['max_ctx'] == 16384
+        assert health['ram_budget_bytes'] == 512 * 1024**2 and health['max_request_bytes'] == 1024**2
+        assert health['sessions'] == health['ram_bytes'] == health['evictions'] == 0
+        (Path(args.artifacts) / 'default-node/result.json').write_text(json.dumps(health, indent=2))
+        print('PASS native defaults: allocation8448, max_ctx16384, retained512MiB, request1MiB, empty store', flush=True)
+
+
 def test_eviction_replay(args, decode, slots):
     # A real global LRU eviction returns 404; proxy replay restores the exact sampled journal and leaves decoder tokens unchanged.
     with PrefillNode(args, 'eviction-node', ('--ram-budget-mib', '48'), context='2048') as prefill:
@@ -143,6 +154,7 @@ def main():
     root = Path(args.artifacts).resolve()
     root.mkdir(parents=True, exist_ok=False)
     args.artifacts = str(root)
+    test_native_defaults(args)
     with native_server(args.server_binary, args.model, root / 'decoder') as (decode, slots):
         test_eviction_replay(args, decode, slots)
         test_budget_benchmark(args, decode, slots)
