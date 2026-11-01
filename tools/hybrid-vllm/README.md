@@ -6,7 +6,8 @@ CPU codec and a source-pinned post-forward hook for vLLM 0.32.0, one CUDA worker
 
 | Tool | Purpose | Command | Output |
 |---|---|---|---|
-| Python 3 (standard library) | Convert an exported capture | `python3 tools/hybrid-vllm/bridge.py CAPTURE/snapshot.json TARGET.json OUTPUT.delta` | Atomic HYBD delta at the explicit output path |
+| Python 3 + NumPy | Convert an exported capture | `python3 tools/hybrid-vllm/bridge.py CAPTURE/snapshot.json TARGET.json OUTPUT.delta --backend numpy` | Atomic HYBD delta; `reference` keeps the scalar oracle, `torch` requires CUDA, `auto` chooses CUDA when available |
+| NumPy; optional torch | Byte equivalence and synthetic converter timing | `python3 -m unittest discover -s tools/hybrid-vllm -p test_fast_codec.py -v`; `python3 tools/hybrid-vllm/bench_converter.py --scratch .temp/TASK/tmp` | Test log and JSON timing rows; scratch tensors/deltas are removed |
 | Python 3 | Install the source-pinned GPU runner hook | `python3 tools/hybrid-vllm/patch_vllm.py /path/to/vllm/v1/worker/gpu_model_runner.py` | One hook in that runner; matching reruns preserve bytes, other hashes or hook locations refuse |
 | vLLM 0.32.0, torch 2.13.0 and their NumPy dependency | Copy live request pages and GDN endpoint state | Set `HYBRID_VLLM_CONFIG` and use the launch command in DESIGN | Private `capture-N/` directories published by rename after validation; failed staging directories removed |
 | libxxhash | Existing protocol XXH3-128 checksum, through ctypes | Used by `bridge.py`; `python3 -c 'import ctypes.util; print(ctypes.util.find_library("xxhash"))'` | No extra artifact; library required on the converter machine |
@@ -31,7 +32,7 @@ export HYBRID_VLLM_NATIVE_CHECK="$PWD/.temp/hybrid-a-r22-261101/native_check"
 nice -n 10 python3 -m unittest discover -s tools/hybrid-vllm -p 'test_*.py' -v
 ```
 
-The native test is mandatory: an absent helper fails the test. No torch, vLLM, NumPy, GPU or model file is needed by this test command. Synthetic data uses the real 64-layer cache geometry; the native helper allocates about 184 MiB of CPU caches. It accepts only chains ending at or before 1024 tokens and is not a production import service.
+The native test is mandatory: an absent helper fails the test. NumPy is required for the fast converter; torch and vLLM remain optional for CPU discovery. No GPU or model file is needed by this test command. Synthetic data uses the real 64-layer cache geometry; the native helper allocates about 184 MiB of CPU caches. It accepts only chains ending at or before 1024 tokens and is not a production import service.
 
 `test_serialized_layout_reference` checks delta bytes against a separately written explicit Hadamard matrix, reference q8_0 encoder and source-layout recurrent permutation. Its files differ by layer, head, token and K/V. `test_fp8_rotated_bytes` independently checks non-unit K/V scales with rotation. Native round-trip checks serialization through allocated caches; it does not establish the source layout. `test_export_refusal_cleanup` uses CPU doubles for directory cleanup and publication. The separate `gather_test.py` uses real CPU tensors and the production page writer, including non-monotonic block tables and split kernel pages. It is outside stdlib-only discovery and is always run first by `gpu-run.sh`.
 

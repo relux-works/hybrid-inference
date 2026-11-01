@@ -186,7 +186,7 @@ def recurrent_row(root, layer, state, layout):
     return f32_bytes(data[t * 10240 + c] if layout == "SD" else data[c * 3 + t] for c in channels for t in range(3))
 
 
-def write_body(output, snapshot, root):
+def write_body(output, snapshot, root, codec=None):
     n0, n1 = snapshot["n0"], snapshot["n1"]
     def pack(fmt, *args):
         output.write(struct.pack("<" + fmt, *args))
@@ -198,12 +198,13 @@ def write_body(output, snapshot, root):
     for value in (False, True):
         for i in ATTENTION:
             pack("iQ", 8, 1088)
-            for row in kv_rows(root, layers[i], snapshot["block_size"], value, snapshot["rotations"][int(value)]):
+            rows = (codec.kv_rows if codec else kv_rows)(root, layers[i], snapshot["block_size"], value, snapshot["rotations"][int(value)])
+            for row in rows:
                 output.write(row)
     pack("IiIII", 1, n1 - 1, 0, 0, 64)
     for state in (False, True):
         for i in RECURRENT:
-            row = recurrent_row(root, layers[i], state, snapshot["conv_layout"])
+            row = (codec.recurrent_row if codec else recurrent_row)(root, layers[i], state, snapshot["conv_layout"])
             pack("iQ", 0, len(row))
             output.write(row)
 
@@ -232,7 +233,7 @@ def xxh128_file(source):
         library.XXH3_freeState(state)
 
 
-def convert(snapshot_path, target, destination):
+def convert(snapshot_path, target, destination, backend="numpy", session_id="vllm-prototype"):
     snapshot_path, destination = Path(snapshot_path), Path(destination)
     require(snapshot_path.stat().st_size <= 16 * 1024**2, "capture manifest too large")
     snapshot = json.loads(snapshot_path.read_text())
@@ -240,14 +241,16 @@ def convert(snapshot_path, target, destination):
     n0, n1 = snapshot["n0"], snapshot["n1"]
     header = dict(magic="HYBD", version=1, body_format="llama-native-seq-v1", kv_type="q8_0", state_dtype="f32",
                   model_sha256=target["model_sha256"], layout_fingerprint=target["layout_fingerprint"],
-                  session_id="vllm-prototype", n0=n0, n1=n1, tokens=snapshot["tokens"][n0:],
+                  session_id=session_id, n0=n0, n1=n1, tokens=snapshot["tokens"][n0:],
                   prefix_hash_n1=token_hash(snapshot["tokens"]),
                   sections=[dict(name="llama_seq_state", offset=0, bytes=body_size(n1 - n0))])
     encoded = json.dumps(header, separators=(",", ":")).encode()
     require(len(encoded) <= min(1024**2, 4096 + 11 * (n1 - n0)), "delta header exceeds range budget")
     # Publish only a fully converted, checksummed file; failures preserve an existing destination.
+    from fast_codec import codec_for
+    codec = codec_for(backend)
     with tempfile.TemporaryFile(dir=destination.parent) as body:
-        write_body(body, snapshot, snapshot_path.parent)
+        write_body(body, snapshot, snapshot_path.parent, codec)
         require(body.tell() == body_size(n1 - n0), "native body size mismatch")
         body.seek(0)
         checksums = xxh128_file(body)
@@ -273,8 +276,9 @@ def main():
     parser.add_argument("snapshot")
     parser.add_argument("target", help="target identity JSON from bench_common.model_identity, plus model_sha256")
     parser.add_argument("output")
+    parser.add_argument("--backend", choices=("numpy", "torch", "auto", "reference"), default="numpy")
     args = parser.parse_args()
-    convert(args.snapshot, json.loads(Path(args.target).read_text()), args.output)
+    convert(args.snapshot, json.loads(Path(args.target).read_text()), args.output, args.backend)
 
 
 if __name__ == "__main__":
