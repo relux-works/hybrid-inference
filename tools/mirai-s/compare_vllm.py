@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified from alesha-pro/llama.cpp-mirai-s fdb1e815 by hybrid-inference: use ASCII escapes in the Russian prompt.
 """Greedy continuations of the same token ids from Mirai's vLLM plugin and the mirai-s llama.cpp fork (or a second
 vLLM server, --vllm-b).
 

@@ -1,3 +1,5 @@
+<!-- Modified from alesha-pro/llama.cpp-mirai-s fdb1e815 by hybrid-inference: document the port and its validation. -->
+
 # Mirai S in llama.cpp
 
 This fork runs Mirai S Qwen3.8-27B (`trymirai/Qwen3.8-27B-S-experimental`, 2.4-bit QTIP-style trellis) from a GGUF
