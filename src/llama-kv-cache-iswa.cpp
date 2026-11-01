@@ -258,7 +258,7 @@ bool llama_kv_cache_iswa::get_can_shift() const {
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_base->state_write(io, seq_id, flags);
-    kv_swa ->state_write(io, seq_id, flags);
+    kv_swa ->state_write(io, seq_id, flags | (swa_type == LLAMA_SWA_TYPE_STANDARD ? LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT : 0));
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -271,7 +271,8 @@ void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id 
         throw std::runtime_error("range export requires standard sliding-window memory");
     }
     kv_base->state_write_range(io, seq_id, p0, p1, flags);
-    kv_swa->state_write_range(io, seq_id, std::max<int64_t>(0, (int64_t) p1 - n_swa), p1, flags);
+    // Keep physical cells and the allocator head: compaction changes attention reduction order.
+    kv_swa->state_write_range(io, seq_id, -1, p1, flags | LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT);
 }
 
 void llama_kv_cache_iswa::state_read_append(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, bool validate, const std::function<void()> & post_check) {

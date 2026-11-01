@@ -128,7 +128,12 @@ Model-free allocated CPU-cache tests (positive, malformed positions, truncation,
 
 ```sh
 nice -n 19 build/bin/llama-hybrid-check-swa
+# Generate a tiny local GGUF, run CPU attention across window/ring boundaries, then remove the GGUF.
+mkdir -p .temp/swa-check
+nice -n 19 build/bin/llama-hybrid-check-swa .temp/swa-check/tiny.gguf
 HYBRID_SWA_CHECKER="$PWD/build/bin/llama-hybrid-check-swa" python3 tools/hybrid-bench/test_bench.py
 ```
 
-The second command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. The native checker covers server architecture admission and rollback after a failed context post-check. These tests do not establish real-model or GPU logit equivalence. [The r17 section of the r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md#r17-rebase-and-review-notes) contains pinned rented-GPU commands and offline nextn/MTP inspection; no SWA model is available on this CPU host. Read the nextn/MTP limitations and proposed follow-up in [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) before provisioning a real file.
+The Python command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. The native checker covers server architecture admission and rollback after a failed context post-check. The optional tiny GGUF test checks CPU same-partition bit-exact logits; production-model and GPU equivalence remain unverified. [The r17 section of the r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md#r17-rebase-and-review-notes) contains pinned rented-GPU commands and offline nextn/MTP inspection; no production SWA GGUF is available on this CPU host. Read the nextn/MTP limitations and proposed follow-up in [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) before provisioning a real file.
+
+SWA ring-placement and reuse-threshold regression evidence, native-record compatibility and the exact GPU block are recorded in [RESULTS-hybrid-b-r33-261101.md](RESULTS-hybrid-b-r33-261101.md). Rebuild node, decoder and checker together; marked physical records fail closed on older decoders.

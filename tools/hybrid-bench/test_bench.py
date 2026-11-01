@@ -89,7 +89,8 @@ class BenchmarkTests(unittest.TestCase):
                 identity = common.model_identity(model.name)
             self.assertEqual(plan['kv_bytes_per_token'], full)
             self.assertEqual(plan['window_kv_bytes_per_token'], window_row)
-            self.assertEqual(plan['window_state_bytes'], window * (window_row + 24))
+            # Transfer sizing includes stale ring cells and their physical indices, not just unmasked positions.
+            self.assertEqual(plan['window_state_bytes'], ((window + 256 + 255) // 256) * 256 * (window_row + 28) + 16)
             self.assertEqual(plan['recurrent_state_bytes'], 0)
             self.assertEqual(identity['model_layout']['sliding_window'], window)
             fixed = plan['window_state_bytes']

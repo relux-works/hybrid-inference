@@ -17,8 +17,9 @@ class llama_io_read_i;
 
 // Internal host-state append mode. Use the transactional API in llama-ext.h.
 #define LLAMA_STATE_SEQ_FLAGS_APPEND (1u << 30)
+#define LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT (1u << 29)
 #define LLAMA_STATE_SEQ_FLAGS_VALIDATE (1u << 31)
-static_assert(((LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE) &
+static_assert(((LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE | LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT) &
                (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) == 0,
               "internal state flags must not overlap public state flags");
 

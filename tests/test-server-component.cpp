@@ -665,6 +665,25 @@ static void test_glob_match(testing & t) {
     });
 }
 
+// Complete SWA caches and the first required cell are reusable; a missing boundary cell is not.
+static void test_prompt_reuse_threshold(testing & t) {
+    for (bool has_new_tokens : {false, true}) {
+        for (llama_pos next : {2, 4, 10}) {
+            const llama_pos expected = next == 10 ? (has_new_tokens ? 8 : 7) : (next == 4 && has_new_tokens ? 2 : 1);
+            const llama_pos threshold = server_prompt_reuse_threshold(next, 4, has_new_tokens);
+            t.assert_equal("SWA below/at/above window", expected, threshold);
+            t.assert_true("complete cache starts at zero", 0 < threshold);
+            t.assert_true("first required cell present", expected - 1 < threshold);
+            t.assert_true("first required cell missing", !(expected < threshold));
+        }
+        // Dense and recurrent models keep the old threshold, including its zero boundary.
+        for (llama_pos next : {0, 1, 2, 4, 10}) {
+            t.assert_equal("non-SWA unchanged", std::max(0, next - (has_new_tokens ? 0 : 1)),
+                           server_prompt_reuse_threshold(next, 0, has_new_tokens));
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -678,6 +697,7 @@ int main(int argc, char ** argv) {
     }
 
     t.test("server_tokens", test_server_tokens);
+    t.test("prompt_reuse_threshold", test_prompt_reuse_threshold);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
     t.test("json_helpers",  test_json_helpers);
