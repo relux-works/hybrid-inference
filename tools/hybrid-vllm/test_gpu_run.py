@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,10 @@ esac
 ''')
         self.command("hostname", 'printf "%s\\n" "${FAKE_HOST:-relux-agents1}"\n')
         self.command("nproc", "printf '16\\n'\n")
+        self.command("ldd", '''printf 'ldd %s preload=%s path=%s\\n' "$*" "${LD_PRELOAD-unset}" "${LD_LIBRARY_PATH-unset}" >> "$CALLS"
+printf '%s\\n' "${LDD_OUTPUT:-libc.so.6 => /lib/libc.so.6}"
+exit "${LDD_EXIT:-0}"
+''')
         self.command("cmake", '''printf 'cmake %s\\n' "$*" >> "$CALLS"
 if [[ $1 == -S ]]; then
     mkdir -p "$BUILD_DIR/bin"
@@ -77,6 +82,8 @@ exit "${CMAKE_EXIT:-0}"
         calls = self.calls.read_text().splitlines()
         self.assertEqual(calls[0], "gather")
         self.assertIn("-DGGML_CUDA=ON", "\n".join(calls))
+        self.assertIn("-DBUILD_SHARED_LIBS=OFF", "\n".join(calls))
+        self.assertIn("-DGGML_BACKEND_DL=OFF", "\n".join(calls))
         self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=120a-real", "\n".join(calls))
         self.assertIn("--target llama-server llama-hybrid-bench-check", "\n".join(calls))
         self.assertEqual((selected / "build.ref").read_text().strip(), "a" * 40)
@@ -84,6 +91,102 @@ exit "${CMAKE_EXIT:-0}"
         self.assertIn("  bin/libllama-server-impl.so\n", (selected / "binaries.sha256").read_text())
         self.assertFalse(self.run_dir.exists())
         self.assertTrue((self.root / "disk-tmp").is_dir())
+
+    # A self-ignoring local .gitignore cannot hide a new source; removing both admits the tree.
+    def test_self_ignoring_source_refusal(self):
+        git = shutil.which("git")
+        source = self.root / "source"
+        subprocess.run([git, "init", "-q", str(source)], check=True)
+        cuda = source / "ggml/src/ggml-cuda"
+        cuda.mkdir(parents=True)
+        (cuda / ".gitignore").write_text("*\n")
+        (cuda / "hidden.cu").write_text("// hidden source\n")
+        self.command("git", '''case "$1" in
+    rev-parse) printf '%s\\n' "$EXPECTED_REF" ;;
+    status|ls-files) "$REAL_GIT" -C "$PLANT_REPO" "$@" ;;
+esac
+''')
+        env = dict(REAL_GIT=git, PLANT_REPO=str(source))
+        result = self.run_step("build", **env)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("hidden.cu", result.stderr)
+        self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
+        (cuda / ".gitignore").unlink()
+        (cuda / "hidden.cu").unlink()
+        result = self.run_step("build", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # Each receiver is inspected after hashes, with loader overrides removed; ldd failure also refuses.
+    def test_receiver_linkage_gate(self):
+        self.command("nvidia-smi", "printf 'header\\n'\n")
+        self.assertEqual(self.run_step("build").returncode, 0)
+        for output, code in (("libllama.so.0 => /elsewhere/libllama.so.0", "0"),
+                             ("libggml-cpu.so.0 => /elsewhere/libggml-cpu.so.0", "0"),
+                             ("libcuda.so.1 => not found", "0"), ("", "9")):
+            for step in ("build", "check"):
+                with self.subTest(output=output, code=code, step=step):
+                    self.calls.unlink()
+                    result = self.run_step(step, LDD_OUTPUT=output, LDD_EXIT=code)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("receiver-ran", self.calls.read_text())
+        self.calls.unlink()
+        result = self.run_step("check", LD_LIBRARY_PATH="/untrusted/override", LD_PRELOAD="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inspections = [line for line in self.calls.read_text().splitlines() if line.startswith("ldd ")]
+        self.assertEqual(len(inspections), 2)
+        for receiver in ("llama-server", "llama-hybrid-bench-check"):
+            self.assertTrue(any("/bin/" + receiver + " preload=unset path=unset" in line for line in inspections))
+
+    # Real ELF shared receivers refuse overrides and copied absolute RUNPATHs; embedded code stays bound.
+    def test_real_elf_loader_binding(self):
+        self.assertEqual(self.run_step("build").returncode, 0)
+        (self.bin / "ldd").unlink()
+        self.command("nvidia-smi", "printf 'header\\n'\n")
+        build = self.run_dir / "build"
+        lib = self.root / "marker.c"
+        main = self.root / "main.c"
+        lib.write_text('const char *llama_marker(void) { return MARKER; }\n')
+        main.write_text('''#include <stdio.h>
+#include <stdlib.h>
+const char *llama_marker(void);
+int main(void) {
+    FILE *f = fopen(getenv("CALLS"), "a");
+    fprintf(f, "loaded %s preload=%s path=%s\\n", llama_marker(), getenv("LD_PRELOAD") ? "set" : "unset", getenv("LD_LIBRARY_PATH") ? "set" : "unset");
+    fclose(f);
+    return 0;
+}
+''')
+        def compile_elf(*args):
+            subprocess.run(["nice", "-n", "10", "cc", *map(str, args)], check=True, capture_output=True)
+        shared = build / "bin/libllama.so.0"
+        compile_elf("-shared", "-fPIC", '-DMARKER="original"', "-Wl,-soname,libllama.so.0", lib, "-o", shared)
+        other = self.root / "other"
+        other.mkdir()
+        compile_elf("-shared", "-fPIC", '-DMARKER="external"', "-Wl,-soname,libllama.so.0", lib, "-o", other / shared.name)
+        for receiver in ("llama-server", "llama-hybrid-bench-check"):
+            compile_elf(main, "-L" + str(shared.parent), "-l:libllama.so.0", "-Wl,-rpath," + str(shared.parent), "-o", shared.parent / receiver)
+        def receipt(directory):
+            paths = sorted((directory / "bin").iterdir())
+            (directory / "binaries.sha256").write_text("".join(hashlib.sha256(p.read_bytes()).hexdigest() + "  bin/" + p.name + "\n" for p in paths))
+        receipt(build)
+        copied = self.root / "copied-build"
+        shutil.copytree(build, copied, symlinks=True)
+        shutil.copyfile(other / shared.name, shared)
+        for env in ({}, {"LD_LIBRARY_PATH": str(other)}, {"LD_PRELOAD": str(other / shared.name)}):
+            for step in ("build", "check"):
+                self.calls.unlink(missing_ok=True)
+                result = self.run_step(step, BUILD_DIR=str(copied), **env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Receiver must use static llama/ggml", result.stderr)
+                self.assertNotIn("loaded ", self.calls.read_text())
+        for receiver in ("llama-server", "llama-hybrid-bench-check"):
+            compile_elf(main, lib, '-DMARKER="embedded"', "-o", copied / "bin" / receiver)
+        receipt(copied)
+        for env in ({}, {"LD_LIBRARY_PATH": str(other)}, {"LD_PRELOAD": str(other / shared.name)}):
+            self.calls.unlink(missing_ok=True)
+            result = self.run_step("check", BUILD_DIR=str(copied), **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.calls.read_text().count("loaded embedded preload=unset path=unset"), 2)
 
     # A failed gather returns its real exit and blocks even the ref check and build.
     def test_gather_failure_stops_all(self):
@@ -102,12 +205,12 @@ exit "${CMAKE_EXIT:-0}"
                 self.calls.unlink(missing_ok=True)
                 result = self.run_step("build", self.root / ("rejected-" + str(index)), **env)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("cmake", self.calls.read_text())
+                self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
         self.calls.unlink(missing_ok=True)
         (self.run_dir / "build").mkdir(parents=True)
         result = self.run_step("build")
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("cmake", self.calls.read_text())
+        self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
 
     # Real porcelain sees a globbed untracked CUDA source; removing it admits the same fixture.
     def test_untracked_cuda_refusal(self):
@@ -129,7 +232,7 @@ esac
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("Refusing dirty source tree (tracked or untracked files)", result.stderr)
         self.assertIn("?? ggml/src/ggml-cuda/zz-untracked-probe.cu", result.stderr)
-        self.assertNotIn("cmake", self.calls.read_text())
+        self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
         self.assertFalse((self.run_dir / "build").exists())
         plant.unlink()
         result = self.run_step("build", **env)
@@ -159,7 +262,7 @@ esac
                 result = self.run_step("build", **env)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("Refusing locally hidden source state", result.stderr)
-                self.assertNotIn("cmake", self.calls.read_text())
+                self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
                 plant.write_text("original\n")
                 real_git("update-index", "--no-" + flag, "hidden.cu")
         untracked = source / "ignored.cu"
@@ -176,7 +279,7 @@ esac
                 result = self.run_step("build", **env)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("ignored.cu", result.stderr)
-                self.assertNotIn("cmake", self.calls.read_text())
+                self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
         untracked.unlink()
         result = self.run_step("build", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -199,7 +302,7 @@ if [[ $1 == rev-parse ]]; then printf '%s\\n' "$EXPECTED_REF"; fi
             result = self.run_step("build", run_dir, BUILD_DIR=str(build_dir), **env)
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("Artifact directory must be outside", result.stderr)
-            self.assertNotIn("cmake", self.calls.read_text())
+            self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
         for run_dir in (self.root / ".temp/accepted", outside / "run"):
             result = self.run_step("build", run_dir, BUILD_DIR=str(run_dir / "build"), **env)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -223,13 +326,13 @@ if [[ $1 == rev-parse ]]; then printf '%s\\n' "$EXPECTED_REF"; fi
         retry = self.root / "capture-retry"
         result = self.run_step("build", retry, BUILD_DIR=str(build_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("cmake", self.calls.read_text())
+        self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
         self.assertEqual((retry / "build.ref").read_bytes(), (build_dir / "build.ref").read_bytes())
         self.assertEqual((retry / "binaries.sha256").read_bytes(), (build_dir / "binaries.sha256").read_bytes())
         self.command("nvidia-smi", "printf 'pid, process_name, used_memory\\n'\n")
         result = self.run_step("check", self.root / "check-retry", BUILD_DIR=str(build_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("cmake", self.calls.read_text())
+        self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
 
     # Existing builds with stale refs, missing hashes or altered binaries refuse without rebuilding.
     def test_build_reuse_refusals(self):
@@ -250,7 +353,7 @@ if [[ $1 == rev-parse ]]; then printf '%s\\n' "$EXPECTED_REF"; fi
                         path.write_bytes(changed)
                     result = self.run_step("build", retry, BUILD_DIR=str(build_dir))
                     self.assertNotEqual(result.returncode, 0, result.stderr)
-                    self.assertNotIn("cmake", self.calls.read_text())
+                    self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
                     self.assertFalse((retry / "build.ref").exists())
                 finally:
                     path.write_bytes(original)
@@ -277,7 +380,7 @@ if [[ $1 == rev-parse ]]; then printf '%s\\n' "$EXPECTED_REF"; fi
                     result = self.run_step(step, retry, BUILD_DIR=str(build_dir))
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertIn("Receiver bin file hashes FAILED", result.stderr)
-                    self.assertNotIn("cmake", self.calls.read_text())
+                    self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
                     self.assertNotIn("receiver-ran", self.calls.read_text())
                     self.assertFalse((retry / "build.ref").exists())
                 for filename, contents in original.items():
@@ -325,6 +428,50 @@ if [[ $1 == rev-parse ]]; then printf '%s\\n' "$EXPECTED_REF"; fi
         self.assertIn("FAIL exit=9", result.stderr)
         self.assertIn("nice -n 10 cmake", result.stderr)
         self.assertFalse((self.run_dir / "build.ref").exists())
+
+    # PID-only INT/TERM stops the owned build group, including a TERM-ignoring grandchild.
+    def test_build_interrupt_process_group(self):
+        ready = self.root / "build-ready"
+        os.mkfifo(ready)
+        harness = self.root / "build_tree.py"
+        harness.write_text('''import os, signal, subprocess, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+worker = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+with open(os.environ["BUILD_READY"], "w") as f:
+    f.write(str(os.getpid()) + " " + str(worker.pid) + "\\n")
+worker.wait()
+''')
+        self.command("cmake", 'exec "' + sys.executable + '" "' + str(harness) + '"\n')
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig):
+                fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+                child = subprocess.Popen(["bash", str(self.script), "build"],
+                                         env=dict(self.env, BUILD_READY=str(ready)),
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                pids = []
+                try:
+                    self.assertTrue(select.select([fd], [], [], 10)[0], "build tree did not start")
+                    pids = list(map(int, os.read(fd, 128).split()))
+                    self.assertEqual(len(pids), 2)
+                    child.send_signal(sig)
+                    try:
+                        stdout, stderr = child.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.fail("signal did not stop the build process group")
+                    self.assertEqual(child.returncode, 128 + sig, stderr)
+                    for pid in pids:
+                        status = Path("/proc") / str(pid) / "stat"
+                        self.assertTrue(not status.exists() or status.read_text().split()[2] == "Z", "build descendant still running: " + str(pid))
+                finally:
+                    os.close(fd)
+                    for pid in [*pids, child.pid]:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    child.wait(timeout=10)
+                    child.stdout.close()
+                    child.stderr.close()
 
     # A changed receiver binary cannot pass the stored exact-build gate or start a checker.
     def test_binary_tamper(self):
@@ -495,7 +642,7 @@ printf 'pid, process_name, used_memory\\n'
 ''')
         result = self.run_step("capture", FAKE_RUNNER=str(runner))
         self.assert_capture_stopped(result, runner, 0)
-        self.assertNotIn("cmake", self.calls.read_text())
+        self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
         self.assertTrue((self.run_dir / "binaries.sha256").is_file())
 
     # Sourcing refuses before changing shell options; help has no run-directory side effects.

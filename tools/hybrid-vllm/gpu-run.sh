@@ -5,6 +5,7 @@ if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
     return 2
 fi
 set -Eeuo pipefail
+unset LD_PRELOAD LD_LIBRARY_PATH
 umask 077
 trap 'status=$?; printf "FAIL setup exit=%s line=%s command=%q\n" "$status" "$LINENO" "$BASH_COMMAND" >&2; exit "$status"' ERR
 
@@ -65,11 +66,13 @@ runner=
 backup=
 stop_pid() {
     local pid=${1:-$owned_pid} status=0 deadline=$((SECONDS + STOP_TIMEOUT))
-    if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || :; fi
-    while kill -0 "$pid" 2>/dev/null; do
+    local target=$pid
+    if [[ $pid == "$command_pid" ]]; then target=-$pid; fi
+    if kill -0 -- "$target" 2>/dev/null; then kill -TERM -- "$target" 2>/dev/null || :; fi
+    while kill -0 -- "$target" 2>/dev/null; do
         if (( SECONDS >= deadline )); then
             printf 'Stop timeout after %s seconds; sending SIGKILL to owned PID %s\n' "$STOP_TIMEOUT" "$pid"
-            kill -KILL "$pid" 2>/dev/null || :
+            kill -KILL -- "$target" 2>/dev/null || :
             break
         fi
         sleep 1
@@ -98,7 +101,7 @@ trap cleanup EXIT
 interrupt() {
     signal_status=$1
     if [[ -n $command_pid ]]; then
-        kill -TERM "$command_pid" 2>/dev/null || :
+        kill -TERM -- "-$command_pid" 2>/dev/null || :
     else
         exit "$signal_status"
     fi
@@ -111,7 +114,7 @@ trap 'interrupt 141' PIPE
 run_child() {
     local status=0
     [[ $STOP_TIMEOUT =~ ^[1-9][0-9]*$ ]]
-    "$@" &
+    setsid "$@" &
     command_pid=$!
     wait "$command_pid" || status=$?
     if (( signal_status )); then exit "$signal_status"; fi
@@ -126,6 +129,11 @@ exact_ref() {
     changes=$(git status --porcelain --untracked-files=all)
     if [[ -n $changes ]]; then
         printf 'Refusing dirty source tree (tracked or untracked files):\n%s\n' "$changes" >&2
+        return 1
+    fi
+    changes=$(git status --porcelain --untracked-files=all --ignored -- CMakeLists.txt cmake common ggml include src tools vendor tests)
+    if [[ -n $changes ]]; then
+        printf 'Refusing ignored or dirty source paths:\n%s\n' "$changes" >&2
         return 1
     fi
     changes=$(git ls-files --others --exclude-per-directory=.gitignore)
@@ -169,6 +177,7 @@ build() {
     [[ $BUILD_JOBS =~ ^[1-9][0-9]*$ ]]
     if [[ $host == agents1 || $host == relux-agents1 ]]; then (( BUILD_JOBS <= 4 )); fi
     run_child nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF \
         -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
         -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" \
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF
@@ -192,6 +201,15 @@ assert_build() {
         printf 'Receiver bin file hashes FAILED: %s\n' "$BUILD_DIR" >&2
         return 1
     fi
+    local receiver dependencies
+    for receiver in llama-server llama-hybrid-bench-check; do
+        dependencies=$(LC_ALL=C ldd "$BUILD_DIR/bin/$receiver") || return $?
+        printf '%s linkage:\n%s\n' "$receiver" "$dependencies"
+        if [[ $dependencies =~ lib(llama|ggml)[^[:space:]]*\.so || $dependencies == *'not found'* ]]; then
+            printf 'Receiver must use static llama/ggml with resolved runtime dependencies: %s\n' "$receiver" >&2
+            return 1
+        fi
+    done
     cp -- "$BUILD_DIR/build.ref" "$BUILD_DIR/binaries.sha256" "$RUN_DIR/"
 }
 wait_health() {

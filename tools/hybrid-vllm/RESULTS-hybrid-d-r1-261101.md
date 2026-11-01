@@ -275,3 +275,124 @@ Some positive-control kills detect an always-refusing implementation, rather tha
 Reviewer rows R1-R6 remain explicit: R1 maps to capture cleanup/request-signal tests and cleanup/TERM/PIPE mutants; R2 to untracked/hidden-source tests and corresponding mutants; R3 to shared-library/file-set/reuse tests and receipt mutants; R4 to build-jobs/refusal tests and agents1 mutants; R5 to the full native suite plus direct/script gather; R6 to the green identity and named assertion controls above. The user brief supplied no formal surface table (brief gap). No requested r5 row is treated as out of contract. Earlier r7b converter-refusal gaps and r7d's structured upper-bound error are outside this reuse/runner scope and unchanged. All reviewer test names are retained.
 
 Self-review: `self-review.md`, scope/security/general/tests/design and process ownership. Board unavailable (`goal-read.log`, exit 1, missing .task-board); existing `.temp/tasks.md` tracks this task. Independent acceptance, hosted checks, landing and primary-goal clear are not claimed. Signed local handoff with the requested trailer and the authorized #hybrid/prototype-go summary is the delivery scope.
+
+## r6: static receiver loader binding (hybrid-d-r6-261101)
+
+Ready for review on `m3-vllm-bridge`, parent `a79334fa551004ac201c74efedbeaff98ee255ea`. r7m requested changes to r5 for `reuse-loader-path-unbound`; its acceptance is not claimed. Scope is `tools/hybrid-vllm/` only. CPU only, no GPU/model downloads, no push.
+
+Fresh receiver builds use `-DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF`. Existing CMake statically links llama, ggml, mtmd and the server implementation. After the complete bin hash check, `ldd` must succeed for both `llama-server` and `llama-hybrid-bench-check` with no llama/ggml shared dependency and no missing runtime library. `LD_PRELOAD` and `LD_LIBRARY_PATH` are unset before children start, including inspection and receiver execution. Legacy shared builds refuse even with matching receipts. No RPATH fallback is needed for these targets.
+
+| r7m finding | Change and regression |
+|---|---|
+| Medium `reuse-loader-path-unbound` | `test_real_elf_loader_binding`: real shared ELF receivers, injected library path/preload, copied build with absolute RUNPATH and original-library replacement all refuse before a receiver runs. Nearby embedded-code ELF controls execute their own marker with loader variables absent. `test_receiver_linkage_gate` inspects both receivers and refuses llama/ggml dependencies, unresolved runtime libraries and resolver failure. Static CMake flags are asserted in `test_build_and_paths`. |
+| Low `hidden-source-untracked-gitignore` | A second scoped porcelain read includes ignored source files. `test_self_ignoring_source_refusal` plants a self-ignoring `.gitignore` and new CUDA source using real Git, then removes both for a valid control. Global/info excludes and index-flag tests remain. |
+| Low `build-interrupt-orphans` | `setsid` starts each command group; interrupt TERM and cleanup TERM/KILL target that owned group while wait reaps its leader. `test_build_interrupt_process_group` uses a TERM-resistant two-level tree. The real CMake/make PID-only TERM/INT probes return 143/130 with no surviving build processes. |
+
+Evidence root: `.temp/hybrid-d-r6-261101/`. JSON records carry exact commands, real exits, observation times, source hashes and disk minima. No formal surface table was supplied (brief gap). Reviewer rows map as follows: R1 cleanup/R7 interruption -> existing capture signal tests plus new group regression and signal probes; R2 source state -> real Git source tests; R3 manifest/loader -> integrity and real ELF tests/probes; R4 jobs -> retained host-cap tests; R5 regressions -> full suite/gather/plants; R6 narrowing -> mutant tables below; R8 artifact paths -> retained real Git artifact test.
+
+| Check | Real result | Evidence |
+|---|---|---|
+| Fresh static CPU receiver configure/build, nice 10, parallel 4 | 0 / 0; server and checker built | `static-configure-01`, `static-build-01` logs/JSON |
+| Real receiver linkage, no llama/ggml shared objects | 0; both inspected, no shared files in bin | `static-linkage-01`, `static-linkage.json` |
+| Native helper linked to these static archives | 0 | `build-native-01` |
+| Full CPU/native suite | 0; 44/44, all old test names kept | `tests-01` |
+| Gather direct / script | 0 / 0; 2/2 each | `gather-01`, `script-gather-01` |
+| Reviewer integrity / loader probes | 0 / 0; 10/10 and 7/7 held | `reviewer-reuse-01`, `reviewer-loader-01`, corresponding probe `results.json` |
+| Real CMake/make build PID-only TERM / INT | 143 / 130; no surviving descendants; probe driver 0 | `reviewer-build-signals-01`, `build-signals/results.json` |
+| Reviewer capture signal scenarios | Driver 0; per-scenario signal exits/restoration/liveness retained | `reviewer-signals-01`, `signals/results.json` |
+| r1/r6x + r7b plants | Identity 0; all 23 killed in named assertions (each exits 1) | `reviewer-r1-plants-01`, `r1plants/r1-plants.json` |
+| Gather/FP8 plants | Identity 0; 14 assertion kills; upper-bound ERROR uncredited | `reviewer-gather-plants-02`, `gather-final/plants.json` |
+| Shell mutants, 28 reviewer + 9 r6 | Identity 0; 36 named assertion kills, 1 survivors; driver 0 is not an all-killed claim | `reviewer-shell-01`, `shell-mutants.json`, `shm-*.log` |
+| Bash parse / Python compilation, ASCII, preserved names / diff whitespace | 0 / 0 / 0 | `bash-syntax-01`, `source-check-01`, `diff-check-01` |
+| CPU server version / checker missing-argument refusal | 0 / 2 (expected-red usage refusal, no model access) | `receiver-version-01`, `checker-usage-01` |
+
+`engine-build-identity.json` records the exact parent engine tree objects, CPU/static cache flags and archive/binary hashes; all engine source paths match that parent because r6 changes only bridge tooling, tests and docs. CMake was absent from PATH (readiness failure); used verified existing CMake 4.4.4 read-only from the hybrid-a tool tree. CPU-only torch 2.13.0+cpu/NumPy 2.5.4 were installed under task scratch without a global change. `TMPDIR` is on disk, bytecode is disabled. Observed minimum free disk across recorded checks: 33.331 GB, above 28 GB. Engine compilation used one task-owned slot beside the other lane's CPU build, at most four jobs. The separate signal probe builds a tiny no-language CMake fixture whose target runs sleep, not another CPU compiler build.
+
+Failed/corrected controls remain explicit: regression-red-01 exits 1 (expected failure of r5); script-tests-01 exits 1 due to the old substring CMake detector, corrected to actual command-line detection and green in -02/full suite. The first reviewer gather-plant driver exits 0 but its child imports failed because the script replaced PYTHONPATH; no kills are credited from that attempt. Rerun -02 supplies the supported HB dependency path. `ty` and `editorconfig-checker` readiness each exit 127; their checks are unrun. Initial wrapper attempts raised FileNotFoundError with exit 1 and no JSON; empty logs are not green evidence. No C++ model-naming files changed. See `revision-notes.md` for details.
+
+Reviewer probe adaptations are bounded and persisted in `probe-adaptations.json`: re-anchor group-aware mutations; update identity suite count to 44; count CMake invocation lines; use explicit ldd doubles only for shell receiver fixtures. The legacy shared ELF identity now expects refusal; the real loader probe still uses real ldd, GCC-built receivers and absolute RUNPATHs. Its L1/L2/L3 attacks refuse. The clean static positive control uses actual static CPU binaries and the real embedded-code ELF regression. No mock-only positive is used to claim static build feasibility.
+
+| Shell mutant | What it narrows the gate to | Named failing test, or survivor bound | Result |
+|---|---|---|---|
+| `cleanup_signals_armed` | Mask repeated cleanup signals | `test_capture_term_ignoring_cleanup` | 1; assertion kill |
+| `cleanup_stop_before_restore` | Restore runner before server stop | `test_capture_term_ignoring_cleanup` | 1; assertion kill |
+| `no_kill_escalation` | Escalate ignored TERM on server and command group | `test_build_interrupt_process_group`, `test_capture_reuses_build`, `test_capture_term_ignoring_cleanup` | 1; assertion kill |
+| `kill_status_not_accepted` | Accept teardown KILL status without false failure | `test_capture_reuses_build` | 1; assertion kill |
+| `exact_ref_diff_only` | Preserve porcelain source diagnostics beside scoped scan | `test_untracked_cuda_refusal` | 1; assertion kill |
+| `exact_ref_untracked_no` | Preserve full untracked porcelain diagnostics | `test_untracked_cuda_refusal` | 1; assertion kill |
+| `reuse_skips_hash` | Compare full stored hashes before admission | `test_binary_tamper`, `test_build_reuse_refusals`, `test_library_set_and_symlink_refusals`, `test_shared_library_reuse_refusals` | 1; assertion kill |
+| `reuse_skips_ref` | Require build receipt source ref | `test_build_reuse_refusals` | 1; assertion kill |
+| `reuse_hash_server_only` | Keep the complete bin receipt | `test_build_and_paths`, `test_build_reuse_refusals`, `test_library_set_and_symlink_refusals`, `test_real_elf_loader_binding`, `test_shared_library_reuse_refusals` | 1; assertion kill |
+| `agents1_cap_off` | Refuse explicit jobs above four on agents1 | `test_build_refusals` | 1; assertion kill |
+| `agents1_default_uncapped` | Cap default jobs at four on agents1 | `test_artifact_path_preflight`, `test_binary_tamper`, `test_build_and_paths`, `test_build_interrupt_process_group`, `test_build_jobs_by_host`, `test_build_reuse`, `test_build_reuse_refusals`, `test_capture_cleanup`, `test_capture_request_signals`, `test_capture_reuses_build`, `test_capture_term_ignoring_cleanup`, `test_checker_exit_policy`, `test_hidden_command_exit`, `test_library_set_and_symlink_refusals`, `test_locally_hidden_source_refusal`, `test_real_elf_loader_binding`, `test_receiver_linkage_gate`, `test_self_ignoring_source_refusal`, `test_shared_library_reuse_refusals`, `test_untracked_cuda_refusal` | 1; assertion kill |
+| `manifest_two_executables` | Cover libraries with unchanged executable shims | `test_build_and_paths`, `test_library_set_and_symlink_refusals`, `test_real_elf_loader_binding`, `test_shared_library_reuse_refusals` | 1; assertion kill |
+| `manifest_no_follow` | Hash followed symlink content | `test_build_and_paths`, `test_library_set_and_symlink_refusals`, `test_real_elf_loader_binding` | 1; assertion kill |
+| `manifest_excludes_so` | Include shared-file content in integrity receipt | `test_build_and_paths`, `test_library_set_and_symlink_refusals`, `test_real_elf_loader_binding`, `test_shared_library_reuse_refusals` | 1; assertion kill |
+| `manifest_names_only` | Hash file content, not names only | `test_binary_tamper`, `test_build_and_paths`, `test_build_reuse_refusals`, `test_library_set_and_symlink_refusals`, `test_real_elf_loader_binding`, `test_shared_library_reuse_refusals` | 1; assertion kill |
+| `hidden_untracked_scan_off` | Keep independent untracked scan | `test_locally_hidden_source_refusal` | 1; assertion kill |
+| `hidden_untracked_standard_excludes` | Do not trust local/global Git excludes | `test_locally_hidden_source_refusal` | 1; assertion kill |
+| `index_flags_ignored` | Reject index flags that hide source changes | `test_locally_hidden_source_refusal` | 1; assertion kill |
+| `index_flags_skip_only` | Reject assume-unchanged as well as skip-worktree | `test_locally_hidden_source_refusal` | 1; assertion kill |
+| `artifact_run_dir_unchecked` | Preflight in-repo run directory | `test_artifact_path_preflight` | 1; assertion kill |
+| `artifact_build_dir_unchecked` | Preflight in-repo build directory | `test_artifact_path_preflight` | 1; assertion kill |
+| `run_child_foreground` | Keep command waits interruptible | `test_build_interrupt_process_group`, `test_capture_request_signals` | 1; assertion kill |
+| `interrupt_no_child_term` | Retain interrupt-time TERM beside cleanup stop | None. Cleanup still stops the group within the tested bound; independent interrupt-time TERM is not required by these assertions. | 0; survivor |
+| `cleanup_no_command_stop` | Stop TERM-resistant command groups during cleanup | `test_build_interrupt_process_group` | 1; assertion kill |
+| `status_clobbered_by_server` | Preserve incoming signal exit during server failure | `test_capture_request_signals` | 1; assertion kill |
+| `pipe_untrapped` | Report PIPE as failing signal exit | `test_capture_request_signals` | 1; assertion kill |
+| `cleanup_no_log_reopen` | Keep cleanup wait/exit evidence in command log | `test_capture_request_signals`, `test_capture_term_ignoring_cleanup` | 1; assertion kill |
+| `final_report_unguarded` | Keep dead-terminal output from replacing signal exit | `test_capture_request_signals` | 1; assertion kill |
+| `r6_static_flag_removed` | Request static llama/ggml and server implementation | `test_build_and_paths` | 1; assertion kill |
+| `r6_dynamic_backends_enabled` | Request GGML_BACKEND_DL=OFF explicitly | `test_build_and_paths` | 1; assertion kill |
+| `r6_preload_preserved` | Clear preload before receivers and inspection | `test_real_elf_loader_binding`, `test_receiver_linkage_gate` | 1; assertion kill |
+| `r6_library_path_preserved` | Clear library search override before receivers and inspection | `test_real_elf_loader_binding`, `test_receiver_linkage_gate` | 1; assertion kill |
+| `r6_ldd_gate_removed` | Inspect actual ELF dependency resolution | `test_real_elf_loader_binding`, `test_receiver_linkage_gate` | 1; assertion kill |
+| `r6_server_not_inspected` | Inspect server as well as checker | `test_receiver_linkage_gate` | 1; assertion kill |
+| `r6_checker_not_inspected` | Inspect checker as well as server | `test_receiver_linkage_gate` | 1; assertion kill |
+| `r6_ignored_source_scan_removed` | Refuse self-ignored new source files | `test_self_ignoring_source_refusal` | 1; assertion kill |
+| `r6_pid_only_stop` | Escalate to the whole owned build group | `test_build_interrupt_process_group` | 1; assertion kill |
+
+| Codec/gather mutant | What it narrows the gate to | Named failing test | Result or survivor bound |
+|---|---|---|---|
+| `p_layer_count` | test_wrong_layer_count contract | `test_wrong_layer_count` | 1; assertion kill |
+| `p_block_size` | test_wrong_block_size contract | `test_wrong_block_size` | 1; assertion kill |
+| `p_head_geometry` | test_wrong_head_geometry contract | `test_wrong_head_geometry` | 1; assertion kill |
+| `p_kv_dtype` | test_unsupported_dtype contract | `test_unsupported_dtype` | 1; assertion kill |
+| `p_partial_endpoint` | test_partial_last_block contract | `test_partial_last_block` | 1; assertion kill |
+| `p_kv_page_order` | test_paged_kv_layout_and_scales contract | `test_paged_kv_layout_and_scales` | 1; assertion kill |
+| `p_fp8_scale` | test_paged_kv_layout_and_scales contract | `test_paged_kv_layout_and_scales` | 1; assertion kill |
+| `p_gdn_heads` | test_recurrent_head_and_conv_layout contract | `test_recurrent_head_and_conv_layout` | 1; assertion kill |
+| `p_rotation` | test_q8_and_rotation contract | `test_q8_and_rotation` | 1; assertion kill |
+| `p_async_schedule` | test_source_config contract | `test_source_config` | 1; assertion kill |
+| `p_runner_hash` | test_patch_location contract | `test_patch_location` | 1; assertion kill |
+| `r_kv_swap` | test_paged_kv_layout_and_scales contract | `test_paged_kv_layout_and_scales` | 1; assertion kill |
+| `r_conv_time_reversal` | test_recurrent_head_and_conv_layout contract | `test_recurrent_head_and_conv_layout` | 1; assertion kill |
+| `r_state_transpose` | test_recurrent_head_and_conv_layout contract | `test_recurrent_head_and_conv_layout` | 1; assertion kill |
+| `r_kv_head_order` | test_paged_kv_layout_and_scales contract | `test_paged_kv_layout_and_scales` | 1; assertion kill |
+| `r_fp8_scale_swap` | test_paged_kv_layout_and_scales contract | `test_paged_kv_layout_and_scales` | 1; assertion kill |
+| `r_rotation_kv_swap` | test_serialized_layout_reference contract | `test_serialized_layout_reference` | 1; assertion kill |
+| `r_cell_ext_xy` | test_serialized_layout_reference contract | `test_serialized_layout_reference` | 1; assertion kill |
+| `r_cell_ext_token` | test_serialized_layout_reference contract | `test_serialized_layout_reference` | 1; assertion kill |
+| `r_attention_layer_order` | test_serialized_layout_reference contract | `test_serialized_layout_reference` | 1; assertion kill |
+| `r_token_order_in_page` | test_serialized_layout_reference contract | `test_serialized_layout_reference` | 1; assertion kill |
+| `r_recurrent_layer_order` | test_serialized_layout_reference contract | `test_serialized_layout_reference` | 1; assertion kill |
+| `r7b_fp8_scale_rotated` | test_fp8_rotated_bytes contract | `test_fp8_rotated_bytes` | 1; assertion kill |
+| `tok_swap01` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `tok_roll_in_kernel` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `tok_swap_last_pair` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `page_order_reversed` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `page_swap_first_two` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `kernel_subpage_flip` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `kernel_interleave_r7b` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `ratio_ignored` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `append_from_zero` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `head_flip` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `kv_half_swap` | Gather page/token/head/KV ordering or input bounds | `test_page_bytes` | 1; assertion kill |
+| `null_page_admitted` | Gather page/token/head/KV ordering or input bounds | `test_refusals` | 1; assertion kill |
+| `upper_bound_off` | Gather page/token/head/KV ordering or input bounds | `test_refusals` | 1; ERROR only, uncredited. Late out-of-range page is not covered by a structured-refusal assertion. |
+| `fp8_scale_rotated` | Rotated FP8 scales | `test_fp8_rotated_bytes` | 1; assertion kill |
+| `fp8_scale_kv_swap_rotated` | Rotated FP8 scales | `test_fp8_rotated_bytes` | 1; assertion kill |
+
+The `r_attention_layer_order` plant retains its named assertion kill and one additional ERROR, which is not credited separately. The known `upper_bound_off` ERROR is a survivor of the structured-refusal claim, not an assertion kill. Every other reported kill has a named failing assertion; identities pass. No reviewer test was removed or renamed.
+
+Out of contract under the brief's CPU-only/no-model rules: CUDA compilation/execution, live vLLM extraction, real model import/logits/performance, and Metal execution. The static CPU build establishes link-mode feasibility, not CUDA qualification. The original hash/inspect/exec custody window, unpinned system/CUDA runtime libraries, general foreground Python signal deferral, and vLLM descendants outside its recorded PID remain finite operational limits. Acceptance at the new head belongs to independent review. Local signed commit and authorized prototype-go handoff are the requested delivery; no push/PR/landing is performed.
