@@ -7,4 +7,4 @@
 - The existing checker begins comparison after a common probe token at N+1. Comparing already-produced logits at N needs a logits capture/reference protocol or a state boundary before the last prompt token; the current whole-block bridge does not claim that comparison.
 - Long-depth reference scoring may exceed device/Mac memory because the current checker holds five contexts. The orchestrator must verify `m3-reference-logits` and its CLI before substituting it, or stay within measured shorter-depth capacity.
 
-These are experiment gates, not claims of a blocked CPU implementation. No formal surface table or independent review was supplied with the brief. Scope remains `tools/hybrid-vllm/` plus the root README link; existing native readers, server code and reviewer tests are preserved.
+These are experiment gates, not claims of a blocked CPU implementation. The original brief supplied no formal surface table. Independent review r6x requested this rework; its CPU fixes require acceptance at the new head, and the GPU gates remain open. Rework scope is `tools/hybrid-vllm/`; existing native readers and server code are preserved.

@@ -8,7 +8,7 @@ Route B uses a source-pinned post-forward hook in the original GPUModelRunner. T
 
 `bridge.py` converts the source-derived logical [page,head,token,K+V] layout, BF16 or FP8 E4M3FN/E5M2 with K/V scales, conv SD/DS and BF16/f32 [value_head,V,K] state. It reorders GDN value heads, converts conv history to [channel,time], applies the client's q8_0 Hadamard rotations and emits the existing native sequence format and HYBD envelope with XXH3-128/SHA-256. It recomputes the receiving GGUF's layout fingerprint. Unknown geometry, dtype, state records, token boundaries and oversize deltas refuse; a failed conversion preserves an existing output file. CPU imports require no vLLM/torch/NumPy.
 
-The hook and live CUDA copies have not run. Synthetic native import proves serialization and tensor permutation controls, not cross-engine mathematical or numerical equivalence. State-only import has no boundary logits; the provided checker plan compares at N+1 after a common probe token. The report does not claim logits at N, a speedup, calibrated quality, or CUDA-to-Metal qualification.
+The hook and live CUDA copies have not run. Synthetic native import checks serialization; tensor permutation evidence comes from the Python assertions, whose layout gaps were subsequently identified in r6x and addressed in [RESULTS-hybrid-d-r1-261101.md](RESULTS-hybrid-d-r1-261101.md). Neither establishes cross-engine mathematical or numerical equivalence. State-only import has no boundary logits; the provided checker plan compares at N+1 after a common probe token. The report does not claim logits at N, a speedup, calibrated quality, or CUDA-to-Metal qualification.
 
 ## Evidence
 

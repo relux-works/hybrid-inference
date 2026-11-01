@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 from bridge import ATTENTION, RECURRENT, SOURCE, body_size, require, validate, MAX_BODY
@@ -58,62 +59,66 @@ def export_snapshot(runner, scheduler_output, config, n0):
     snapshot = dict(version=1, source_contract=SOURCE, tp_size=1, pp_size=1, cache_mode="align", block_size=block,
                     n0=n0, n1=n1, tokens=req.prompt_token_ids[:n1], model_layout=target["model_layout"],
                     conv_layout=get_conv_state_layout(), rotations=config.get("rotations", [256, 64]), layers=[])
-    folder = Path(config["output"]) / ("capture-%08d" % n1)
-    folder.mkdir(mode=0o700, parents=True, exist_ok=False)
-    context = runner.vllm_config.compilation_config.static_forward_context
+    destination = Path(config["output"]) / ("capture-%08d" % n1)
+    require(not destination.exists(), "capture already exists")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="." + destination.name + "-", dir=destination.parent) as partial:
+        folder = Path(partial)
+        context = runner.vllm_config.compilation_config.static_forward_context
 
-    def save(name, tensor, dtype=None):
-        dtype = dtype or str(tensor.dtype).removeprefix("torch.")
-        data = tensor.detach().cpu().contiguous()
-        with (folder / name).open("xb") as out:
-            out.write(data.view(torch.uint8).numpy().tobytes())
-        return dict(file=name, shape=list(tensor.shape), dtype=dtype)
+        def save(name, tensor, dtype=None):
+            dtype = dtype or str(tensor.dtype).removeprefix("torch.")
+            data = tensor.detach().cpu().contiguous()
+            with (folder / name).open("xb") as out:
+                out.write(data.view(torch.uint8).numpy().tobytes())
+            return dict(file=name, shape=list(tensor.shape), dtype=dtype)
 
-    # Device work and state copies finish before the request can release its blocks.
-    torch.cuda.synchronize()
-    for gid, group in enumerate(groups):
-        spec = group.kv_cache_spec
-        blocks = req.block_ids[gid]
-        for name in group.layer_names:
-            i = extract_layer_index(name)
-            layer = context[name]
-            row = dict(layer=i)
-            if i in ATTENTION:
-                require(type(spec) is FullAttentionSpec and spec.sliding_window is None and spec.attention_chunk_size is None, "unsupported attention cache spec")
-                require(spec.num_kv_heads == 4 and spec.head_size == spec.head_size_v == 256, "wrong head geometry")
-                cache = layer.kv_cache
-                require(cache.ndim == 4 and cache.shape[1] == 4 and cache.shape[3] == 512, "unsupported attention tensor layout")
-                kernel = cache.shape[2]
-                require(kernel > 0 and block % kernel == 0, "wrong kernel block size")
-                ratio = block // kernel
-                dtype = str(cache.dtype).removeprefix("torch.")
-                mode = runner.cache_config.cache_dtype
-                if mode in ("fp8", "fp8_e4m3", "fp8_e5m2"):
-                    require(dtype == "uint8", "unsupported FP8 storage dtype")
-                    dtype = "float8_e5m2" if mode == "fp8_e5m2" else "float8_e4m3fn"
-                    scales = [float(layer._k_scale.item()), float(layer._v_scale.item())]
+        # Device work and state copies finish before the request can release its blocks.
+        torch.cuda.synchronize()
+        for gid, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            blocks = req.block_ids[gid]
+            for name in group.layer_names:
+                i = extract_layer_index(name)
+                layer = context[name]
+                row = dict(layer=i)
+                if i in ATTENTION:
+                    require(type(spec) is FullAttentionSpec and spec.sliding_window is None and spec.attention_chunk_size is None, "unsupported attention cache spec")
+                    require(spec.num_kv_heads == 4 and spec.head_size == spec.head_size_v == 256, "wrong head geometry")
+                    cache = layer.kv_cache
+                    require(cache.ndim == 4 and cache.shape[1] == 4 and cache.shape[3] == 512, "unsupported attention tensor layout")
+                    kernel = cache.shape[2]
+                    require(kernel > 0 and block % kernel == 0, "wrong kernel block size")
+                    ratio = block // kernel
+                    dtype = str(cache.dtype).removeprefix("torch.")
+                    mode = runner.cache_config.cache_dtype
+                    if mode in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+                        require(dtype == "uint8", "unsupported FP8 storage dtype")
+                        dtype = "float8_e5m2" if mode == "fp8_e5m2" else "float8_e4m3fn"
+                        scales = [float(layer._k_scale.item()), float(layer._v_scale.item())]
+                    else:
+                        require(mode == "auto" and dtype == "bfloat16", "unsupported KV dtype")
+                        scales = [1.0, 1.0]
+                    filename = "%02d-kv.bin" % i
+                    with (folder / filename).open("xb") as output:
+                        for logical in range(n0 // block, n1 // block):
+                            physical = blocks[logical]
+                            require(physical > 0 and (physical + 1) * ratio <= cache.shape[0], "invalid attention block ownership")
+                            page = cache[physical * ratio:(physical + 1) * ratio].permute(1, 0, 2, 3).reshape(4, block, 512)
+                            output.write(page.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+                    row.update(kv=dict(file=filename, shape=[(n1 - n0) // block, 4, block, 512], dtype=dtype), scales=scales)
                 else:
-                    require(mode == "auto" and dtype == "bfloat16", "unsupported KV dtype")
-                    scales = [1.0, 1.0]
-                filename = "%02d-kv.bin" % i
-                with (folder / filename).open("xb") as output:
-                    for logical in range(n0 // block, n1 // block):
-                        physical = blocks[logical]
-                        require(physical > 0 and (physical + 1) * ratio <= cache.shape[0], "invalid attention block ownership")
-                        page = cache[physical * ratio:(physical + 1) * ratio].permute(1, 0, 2, 3).reshape(4, block, 512)
-                        output.write(page.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
-                row.update(kv=dict(file=filename, shape=[(n1 - n0) // block, 4, block, 512], dtype=dtype), scales=scales)
-            else:
-                require(i in RECURRENT and type(spec) is MambaSpec and spec.mamba_cache_mode == "align"
-                        and spec.num_speculative_blocks == spec.num_prefill_checkpoint_blocks == 0, "unsupported Mamba cache spec")
-                slot = blocks[(n1 - 1) // block]
-                require(len(layer.kv_cache) == 2, "unsupported recurrent state records")
-                conv, state = layer.kv_cache
-                require(slot > 0 and slot < conv.shape[0] and slot < state.shape[0], "invalid recurrent block ownership")
-                row.update(conv=save("%02d-conv.bin" % i, conv[slot]), state=save("%02d-state.bin" % i, state[slot]))
-            snapshot["layers"].append(row)
-    validate(snapshot, target)
-    (folder / "snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n")
+                    require(i in RECURRENT and type(spec) is MambaSpec and spec.mamba_cache_mode == "align"
+                            and spec.num_speculative_blocks == spec.num_prefill_checkpoint_blocks == 0, "unsupported Mamba cache spec")
+                    slot = blocks[(n1 - 1) // block]
+                    require(len(layer.kv_cache) == 2, "unsupported recurrent state records")
+                    conv, state = layer.kv_cache
+                    require(slot > 0 and slot < conv.shape[0] and slot < state.shape[0], "invalid recurrent block ownership")
+                    row.update(conv=save("%02d-conv.bin" % i, conv[slot]), state=save("%02d-state.bin" % i, state[slot]))
+                snapshot["layers"].append(row)
+        validate(snapshot, target)
+        (folder / "snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n")
+        folder.rename(destination)
     return n1
 
 
