@@ -49,22 +49,22 @@ Native references at the requested base: `src/llama-context.cpp:3471-3491` adds 
 Run the script from the reviewed `m3-vllm-bridge` checkout. Reserve exclusive use of the GPU and vLLM environment while its runner is patched. No installation or model download is performed. Every command first runs `gather_test.py` with real torch CPU tensors and CUDA hidden. **STOP if this test fails.** Do not skip it: GPU logits cannot detect a joint K/V page or token permutation.
 
 ```sh
-EXPECTED_REF=FULL_REVIEWED_R2_SHA bash tools/hybrid-vllm/gpu-run.sh gather
+EXPECTED_REF=FULL_REVIEWED_R3_SHA bash tools/hybrid-vllm/gpu-run.sh gather
 ```
 
-Use the full head SHA delivered with r2 for `EXPECTED_REF`, and run the following command with the same value. Each invocation is a child Bash process: failure returns to the operator's shell. Do not source the script or set interactive `errexit`.
+Use the full reviewed r3 head SHA for `EXPECTED_REF`, and run the following command with the same value. Each invocation is a child Bash process: failure returns to the operator's shell. Do not source the script or set interactive `errexit`.
 
 ```sh
-EXPECTED_REF=FULL_REVIEWED_R2_SHA bash tools/hybrid-vllm/gpu-run.sh all /root/proto/runs/hybrid-d-r2-smoke
+EXPECTED_REF=FULL_REVIEWED_R3_SHA bash tools/hybrid-vllm/gpu-run.sh all /root/proto/runs/hybrid-d-r3-smoke
 ```
 
-`all` runs `gather`, `build`, `capture`, `convert`, `check`, then `import`, stopping at the first failure. Individual subcommands support inspection between steps; pass the same `RUN_DIR` argument or environment each time. Parents are created with `mkdir -p`, including on a fresh clone without `.temp`. The default is `$PWD/.temp/hybrid-d-r2-261101-gpu`. Capture attempts and build directories refuse reuse; use a fresh run directory on retry. Partial conversion output is retained for diagnosis; a retry needs a fresh conversion directory and must not mix chains.
+`all` runs `gather`, `build`, `capture`, `convert`, `check`, then `import`, stopping at the first failure. Individual subcommands support inspection between steps; pass the same `RUN_DIR` argument or environment each time. Parents are created with `mkdir -p`, including on a fresh clone without `.temp`. The default is `$PWD/.temp/hybrid-d-r2-261101-gpu`. Capture attempts refuse reuse; use a fresh run directory on retry. Set `BUILD_DIR` to the previous run's absolute build path to reuse it through `all`, `build`, `capture`, `check` or `import`. Partial conversion output is retained for diagnosis; a retry needs a fresh conversion directory and must not mix chains.
 
 The first gate checks contiguous and strided BF16/uint8 cache views, manager/kernel ratios 1, 2 and 3, non-monotonic block tables and append intervals against independently enumerated little-endian bytes. It calls the same `write_attention_pages` used by `export_snapshot`, without vLLM doubles. It does not qualify CUDA views, scheduler ownership or recurrent endpoints.
 
-The build subcommand checks `HEAD == EXPECTED_REF` (full 40-character SHA) and rejects tracked modifications before and after the build. It requires a fresh build directory. It runs `nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF`, then `nice -n 10 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS" --target llama-server llama-hybrid-bench-check`. Use the script's `build` subcommand to retain its gates and logs.
+The build subcommand checks `HEAD == EXPECTED_REF` (full 40-character SHA) and refuses tracked or untracked files reported by `git status --porcelain --untracked-files=all` before and after the build. Keep build/run artifacts in ignored directories such as `.temp/` or outside the checkout. An existing build directory must contain a matching `build.ref` and valid `binaries.sha256`; verification reuses it without CMake. An incomplete, stale or changed build refuses without rebuilding. A fresh build runs `nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF`, then `nice -n 10 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS" --target llama-server llama-hybrid-bench-check`. Use the script's `build` subcommand to retain its gates and logs.
 
-`source.ref`, `build.ref` and `binaries.sha256` bind both receiver binaries to the checked ref. Capture, check and import verify these before use. Log files contain traced commands, stderr and exit status; failures print the failing command, exit, log path and its last 30 lines to the terminal. Server output stays in `vllm-01.log` or `client-<quant>.log`, with the PID and wait exit in the command log. Signals exit 130/143/129 and run PID cleanup plus runner restore. SIGKILL or host failure cannot run traps: restore the saved `gpu_model_runner.py.original` at the logged runner path before restarting vLLM.
+`BUILD_DIR/build.ref` and `BUILD_DIR/binaries.sha256` bind both receiver binaries to the checked ref. Capture, check and import verify these before use and copy the receipts into the current `RUN_DIR`, alongside `source.ref`. Older builds with receipts only in `RUN_DIR` must be rebuilt once. Log files contain traced commands, stderr and exit status; failures print the failing command, exit, log path and its last 30 lines to the terminal. Server output stays in `vllm-01.log` or `client-<quant>.log`, with the PID and wait exit in the command log. Signals exit 130/143/129. Cleanup ignores further INT/TERM/HUP and restores and byte-compares the runner before stopping the owned PID. The stop sends TERM, polls until `STOP_TIMEOUT`, then logs and sends SIGKILL to that recorded PID only and reaps it. SIGKILL or host failure cannot run traps: restore the saved `gpu_model_runner.py.original` at the logged runner path before restarting vLLM.
 
 | Environment | Default / meaning |
 |---|---|
@@ -73,15 +73,16 @@ The build subcommand checks `HEAD == EXPECTED_REF` (full 40-character SHA) and r
 | `HF_MODEL` | Auto-select the unique cached Qwen35 64-layer, 5120-embedding FP8 snapshot. Ambiguity or no match refuses. Override with a cached snapshot directory or repo id (resolved with `local_files_only=True`). |
 | `BF16_GGUF`, `Q4_K_M_GGUF` | `/root/proto/models/Qwen3.8-27B-BF16.gguf`, `/root/proto/models/Qwen3.8-27B-Q4_K_M.gguf` |
 | `CUDA_HOME`, `CUDACXX`, `CUDA_ARCH` | `/usr/local/cuda-12.8`, its `bin/nvcc`, `120a-real` for RTX PRO 6000 sm_120a |
-| `BUILD_DIR`, `BUILD_JOBS` | `RUN_DIR/build`, 4 (accepted range 1..4) |
+| `BUILD_DIR`, `BUILD_JOBS` | `RUN_DIR/build`, host core count (`nproc`); agents1 defaults to at most 4 and refuses explicit jobs >4. Other hosts accept positive job counts. |
 | `TMPDIR` | `RUN_DIR/tmp`, on disk; override with another disk directory. `PYTHONDONTWRITEBYTECODE=1`. |
 | `TOKEN_FILE` | `RUN_DIR/tokens.json`; if absent, generate deterministic synthetic IDs within the target vocabulary. An explicit external file must exist. Token IDs are passed directly to both engines. |
 | `EXPORT_N`, `CONTEXT_SIZE`, `PROBE_TOKEN` | 784 (one expected BF16-KV block), 32768, 1 |
 | `KV_CACHE_DTYPE`, `PREFILL_CHUNK` | `auto` (BF16 KV), 7840 |
 | `HEALTH_TIMEOUT`, `REQUEST_TIMEOUT` | 1800 seconds each; raise request timeout for larger depths |
+| `STOP_TIMEOUT` | 120 seconds before PID-only SIGKILL; positive integer |
 | `VLLM_PORT`, `LLAMA_PORT` | 8100, 8101 on localhost |
 
-The capture records installed vLLM, torch, transformers and flashinfer-python versions, the resolved HF snapshot, target identity and source ref. Expected environment: vLLM 0.32.0, torch 2.13.0, transformers 5.19.0, flashinfer 0.7.0.post1. The runner's exact original hash is still mandatory. A version or source refusal requires inspection; do not weaken it. After capture the script stops and waits for its recorded vLLM PID, restores and byte-compares the runner, then requires `nvidia-smi` to show no compute processes before proceeding. A surviving EngineCore process stops the run; ask its owner to release it, then continue from the appropriate subcommand.
+The capture records installed vLLM, torch, transformers and flashinfer-python versions, the resolved HF snapshot, target identity and source ref. Expected environment: vLLM 0.32.0, torch 2.13.0, transformers 5.19.0, flashinfer 0.7.0.post1. The runner's exact original hash is still mandatory. A version or source refusal requires inspection; do not weaken it. After capture the script restores and byte-compares the runner, stops and waits for its recorded vLLM PID, then requires `nvidia-smi` to show no compute processes before proceeding. A surviving EngineCore process stops the run; ask its owner to release it, then continue from the appropriate subcommand.
 
 Inspect the log's resolved block sizes. The expected BF16-KV/FP32-SSM block is 784; the live cache specs remain authoritative. If it differs, choose aligned N and chunk size in a fresh RUN_DIR. Require a final manifest at n1=N. After the one-block smoke succeeds, use EXPORT_N=1568 in a new directory for two blocks. A request with max_tokens=1 samples one token but never forwards it before capture.
 

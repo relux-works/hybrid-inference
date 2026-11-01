@@ -15,6 +15,7 @@ Commands: gather, build, capture, convert, check, import, all
 all runs these in order and stops at the first failure. Each GPU command reruns gather.
 RUN_DIR defaults to $RUN_DIR or .temp/hybrid-d-r2-261101-gpu under this checkout.
 Use a new RUN_DIR for each capture attempt. No install or download is performed.
+Set BUILD_DIR to a previous verified build to reuse it without rebuilding.
 HELP
 }
 if [[ ${1:-} == --help || $# == 0 ]]; then usage; exit 0; fi
@@ -41,11 +42,12 @@ export EXPORT_N=${EXPORT_N:-784} CONTEXT_SIZE=${CONTEXT_SIZE:-32768} PROBE_TOKEN
 export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto} PREFILL_CHUNK=${PREFILL_CHUNK:-7840}
 export VLLM_PORT=${VLLM_PORT:-8100} LLAMA_PORT=${LLAMA_PORT:-8101}
 export HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-1800} REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
+export STOP_TIMEOUT=${STOP_TIMEOUT:-120}
 export BUILD_DIR=${BUILD_DIR:-$RUN_DIR/build}
 if [[ $BUILD_DIR != /* ]]; then BUILD_DIR=$repo/$BUILD_DIR; fi
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export CUDACXX=${CUDACXX:-$CUDA_HOME/bin/nvcc}
-export CUDA_ARCH=${CUDA_ARCH:-120a-real} BUILD_JOBS=${BUILD_JOBS:-4}
+export CUDA_ARCH=${CUDA_ARCH:-120a-real}
 export PYTHONPATH="$repo/tools/hybrid-vllm:$repo/tools/hybrid-bench${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_USE_V2_MODEL_RUNNER=0
 exec 3>&2
@@ -59,21 +61,30 @@ owned_pid=
 runner=
 backup=
 stop_pid() {
-    local status=0
-    if kill -0 "$owned_pid" 2>/dev/null; then kill "$owned_pid"; fi
+    local status=0 deadline=$((SECONDS + STOP_TIMEOUT))
+    if kill -0 "$owned_pid" 2>/dev/null; then kill -TERM "$owned_pid" 2>/dev/null || :; fi
+    while kill -0 "$owned_pid" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then
+            printf 'Stop timeout after %s seconds; sending SIGKILL to owned PID %s\n' "$STOP_TIMEOUT" "$owned_pid"
+            kill -KILL "$owned_pid" 2>/dev/null || :
+            break
+        fi
+        sleep 1
+    done
     wait "$owned_pid" || status=$?
     printf 'PID %s wait exit: %s\n' "$owned_pid" "$status"
     owned_pid=
-    case "$status" in 0|143) return 0 ;; *) return "$status" ;; esac
+    case "$status" in 0|137|143) return 0 ;; *) return "$status" ;; esac
 }
 cleanup() {
     local status=$?
+    trap '' INT TERM HUP
     trap - EXIT ERR
-    if [[ -n $owned_pid ]]; then stop_pid || status=1; fi
     if [[ -n $backup ]]; then
         cp -p -- "$backup" "$runner" || status=1
         cmp -- "$backup" "$runner" || status=1
     fi
+    if [[ -n $owned_pid ]]; then stop_pid || status=1; fi
     printf 'EXIT %s\n' "$status"
     printf '%s exit=%s log=%s\n' "$step" "$status" "$log" >&3
     exit "$status"
@@ -84,9 +95,14 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 exact_ref() {
+    local changes
     [[ ${EXPECTED_REF:-} =~ ^[0-9a-f]{40}$ ]]
     [[ $(git rev-parse HEAD) == "$EXPECTED_REF" ]]
-    git diff --exit-code HEAD -- .
+    changes=$(git status --porcelain --untracked-files=all)
+    if [[ -n $changes ]]; then
+        printf 'Refusing dirty source tree (tracked or untracked files):\n%s\n' "$changes" >&2
+        return 1
+    fi
     printf '%s\n' "$EXPECTED_REF" > "$RUN_DIR/source.ref"
 }
 gather() {
@@ -95,8 +111,19 @@ gather() {
 }
 build() {
     exact_ref
-    [[ $BUILD_JOBS =~ ^[1-4]$ ]]
-    [[ ! -e $BUILD_DIR ]]
+    if [[ -e $BUILD_DIR ]]; then
+        assert_build
+        printf 'Reusing verified build: %s\n' "$BUILD_DIR"
+        return
+    fi
+    local host
+    host=$(hostname -s)
+    if [[ -z ${BUILD_JOBS:-} ]]; then
+        BUILD_JOBS=$(nproc)
+        if [[ $host == agents1 || $host == relux-agents1 ]] && (( BUILD_JOBS > 4 )); then BUILD_JOBS=4; fi
+    fi
+    [[ $BUILD_JOBS =~ ^[1-9][0-9]*$ ]]
+    if [[ $host == agents1 || $host == relux-agents1 ]]; then (( BUILD_JOBS <= 4 )); fi
     nice -n 10 cmake -S "$repo" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
         -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" \
@@ -104,13 +131,20 @@ build() {
     nice -n 10 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS" \
         --target llama-server llama-hybrid-bench-check
     exact_ref
-    sha256sum "$BUILD_DIR/bin/llama-server" "$BUILD_DIR/bin/llama-hybrid-bench-check" > "$RUN_DIR/binaries.sha256"
-    printf '%s\n' "$EXPECTED_REF" > "$RUN_DIR/build.ref"
+    (cd -- "$BUILD_DIR" && sha256sum bin/llama-server bin/llama-hybrid-bench-check) > "$BUILD_DIR/binaries.sha256"
+    printf '%s\n' "$EXPECTED_REF" > "$BUILD_DIR/build.ref"
+    assert_build
 }
 assert_build() {
+    local hashes
     exact_ref
-    [[ $(cat "$RUN_DIR/build.ref") == "$EXPECTED_REF" ]]
-    sha256sum --check "$RUN_DIR/binaries.sha256"
+    [[ $(cat "$BUILD_DIR/build.ref") == "$EXPECTED_REF" ]]
+    hashes=$(cd -- "$BUILD_DIR" && sha256sum bin/llama-server bin/llama-hybrid-bench-check)
+    if [[ $hashes != "$(cat "$BUILD_DIR/binaries.sha256")" ]]; then
+        printf 'Receiver binary hashes FAILED: %s\n' "$BUILD_DIR" >&2
+        return 1
+    fi
+    cp -- "$BUILD_DIR/build.ref" "$BUILD_DIR/binaries.sha256" "$RUN_DIR/"
 }
 wait_health() {
     local url=$1 deadline=$((SECONDS + HEALTH_TIMEOUT))
@@ -127,6 +161,7 @@ wait_health() {
 }
 capture() {
     assert_build
+    [[ $STOP_TIMEOUT =~ ^[1-9][0-9]*$ ]]
     [[ ! -e $RUN_DIR/captures && ! -e $RUN_DIR/gpu_model_runner.py.original ]]
     "$PYTHON" "$repo/tools/hybrid-vllm/gpu_run.py" prepare
     runner=$("$PYTHON" - <<'PY'
@@ -154,10 +189,10 @@ PY
     wait_health "http://127.0.0.1:$VLLM_PORT/health"
     curl --fail --max-time "$REQUEST_TIMEOUT" -H 'Content-Type: application/json' \
         --data-binary "@$RUN_DIR/request.json" "http://127.0.0.1:$VLLM_PORT/v1/completions" > "$RUN_DIR/response.json"
-    stop_pid
     cp -p -- "$backup" "$runner"
     cmp -- "$backup" "$runner"
     backup=
+    stop_pid
     unset HYBRID_VLLM_CONFIG
     [[ -f $RUN_DIR/captures/capture-$(printf '%08d' "$EXPORT_N")/snapshot.json ]]
     # Require explicit confirmation before any receiver reserves GPU memory.
@@ -202,6 +237,7 @@ import_target() {
 }
 import_chains() {
     assert_build
+    [[ $STOP_TIMEOUT =~ ^[1-9][0-9]*$ ]]
     gpu_idle
     import_target bf16 "$BF16_GGUF"
     import_target q4_k_m "$Q4_K_M_GGUF"

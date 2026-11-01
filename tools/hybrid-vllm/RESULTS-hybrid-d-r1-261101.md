@@ -124,3 +124,94 @@ CPU torch and NumPy were installed only into this task's scratch directory, usin
 Self-review covered scope, security, design, tests and general conventions. No formal surface table was supplied (brief gap); no requested r2 row is treated as out of contract. No reviewer tests were removed. Rework stays inside the named module. GPU runtime compatibility, actual CUDA views, recurrent ownership/chronology, source checkpoint/tokenizer provenance, calibrated quality bounds and long-depth memory remain open. The script requires an idle compute-process list after stopping vLLM and before receiver subcommands; it never stops foreign processes. Checker exit 5 is retained as uncalibrated evidence, with a dedicated positive/error policy test, not reported as passing quality. The earlier r7b finding 5 (three untested converter refusals) is outside this requested runbook follow-up and remains unchanged.
 
 Task-board remains absent (`goal-read-01.log`, exit 1); `.temp/tasks.md` tracks this run. Signed local delivery and the requested #hybrid / prototype-go handoff are authorized; publication, landing and GPU acceptance are not claimed.
+
+## r3: hybrid-d-r3-261101, bounded stop and clean-tree gate
+
+Ready for review on `m3-vllm-bridge`, parent `09557d6d3e3e961883d858fcb251656be4dbfd53`, accepted by Claude r7d. This new diff is confined to `tools/hybrid-vllm/`. CPU only; no GPU operation, CUDA build, vLLM installation or model download. Signed local delivery is requested; no push is authorized.
+
+| Request | Change and named evidence |
+|---|---|
+| Low 1: stop hangs and second signal skips restore | Cleanup ignores INT/TERM/HUP, restores and compares the runner first, then stops the recorded PID. TERM polls to `STOP_TIMEOUT` (default 120 s), logs PID-only SIGKILL escalation and reaps the child. Normal capture also restores before stopping. `test_capture_term_ignoring_cleanup` covers HTTP failure, one TERM and repeated INT/TERM/HUP during cleanup, preserving exits 22/143 and observing child wait exit 137. The reviewer's original TERM-ignoring Bash loop passes the same assertions in `reviewer-hang-probe-01.log`. |
+| Low 2: untracked CUDA sources | `exact_ref` requires empty `git status --porcelain --untracked-files=all`, with a dirty-tree message listing offending paths. `test_untracked_cuda_refusal` uses real Git porcelain on an untracked `ggml/src/ggml-cuda/zz-untracked-probe.cu`, requires exit 1 before CMake, then removes the plant and admits the same clean fixture. |
+| Fresh capture retries reuse the build | Ref and relative binary hash receipts now live in `BUILD_DIR`; they are verified and copied to each `RUN_DIR`. `all`/`build` reuse an existing matching build without CMake; incomplete, stale, empty-receipt or changed-binary builds refuse without rebuilding. `test_build_reuse`, `test_build_reuse_refusals`, `test_binary_tamper` and `test_capture_reuses_build` cover both receiving binaries, fresh directories and successful teardown before the idle check. |
+| GPU host build concurrency | Default jobs use `nproc`. Only hostnames `agents1` and `relux-agents1` default to at most four and refuse explicit jobs >4. Other hosts accept positive job counts. `test_build_jobs_by_host` covers a 16-core GPU-host double and explicit 12 jobs; `test_build_refusals` covers the agents1 excess. Actual native compilation used one niced compiler at a time. |
+
+Retry example, after r3 acceptance: `BUILD_DIR=/root/proto/runs/first/build EXPECTED_REF=FULL_REVIEWED_R3_SHA bash tools/hybrid-vllm/gpu-run.sh all /root/proto/runs/retry`. Use a new capture directory. Builds whose r2 receipts exist only in RUN_DIR require one fresh build.
+
+Evidence root: `.temp/hybrid-d-r3-261101/`. `validation.json` records command argv, actual exits, environment, timestamps and hashes. `controls-final.json` records each edit, copied-source hashes, selected tests and failures; child PIDs and full logs are under `plant-logs/`. TMPDIR is on disk, `PYTHONDONTWRITEBYTECODE=1`, and commands run directly with redirected logs, never through tee. Platform: Linux x86_64, Python 3.14.4, GCC 15.2.0. CPU gather used torch 2.13.0+cpu and NumPy 2.5.4; CUDA build is None and initialization is false.
+
+| Validation | Actual exit | Evidence and limit |
+|---|---:|---|
+| Own SHA-256 object and native helper link | 0 / 0 | `build-sha256-01.log`, `build-native-01.log`, `native-libraries.json`. Pinned CPU library hashes match r2/r7d; own SHA-256 source/object and archive hash recorded. No engine build. |
+| Full CPU/native suite on the settled code, 35/35 | 0 | `tests-05.log`, 28.753 s unittest time; `tests-05.json` binds the exact executable/test hashes. Includes all prior 29 names and six new script tests. Minimum observed free disk 29,223,968,768 bytes. |
+| Torch CPU gather control, 2/2; actual script gather | 0 / 0 | `plant-logs/r7d_identity.log`, `script-gather-01.log`; no GPU or live vLLM. |
+| Reviewer's TERM-ignoring Bash-loop double, three exit/signal cases | 0 | `reviewer-hang-probe-01.log`. Readiness FIFO removes server-start races. Repeated signals are injected from the stop polling command, after cleanup has begun. |
+| r1/r6x 22 plants plus pre-fix export cleanup | 1 each | Named assertion kills, no unittest errors; `controls-other.json` and `plant-logs/`. Targeted named tests, not a full suite per mutant. |
+| r2 five plants plus r7d 15 mutants | 1 each | 19 assertion kills; upper-bound mutant remains an unstructured RuntimeError and is not credited as an assertion kill. `controls-torch.json`. |
+| Eight new shell mutants | 1 each | All named assertion kills with no unittest errors on the settled tests; `controls-shell.json`, `controls-shell-01.log`. Driver exits 0. |
+| Bash syntax, Python/heredoc AST, ASCII, whitespace and prior test-name retention | 0 | `bash-syntax-01.log`, `source-check-03.log`, `diff-check-02.log`; original `test_bridge.py` is unchanged and all 10 prior `test_gpu_run.py` names remain. |
+| Python type checker | 127 | `typecheck-02.log`: ty unavailable. An earlier direct launcher attempt failed with FileNotFoundError (launcher exit 1); no type-check pass is claimed. |
+| CUDA build, live capture, real BF16/Q4_K_M, logits, HTTP import and Metal | Unrun | Orchestrator's GPU/Mac qualification gates. Command doubles do not qualify these paths. |
+
+Disk control failed in two early batches: `tests-02.json` recorded 27,145,482,240 free bytes and `controls-torch-01.json` recorded 27,223,601,152, below the required 28,000,000,000-byte floor. This run did not maintain the floor throughout. The floor-only admission check was insufficient. After removing the 951 MiB task-local CPU dependencies, the monitor gained an abort margin: `tests-03` was interrupted by SIGTERM (child return -15) at 28,138,360,832 bytes; `controls-other-01` exited 143 at 28,196,454,400. Their partial evidence is not a full-suite/driver pass. Completed named plant records were retained, the remaining controls resumed, and the settled full suite passed with the minimum above. No foreign files or processes were removed. `disk-control-failure.md` preserves the failed control and correction; final free space is in validation.json.
+
+Two test-harness corrections are explicit: the initial script-only run exited 1 on three set/iterator errors in log assertions (`script-tests-01.log`); fixed before the full suite. Early ref/cap mutants exposed cross-case fixture contamination, producing extra errors (`controls-rest-01.log`, `controls-last-01.log`); isolated directories and finally-restored fixtures removed the cascades, and the final shell controls are clean. No setup error is counted as a kill.
+
+| Mutant | Gate narrowed to | Named failing test | Exit / verdict and survivor bound |
+|---|---|---|---|
+| p_layer_count | Exactly 64 distinct captured layer IDs | `test_wrong_layer_count` | 1, assertion killed |
+| p_block_size | Minimum/multiple-of-16 size despite consistent page shape | `test_wrong_block_size` | 1, assertion killed |
+| p_head_geometry | 256-dimensional heads despite matching fingerprint | `test_wrong_head_geometry` | 1, assertion killed |
+| p_kv_dtype | Explicit KV dtype whitelist | `test_unsupported_dtype` | 1, assertion killed |
+| p_partial_endpoint | Whole-block exporter endpoint | `test_partial_last_block` | 1, assertion killed |
+| p_kv_page_order | Logical page order | `test_paged_kv_layout_and_scales` | 1, assertion killed |
+| p_fp8_scale | Actual per-K/V dequantization scales | `test_paged_kv_layout_and_scales` | 1, assertion killed |
+| p_gdn_heads | Grouped-to-tiled state head order | `test_recurrent_head_and_conv_layout` | 1, assertion killed |
+| p_rotation | Actual Hadamard operation | `test_q8_and_rotation` | 1, assertion killed |
+| p_async_schedule | Synchronous scheduling requirement | `test_source_config` | 1, assertion killed |
+| p_runner_hash | Exact original runner hash | `test_patch_location` | 1, assertion killed |
+| r_kv_swap | K and V source halves | `test_paged_kv_layout_and_scales` | 1, assertion killed |
+| r_conv_time_reversal | Oldest-to-newest conv history | `test_recurrent_head_and_conv_layout` | 1, assertion killed |
+| r_state_transpose | Preserve [V,K] within each state head | `test_recurrent_head_and_conv_layout` | 1, assertion killed |
+| r_kv_head_order | Attention head order | `test_paged_kv_layout_and_scales` | 1, assertion killed |
+| r_fp8_scale_swap | K scale for K, V scale for V | `test_paged_kv_layout_and_scales` | 1, assertion killed |
+| r_rotation_kv_swap | Serialized K uses 256, V uses 64 | `test_serialized_layout_reference` | 1, assertion killed |
+| r_cell_ext_xy | Text x/y positions follow the cell position | `test_serialized_layout_reference` | 1, assertion killed |
+| r_cell_ext_token | Cell token ID follows the journal | `test_serialized_layout_reference` | 1, assertion killed |
+| r_attention_layer_order | Serialized attention layer identity/order | `test_serialized_layout_reference` | 1, assertion killed |
+| r_token_order_in_page | Serialized token order within each page | `test_serialized_layout_reference` | 1, assertion killed |
+| r_recurrent_layer_order | Serialized conv/state layer identity/order | `test_serialized_layout_reference` | 1, assertion killed |
+| e_export_refusal_cleanup | Late export refusal leaves no partial capture | `test_export_refusal_cleanup` | 1, assertion killed |
+| s_cleanup_signals_armed | Repeated cleanup INT/TERM/HUP cannot interrupt restoration or stop | `test_capture_term_ignoring_cleanup` | 1, assertion killed |
+| s_restore_after_stop | Runner bytes are restored before the server stop | `test_capture_term_ignoring_cleanup` | 1, assertion killed |
+| r7d_identity | Unmodified CPU gather admits the listed layouts only | `GatherTests.test_page_bytes, test_refusals` | 0, required survivor; assumed CPU layouts/geometry only |
+| r7d_tok_swap01 | First token pair retains position, K and V together | `test_page_bytes` | 1, assertion killed |
+| r7d_tok_roll_in_kernel | Token order within kernel pages | `test_page_bytes` | 1, assertion killed |
+| r7d_tok_swap_last_pair | Last token pair retains position | `test_page_bytes` | 1, assertion killed |
+| r7d_page_order_reversed | Logical manager page order, K and V together | `test_page_bytes` | 1, assertion killed |
+| r7d_page_swap_first_two | First logical page pair retains order | `test_page_bytes` | 1, assertion killed |
+| r7d_kernel_subpage_flip | Kernel subpage order within manager pages | `test_page_bytes` | 1, assertion killed |
+| r7d_kernel_interleave_r7b | Head/kernel-page axes before joining manager pages | `test_page_bytes` | 1, assertion killed |
+| r7d_ratio_ignored | Manager/kernel ratio in physical page addressing | `test_page_bytes` | 1, assertion killed |
+| r7d_append_from_zero | Append interval starts at its actual logical offset | `test_page_bytes` | 1, assertion killed |
+| r7d_head_flip | KV-head identity | `test_page_bytes` | 1, assertion killed |
+| r7d_kv_half_swap | K/V half identity | `test_page_bytes` | 1, assertion killed |
+| r7d_null_page_admitted | Null physical page refuses | `test_refusals` | 1, assertion killed |
+| r7d_upper_bound_off | Structured upper-bound refusal; not an assertion kill | `GatherTests.test_refusals (ERROR, not an assertion)` | 1, survivor of assertion criterion; fails closed via torch RuntimeError, structured refusal unproved |
+| r7d_fp8_scale_rotated | Separate FP8 scales apply under rotation | `test_fp8_rotated_bytes` | 1, assertion killed |
+| r7d_fp8_scale_kv_swap_rotated | Rotated K and V use their own scales | `test_fp8_rotated_bytes` | 1, assertion killed |
+| r2_kernel_interleave | Head/kernel axes before joining manager pages | `test_page_bytes` | 1, assertion killed |
+| r2_manager_page_swap | Logical manager page table order | `test_page_bytes` | 1, assertion killed |
+| r2_joint_token_reverse | Token order even when K and V move together | `test_page_bytes` | 1, assertion killed |
+| r2_kv_swap | K/V halves and channel coordinates | `test_page_bytes` | 1, assertion killed |
+| r2_fp8_scale_rotated | FP8 scale applies under rotation | `test_fp8_rotated_bytes` | 1, assertion killed |
+| s_no_kill | Ignored TERM reaches KILL and a bounded exit | `test_capture_term_ignoring_cleanup` | 1, assertion killed |
+| s_untracked_ignored | Untracked CUDA input refuses before CMake | `test_untracked_cuda_refusal` | 1, assertion killed |
+| s_build_ref_ignored | Reused build receipt matches the exact ref | `test_build_reuse_refusals` | 1, assertion killed |
+| s_binary_hash_ignored | Both binaries match complete hash receipts | `test_build_reuse_refusals` | 1, assertion killed |
+| s_reuse_disabled | Fresh RUN_DIR reuses verified binaries without CMake | `test_build_reuse` | 1, assertion killed |
+| s_agents1_cap_removed | Explicit agents1 jobs above four refuse | `test_build_refusals` | 1, assertion killed |
+
+The finite set has 50 assertion kills, one uncredited error mutant and one required identity survivor. No formal surface table was supplied (brief gap). No requested r3 row is treated as out of contract. The earlier r7b finding 5 (three converter refusal tests) and r7d N2's structured upper-bound refusal are outside this brief's two Low findings/operator notes; both remain unchanged and explicit. No reviewer tests were removed. Self-review covered scope, security, design, tests, process ownership and claim accuracy. Runtime CUDA views, recurrent ownership/chronology, checkpoint/tokenizer provenance, calibrated quality bounds and long-depth capacity remain GPU gates.
+
+Task-board is absent (`goal-read-01.log`, exit 1); the existing `.temp/tasks.md` tracks this rework. No primary-goal mutation/clear, independent r3 acceptance, hosted check or landing is claimed. Signed local handoff and the authorized #hybrid / prototype-go summary are the delivery scope.
