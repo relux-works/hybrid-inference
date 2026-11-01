@@ -16,6 +16,38 @@ from policy import extend_chunk_limit
 
 
 class BenchmarkTests(unittest.TestCase):
+    # Client partitions are bounded before preflight or state writes; the native node's fixed partition cannot be mislabeled.
+    def test_client_partition_bounds(self):
+        args = manage.parser().parse_args(['client', '--state', 'fixture', '--batch', '64', '--ubatch', '32'])
+        self.assertEqual((args.batch, args.ubatch), (64, 32))
+        for role, batch, ubatch in (('client', '0', '0'), ('client', '64', '65'),
+                                     ('client', '65537', '1'), ('node', '64', '64')):
+            with mock.patch('sys.argv', ['manage.py', role, '--state', 'fixture', '--batch', batch, '--ubatch', ubatch]), mock.patch.object(manage, 'preflight') as preflight:
+                with self.assertRaisesRegex(common.Refusal, 'batch/ubatch|batch/--ubatch'):
+                    manage.main()
+                preflight.assert_not_called()
+
+    # A selected client partition reaches both the actual decoder command and published metadata, with other flags unchanged.
+    def test_client_partition_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tokens = root / 'tokens.json'
+            common.private_json(tokens, {'eval': 'x' * 24})
+            identity = dict(layout_fingerprint='1' * 64, quantization_type='Q4_0')
+            plan = dict(context=4096, kv_bytes_per_token=6528, recurrent_state_bytes=20201472)
+            record = dict(commit='a' * 40, flags=[], binaries={}, source_path=str(root))
+            for batch, ubatch in ((64, 32), (256, 256)):
+                state = root / str(batch)
+                argv = ['manage.py', 'client', '--state', str(state), '--model', 'fixture', '--token-file', str(tokens),
+                        '--node-sha256', 'a' * 64, '--batch', str(batch), '--ubatch', str(ubatch)]
+                with mock.patch('sys.argv', argv), mock.patch.object(manage, 'preflight', return_value={'backend': 'cpu'}), mock.patch.object(manage, 'check_ports'), mock.patch.object(manage, 'obtain_model', return_value=(root / 'model', 'a' * 64, False)), mock.patch.object(manage, 'context_plan', return_value=dict(plan)), mock.patch.object(manage, 'model_identity', return_value=identity), mock.patch.object(manage, 'http', return_value=dict(model_sha256='a' * 64)), mock.patch.object(manage, 'build', return_value=(root / 'build', record)), mock.patch.object(manage, 'start_process') as start, mock.patch.object(manage, 'wait_health'):
+                    self.assertEqual(manage.main(), 0)
+                command = start.call_args_list[0].args[0]
+                for flag, expected in (('-b', batch), ('-ub', ubatch), ('-ngl', 0), ('-np', 1), ('-ctk', 'q8_0')):
+                    self.assertEqual(command[command.index(flag) + 1], expected)
+                info = common.read_private(state / 'client-info.json')
+                self.assertEqual((info['batch'], info['ubatch']), (batch, ubatch))
+
     # An exact-ref build refuses tracked changes before CMake or a worktree mutation can run.
     def test_build_refuses_dirty_source(self):
         args = argparse.Namespace(ref='HEAD')

@@ -34,8 +34,8 @@ def main():
     identity = dict(model_sha256=sha256(model), backend='cpu', **model_identity(model))
     context = max(args.depths) + 2048
     plan = context_plan(model, host_info(), context, True)
-    node_port, decode_port, proxy_port = port(), port(), port()
-    require(len({node_port, decode_port, proxy_port}) == 3, 'allocated ports collided; rerun')
+    node_port, decode_port, proxy_port, partition_decode_port, partition_proxy_port = [port() for _ in range(5)]
+    require(len({node_port, decode_port, proxy_port, partition_decode_port, partition_proxy_port}) == 5, 'allocated ports collided; rerun')
     credential, node_token = secrets.token_hex(24), secrets.token_hex(24)
     private_json(root / 'node-tokens.json', {'eval': node_token})
     (root / 'slots').mkdir(mode=0o700)
@@ -50,18 +50,32 @@ def main():
     private_json(root / 'proxy-config.json', config)
     binaries = {name: sha256(path) for name, path in [('node', args.node_binary), ('decode', args.decode_binary)]}
     info = dict(identity, context=context, batch=256, ubatch=256, threads=2, threads_batch=2, binaries=binaries)
-    private_json(root / 'client-info.json', dict(info, proxy_url=f'http://127.0.0.1:{proxy_port}', model_path=str(model)))
+    private_json(root / 'client-info.json', dict(info, batch=64, ubatch=64, proxy_url=f'http://127.0.0.1:{proxy_port}', model_path=str(model)))
     private_json(root / 'node-info.json', info)
+    partition_root = root / 'partition'
+    partition_root.mkdir(mode=0o700)
+    (partition_root / 'slots').mkdir(mode=0o700)
+    partition_config = dict(config, decode_url=f'http://127.0.0.1:{partition_decode_port}', slot_path=str(partition_root / 'slots'))
+    private_json(partition_root / 'proxy-config.json', partition_config)
+    private_json(partition_root / 'client-info.json', dict(info, proxy_url=f'http://127.0.0.1:{partition_proxy_port}', model_path=str(model)))
     node_command = ['nice', '-n', '10', args.node_binary, model, root / 'node-tokens.json', node_port, context,
                     '--max-ctx', context, '--ram-budget-mib', 512, '--max-request-mib', 1]
     decode_command = ['nice', '-n', '10', args.decode_binary, '-m', model, '--host', '127.0.0.1', '--port', decode_port,
-                      '-ngl', 0, '-t', 2, '-tb', 2, '-c', context, '-np', 1, '-b', 256, '-ub', 256,
+                      '-ngl', 0, '-t', 2, '-tb', 2, '-c', context, '-np', 1, '-b', 64, '-ub', 64,
                       '-ctk', 'q8_0', '-ctv', 'q8_0', '-fa', 'on', '--jinja', '--slots', '--no-context-shift',
                       '--cache-ram', 0, '--no-cache-idle-slots', '--ctx-checkpoints', 0,
                       '--checkpoint-min-step', 0, '--slot-save-path', str(root / 'slots') + '/']
     proxy_command = ['nice', '-n', '10', sys.executable, Path(__file__).resolve().parents[1] / 'hybrid-proxy/proxy.py',
                      '--config', root / 'proxy-config.json', '--database', root / 'proxy.sqlite', '--port', proxy_port]
-    commands = [list(map(str, command)) for command in (node_command, decode_command, proxy_command)]
+    partition_decode_command = list(decode_command)
+    for flag, value in (('--port', partition_decode_port), ('-b', 256), ('-ub', 256),
+                        ('--slot-save-path', str(partition_root / 'slots') + '/')):
+        partition_decode_command[partition_decode_command.index(flag) + 1] = value
+    partition_proxy_command = ['nice', '-n', '10', sys.executable, Path(__file__).resolve().parents[1] / 'hybrid-proxy/proxy.py',
+                               '--config', partition_root / 'proxy-config.json', '--database', partition_root / 'proxy.sqlite',
+                               '--port', partition_proxy_port]
+    commands = [list(map(str, command)) for command in (node_command, decode_command, proxy_command,
+                                                      partition_decode_command, partition_proxy_command)]
     private_json(root / 'commands.json', commands)
     children = []
     try:
@@ -76,6 +90,12 @@ def main():
         proxy = start_process(proxy_command, root, 'proxy')
         children.append(proxy)
         wait_health(f'http://127.0.0.1:{proxy_port}', '/health', proxy, token=credential)
+        partition_decode = start_process(partition_decode_command, partition_root, 'decode')
+        children.append(partition_decode)
+        wait_health(partition_config['decode_url'], '/health', partition_decode)
+        partition_proxy = start_process(partition_proxy_command, partition_root, 'proxy')
+        children.append(partition_proxy)
+        wait_health(f'http://127.0.0.1:{partition_proxy_port}', '/health', partition_proxy, token=credential)
         def tokenize(text):
             return http(config['decode_url'], '/tokenize', data=dict(content=text, add_special=False))['tokens']
         # The real tokenizer, at every requested small depth, preserves seeded contents, fitting and position order.
@@ -88,6 +108,7 @@ def main():
                 checks.append({k: spec[k] for k in ('kind', 'requested_depth', 'material_tokens', 'record_token_offsets', 'material_sha256')})
         private_json(root / 'generator-checks.json', checks)
         command = [sys.executable, str(Path(__file__).with_name('hybrid_eval.py')), '--client-state', str(root),
+                   '--partition-client-state', str(partition_root),
                    '--output', str(root), '--label', 'cpu', '--depths', *map(str, args.depths), '--positions', '0.1',
                    '--tasks', *args.tasks, '--request-timeout', '300']
         with (root / 'evaluation.log').open('wb') as log:
@@ -101,25 +122,28 @@ def main():
                     process.wait(timeout=15)
         private_json(root / 'evaluation-exit.json', dict(command=command, exit_code=code))
         require(code == 0, 'evaluation failed; inspect evaluation.log and bundle')
-        # Every task executes all treatments and the noise control, with equal paired prompts and a local answer turn.
+        # All five treatments preserve answer-prompt tokens, report repeat determinism, and use a local answer turn.
         rows = [json.loads(line) for line in next(root.glob('hybrid-eval-*.jsonl')).read_text().splitlines()]
         tasks = [row for row in rows if row['stage'] == 'task']
         require(len(tasks) == len(args.tasks) * len(args.depths), 'missing task results')
         for task in tasks:
-            require(set(task['results']) == {'local', 'hybrid', 'offload', 'local_split'}, 'missing mode')
+            require(set(task['results']) == {'local', 'local_repeat', 'hybrid', 'offload', 'local_partition'}, 'missing mode')
             for mode, result in task['results'].items():
                 require(result['turns'][-1]['remote_applied'] == 0, 'answer offloaded')
+                if mode != 'local':
+                    require(result['vs_local']['prompt_identical'], 'paired prompt differs')
                 if mode in ('hybrid', 'offload'):
                     require(result['turns'][0]['remote_applied'] > 0, 'ingest stayed local')
-                    require(result['vs_local']['prompt_identical'], 'paired prompt differs')
         health = http(config['prefill_url'], '/v1/health')
         require(health['sessions'] == health['ram_bytes'] == 0, 'remote session leaked')
         private_json(root / 'result.json', dict(status='passed', tasks=len(tasks), health=health,
                                                limits='CPU routing/scoring execution only; accuracy is measured, not asserted'))
-        print(f'PASS {len(tasks)} tasks x four treatments; real tokenizer; imported ingest, local answers, zero retained sessions')
+        paired = [row for row in rows if row['stage'] == 'paired']
+        require(len(paired) == len(tasks) * 4, 'paired summary missing')
+        print(f'PASS {len(tasks)} tasks x five treatments; identical prompts; repeat and partition controls; zero retained sessions')
         return 0
     finally:
-        state = control(root, stop=True)
+        state = dict(client=control(root, stop=True), partition=control(partition_root, stop=True))
         for child in children:
             child.wait(timeout=15)
         private_json(root / 'cleanup.json', state)

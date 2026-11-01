@@ -38,6 +38,8 @@ tools/hybrid-bench/deploy-prefill-node.sh --state .temp/bench/node \
 
 ## 2. Open the SSH tunnel (from the client)
 
+For a client partition experiment, `setup-client.sh --batch 64 --ubatch 64 ...` sets the decoder's logical and physical batch sizes and records them in client-info. Defaults remain 256/256; require `1 <= ubatch <= batch <= 65536`. The native node remains fixed at 256/256 and refuses other launcher values. A second client needs distinct `--decode-port`, `--port` and `--state`; see the [task evaluator](../hybrid-eval/README.md) for the identical-token control and aggregate memory requirements.
+
 ```sh
 ssh -N -L 8091:127.0.0.1:8091 prefill-host
 ```

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import random
 import re
@@ -142,12 +143,8 @@ def public_trace(trace):
 
 
 def run_task(spec, mode, config, client, node, max_tokens, seed, timeout, release_rows):
-    control = mode == 'local_split'
-    wire_mode = 'local' if control else mode
-    text = spec['material']
-    split = text.rfind('\n', 0, len(text) // 2) + 1
-    pieces = [text[:split], text[split:]] if control else [text]
-    require(all(pieces), 'empty tool split')
+    wire_mode = 'local' if mode in ('local_repeat', 'local_partition') else mode
+    pieces = [spec['material']]
     history = [dict(role='system', content=SYSTEM)]
     previous, turns = 0, []
     sid = 'eval-' + uuid.uuid4().hex
@@ -192,38 +189,104 @@ def run_task(spec, mode, config, client, node, max_tokens, seed, timeout, releas
 
 
 def comparison(local, other):
+    require(local['answer_prompt_sha256'] == other['answer_prompt_sha256'],
+            'mode prompts differ; invalid paired comparison')
     return dict(answer_agreement=canonical(local['answer']) == canonical(other['answer']),
                 first_differing_token=first_difference(local['answer_tokens'], other['answer_tokens']),
                 prompt_identical=local['answer_prompt_sha256'] == other['answer_prompt_sha256'])
+
+
+def validate_partition(local, partition, node):
+    for key in ('model_sha256', 'quantization_type', 'backend', 'context', 'threads', 'threads_batch', 'binaries'):
+        require(key in local and local[key] == partition.get(key), 'partition client differs beyond batch/ubatch: ' + key)
+    for info in (local, partition, node):
+        require(isinstance(info.get('batch'), int) and isinstance(info.get('ubatch'), int) and
+                1 <= info['ubatch'] <= info['batch'], 'invalid batch/ubatch metadata')
+    require((local['batch'], local['ubatch']) != (partition['batch'], partition['ubatch']),
+            'partition control must use different batch/ubatch')
+    require((partition['batch'], partition['ubatch']) == (node['batch'], node['ubatch']),
+            'partition control must use node batch/ubatch')
+
+
+def paired_summary(tasks, mode, measure):
+    require(measure in ('answer', 'tokens'), 'unknown paired measure')
+    cells = [0, 0, 0, 0]
+    for task in tasks:
+        require(mode in task['results'] and 'local_partition' in task['results'], 'paired modes missing')
+        pair = [task['results'][name]['vs_local'] for name in (mode, 'local_partition')]
+        require(all(p['prompt_identical'] for p in pair), 'mode prompts differ; invalid paired comparison')
+        h, p = [not c['answer_agreement'] if measure == 'answer' else c['first_differing_token'] is not None for c in pair]
+        cells[2 * int(h) + int(p)] += 1
+    a, c, b, d = cells
+    discordant = b + c
+    # Under the paired null, the two discordant directions are Binomial(b+c, 0.5).
+    exact_p = min(1.0, 2 * sum(math.comb(discordant, k) for k in range(min(b, c) + 1)) / (1 << discordant))
+    return dict(n=sum(cells), both_agree=a, hybrid_only_disagrees=b, partition_only_disagrees=c,
+                both_disagree=d, hybrid_disagreements=b + d, partition_disagreements=c + d, exact_p=exact_p)
+
+
+def paired_groups(rows):
+    tasks = [r for r in rows if r.get('stage') == 'task']
+    groups = []
+    for depth, kind in sorted({(r['requested_depth'], r['kind']) for r in tasks}):
+        group = [r for r in tasks if r['requested_depth'] == depth and r['kind'] == kind]
+        for mode in ('hybrid', 'offload'):
+            if any(mode in r['results'] for r in group):
+                for measure in ('answer', 'tokens'):
+                    groups.append(dict(stage='paired', requested_depth=depth, kind=kind, mode=mode, measure=measure,
+                                       **paired_summary(group, mode, measure)))
+    return groups
 
 
 def summary(rows):
     lines = ['# Patchwork task quality', '',
              'Accuracy is full-answer exact match after outer/comma whitespace normalization.',
              'Token difference is zero-based on actual sampled IDs (including EOS); null means identical.',
-             'local_split is a framing-confounded local noise reference, not a calibrated numerical threshold.', '',
-             '| Depth | Task | Mode | N | Correct | Accuracy | Agree/local | Token disagreements | Seconds |',
-             '|---:|---|---|---:|---:|---:|---:|---:|---:|']
+             'local_repeat is the same-partition determinism baseline; local_partition uses a second local decoder with node batch/ubatch.',
+             'Every comparison requires identical answer-prompt tokens. Agreement is bounded by the output budget.', '']
     results = [row for row in rows if row.get('stage') == 'task']
+    identities = sorted({(r.get('client_model_sha256'), r.get('node_model_sha256'), r.get('client_quantization_type'),
+                          r.get('node_quantization_type'), r.get('hetero_quant', False)) for r in rows if 'client_model_sha256' in r})
+    for client_sha, node_sha, client_quant, node_quant, hetero in identities:
+        lines += [f'Identity: client {client_sha} ({client_quant}); node {node_sha} ({node_quant}); '
+                  + ('heterogeneous: disagreement includes quantization/model differences, not only numerical noise.' if hetero else 'homogeneous model identity.'), '']
+    eligible = [r for r in results if 'hybrid' in r['results'] and 'offload' in r['results']]
+    same = 0
+    for row in eligible:
+        ingests = [[t for t in row['results'][m]['turns'] if t['stage'] == 'ingest'] for m in ('hybrid', 'offload')]
+        same += (len(ingests[0]) == len(ingests[1]) == 1 and
+                 all(t['path'] == 'offload' and t['remote_applied'] == t['new_tokens'] - 1 for ts in ingests for t in ts) and
+                 ingests[0][0]['new_tokens'] == ingests[1][0]['new_tokens'])
+    lines += [f'hybrid equals offload on whole-ingest routing: {same}/{len(eligible)} fixtures (the final token is evaluated locally). '
+              'These fixtures are the same treatment; do not count them as independent evidence.', '',
+              '| Depth | Task | Mode | N | Correct | Accuracy | Agree/local | Token disagreements | Budget hits | Seconds |',
+              '|---:|---|---|---:|---:|---:|---:|---:|---:|---:|']
     for depth, kind, mode in sorted({(r['requested_depth'], r['kind'], m) for r in results for m in r['results']}):
         group = [r['results'][mode] for r in results if r['requested_depth'] == depth and r['kind'] == kind]
         correct = sum(r['correct'] for r in group)
         comparisons = [r['vs_local'] for r in group if 'vs_local' in r]
         agreement = str(sum(r['answer_agreement'] for r in comparisons)) + '/' + str(len(comparisons)) if comparisons else '-'
         differences = str(sum(r['first_differing_token'] is not None for r in comparisons)) if comparisons else '-'
-        lines.append(f'| {depth} | {kind} | {mode} | {len(group)} | {correct} | {correct / len(group):.3f} | {agreement} | {differences} | {sum(r["seconds"] for r in group):.2f} |')
+        lines.append(f'| {depth} | {kind} | {mode} | {len(group)} | {correct} | {correct / len(group):.3f} | {agreement} | {differences} | {sum(r["output_budget_reached"] for r in group)} | {sum(r["seconds"] for r in group):.2f} |')
+    lines += ['', 'Paired disagreement with local: both_agree, H_only, P_only, both_disagree. H is the named treatment; P is local_partition.',
+              'Exact p is the two-sided McNemar binomial tail on H_only/P_only, unadjusted for multiple comparisons. No discordants gives p=1; this does not establish equivalence.', '',
+              '| Depth | Task | Treatment | Measure | N | both_agree | H_only | P_only | both_disagree | Exact p |',
+              '|---:|---|---|---|---:|---:|---:|---:|---:|---:|']
+    for pair in paired_groups(rows):
+        lines.append('| ' + ' | '.join(str(pair[k]) for k in ('requested_depth', 'kind', 'mode', 'measure', 'n',
+                     'both_agree', 'hybrid_only_disagrees', 'partition_only_disagrees', 'both_disagree', 'exact_p')) + ' |')
     lines += ['', 'Execution: ' + rows[-1]['status'] + '; exit ' + str(rows[-1]['exit_code']) + '.',
               'Execution success does not assert task accuracy or noise equivalence. Inspect each denominator and disagreement.']
     return '\n'.join(lines) + '\n'
 
 
-def bundle(root, name, rows, client, node):
+def bundle(root, name, rows, client, node, partition=None):
     # Explicit allowlist excludes paths, addresses, credentials, session IDs, inputs and native state.
     info_keys = ('backend', 'commit', 'model_sha256', 'quantization_type', 'layout_fingerprint',
                  'context', 'batch', 'ubatch', 'threads', 'threads_batch', 'binaries')
     public = {name + '.jsonl': ''.join(json.dumps(r, sort_keys=True) + '\n' for r in rows).encode(),
               name + '.md': summary(rows).encode()}
-    for label, info in [('client', client), ('node', node)]:
+    for label, info in [('client', client), ('node', node)] + ([('partition-client', partition)] if partition else []):
         public[label + '-info.json'] = (json.dumps({k: info[k] for k in info_keys if k in info}, sort_keys=True, indent=2) + '\n').encode()
     public['SHA256SUMS'] = ''.join(hashlib.sha256(data).hexdigest() + '  ' + filename + '\n'
                                    for filename, data in sorted(public.items())).encode()
@@ -243,6 +306,7 @@ def bundle(root, name, rows, client, node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--client-state', required=True)
+    parser.add_argument('--partition-client-state', required=True, help='second local client with node batch/ubatch')
     parser.add_argument('--node-info')
     parser.add_argument('--output', required=True)
     parser.add_argument('--label', default='quality')
@@ -258,52 +322,67 @@ def main():
     require(re.fullmatch('[a-zA-Z0-9_-]{1,64}', args.label), 'invalid label')
     require(all(128 <= n <= 1048576 for n in args.depths), 'depth must be in 128..1048576')
     require(all(0 <= p <= 1 for p in args.positions), 'position must be in 0..1')
+    require(all(len(set(values)) == len(values) for values in (args.depths, args.tasks, args.positions)),
+            'duplicate depth, task or position would invalidate paired counts')
     require(1 <= args.repeats <= 100 and 1 <= args.max_tokens <= 256 and 1 <= args.request_timeout <= 86400, 'invalid run bounds')
     require('local' in args.modes and len(set(args.modes)) == len(args.modes), 'include local exactly once as the reference')
     state, root = Path(args.client_state), Path(args.output)
     require(root.is_dir(), 'output directory must exist')
     config = read_private(state / 'proxy-config.json')
     client = read_private(state / 'client-info.json')
+    partition_state = Path(args.partition_client_state)
+    partition_config = read_private(partition_state / 'proxy-config.json')
+    partition_client = read_private(partition_state / 'client-info.json')
     node = json.loads(Path(args.node_info or state / 'node-info.json').read_text())
     require(config.get('benchmark'), 'proxy must enable benchmark traces')
     require(client['model_sha256'] == config['model_sha256'], 'client metadata model identity mismatch')
     require(node['model_sha256'] == config.get('node_model_sha256', config['model_sha256']), 'node metadata model identity mismatch')
     validate_identity(client['model_sha256'], client, node['model_sha256'], node, config.get('hetero_quant', False))
     require(client.get('quantization_type') and node.get('quantization_type'), 'quantization metadata required')
+    validate_partition(client, partition_client, node)
+    require(partition_config.get('benchmark'), 'partition proxy must enable benchmark traces')
+    require(partition_config['decode_url'] != config['decode_url'] and partition_client['proxy_url'] != client['proxy_url'],
+            'partition client must use a second decoder and proxy')
+    require(partition_config['model_sha256'] == client['model_sha256'], 'partition proxy model identity mismatch')
+    require(partition_config['prefill_url'] == config['prefill_url'], 'partition proxy must use the same node')
     name = 'hybrid-eval-' + args.label + '-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     rows = [dict(stage='run', generator_version=1, evaluator_sha256=sha256(__file__), seed=args.seed,
                  depths=args.depths, positions=args.positions, tasks=args.tasks, repeats=args.repeats,
-                 modes=args.modes + ['local_split'], max_tokens=args.max_tokens,
-                 noise_control='identical material in two tool turns; framing differs',
+                 modes=args.modes + ['local_repeat', 'local_partition'], max_tokens=args.max_tokens,
+                 noise_control='identical tokens; second local decoder with node batch/ubatch',
+                 local_partition=dict(batch=client['batch'], ubatch=client['ubatch']),
+                 control_partition=dict(batch=partition_client['batch'], ubatch=partition_client['ubatch']),
                  comparison_calibrated=False, question_mode='local')]
     code = 0
     try:
         def tokenize(text):
             return http(config['decode_url'], '/tokenize', config['decode_token'],
                         dict(content=text, add_special=False), timeout=args.request_timeout)['tokens']
-        http(config['decode_url'], '/health', config['decode_token'], timeout=5)
-        props = http(config['decode_url'], '/props', config['decode_token'], timeout=5)
-        require(sha256(props['model_path']) == client['model_sha256'], 'live decoder model file hash differs from client metadata')
-        live_client = model_identity(props['model_path'])
-        require(live_client['quantization_type'] == client['quantization_type'], 'live decoder quantization differs from client metadata')
+        for cfg, info in ((config, client), (partition_config, partition_client)):
+            http(cfg['decode_url'], '/health', cfg['decode_token'], timeout=5)
+            props = http(cfg['decode_url'], '/props', cfg['decode_token'], timeout=5)
+            require(sha256(props['model_path']) == info['model_sha256'], 'live decoder model file hash differs from client metadata')
+            live_client = model_identity(props['model_path'])
+            require(live_client['quantization_type'] == info['quantization_type'], 'live decoder quantization differs from client metadata')
         rows[0].update(client_identity_source='client-info plus live decoder props and model-file SHA-256',
                        node_identity_source='node-info quantization bound to live health model SHA-256',
                        live_client_quantization_type=props['model_ftype'])
         for depth in args.depths:
             for kind in args.tasks:
                 for repeat in range(args.repeats):
-                    for position in args.positions:
-                        spec = generate(kind, args.seed, repeat, depth, position, tokenize)
+                    for position_index, position in enumerate(args.positions):
+                        spec = generate(kind, args.seed, repeat * len(args.positions) + position_index, depth, position, tokenize)
+                        require(spec['material_tokens'] > max(client['batch'], partition_client['batch']),
+                                'material too short to exercise both batch partitions')
                         results = {}
                         releases = []
                         try:
-                            for mode in ['local'] + [m for m in args.modes if m != 'local'] + ['local_split']:
-                                results[mode] = run_task(spec, mode, config, client, node, args.max_tokens,
+                            for mode in ['local', 'local_repeat'] + [m for m in args.modes if m != 'local'] + ['local_partition']:
+                                cfg, info = (partition_config, partition_client) if mode == 'local_partition' else (config, client)
+                                results[mode] = run_task(spec, mode, cfg, info, node, args.max_tokens,
                                                          args.seed, args.request_timeout, releases)
                                 if mode != 'local':
                                     results[mode]['vs_local'] = comparison(results['local'], results[mode])
-                                    if mode != 'local_split':
-                                        require(results[mode]['vs_local']['prompt_identical'], 'mode prompts differ; invalid paired comparison')
                             for result in results.values():
                                 result['answer_tokens_sha256'] = digest(result.pop('answer_tokens'))
                             rows.append(dict(stage='task', **{k: v for k, v in spec.items() if k not in ('material', 'records')},
@@ -316,13 +395,14 @@ def main():
     except Exception as error:
         code = 2
         rows.append(dict(stage='error', reason=str(error) if isinstance(error, Refusal) else type(error).__name__))
+    rows.extend(paired_groups(rows))
     rows.append(dict(stage='summary', status='interrupted' if code == 130 else 'aborted' if code else 'executed',
                      exit_code=code, tasks_executed=sum(r['stage'] == 'task' for r in rows)))
     for row in rows:
         row.update(client_model_sha256=client['model_sha256'], node_model_sha256=node['model_sha256'],
                    client_quantization_type=client['quantization_type'], node_quantization_type=node['quantization_type'],
                    hetero_quant=config.get('hetero_quant', False))
-    archive = bundle(root, name, rows, client, node)
+    archive = bundle(root, name, rows, client, node, partition_client)
     print(str(archive))
     print('sha256 ' + sha256(archive))
     return code

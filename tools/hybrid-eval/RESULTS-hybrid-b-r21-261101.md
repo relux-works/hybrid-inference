@@ -138,3 +138,90 @@ tools/hybrid-bench/deploy-prefill-node.sh --state "$RUN/node" --stop
 For an already-running qualified node/client, run only the evaluator command with the actual client state. Pilot at 2048 tokens and one task/position first if policy calibration or memory fit is uncertain. The [README](README.md) gives the Mac SSH tunnel, local Metal client setup, tools/output table and per-depth runtime budget formula. The default GPU sweep has 60 cases and 540 completion requests; no GPU/Metal runtime estimate is presented as an observation.
 
 Remaining qualification: GPU/Metal, 27B, long depths through 128k, heterogeneous task accuracy, more seeds/positions and an actual noise acceptance bound. The split control changes framing, so a later backend exposing an identical-prompt batch partition control would narrow the numerical interpretation. The small 0.8B tracking/aggregation failures remain visible. Required upstream/hosted checks, independent review, publication and landing were not requested for this no-push local handoff.
+
+
+## r22 - clean same-token partition control (2026-11-01)
+
+Review r4q requested changes on `46c967334e902f2d6ab1f3c607c2a1c705c5102b`. The old `local_split` results above remain historical **framing sensitivity**, not numerical noise evidence. They must not support a paper claim that hybrid is within local noise.
+
+The single task commit was rebased cleanly and re-signed onto the owner's exact `7e1a477b2e8dfc8146744f4f81d73abca25e7d4a`, producing `fa79daa472` before rework. The prescribed fetch of local prototype `main` actually returned `0124e89a`; the requested hash was available on its `m1-test-host-aware` branch and was fetched by exact object ID. No remote/default ref was changed. All subsequent work stays local on `m2-task-eval`, with no push.
+
+### Mechanism and paired design
+
+The simpler clean control is a **second local decoder/proxy with the node's batch/ubatch**, not a split conversation. The primary local decoder uses `-b 64 -ub 64`; the control and native node use 256/256. The same decoder binary, model, backend, context, threads, KV types, attention and checkpoint options are used for both local decoders. Both consume the exact same conversation. `comparison()` now refuses any unequal actual answer-prompt token hash, including the partition control and local repeat. `local_repeat` runs the primary local mode again in a fresh session with the same seed/settings. No framing control is included in any noise count.
+
+JSONL and markdown report paired answer and sampled-token disagreement for each depth/type. Cells are both agree, H-only disagreement, P-only disagreement and both disagree relative to local, with H the named hybrid/offload treatment and P the partition control. The exact two-sided McNemar tail is conditional Binomial(H-only + P-only, 0.5), capped at one; no discordants gives p=1. The [official statistical reference](https://www.statsmodels.org/dev/generated/statsmodels.stats.contingency_tables.mcnemar.html) describes this exact binomial form. P-values are unadjusted and do not prove equivalence.
+
+Duplicate depth/task/position arguments now refuse before state admission so repeated cases cannot inflate paired counts. Plan **300 distinct tasks per depth/type**, balanced over three positions with `--repeats 100 --positions 0.1 0.5 0.9`. Repeat/position pairs have distinct task indices rather than reusing facts at each position. Four depths x five types therefore require 6000 paired cases, five conversations each. There is no effect-independent sufficient sample size: assuming H-only probability .15 and P-only .05, exact two-sided alpha .05 power is .9736022 at N=300, versus .5444454 at N=100 and .8753005 at N=200. These are planning assumptions, not measured rates. Smaller effects and multiplicity correction require more cases; declare primary endpoints and multiplicity handling before paper claims. The reproducible calculation is `.temp/hybrid-b-r22-261101/planning.py`, output `planning-02.log` (exit 0).
+
+Minimal scope extension outside `tools/hybrid-eval/`: `tools/hybrid-bench/manage.py`, its existing `test_bench.py`, and its README now accept, validate, test and document client `--batch/--ubatch`. Native node partition remains fixed at 256/256; defaults are unchanged. This makes the second decoder provisionable through the established launcher instead of an ad-hoc runtime script. No core/native code or public API changed.
+
+### Short CPU pilot
+
+Command, run from this checkout:
+
+```sh
+nice -n 10 python3 tools/hybrid-eval/test_native.py \
+  --node-binary /home/agent/Werkstatt/hybrid-a/llama.cpp/build/bin/llama-hybrid-prefill \
+  --decode-binary /home/agent/Werkstatt/hybrid-a/llama.cpp/build/bin/llama-server \
+  --model "$HOME/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf" \
+  --artifacts .temp/hybrid-b-r22-261101/native-02 --depths 2048
+```
+
+Exit **0**: five task types x five treatments, position .1, seed 17, max output 48, actual material 2048 tokens, context 4096, CPU only and two threads per service. Native children inherited effective nice 19 (harness nice 10 plus child adjustment). Existing A-workbench binaries were read-only. Native-01 had equal before/after executable/library hashes. The shared A build changed between pilots at 12:10 UTC, before native-02 launched at 12:13 UTC. Native-02 startup executable hashes match the post-run files; library hashes were captured afterward and all their mtimes precede launch, but its full before-run library snapshot is unavailable. The two pilots are not identical-environment evidence. Their build stamp is historically stale, so this is not an exact-source native rebuild claim. No configure, build, install or download ran; the shared build lock was not needed. No model or golden was modified.
+
+| Treatment | Exact correct | Answer disagreements/local | Token disagreements/local | Budget hits | Request seconds |
+|---|---:|---:|---:|---:|---:|
+| local | 3/5 | - | - | 0 | 38.144 |
+| local_repeat | 3/5 | 0 | 0 | 0 | 39.077 |
+| hybrid | 3/5 | 1 | 1 | 0 | 49.161 |
+| offload | 3/5 | 1 | 1 | 0 | 46.842 |
+| local_partition | 3/5 | 0 | 0 | 0 | 42.764 |
+
+All 20 nonreference prompt comparisons are token-identical. The aggregate descriptive hybrid/partition table is (both agree=4, H-only=1, P-only=0, both disagree=0) for both answer and token endpoints. The sole hybrid/offload disagreement is aggregation; the other four tasks agree with local. Each persisted per-type paired table has N=1 and exact p=1. This pilot is too small for a noise/equivalence conclusion. Accuracy remains 3/5, with aggregation and tracking failures visible in every treatment.
+
+The generated summary says **hybrid equals offload on whole-ingest routing: 5/5**. Both modes offload the whole ingest except its final local token and answer the later question locally. Their agreement is not independent evidence. It now also includes per-mode budget-hit counts and both model/quantization identities plus a heterogeneous label; heterogeneous disagreements explicitly include quantization/model effects, not just numerical noise.
+
+### Tests and controls
+
+All test commands ran directly with redirected logs; no tee pipeline or fabricated status. Logs below are relative to `.temp/hybrid-b-r22-261101/`.
+
+| Check | Exit | Evidence and bound |
+|---|---:|---|
+| Evaluator unit suite | 0 | `unit-05.log`, 11 tests, including prompt rejection/acceptance, partition identity, local-repeat reporting, constructed paired cells/tails, endpoint separation and archive exclusion |
+| Existing benchmark suite plus partition tests | 0 | `bench-unit-02.log`, 27 tests; selected partition reaches real startup-command construction and metadata, invalid settings refuse before preflight/state writes |
+| Existing proxy suite | 0 | `proxy-unit-01.log`, 68 tests, unchanged proxy source |
+| Native integration | 0 | `native-01.log` and final-source `native-02.log`, each five real task types x all five modes; import, identical prompt and local-answer checks; zero retained remote sessions/RAM |
+| Python syntax, whitespace and evaluator CLI help | 0 | `syntax-02.log`, `whitespace-01.log`, `evaluator-help-01.log` |
+| Archive/private-data/process/binary audit | 0 | `audit-02.log`/`audit-02.json` (pilot 1), `audit-native02-02.log`/`audit-native-02.json` (pilot 2); member hashes/sidecars, actual credential/address/path exclusion, prompt hashes, all 12 recorded PIDs gone and ten ports closed; native provenance bounds stated above |
+| Narrowing mutation runner, corrected controls | 0 | `mutants-04.log` (eleven controls); each named mutant subprocess actually exits 1 with its named assertion failure |
+| Type/EditorConfig checker readiness | 127 / 127 | `ty-readiness.log`, `editorconfig-readiness.log`; both unavailable, so their actual checks are **unrun**, no packages installed |
+
+The preimplementation unit run `unit-red-01.log` exited 1 because the new functions were not yet defined; that is not mutation/control evidence. The native node readiness invocation intentionally omitted arguments and returned its expected usage with exit 2, not a passing gate. The first audit exited 1 because its port index selected the token-file path; the corrected task-local audit uses the actual node port and exits 0. No product/source change was needed for that audit correction. The first native-02 audit (`audit-native02-01.log`, exit 1) incorrectly reused pilot 1's binary snapshot and exposed the between-pilot rebuild; the corrected audit verifies pilot 2's startup executable hashes and records the missing library-before snapshot instead of claiming identical environments. Its immediately dependent report read also exited 1 because no successful audit artifact yet existed. The corrected audit exits 0. A final self-review added duplicate-argument refusal, then reran the 11 evaluator unit tests and all five native task types on the final source; both pilots have identical prompt/answer hashes, exact scores and budget flags (`repeat-check-01.log`).
+
+| Mutant | Narrows the gate to | Named failing test | Result / survivor bound |
+|---|---|---|---|
+| Remove prompt identity refusal | Rejecting the r4q changed-framing witness even with identical output | `test_noise_control_changes_input_regression` | killed, exit 1 |
+| Remove different-partition refusal, first control | Original negative combined same partition with node mismatch | none | **survived**, exit 0; original test proved only another identity/partition rejection, not this guard |
+| Remove different-partition refusal, isolated control | Same client/control/node partition alone must refuse | `test_partition_identity_controls` | killed after adding isolated regression, exit 1 |
+| One-sided tail | Two-sided exact probability, not half the intended p | `test_paired_summary_constructed_table` | killed, exit 1 |
+| Swap discordant cells | Direction and denominator of each paired cell | `test_paired_summary_constructed_table` | killed, exit 1 |
+| Use text for token endpoint | Token disagreement is independent of normalized text agreement | `test_paired_summary_constructed_table` | killed, exit 1 |
+| Hide budget column | Budget censoring remains visible in markdown | `test_summary_baselines_and_labels` | killed, exit 1 |
+| Substring scoring | Extra prose must not pass exact scoring | `test_exact_scoring_negative_controls` | killed, exit 1 |
+| Allow missing import | Hybrid routing requires an actual nonzero import | `test_patchwork_route_controls` | killed, exit 1 |
+| Allow wrong control model | Model identity must match between the local decoders | `test_partition_identity_controls` | killed, exit 1 |
+| Archive credential | Shareable metadata must exclude a credential canary | `test_sanitized_bundle` | killed, exit 1 |
+| Allow duplicate sweep cases | Repeated arguments must not inflate paired counts or reach state admission | `test_duplicate_cases_refuse_before_admission` | killed, exit 1 |
+
+Initial mutation runner exit 1 and all initial results remain in `mutants-01.log`/`mutants-01.json`; there are no survivors in the corrected six-mutant, extended ten-mutant or final eleven-mutant runs. These controls are finite instrument checks, not exhaustive mutation coverage.
+
+### Artifacts, review and limits
+
+Final-source shareable bundle: `.temp/hybrid-b-r22-261101/native-02/hybrid-eval-cpu-20261101T121346660615Z.tar.gz`, SHA-256 `53f44a23f68ef0cc2d8aaea876710c73685597fe283c417e29392d22d10a3864`. Evaluator SHA-256 `60be16484a23b5669271f0ef39d2308e75addb28ef20d0afab52d5d969f07b69`. Public JSONL contains 20 per-type paired rows and the determinism/partition results. `audit-native-02.json` observed cleanup and the bounded native provenance at `2026-11-01T12:19:04.727273+00:00`. All shareable member manifests and the sidecar verified. The first pilot's retained archive is `native-01/hybrid-eval-cpu-20261101T120301427504Z.tar.gz`, SHA-256 `7d1bb92ce19b5581308dfddd0849c265d693b9529660fcc4d02fc365f54dd7a2`, evaluator SHA-256 `5d6168ba33a9912925208c584491ade575911bc725a12b8565fedac96550da18`; its full before/after binary snapshot is in `native-identity-before.json` and `audit-02.json`.
+
+Owned parked slots, SQLite state and credentials were hashed then removed: 32 files, 800984469 bytes, `cleanup-manifest.json` SHA-256 `e51910d46811f7af739d8f05b4b559adf90961490c6f575ea1a2610d8eec6619`. Final-source pilot 2 cleanup: 32 more files, 800988589 bytes, `cleanup-manifest-02.json` SHA-256 `dad336c3053d68775a61cf7bbc4f9182e1b605b63c11cd4ab0578caf4d03adc5`. Across both pilots 64 owned files / 1601973058 bytes were removed. No other task's state was removed.
+
+Self-review uses the code-review skill's scope, security, approach, tests and general checklists. The named prompt regression addresses r4q's finding; review said `repeat-of: none`. The owner rework brief has no acceptance surface table or designated landing-property suite, an explicit brief gap. The six observational rows in r4q are mapped in [coverage-map.md](coverage-map.md), with named tests, killed narrowing mutants and finite limits; this does not claim exhaustive backend coverage. Previously committed evaluator/benchmark/proxy tests remain present and green. The only out-of-module paths are the three launcher paths justified above. Unchanged native/backend behavior, cross-backend distribution/KL calibration, EOG inclusion details, heterogeneous native accuracy, 27B/GPU/Metal and long-depth/paper-size measurements remain outside this CPU-only task. Batch metadata is checked but `/props` does not expose its live batch settings; custom launches need their startup-command audit. No calibrated noise-equivalence acceptance is claimed.
+
+This is a local ready-for-review handoff. Independent acceptance, hosted checks, publication and landing were not requested and no push was made. The signed rework head is supplied in the orchestrator notice and human handoff; no session links are included.
