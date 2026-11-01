@@ -85,12 +85,19 @@ def test_chunk_transaction(remote, decode, slots, model_hash):
         unchanged()
         decode.request('POST', slot + '?action=abort_delta', {})
         print('PASS HTTP chunk refusal ' + name, flush=True)
-    # The same valid producer chunks still commit all tokens at the final boundary after every negative control.
-    for index, wire in enumerate(wires):
+    # A proxy crash leaves staging without abort; a new transfer replaces it on its first request and commits only at the end.
+    for wire in wires[:2]:
+        decode.request('POST', slot + '?action=import_delta', wire, headers)
+    replacement = []
+    for wire in wires:
+        h, b = unpack(wire)
+        replacement.append(envelope(dict(h, transfer_id='http-replacement'), b))
+    for index, wire in enumerate(replacement):
         decode.request('POST', slot + '?action=import_delta', wire, headers)
         if index != 3:
             unchanged()
     require(decode.request('GET', slot + '/info')['tokens'] == tokens, 'HTTP final did not commit the whole range')
+    print('PASS HTTP stale staging replaced on first request, final-only commit', flush=True)
     decode.request('POST', slot + '?action=erase', {})
     remote.request('DELETE', '/v1/sessions/' + sid)
     print('PASS HTTP final state once, final-only commit, checksum-preserving refusals', flush=True)

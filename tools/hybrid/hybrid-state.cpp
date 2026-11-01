@@ -187,12 +187,17 @@ std::string encode_delta(json header, const std::string & state) {
     return out + text + state + checksums(state);
 }
 
-delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0) {
+static json read_delta_header(const std::string & wire, uint32_t & size) {
     require(wire.size() >= 4, "truncated delta length");
-    uint32_t size = 0;
+    size = 0;
     for (int i = 0; i < 4; ++i) { size |= (uint32_t) (unsigned char) wire[i] << (8 * i); }
     require(size <= max_delta_header_bytes && size <= wire.size() - 4, "invalid delta header length");
-    json h = parse_json(wire.substr(4, size));
+    return parse_json(wire.substr(4, size));
+}
+
+delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0) {
+    uint32_t size;
+    json h = read_delta_header(wire, size);
     require(h.is_object() && h.at("magic") == "HYBD" && h.at("version").is_number_integer() && h.at("version") == 2, "unsupported delta version");
     require(h.at("body_format") == "llama-native-chunks-v2" && h.at("kv_type") == "q8_0" && h.at("state_dtype") == "f32", "unsupported delta layout");
     require(h.at("model_sha256").is_string() && h.at("model_sha256") == model_sha256, "model hash mismatch");
@@ -231,6 +236,13 @@ void delta_import::clear() {
 bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, const std::string & wire, const std::string & model_hash, const std::string & session_id,
                          const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab) {
     try {
+        if (!chunks.empty()) {
+            uint32_t size;
+            const auto h = read_delta_header(wire, size);
+            if (h.at("chunk_index") == 0 && h.at("transfer_id") != chunks.front().header.at("transfer_id")) {
+                clear();
+            }
+        }
         auto next = read_delta(wire, model_hash, chunks.empty() ? current.size() : tokens.size());
         const auto & h = next.header;
         require(h.at("session_id") == session_id, "Delta session mismatch");

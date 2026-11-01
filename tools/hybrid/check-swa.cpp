@@ -93,6 +93,56 @@ static std::string snapshot(llama_kv_cache_iswa & cache, int seq = -1) {
     return out.data;
 }
 
+static void chunk_late_window_rollback(llama_model & model) {
+    auto & hp = model.hparams;
+    const auto saved_window = hp.n_swa;
+    hp.n_swa = 512;
+    llama_kv_cache_iswa cache(model, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                             false, false, false, true, 512, 2, 256, nullptr, nullptr, nullptr, nullptr);
+    cache.clear(true);
+    auto * base = cache.get_base();
+    auto * fixed = cache.get_swa();
+    { const auto bytes = cache_record(base, hp, {0, 1}); reader input(bytes); base->state_read(input, 0, 0); }
+    { const auto bytes = cache_record(fixed, hp, {0, 1}); reader input(bytes); fixed->state_read(input, 0, 0); }
+    std::vector<int> occupied(510);
+    std::iota(occupied.begin(), occupied.end(), 0);
+    { const auto bytes = cache_record(fixed, hp, occupied); reader input(bytes); fixed->state_read(input, 1, 0); }
+    auto framed = [&](const std::string & bytes) {
+        writer out;
+        out.scalar<uint32_t>(0xaf143cd8);
+        out.scalar<int32_t>(0);
+        return out.data + bytes;
+    };
+    const auto early = framed(cache_record(base, hp, {2}));
+    const auto final = framed(cache_record(base, hp, {3, 4}) + cache_record(fixed, hp, {0, 1, 2, 3, 4}));
+    const std::vector<llama_state_seq_chunk> chunks {{(const uint8_t *) early.data(), early.size(), 3},
+                                                    {(const uint8_t *) final.data(), final.size(), 5}};
+    auto physical_keys = [&] {
+        writer out;
+        for (auto * kv : {base, fixed}) {
+            for (auto il : kv->get_layer_ids()) {
+                auto * tensor = kv->get_k_storage(il);
+                out.write_tensor(tensor, 0, ggml_nbytes(tensor));
+            }
+        }
+        return out.data;
+    };
+    const auto before = snapshot(cache), neighbor = snapshot(cache, 1), keys = physical_keys();
+    // Validation passes; apply queues base writes, removes the old window, then cannot allocate five cells.
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 2, 512, true) == early.size() + final.size(), "late SWA fixture failed validation");
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 2, 512) == 0, "late SWA allocation failure accepted");
+    require(physical_keys() == keys, "swa_chunk_late_window_rollback: deferred keys written after rejection");
+    require(snapshot(cache) == before && snapshot(cache, 1) == neighbor, "swa_chunk_late_window_rollback: metadata or neighbor changed");
+    std::cout << "PASS swa_chunk_late_window_rollback " << model.arch_name() << '\n';
+    // Freeing three neighbor cells admits the same transaction, ruling out unconditional refusal.
+    fixed->seq_rm(1, 0, 3);
+    const auto remaining_neighbor = snapshot(cache, 1);
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 2, 512) == early.size() + final.size(), "late SWA positive control failed");
+    require(base->seq_pos_max(0) == 4 && fixed->seq_pos_max(0) == 4 && snapshot(cache, 1) == remaining_neighbor, "late SWA positive control changed neighbor or endpoint");
+    std::cout << "PASS swa_chunk_late_window_capacity_control " << model.arch_name() << '\n';
+    hp.n_swa = saved_window;
+}
+
 static void run(llm_arch arch, bool unified) {
     hybrid::model_ptr model(llama_model_create(arch, llama_model_default_params()));
     auto & hp = model->hparams;
@@ -288,6 +338,7 @@ static void run(llm_arch arch, bool unified) {
     }
     require(fresh.seq_pos_max(0) == 1, "initial import failed");
     std::cout << "PASS initial_short_window_import\n";
+    if (unified) { chunk_late_window_rollback(*model); }
 }
 
 int main() {

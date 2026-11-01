@@ -184,3 +184,95 @@ python3 tools/hybrid-bench/hybrid_bench.py --client-state "$run_path/client" \
 ```
 
 Retain the real process exit, sanitized bundle and SHA sidecar. CUDA-to-Metal numerical results remain uncalibrated (exit 5), even when within the inherited numerical bounds. Verify the first forced-offload call has four chunks, three `staged` and one `imported`, `remote_applied` equal to the complete imported range, and no fallback; compare its actual wire bytes with the prior run, accounting for actual token IDs and chunk endpoints. Small subsequent turns legitimately carry one fixed state each. On interruption, retain the result/error evidence and verify original slot bytes before local fallback through the HTTP/native controls; do not count staged ranges as applied. After the Mac client releases its sessions, stop the GPU node with `deploy-prefill-node.sh --state "$run_path/node" --stop` in the GPU shell. Return sanitized bundles only, not credentials or native states.
+
+## r25 - r7g follow-ups
+
+Continuation of accepted r24 head `675cc8f7f41da3023bd101f41ed68126616355c2` on `m3-chunk-state`, run `hybrid-a-r25-261101`. Local signed delivery only; no push. Review input: `/home/agent/Werkstatt/hybrid-review-proto/llama.cpp/.temp/REVIEW-chunk-state-claude.md`. Evidence, exact commands, PIDs and exits: `.temp/hybrid-a-r25-261101/`. No changes to SWA window export or any `src/` file. The separate `m3-swa-fix` merge and its combined-tree validation remain pending.
+
+### Regressions and stale staging
+
+`test_staged_chunks_do_not_persist_applied_state_or_drop_checkpoints` opens a fresh SQLite connection before each next chunk request. In token-journal and message-turn modes it requires the old durable tokens/remote boundary and zero applied count throughout staging; message-turn checkpoints must survive until final commit. The same transfer then succeeds and clears the checkpoints. The reviewer's exact M6 deletion now fails on the fresh reader observing two uncommitted tokens. Producer error cleanup and local fallback cannot conceal this observation.
+
+`swa_chunk_late_window_rollback` allocates real CPU Gemma/Glimmer caches with a 512-cell window. The destination occupies two window cells and its neighbor occupies 510. Both chunks validate. Apply queues base KV writes, removes the destination's old window metadata, then fails to allocate the five-cell final window. The test checks byte-exact metadata/neighbor snapshots and all physical K storage, including unused cells where an undiscarded queued write would otherwise escape serialization checks. Freeing three neighbor cells admits the identical transaction (`swa_chunk_late_window_capacity_control`). This new allocation-pressure case uses unified storage on both architectures; the existing separate/unified fixtures remain green. It does not establish real-model SWA logits or arbitrary backend-failure recovery.
+
+Stale staging was reproduced before the fix through the real node/server: two abandoned chunks, then a new chunk zero on the same live prefix, returned HTTP 400 with `position gap or overlap` (`http-red-01.log`, actual exit 1; server log records the intended rejection). The decoder used the abandoned staged endpoint as the expected start. That rejection is spurious; the old slot is still intact. A new transfer now replaces host staging only when its ID differs and its chunk index is zero, then undergoes all normal live-prefix, session, model, endpoint, vocabulary, checksum and native checks. Same-transfer duplicates, changed IDs on later chunks, wrong-prefix replacements, foreign sessions and corrupt replacements still refuse with unchanged state/logits. The real HTTP regression now accepts the first replacement request, keeps slot bytes unchanged before its final chunk, and commits the complete replacement at the end. No retry, fallback exception allowance or reuse-threshold change was added.
+
+| Mutant | Property narrowed | Named failing test | Actual result |
+|---|---|---|---|
+| M6: remove the proxy's non-final `continue` | Staged chunks cannot enter the durable applied prefix | `test_staged_chunks_do_not_persist_applied_state_or_drop_checkpoints` | Exit 1; `m6-mutant-02.log` |
+| M2: remove failed chunk readers' `discard()` | Queued physical KV writes cannot publish on late SWA failure | `swa_chunk_late_window_rollback` | Exit 1, `deferred keys written after rejection`; `m2-swa-red-01.log` |
+| M3: remove `restore_fixed()` | Late SWA failure must restore the old window metadata | `swa_chunk_late_window_rollback` | Exit 1, `metadata or neighbor changed`; `m3-swa-red-01.log` |
+
+No mutant survived this bounded set. The native mutants compile/link independently with exit 0 from copies under task scratch; the candidate library hash remains unchanged. `controls.json` records the direct processes and actual exits. These controls supplement the retained r24 refusals and do not claim exhaustive failure injection.
+
+### Layout formulas and real 0.8B measurement
+
+Let `A` be attention layers, `Q` recurrent layers, `s` KV streams, `P` old committed token depth, and `D` newly transferred tokens. For these Qwen layouts, q8_0 blocks hold 32 values in 34 bytes, each cell has 24 metadata bytes, and recurrent tensors use four-byte floats. Non-transposed K/V, one selected sequence, text-only tokens and no draft state are assumed.
+
+```text
+K = sum_attention(kv_heads * (key_dim + value_dim) * 34 / 32)
+R = 4 * Q * (state * inner + (conv - 1) * (inner + 2 * groups * state))
+F = R + 20 + 24 * Q                         # one native recurrent record
+C(s) = 8 + 4 + 4*s + 16 + 24*A              # native KV chunk framing, including magic/sequence
+B(chunk_tokens, final) = (K + 24)*chunk_tokens + C(s) + (final ? F : 0)
+Save(P,s) = (K + 28)*P + F + C(s) + 20      # occupied P > 0, no checkpoint appendix
+Appendix(q > 0) = 12 + sum_checkpoint(40 + target_bytes + draft_bytes + spec_bytes)
+```
+
+`Save` includes the native slot-file header (12 bytes), packed server token framing (16 plus four bytes/token), and memory state without the chunk's eight-byte magic/sequence prefix. Empty streams each add four bytes; empty slots have different zero-cell framing. `F` includes one recurrent cell header and two type/row-size descriptors per recurrent layer. Existing Qwen partial recurrent checkpoints have `target_bytes = F + 8`; without draft/spec state, a nonempty appendix is `12 + q*(F + 48)`. It is not included in the base-file table below.
+
+For `m = ceil(D/w)` equal-width chunks, the last possibly shorter, retained native-body bytes immediately before the final chunk are `(K+24)*w*(m-1) + C(s)*(m-1)`. Once that chunk has been parsed and staged, they are `(K+24)*D + C(s)*m + F`. This counts body string lengths, not allocator capacity or RSS. Additional allocations include retained JSON token arrays and object/string storage, prefix/cumulative token vectors, the current wire and HTTP/task buffers, model/cache storage and snapshot I/O buffers. The wire/body copies can coexist with all previously staged bytes. Deferred tensor readers refer to these bodies; they do not remove the staging cost.
+
+Measured with the existing `Qwen3.5-0.8B-Q4_0.gguf`, real node exports and real decoder `action=save`, CPU only: `A=6`, `Q=18`, `inner=2048`, `state=128`, `groups=16`, `conv=4`, two KV heads and 256/256 dimensions. Thus `K=6,528`, `R=20,201,472`, `F=20,201,924`, node `C(1)=176`, decoder `C(3)=184`. The node makes four chunks of four appended tokens after each old prefix. Nine snapshots were saved immediately before the final import and deleted after reading their size. The following predictions matched every observed byte count; `measure.py` asserts the formulas from health's actual layout (`measurement-03.log`, `measurement.json`, exit 0).
+
+| Old depth P | Full node body at P | Recovery file, predicted = observed | Median server save_ms, 3 runs | Median request wall ms |
+|---|---:|---:|---:|---:|
+| 32 | 20,411,764 | 20,411,920 | 5.736 | 7.385 |
+| 128 | 21,040,756 | 21,041,296 | 6.851 | 8.516 |
+| 512 | 23,556,724 | 23,558,800 | 7.460 | 10.990 |
+
+Each early four-token body was exactly 26,384 bytes and the final body 20,228,308. Three staged early bodies retain 79,152 bytes; all four retain 20,307,460. A separate real two-token local generation produced one checkpoint: at P=33 the base file is 20,418,476 bytes, the target checkpoint buffer 20,201,932, its appendix 20,201,984, and the complete recovery file 40,620,460. Actual server save time was 35.888 ms (`checkpoint-measure-01.log`, exit 0). This confirms that ordinary retained checkpoints materially increase recovery I/O. Save timing is CPU/host/filesystem-specific, includes page-cache writes, and is not an fsync durability or Mac latency measurement. Earlier sizing runs 01/02 also passed; run 03 additionally checks every formula and packed-token/stream framing explicitly.
+
+### 27B at 40k and 131k
+
+For the existing 27B layout, `A=16`, `Q=48`, four KV heads, 256/256 dimensions, `inner=6144`, `state=128`, `groups=16`, `conv=4`: `K=34,816`, `R=156,893,184`, `F=156,894,356`, `C(1)=416`. The table uses one KV stream and the r24 arithmetic fixture's explicit width `w=10,871`. The current proxy default is 10,873; explicit exact-layout geometry admits 10,876. These are layout calculations, not a downloaded/loaded 27B run. `131k` below means 131,072 tokens.
+
+| Cost in bytes | 40,000 tokens | 131,072 tokens |
+|---|---:|---:|
+| Recovery file at old depth P, no checkpoints | 1,550,654,792 | 4,723,967,560 |
+| Recovery file with one recurrent checkpoint | 1,707,549,208 | 4,880,861,976 |
+| Retained early bodies before final, new range D | 1,136,238,168 | 4,544,952,672 |
+| All KV bodies, excluding final recurrent record | 1,393,601,664 | 4,566,553,888 |
+| All staged bodies including final state | 1,550,496,020 | 4,723,448,244 |
+
+The base recovery values are 1.551/4.724 decimal GB (1.444/4.400 GiB). The pre-final staging values are 1.136/4.545 GB; the full staged payload is 1.550/4.723 GB. Thus the reviewer's roughly 1.4 GB corresponds to the aggregate 40k KV term, not the actual three early chunks with this width. Three decoder streams add only eight bytes to the base recovery file. Every retained checkpoint adds 156,894,404 bytes plus the appendix's one-time 12 bytes; with 32 checkpoints, total recovery files would be 6,571,275,732 / 9,744,588,500 bytes. That is a conditional size, not an observed checkpoint count at those depths. If 131k means 131,000, base recovery is 4,721,458,792 bytes and full staging 4,720,939,764; `sizing-27b.json` records both conventions.
+
+P and D are independent. A short offloaded append at an old depth of 40k still writes the roughly 1.55 GB base backup but stages only that append plus fixed state. A fresh 40k transfer stages the large range while its empty old-slot recovery file is small. Each offloaded turn that reaches its final chunk saves the whole old slot, including single-chunk turns. This operation is currently counted inside proxy `import_ms`; the 27B/Mac rerun should meter `action=save` bytes and latency separately. No 27B timing is extrapolated from the 0.8B timings.
+
+### Recovery proposal, not implemented
+
+Replace the per-turn full snapshot with an undo record owned by the decoder transaction. Before changing live state, retain the old recurrent/SWA payload, old token/checkpoint bookkeeping and allocator metadata, and capture any KV cells that can be overwritten. Full-attention append normally needs suffix removal plus metadata restoration; that alone cannot restore recurrent state or overwritten SWA cells. Existing `PARTIAL_ONLY` export can supply fixed state, but the current in-process metadata restore closures are not a persistent undo format.
+
+Keep the undo record and transfer identity through final application until an explicit client confirmation. A lost final response must permit an idempotent abort that restores the old slot, or a status query followed by that abort; accepting the new state merely because status says committed would change the current rollback guarantee. Reject decode/reuse while confirmation is unresolved. If preserving recovery across decoder/process restarts is required, write a checksummed, generation-bound undo intent durably before mutation and recover it on startup; an in-memory undo alone would narrow that guarantee. Retain the old token journal/checkpoints until confirmation and bind every operation to the exact session, transfer and prefix. Refuse before mutation if undo allocation/persistence fails.
+
+For Qwen this changes routine backup data from `O(P*K + F + checkpoints)` to `O(F + overwritten_KV + changed_metadata/checkpoints)`, potentially about 157 MB of recurrent payload on 27B instead of copying the old full-attention prefix. A retained snapshot plus an append-only KV journal is another option if a restartable on-disk format is wanted. Both need explicit retry, lost-confirmation, crash, checkpoint and capacity tests before replacing the current full save. Neither optimization is implemented in r25.
+
+### Validation and limits
+
+| Check | Result and evidence |
+|---|---|
+| CPU Release selected targets, nice 19, -j4 maximum | Build 01, 03, 04 exit 0; exact commands/PIDs/disk samples in build logs |
+| Candidate codec and allocated SWA | Exit 0 each; `codec-01.log`, `swa-02.log` |
+| Fresh/populated four-chunk Q4_0 and Q8_0, same-partition bytes/logits, retained refusals and new replacement refusals | Exit 0 each on final checker; `chunks-q4-02.log`, `chunks-q8-02.log`, `final-checks.json` |
+| Real node/server/proxy HTTP, first-request stale replacement, existing replay/fallback/checkpoint controls | Exit 0; `http-01.log`, `checks.json` |
+| Malformed recurrent-state checks | Exit 0; `recurrent-01.log` |
+| Full proxy suite including new M6 regression | 119 tests, exit 0; `proxy-01.log` |
+| Benchmark unit suite with native SWA checker | 54 tests, no skips, exit 0; `bench-01.log` |
+| Real layout/snapshot/staging arithmetic and checkpoint appendix | Exit 0; `measurement-03.log`, `checkpoint-measure-01.log` |
+| Bounded M2/M3/M6 controls | Intended failures, actual exit 1 each; compile/link and asserting drivers exit 0 |
+
+Build 02 failed with exit 2 because the new test initially accessed private staging fields; it was corrected to exercise replacement through the public stage API. One queued shared-lock controls invocation was cancelled before it started (143); the actual controls ran in the allowed second build slot, serially under the task lock. Own builds were always niced, no more than one ran at a time, with one other host builder observed. Guard admission was above 28.5 GB and abort threshold above 28.1 GB; sampled free space stayed above 28 GB. All TMPDIR paths are on disk and Python bytecode is disabled. Build 01 retrieved the default prebuilt UI assets; no model was downloaded and no GPU was used.
+
+No existing reviewer test was removed. All changes stay in the hybrid helper/tests/docs and proxy tests; production proxy and SWA export are unchanged. The original brief has no formal surface table; the r7g rows provide the review context, with r25 specifically strengthening R1/R2/R8 and retaining R3-R6's executable controls. R7's documented baseline whole-prompt discrepancy, real SWA inference, GPU/Mac qualification and the combined `m3-swa-fix` export/layout qualification remain outside this follow-up's acceptance claim. The full inherited timing driver was not rerun: this change uses exact same-partition/native/HTTP gates and does not repair its already reproduced whole-prompt discrepancy. Type/style tools `ty`, `editorconfig-checker` and `clang-format` are unavailable; those checks are unrun. Local syntax, ASCII, diff/retained-test and signature audits are recorded separately. Temporary build/control executables and saved binary fixtures are removed before handoff; model files are retained. Ready for review.
+
+Final audit: `audit-02.log` exits 0 for syntax/ASCII, retained Python test names, actual gate/control exits, untouched core/export scope and 23 inactive recorded process IDs. Audit 01 failed on its own incorrect expectation that the probe node exits 0; the probe deliberately terminates that PID with SIGTERM (-15) after its successful assertions. This was an audit assumption correction, not a product/test change. `validation-identity.json` binds source/binary hashes and observation time. Cleanup exits 0: own build tree, temporary control libraries/objects and saved binary fixtures are absent; logs and build metadata remain. Free disk after cleanup at 2026-11-01T21:41:16Z was 28,598,861,824 bytes, above the 28 GB floor.

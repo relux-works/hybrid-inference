@@ -200,6 +200,22 @@ static void chunk_tests(llama_model * model, const std::string & hash, bool fres
     auto stage = [&](hybrid::delta_import & pending, const std::string & wire) {
         return pending.stage(dest.get(), 0, wire, hash, "chunks", prefix, 512, vocab);
     };
+    // A new transfer starts from the live prefix even when an abandoned transfer left host chunks behind.
+    {
+        hybrid::delta_import pending;
+        stage(pending, wires[0]);
+        stage(pending, wires[1]);
+        auto replacement = headers[0];
+        replacement["transfer_id"] = "replacement-transfer";
+        try { require(!stage(pending, hybrid::encode_delta(replacement, bodies[0])), "replacement committed early"); }
+        catch (const std::exception & error) { throw std::runtime_error(std::string("chunk_stale_transfer_replacement: ") + error.what()); }
+        replacement = headers[1];
+        replacement["transfer_id"] = "replacement-transfer";
+        require(!stage(pending, hybrid::encode_delta(replacement, bodies[1])), "replacement continuation committed early");
+        unchanged();
+        pending.clear();
+        std::cout << "PASS chunk_stale_transfer_replacement cells/state/logits unchanged\n";
+    }
     // Dropping any proper chunk prefix leaves serialized cells/state and every next-token logit unchanged.
     for (size_t k : {1, 2, 3}) {
         hybrid::delta_import pending;
@@ -244,6 +260,19 @@ static void chunk_tests(llama_model * model, const std::string & hash, bool fres
     reject("chunk_mixed_transfer", {wires[0], hybrid::encode_delta(h, bodies[1])}, "chunk transfer mismatch");
     auto corrupt = wires[1]; corrupt.back() ^= 1;
     reject("chunk_checksum", {wires[0], corrupt}, "checksum mismatch");
+    // A replacement still requires chunk zero at the live prefix, the expected session, and a valid checksum.
+    auto replacement = headers[0];
+    replacement["transfer_id"] = "replacement-transfer";
+    const auto replacement_wire = hybrid::encode_delta(replacement, bodies[0]);
+    auto wrong_prefix = hybrid::read_delta(replacement_wire, hash, prefix.size()).header;
+    wrong_prefix["n0"] = prefix.size() + 1;
+    reject("chunk_replacement_wrong_prefix", {wires[0], replace_header(replacement_wire, wrong_prefix)}, "position gap or overlap");
+    auto wrong_session = replacement;
+    wrong_session["session_id"] = "foreign-session";
+    reject("chunk_replacement_wrong_session", {wires[0], hybrid::encode_delta(wrong_session, bodies[0])}, "Delta session mismatch");
+    auto bad_replacement = hybrid::encode_delta(replacement, bodies[0]);
+    bad_replacement.back() ^= 1;
+    reject("chunk_replacement_checksum", {wires[0], bad_replacement}, "checksum mismatch");
     // A final recurrent endpoint mismatch reaches apply after all KV metadata changes; rollback also preserves logits.
     auto late = bodies[3];
     const size_t fixed_offset = no_state.size();

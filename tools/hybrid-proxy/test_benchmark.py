@@ -69,6 +69,53 @@ class ChunkAndLifecycleTests(unittest.TestCase):
     setUp = BenchmarkProxyTests.setUp
     tearDown = BenchmarkProxyTests.tearDown
 
+    # A fresh database reader between chunks sees only committed state; staging cannot drop live turn checkpoints.
+    def test_staged_chunks_do_not_persist_applied_state_or_drop_checkpoints(self):
+        from pathlib import Path
+        from store import Store
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        original = fixture.app.store.get(sid)
+        fixture.app.extend_chunk_tokens = 2
+        owner = fixture.config['clients']['fixture-a']
+        backup = sid + '-test-prefix.bin'
+        fixture.app.decode.request('POST', f"/slots/{original['slot']}?action=save", dict(filename=backup))
+        for journal_turn in (False, True):
+            fixture.app.store.save(original)
+            session = dict(original, remote_id=None, remote_n=0)
+            checkpoint = dict(n=len(original['tokens']), filename='existing-checkpoint.bin')
+            if journal_turn:
+                session['_turn'] = dict(checkpoints=[checkpoint])
+            observed = []
+            durable = []
+            remote = fixture.app.remote(owner)
+            dispatch = remote.request
+            def inspect_next_chunk(method, path, body=None, **kwargs):
+                if path.endswith('/extend') and body.get('return_delta'):
+                    restarted = Store(str(Path(fixture.temp.name) / 'proxy.sqlite'), fixture.app.model)
+                    try:
+                        persisted = restarted.get(sid)
+                    finally:
+                        restarted.close()
+                    if body['chunk_index'] == 0:
+                        durable.append(persisted['remote_n'])
+                    self.assertEqual(persisted['tokens'], original['tokens'])
+                    self.assertEqual(persisted['remote_n'], durable[0])
+                    self.assertEqual(session['_remote_applied'], 0)
+                    if journal_turn:
+                        self.assertEqual(session['_turn']['checkpoints'], [checkpoint])
+                    if body['chunk_index'] > 0:
+                        observed.append(body['chunk_index'])
+                return dispatch(method, path, body, **kwargs)
+            with mock.patch.object(fixture.app, 'remote', return_value=remote), mock.patch.object(remote, 'request', side_effect=inspect_next_chunk):
+                fixture.app.prepare_session(owner, {}, session, original['tokens'] + list(range(20, 27)))
+            self.assertEqual(observed, [1, 2])
+            self.assertEqual(session['_remote_applied'], 6)
+            if journal_turn:
+                self.assertEqual(session['_turn']['checkpoints'], [])
+            fixture.app.decode.request('POST', f"/slots/{session['slot']}?action=restore",
+                                       dict(filename=backup))
+
     # For several interrupted prefixes, fallback starts from the original slot and the staged host bytes are discarded.
     def test_interruption_preserves_slot_before_fallback(self):
         fixture = self.fixture
