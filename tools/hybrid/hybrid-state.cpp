@@ -6,8 +6,15 @@ extern "C" {
 #include "hash/sha256/sha256.h"
 }
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__APPLE__)
+#define HYBRID_SHA_NI
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
 #endif
@@ -73,31 +80,123 @@ json model_layout(const llama_model * model) {
             {"vocab_size", vocab.n_tokens()}, {"vocab_sha256", hex(digest, sizeof(digest))}};
 }
 
-std::string file_hash(const std::string & path) {
+#ifdef HYBRID_SHA_NI
+static bool sha_ni_available() {
+    unsigned int a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || (c & bit_SSSE3) == 0 || (c & bit_SSE4_1) == 0) {
+        return false;
+    }
+    return __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & bit_SHA) != 0;
+}
+
+__attribute__((target("sha,ssse3,sse4.1")))
+static void sha256_blocks_ni(uint32_t * state, const unsigned char * data, size_t blocks) {
+    static const uint32_t k[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    __m128i abcd = _mm_loadu_si128(reinterpret_cast<const __m128i *>(state));
+    __m128i efgh = _mm_loadu_si128(reinterpret_cast<const __m128i *>(state + 4));
+    abcd = _mm_shuffle_epi32(abcd, 0xb1);
+    efgh = _mm_shuffle_epi32(efgh, 0x1b);
+    // SHA rounds use ABEF and CDGH, with the least significant word first.
+    __m128i abef = _mm_alignr_epi8(abcd, efgh, 8);
+    __m128i cdgh = _mm_blend_epi16(efgh, abcd, 0xf0);
+    for (size_t block = 0; block < blocks; ++block, data += 64) {
+        const __m128i saved_abef = abef;
+        const __m128i saved_cdgh = cdgh;
+        __m128i words[4];
+        for (int i = 0; i < 4; ++i) {
+            words[i] = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(data + 16 * i)), swap);
+        }
+        for (int i = 0; i < 16; ++i) {
+            const int j = i & 3;
+            if (i >= 4) {
+                __m128i next = _mm_sha256msg1_epu32(words[j], words[(j + 1) & 3]);
+                next = _mm_add_epi32(next, _mm_alignr_epi8(words[(j + 3) & 3], words[(j + 2) & 3], 4));
+                words[j] = _mm_sha256msg2_epu32(next, words[(j + 3) & 3]);
+            }
+            __m128i rounds = _mm_add_epi32(words[j], _mm_loadu_si128(reinterpret_cast<const __m128i *>(k + 4 * i)));
+            cdgh = _mm_sha256rnds2_epu32(cdgh, abef, rounds);
+            rounds = _mm_shuffle_epi32(rounds, 0x0e);
+            abef = _mm_sha256rnds2_epu32(abef, cdgh, rounds);
+        }
+        abef = _mm_add_epi32(abef, saved_abef);
+        cdgh = _mm_add_epi32(cdgh, saved_cdgh);
+    }
+    abcd = _mm_shuffle_epi32(abef, 0x1b);
+    efgh = _mm_shuffle_epi32(cdgh, 0xb1);
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(state), _mm_blend_epi16(abcd, efgh, 0xf0));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(state + 4), _mm_alignr_epi8(efgh, abcd, 8));
+}
+
+static void sha256_update_ni(sha256_t * hash, const unsigned char * data, size_t size) {
+    const size_t pending = hash->count & 63;
+    hash->count += size;
+    if (pending) {
+        const size_t copied = std::min(size, 64 - pending);
+        std::memcpy(hash->buffer + pending, data, copied);
+        data += copied;
+        size -= copied;
+        if (pending + copied < 64) { return; }
+        sha256_blocks_ni(hash->state, hash->buffer, 1);
+    }
+    if (size >= 64) {
+        sha256_blocks_ni(hash->state, data, size / 64);
+        data += size & ~size_t(63);
+        size &= 63;
+    }
+    if (size) { std::memcpy(hash->buffer, data, size); }
+}
+#endif
+
+std::string file_hash(const std::string & path, size_t read_bytes, const char ** backend) {
+    require(read_bytes > 0 && read_bytes <= 65536, "invalid hash read size");
     std::ifstream file(path, std::ios::binary);
     require(file.good(), "cannot open model");
-#ifdef __APPLE__
-    CC_SHA256_CTX hash;
-    require(CC_SHA256_Init(&hash) == 1, "cannot initialize model hash");
-#else
-    sha256_t hash;
-    sha256_init(&hash);
-#endif
+    const char * force_portable = std::getenv("HYBRID_HASH_PORTABLE");
+    const bool portable = force_portable && std::strcmp(force_portable, "1") == 0;
     char buffer[65536];
-    while (file.read(buffer, sizeof(buffer)) || file.gcount()) {
-#ifdef __APPLE__
-        require(CC_SHA256_Update(&hash, buffer, static_cast<CC_LONG>(file.gcount())) == 1, "cannot update model hash");
-#else
-        sha256_update(&hash, reinterpret_cast<const unsigned char *>(buffer), file.gcount());
-#endif
-    }
-    require(file.eof(), "cannot read model");
     unsigned char digest[32];
 #ifdef __APPLE__
-    require(CC_SHA256_Final(digest, &hash) == 1, "cannot finalize model hash");
-#else
-    sha256_final(&hash, digest);
+    if (!portable) {
+        if (backend) { *backend = "commoncrypto"; }
+        CC_SHA256_CTX hash;
+        require(CC_SHA256_Init(&hash) == 1, "cannot initialize model hash");
+        while (file.read(buffer, read_bytes) || file.gcount()) {
+            require(CC_SHA256_Update(&hash, buffer, static_cast<CC_LONG>(file.gcount())) == 1, "cannot update model hash");
+        }
+        require(file.eof(), "cannot read model");
+        require(CC_SHA256_Final(digest, &hash) == 1, "cannot finalize model hash");
+        return hex(digest, sizeof(digest));
+    }
 #endif
+    auto update = sha256_update;
+    const char * selected = "portable";
+#ifdef HYBRID_SHA_NI
+    if (!portable && sha_ni_available()) {
+        update = sha256_update_ni;
+        selected = "sha-ni";
+    }
+#else
+    (void) portable;
+#endif
+    if (backend) { *backend = selected; }
+    sha256_t hash;
+    sha256_init(&hash);
+    while (file.read(buffer, read_bytes) || file.gcount()) {
+        update(&hash, reinterpret_cast<const unsigned char *>(buffer), file.gcount());
+    }
+    require(file.eof(), "cannot read model");
+    // The vendor finalizer consumes the same state, byte count and partial block.
+    sha256_final(&hash, digest);
     return hex(digest, sizeof(digest));
 }
 
