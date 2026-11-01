@@ -281,7 +281,8 @@ def context_plan(model, info, requested=None, client=False):
                 max_ctx=ctx, ram_budget_mib=(ram_budget + 1024**2 - 1) // 1024**2,
                 max_request_mib=max(1, (4096 + 11 * ctx + 1024**2 - 1) // 1024**2), kv_bytes_per_token=kv, recurrent_state_bytes=recurrent_bytes,
                 weights_bytes=weights, margin_fraction=0.20, compute_reserve_bytes=2 * GIB,
-                memory_limit=memory_ctx, store_limit=store_ctx, protocol_limit=16384,
+                memory_limit=memory_ctx, store_limit=store_ctx, node_default_max_ctx=16384,
+                delta_body_limit_bytes=512 * 1024**2, delta_header_limit_bytes=1024**2,
                 checkpoint_count=0 if client else None)
 
 

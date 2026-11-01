@@ -104,7 +104,7 @@ class BenchmarkTests(unittest.TestCase):
                     hybrid_bench.main()
                 read.assert_not_called()
 
-    # The memory planner accepts a bounded positive case and refuses both RAM overflow and the prototype cap.
+    # The planner records wire caps separately from the node default; RAM and excessive contexts still refuse.
     def test_context_bounds(self):
         metadata = {'general.architecture': 'qwen35'}
         metadata.update({'qwen35.' + k: v for k, v in dict(block_count=24, context_length=262144,
@@ -115,6 +115,10 @@ class BenchmarkTests(unittest.TestCase):
             plan = common.context_plan(model.name, info, 1024)
             self.assertEqual(plan['kv_bytes_per_token'], 6528)
             self.assertEqual(plan['recurrent_state_bytes'], 20201472)
+            self.assertEqual(plan['node_default_max_ctx'], 16384)
+            self.assertEqual(plan['delta_body_limit_bytes'], 512 * 1024**2)
+            self.assertEqual(plan['delta_header_limit_bytes'], 1024**2)
+            self.assertNotIn('protocol_limit', plan)
             with self.assertRaisesRegex(common.Refusal, 'cannot fit'):
                 common.context_plan(model.name, info, 10**9)
             with self.assertRaisesRegex(common.Refusal, 'cannot fit'):
