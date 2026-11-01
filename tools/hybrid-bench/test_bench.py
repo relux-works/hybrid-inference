@@ -23,6 +23,21 @@ class BenchmarkTests(unittest.TestCase):
                 manage.build(args, ['llama-hybrid-prefill'], {})
             run.assert_not_called()
 
+    # Offline builds explicitly disable both UI sources; an offline download request never reaches preflight.
+    def test_offline_build_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = argparse.Namespace(ref='HEAD', state=str(root / 'state'), build_dir=str(root / 'build'), build_lock=str(root / 'build.lock'), cuda=False, skip_build=False, offline=True)
+            (root / 'build').mkdir()
+            with mock.patch.object(manage, 'output', side_effect=['a' * 40, 'a' * 40, '']), mock.patch.object(manage, 'compile_targets', return_value={}) as compile:
+                manage.build(args, [], dict(os='Linux'))
+            self.assertIn('-DLLAMA_BUILD_UI=OFF', compile.call_args.args[3])
+            self.assertIn('-DLLAMA_USE_PREBUILT_UI=OFF', compile.call_args.args[3])
+        with mock.patch('sys.argv', ['manage.py', 'node', '--state', 'fixture', '--offline', '--hf-repo', 'fixture']), mock.patch.object(manage, 'preflight') as preflight:
+            with self.assertRaisesRegex(common.Refusal, 'offline requires --model'):
+                manage.main()
+            preflight.assert_not_called()
+
     # A checksum is a prerequisite to publication: wrong local/downloaded bytes leave no cached partial model.
     def test_model_hash_atomicity(self):
         with tempfile.TemporaryDirectory() as directory:

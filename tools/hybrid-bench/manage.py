@@ -32,6 +32,8 @@ def build(args, targets, info):
     build_dir = Path(args.build_dir or source / 'build').expanduser().resolve()
     flags = ['-DCMAKE_BUILD_TYPE=Release', '-DGGML_CUDA=' + ('ON' if args.cuda else 'OFF'),
              '-DGGML_METAL=' + ('ON' if info['os'] == 'Darwin' else 'OFF'), '-DLLAMA_CURL=OFF']
+    if getattr(args, 'offline', False):
+        flags += ['-DLLAMA_BUILD_UI=OFF', '-DLLAMA_USE_PREBUILT_UI=OFF']
     stamp = build_dir / 'hybrid-bench-build.json'
     if args.skip_build:
         require(stamp.is_file(), '--skip-build requires a previous successful benchmark build record')
@@ -118,6 +120,7 @@ def parser():
     p.add_argument('--build-dir')
     p.add_argument('--build-lock')
     p.add_argument('--skip-build', action='store_true')
+    p.add_argument('--offline', action='store_true', help='require a local model and disable UI build/downloads')
     p.add_argument('--port', type=int, default=None)
     p.add_argument('--bind', default='127.0.0.1')
     p.add_argument('--public', action='store_true')
@@ -155,6 +158,7 @@ def main():
         private_json(args.generate_token, {'bench': secrets.token_urlsafe(32)})
         print(str(Path(args.generate_token).resolve()))
         return 0
+    require(not args.offline or args.model, '--offline requires --model; model downloads are disabled')
     info = preflight(args.cuda, args.role == 'node')
     require(not state.exists(), '--state must not exist; preserve or remove a previous stopped run explicitly')
     require(state.parent.is_dir(), 'state parent must already exist')

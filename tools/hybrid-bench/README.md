@@ -1,6 +1,6 @@
 # Hybrid benchmark operator guide
 
-Run from a checkout containing these tools. Python 3.10+ and its standard library are sufficient for scripts. Native targets require Git, CMake and a C++ compiler. Linux CUDA additionally requires the driver, `nvidia-smi` and `nvcc`; macOS requires Xcode's Metal compiler. Install prerequisites using the refusal message, then retry. Scripts never install packages.
+Run from a checkout containing these tools. Python 3.10+ and its standard library are sufficient for scripts. Native targets require Git, CMake and a C++ compiler. Linux CUDA additionally requires the driver, `nvidia-smi` and `nvcc`; macOS requires Xcode's Metal compiler. Install prerequisites using the refusal message, then retry. Scripts never install packages. For a no-download run, pass `--offline --model /local/model.gguf` to both launchers. This also disables prebuilt UI retrieval and local UI builds in CMake; an ordinary server build can otherwise fetch UI checksums even when weights are local.
 
 Current scope: dense `qwen35` GGUF, one visible GPU, one decode slot, `q8_0` KV and native f32 recurrent state. The node defaults to a 16,384-token ceiling and 512 MiB retained-session budget; the launcher sets limits derived from the selected context and host memory. Native delta bodies remain bounded to 512 MiB and critical extends are chunked. The 50-prompt, 32k/128k cross-backend acceptance matrix in specification section 11 remains future qualification. Do not treat a short smoke run as that acceptance.
 
