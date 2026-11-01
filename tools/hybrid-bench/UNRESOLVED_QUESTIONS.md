@@ -1,7 +1,7 @@
 # Qualification limits and open questions
 
-- A node limits/LRU and B chunk transport/launcher are merged locally on `m1-integrated`. CPU integration evidence is in `RESULTS-hybrid-a-r11-261101.md`; 256k native state copying, memory amplification and target-GPU checker allocation still need qualification.
-- Heterogeneous admission matches native layout and ordered vocabulary, not base-weight provenance. A local Q4_0-to-Q8_0 requantization tests compatibility, not increased model precision or production accuracy. Cross-quantization thresholds are uncalibrated.
+- A node limits/LRU and B chunk transport/launcher are merged locally on `m1-integrated`. CPU integration and rework evidence is in `RESULTS-hybrid-a-r11-261101.md` and `RESULTS-hybrid-a-r12-261101.md`; 256k native state copying, memory amplification and target-GPU checker allocation still need qualification.
+- Heterogeneous admission matches native layout and ordered vocabulary, not base-weight provenance. Exact SHA is required by default. Experimental `--hetero-quant` admits only matching layout fingerprints and rewrites the envelope SHA, bypassing the native SHA guard. Layout shapes do not establish numerical equivalence. Quality remains unverified/uncalibrated: the r11 Q4_0-to-Q8_0 requantization gave KL 0.0145 > 0.01 and top-1 62/64; it does not recover source precision.
 - CUDA loading, CUDA cache offload, Metal client build, cross-backend native state portability and the 27B file geometry need real target machines. CPU evidence cannot answer these questions.
 - Cross-backend section-11 thresholds need calibration on real target pairs. The benchmark reports current reference thresholds and explicitly marks that calibration absent.
 - The synthetic ladder is one growing conversation per mode, not the section-11 50-prompt matrix, multi-client contention, realistic networks or a production security audit.

@@ -15,7 +15,7 @@ large turns.
 
 In scope:
 - one model, Qwen3.8-27B (hybrid: 16 full-attention layers and 48 Gated DeltaNet layers);
-- one GGUF file used on both sides;
+- one GGUF file used on both sides by default;
 - one prefill node serving several clients (Macs), each with several concurrent sessions (section 4a).
 
 Out of scope:
@@ -39,13 +39,15 @@ Out of scope:
 
 ## 3. Model and formats
 
-- Weights: one Qwen3.8-27B GGUF, for example Q4_K_M, with the same file and SHA-256 on server and client. The model hash goes into every state delta.
+- Weights: by default, one Qwen3.8-27B GGUF, for example Q4_K_M, with the same file and SHA-256 on server and client. The model hash goes into every state delta.
 - KV cache: `q8_0` for K and V on both sides, with flash attention on. `q4_0` V is an M4 experiment.
 - Recurrent state: dtype as the engine stores it (f32 today). Transfer in f32 for M0–M2; bf16 and fp8 are M4 experiments.
 - Expected sizes, to be verified in M1:
   - KV: 16 layers × 2 × 4 heads × 256 dims × 1 byte ≈ 32 KiB per token;
   - state: about 157 MB in f32, 78 MB in bf16.
 - llama.cpp: pin one upstream commit at the start of the project. The fork keeps patches small enough to offer upstream.
+
+M1 implementation note (2026-11-01): Exact model SHA-256 is required by default. Experimental `--hetero-quant` (`hetero_quant=true` in the proxy) admits a different SHA only after a matching layout fingerprint; the proxy then rewrites the delta envelope SHA, bypassing the native SHA guard. A layout match establishes shapes only, not base-weight identity or numerical equivalence. Quality is unverified and uncalibrated: the r11 CPU Q4_0 node / Q8_0 client measurement gave mean KL 0.0145 nats/token (above the 0.01 reference) and top-1 62/64. The Q8 file was a requantization of Q4 weights, not an independent higher-precision source. Heterogeneous benchmark results remain uncalibrated even when their measured values meet the reference. This experimental mode does not establish the homogeneous section-11 acceptance claim.
 
 ## 4. Architecture
 
