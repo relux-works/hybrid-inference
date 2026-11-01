@@ -186,20 +186,21 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
-                                     deltas=paths, max_ctx=client['context']))
+                                     deltas=paths, max_ctx=client['context'],
+                                     noise_chunks=args.noise_chunks, uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
         process = run_checker([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
             '0' if client['backend'] == 'cpu' else '999'], scratch)
         require(result_path.is_file(), 'equivalence checker aborted before producing metrics')
         result = json.loads(result_path.read_text())
-        require(process.returncode in (0, 3), 'equivalence checker failed before valid metrics')
-        status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False))
+        require(process.returncode in (0, 3, 5), 'equivalence checker failed before valid metrics')
+        status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False), client['backend'])
         result.update(exit_code=code, checker_exit_code=process.returncode, status=status,
                       check_mode='append_chain' if boundaries is not None else 'fresh',
                       append_endpoints=ends, delta_count=len(paths), cross_backend=cross_backend,
                       cross_backend_thresholds_calibrated=False if cross_backend else None,
                       hetero_quant_thresholds_calibrated=False if config.get('hetero_quant') else None,
-                      reference='same-partition and whole-prompt on client backend; full-vocabulary KL')
+                      reference='same-partition, whole-prompt and alternate partitions on client backend; full-vocabulary KL')
         return result
     finally:
         request = urllib.request.Request(base + '/v1/sessions/' + remote, method='DELETE',
@@ -215,10 +216,10 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 raise
 
 
-def classify_equivalence(result, cross_backend):
+def classify_equivalence(result, cross_backend, backend='cpu'):
     if cross_backend:
-        return ('uncalibrated' if result['numerical_within_bounds'] else 'uncalibrated_outside_reference', 5)
-    return ('passed', 0) if result['same_partition_exact'] and result['numerical_within_bounds'] else ('failed', 3)
+        return ('uncalibrated', 5)
+    return ('passed', 0) if result['same_partition_exact'] and (backend != 'cpu' or result['numerical_within_bounds']) else ('failed', 3)
 
 
 @contextlib.contextmanager
@@ -272,6 +273,14 @@ def bundle(root, name, rows, client, node):
               'Decode rate uses native generation time; TTFT is the first nonempty streamed text/reasoning delta.']
     for row in rows:
         if row.get('stage') == 'equivalence':
+            lines += ['', f"Status: {row['status']} (rule: {row['status_rule']}; {row['check_mode']}, depth {row['depth']}).",
+                      '', '| Comparison | KL (nats/token) | Top-1 agreed | Free-running first divergence (0-based) |',
+                      '|---|---:|---:|---:|',
+                      f"| Hybrid / whole prompt | {row['mean_kl_nats']:.9g} | {row['top1_agreed']}/{row['k']} | {row['free_running_first_divergence']} |"]
+            for noise in row['noise_partitions']:
+                lines.append(f"| Local chunks {noise['chunk_tokens']} / whole prompt | {noise['noise_kl_nats']:.9g} | {noise['noise_top1_agreed']}/{row['k']} | {noise['noise_free_running_first_divergence']} |")
+            lines += [f"| Noise maximum KL / minimum agreement / earliest divergence | {row['noise_kl_nats']:.9g} | {row['noise_top1_agreed']}/{row['k']} | {row['noise_free_running_first_divergence']} |",
+                      '', f"Hybrid KL / maximum local noise KL: {row['kl_to_noise_ratio']} ({row['kl_to_noise_ratio_status']})."]
             lines += ['', 'Equivalence: `' + json.dumps(row, sort_keys=True) + '`.']
         if row.get('stage') == 'error':
             lines += ['', 'Aborted: ' + row['reason'] + '.']
@@ -308,11 +317,13 @@ def main():
     p.add_argument('--request-timeout', type=int, help='HTTP response timeout in seconds for long CPU runs')
     p.add_argument('--check', action='store_true')
     p.add_argument('--check-tokens', type=int, default=64)
+    p.add_argument('--noise-chunks', type=int, nargs='+', default=[128, 255], help='1..4 alternate local batch sizes in 1..256')
     p.add_argument('--check-depths', type=int, nargs='+', help='check first completed call at or above each depth')
     args = p.parse_args()
     require(args.request_timeout is None or 1 <= args.request_timeout <= 86400, '--request-timeout must be in 1..86400')
     require(re.fullmatch('[a-zA-Z0-9_-]{1,64}', args.label), 'label must contain 1-64 letters, digits, underscores or hyphens')
     require(1 <= args.check_tokens <= 256, '--check-tokens must be in 1..256')
+    require(1 <= len(args.noise_chunks) <= 4 and all(1 <= n <= 256 for n in args.noise_chunks), 'noise chunks must be 1..4 values in 1..256')
     state, root, scratch = Path(args.client_state), Path(args.output), Path(args.scratch)
     require(root.is_dir() and scratch.is_dir(), 'output and scratch directories must already exist')
     config = read_private(state / 'proxy-config.json')

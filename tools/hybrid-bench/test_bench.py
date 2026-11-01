@@ -213,8 +213,51 @@ class BenchmarkTests(unittest.TestCase):
         result = dict(same_partition_exact=False, numerical_within_bounds=True)
         self.assertEqual(classify_equivalence(result, False), ('failed', 3))
         self.assertEqual(classify_equivalence(result, True), ('uncalibrated', 5))
-        self.assertEqual(classify_equivalence(dict(result, numerical_within_bounds=False), True), ('uncalibrated_outside_reference', 5))
+        self.assertEqual(classify_equivalence(dict(result, numerical_within_bounds=False), True), ('uncalibrated', 5))
         self.assertEqual(classify_equivalence(dict(result, same_partition_exact=True), False), ('passed', 0))
+
+    # GPU acceptance requires same-partition equality even when KL is small, and CPU keeps its historical numerical gate.
+    def test_gpu_noise_classification(self):
+        for backend in ('cuda', 'metal'):
+            for numerical in (False, True):
+                result = dict(same_partition_exact=True, numerical_within_bounds=numerical)
+                self.assertEqual(classify_equivalence(result, False, backend), ('passed', 0))
+                self.assertEqual(classify_equivalence(dict(result, same_partition_exact=False), False, backend), ('failed', 3))
+                self.assertEqual(classify_equivalence(result, True, backend), ('uncalibrated', 5))
+                self.assertEqual(classify_equivalence(result, False, 'cpu'), ('passed', 0) if numerical else ('failed', 3))
+
+    # Invalid noise plans refuse before loading private runtime state; valid plans still reach state loading.
+    def test_noise_chunk_bounds(self):
+        base = ['hybrid_bench.py', '--client-state', 'fixture', '--scratch', '.', '--noise-chunks']
+        for chunks in (['0'], ['257'], ['1'] * 5):
+            with mock.patch('sys.argv', base + chunks), mock.patch.object(hybrid_bench, 'read_private') as read:
+                with self.assertRaisesRegex(common.Refusal, 'noise chunks'):
+                    hybrid_bench.main()
+                read.assert_not_called()
+        with mock.patch('sys.argv', base + ['128', '255']), mock.patch.object(hybrid_bench, 'read_private', side_effect=RuntimeError('valid plan')):
+            with self.assertRaisesRegex(RuntimeError, 'valid plan'):
+                hybrid_bench.main()
+
+    # Public JSONL, Markdown tables and archived members preserve every measured partition, maximum and applied rule.
+    def test_noise_bundle(self):
+        noise = dict(chunk_tokens=128, noise_kl_nats=.02, noise_top1_agreed=7, noise_free_running_first_divergence=3)
+        row = dict(stage='equivalence', check_mode='fresh', depth=132, k=8, status='passed',
+                   status_rule='same_backend_same_partition_exact', mean_kl_nats=.03, top1_agreed=7,
+                   free_running_first_divergence=2, noise_partitions=[noise], noise_kl_nats=.02,
+                   noise_top1_agreed=7, noise_free_running_first_divergence=3, kl_to_noise_ratio=1.5,
+                   kl_to_noise_ratio_status='finite')
+        rows = [row, dict(status='passed', skipped=0, aborted=0, exit_code=0)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle(root, 'noise', rows, {}, {})
+            self.assertEqual(json.loads((root / 'noise.jsonl').read_text().splitlines()[0]), row)
+            markdown = (root / 'noise.md').read_text()
+            self.assertIn('| Local chunks 128 / whole prompt | 0.02 | 7/8 | 3 |', markdown)
+            self.assertIn('rule: same_backend_same_partition_exact', markdown)
+            self.assertIn('1.5 (finite)', markdown)
+            with tarfile.open(root / 'noise.tar.gz') as archive:
+                self.assertEqual(archive.extractfile('noise.jsonl').read(), (root / 'noise.jsonl').read_bytes())
+                self.assertEqual(archive.extractfile('noise.md').read().decode(), markdown)
 
     # Startup cleanup preserves readable private logs while credentials stay in the removable state directory.
     def test_startup_log_preservation(self):

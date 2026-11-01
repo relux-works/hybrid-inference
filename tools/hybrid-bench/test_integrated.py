@@ -4,6 +4,8 @@ import contextlib
 import copy
 import http.server
 import json
+import math
+import os
 from pathlib import Path
 import secrets
 import struct
@@ -56,7 +58,7 @@ def test_native_defaults(args):
 
 
 def test_prefill_timing(args, decode, slots):
-    # A complete forced-offload benchmark has real timing with and without the optional link endpoint, with no fallback or leaked session.
+    # Real forced-offload checks serialize finite noise metrics and CPU rules with and without the link endpoint, with no fallback or leaked session.
     for enabled in (False, True):
         name = 'timing-link' if enabled else 'timing-no-link'
         with PrefillNode(args, name, ('--bench',) if enabled else (), context='2048') as prefill:
@@ -66,10 +68,11 @@ def test_prefill_timing(args, decode, slots):
                 identity = model_identity(args.model)
                 info = dict(model_sha256=config['model_sha256'], context=2048, backend='cpu', bench_link=enabled, **identity)
                 private_json(root / 'proxy-config.json', config)
-                private_json(root / 'client-info.json', dict(info, proxy_url=client.url))
+                private_json(root / 'client-info.json', dict(info, proxy_url=client.url, model_path=args.model,
+                    build_dir=str(Path(args.checker_binary).resolve().parents[1])))
                 private_json(root / 'node-info.json', info)
                 command = [sys.executable, str(ROOT / 'tools/hybrid-bench/hybrid_bench.py'), '--client-state', str(root),
-                    '--scratch', str(root), '--output', str(root), '--label', name, '--smoke', '--depths', '128', '--modes', 'offload']
+                    '--scratch', str(root), '--output', str(root), '--label', name, '--smoke', '--depths', '128', '--modes', 'offload', '--check', '--check-tokens', '8']
                 with (root / 'benchmark.log').open('wb') as log:
                     process = subprocess.Popen(command, stdout=log, stderr=log)
                     (root / 'benchmark.pid').write_text(str(process.pid))
@@ -87,6 +90,13 @@ def test_prefill_timing(args, decode, slots):
                 link = next(row for row in rows if row.get('stage') == 'link')
                 assert link['status'] == ('passed' if enabled else 'skipped')
                 assert rows[-1]['status'] == 'passed' and rows[-1]['aborted'] == rows[-1]['skipped'] == 0
+                checks = [row for row in rows if row.get('stage') == 'equivalence']
+                assert len(checks) == 2 and {row['check_mode'] for row in checks} == {'fresh', 'append_chain'}
+                for row in checks:
+                    assert row['same_partition_exact'] and row['status_rule'] == 'cpu_legacy_reference'
+                    assert len(row['noise_partitions']) == 2 and math.isfinite(row['noise_kl_nats'])
+                markdown = next(root.glob('hybrid-bench-*.md')).read_text()
+                assert 'rule: cpu_legacy_reference' in markdown and '| Local chunks 128 / whole prompt |' in markdown
                 release = next(row for row in rows if row.get('stage') == 'release')
                 assert release['node_sessions'] == release['node_ram_bytes'] == 0
                 print(f'PASS {name}: benchmark exit0, four timed offloads, link={link["status"]}, zero retained sessions', flush=True)
@@ -209,23 +219,99 @@ def test_budget_benchmark(args, decode, slots):
             print(f'PASS native budget refusal: {refusal}; benchmark aborted 2 with budget reason and zero sessions', flush=True)
 
 
+def test_equivalence_noise(args):
+    # Real CPU deltas retain same-partition equality; distinct local partitions yield finite, nonzero noise at identical inputs/depth.
+    root = Path(args.artifacts) / 'equivalence'
+    root.mkdir()
+    with PrefillNode(args, 'noise-node', context='2048') as prefill:
+        tokens = [100 + i % 31 for i in range(132)]
+        session = prefill.create()
+        paths = []
+        for n0, n1 in ((0, 48), (48, 96), (96, 131)):
+            path = root / f'{n0}.delta'
+            path.write_bytes(prefill.extend(session, tokens[n0:n1], tokens[:n0], delta=True))
+            paths.append(str(path))
+        prefill.request('DELETE', session, expected=204)
+        assert prefill.request('GET', '/v1/health')['sessions'] == 0
+        fixture = dict(tokens=tokens, model_sha256=sha256(args.model), k=8, deltas=paths, max_ctx=2048)
+        token_path = root / 'tokens.json'
+        private_json(token_path, fixture)
+
+        def run(name, binary, data=fixture):
+            token_path.write_text(json.dumps(data))
+            result_path = root / (name + '.json')
+            command = [str(Path(binary).resolve()), args.model, str(token_path), paths[0], str(result_path), '0']
+            env = dict(os.environ, LD_LIBRARY_PATH=str(Path(args.checker_binary).resolve().parent))
+            with (root / (name + '.log')).open('wb') as log:
+                process = subprocess.Popen(command, stdout=log, stderr=log, env=env)
+                (root / (name + '.pid')).write_text(str(process.pid))
+                try:
+                    code = process.wait(timeout=240)
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=15)
+            (root / (name + '.command.json')).write_text(json.dumps(dict(command=command, exit_code=code)))
+            return code, json.loads(result_path.read_text()) if result_path.exists() else None
+
+        code, result = run('noise', args.checker_binary)
+        assert code in (0, 3) and result['same_partition_exact'] and result['same_partition_agreed'] == 8
+        assert result['status_rule'] == 'cpu_legacy_reference'
+        assert code == (0 if result['numerical_within_bounds'] else 3)
+        assert len(result['noise_partitions']) == 2
+        for row in result['noise_partitions']:
+            assert math.isfinite(row['noise_kl_nats']) and row['noise_kl_nats'] >= 0
+            assert math.isfinite(row['noise_top1_agreement']) and 0 <= row['noise_top1_agreement'] <= 1
+            assert -1 <= row['noise_free_running_first_divergence'] < 8
+        assert result['noise_kl_nats'] == max(r['noise_kl_nats'] for r in result['noise_partitions']) > 0
+        assert math.isfinite(result['kl_to_noise_ratio'])
+        # For this 132-token fixture, these are distinct from whole [132] and imported [48,96,131,132].
+        assert [r['chunk_tokens'] for r in result['noise_partitions']] == [128, 131]
+        print('PASS CPU local noise: ' + json.dumps(result), flush=True)
+
+        # The original CPU fields and exit code remain bit-for-bit identical to the unchanged M1 executable.
+        if args.baseline_checker:
+            baseline_code, baseline = run('baseline', args.baseline_checker)
+            assert code == baseline_code
+            assert all(result[key] == value for key, value in baseline.items()), (baseline, result)
+            print('PASS CPU legacy fields/exit: identical to baseline executable', flush=True)
+
+        # A byte flip in an imported body fails the intended checksum gate and emits no successful metrics.
+        bad = root / 'corrupt.delta'
+        wire = bytearray(Path(paths[0]).read_bytes())
+        header_size, = struct.unpack_from('<I', wire)
+        wire[4 + header_size + 1024] ^= 1
+        bad.write_bytes(wire)
+        bad_fixture = dict(fixture, deltas=[str(bad), *paths[1:]])
+        bad_code, bad_result = run('corrupt', args.checker_binary, bad_fixture)
+        assert bad_code == 2 and bad_result is None
+        assert 'delta checksum mismatch' in (root / 'corrupt.log').read_text()
+        print('PASS corrupt imported delta: exit 2, delta checksum mismatch, no metrics', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prefill-binary', required=True)
     parser.add_argument('--server-binary', required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--artifacts', required=True)
-    parser.add_argument('--case', choices=('all', 'timing', 'chunk'), default='all')
+    parser.add_argument('--case', choices=('all', 'timing', 'chunk', 'noise'), default='all')
+    parser.add_argument('--checker-binary', default=str(ROOT / 'build/bin/llama-hybrid-bench-check'))
+    parser.add_argument('--baseline-checker', help='optional unchanged M1 executable for bit-for-bit CPU regression')
     args = parser.parse_args()
     args.model = str(Path(args.model).resolve())
     args.binary = str(Path(args.prefill_binary).resolve())
     root = Path(args.artifacts).resolve()
     root.mkdir(parents=True, exist_ok=False)
     args.artifacts = str(root)
+    if args.case == 'noise':
+        test_equivalence_noise(args)
+        return
     if args.case == 'chunk':
         test_native_chunk_slope(args)
         return
     if args.case == 'all':
+        test_equivalence_noise(args)
         test_native_defaults(args)
         test_native_chunk_slope(args)
     with native_server(args.server_binary, args.model, root / 'decoder') as (decode, slots):
