@@ -8,7 +8,7 @@ the model's codec to ggml, and the CUDA kernels are ports of Mirai's vLLM plugin
 
 Source reference: alesha-pro/llama.cpp-mirai-s at `fdb1e815dbbad220c2f41b94535049fdbd20c3ca`, based on llama.cpp `d834d44e6`; documentation correction `d1c5a693444ee2bd13205bc1992e1853b1ef4426` is included.
 
-This repository ports only the Mirai format, CPU/CUDA kernels, graph integration, converter and tests onto hybrid-inference `a3752b04cbd905bf61ffe6d9a4e7df738f26f4c2`. The source fork's FA GQA packing, chunked DeltaNet kernel and text-aligned prompt cache are omitted. The commands, validation claims and performance tables below describe the source fork, not measurements of this port. For this port's CPU evidence and pending GPU parity gate, see [the run report](../hybrid-bench/RESULTS-hybrid-c-r1-261101.md). Hybrid clients explicitly use `--spec-type none`, with only the 64 trunk layers in identity and transferred state.
+This repository ports only the Mirai format, CPU/CUDA kernels, graph integration, converter and tests onto hybrid-inference `a3752b04cbd905bf61ffe6d9a4e7df738f26f4c2`. The source fork's FA GQA packing, chunked DeltaNet kernel and text-aligned prompt cache are omitted. Except for the measured port parity section below, the commands, validation claims and performance tables describe the source fork. For this port's CPU evidence, see [the run report](../hybrid-bench/RESULTS-hybrid-c-r1-261101.md). Hybrid clients explicitly use `--spec-type none`, with only the 64 trunk layers in identity and transferred state.
 
 ## Quick start
 
@@ -50,6 +50,8 @@ text, scene descriptions in my checks).
 | `ggml/src/ggml-cpu/mirai-s.cpp` | CPU implementation, the reference for the CUDA kernels (layouts and math documented there) |
 | `ggml/src/ggml-cuda/mirai-s.cu` | CUDA kernels |
 | `tests/test-backend-ops.cpp` | `test_mirai_s`: CUDA against CPU on random codes, every path and format |
+| `tools/mirai-s/parity.py` | collect and compare the fork/port ten-case greedy parity gate; JSON artifacts and mismatch diagnostics |
+| `tools/mirai-s/test_parity.py` | CPU contract tests for the parity gate |
 | `tools/mirai-s/compare_vllm.py` | greedy continuations and top-5 logprobs against Mirai's vLLM plugin |
 
 ## Format
@@ -162,3 +164,29 @@ short prompts: 44 vs 39 tok/s decode, 1336 vs 1120 prefill, 107 vs 84 on code wi
 
 The long-context changes, each against its off switch on the same binary (llama-bench, q8_0 KV): decode at 64K
 27.9 -> 35.2 tok/s (q4_0 KV 26.6 -> 34.8), prefill of 2048 tokens 1103 -> 1225 tok/s.
+
+
+## Measured port parity, 2026-11-01
+
+The orchestrator measured **10/10 token-identical greedy continuations** between alesha-pro/llama.cpp-mirai-s `fdb1e815dbbad220c2f41b94535049fdbd20c3ca` and this port's combined `m3-study-mirai` head `5464a4fa1b79c23b1cec7177299f4c6cceae6616`. This is a measured GPU result reported by the orchestrator, not a GPU execution by the CPU-only follow-up run.
+
+Both sides used the same Mirai GGUF, the same token IDs, `-np 1`, `-c 20480`, `-fa on`, q8_0 K/V cache, MTP off, and greedy decoding (`temperature=0`, `top_k=1`, `seed=0`, prompt cache off). The fork's unrelated changes were disabled with `GGML_CUDA_FA_VEC_GQA=0 GGML_CUDA_GDN_CHUNKED=0 LLAMA_SERVER_TEXT_ALIGN=0`. Coverage was eight fixed short prompts x 48 tokens plus two book prefixes of 4096 and 12288 tokens x 32 tokens. All ten continuations matched. This finite result establishes parity for that setup; it does not measure KL quality, speed, or imported-state equivalence.
+
+Source scripts: `/home/agent/lanes/hybrid/.temp/vast/stage-mirai1.sh` and `mirai_parity.py`. The stage names `/root/proto/logs/mirai1/parity-{fork,port}.json` and `parity-compare.txt` as its GPU-host artifacts. They were not retrieved or rerun by this follow-up.
+
+The adapted standard-library tool below preserves those prompts and settings, adds explicit validation of all ten nonempty cases, and prints the first token mismatch with available top-two logprob margins. Start the pinned fork and port servers sequentially with the setup above and the same GGUF. Use local book text, then reuse the fork's token IDs on the port:
+
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+PARITY_OUT=.temp/mirai-parity
+mkdir -p "$PARITY_OUT/tmp"
+export TMPDIR="$PWD/$PARITY_OUT/tmp"
+# Fork server running at 8120; stop it before starting the port server at 8120.
+python3 tools/mirai-s/parity.py collect --url http://127.0.0.1:8120 --side fork --text-dir /data/books --out "$PARITY_OUT/fork.json"
+# Port server running with --spec-type none and the same server flags.
+python3 tools/mirai-s/parity.py collect --url http://127.0.0.1:8120 --side port --reuse "$PARITY_OUT/fork.json" --out "$PARITY_OUT/port.json"
+python3 tools/mirai-s/parity.py compare --a "$PARITY_OUT/fork.json" --b "$PARITY_OUT/port.json" || { echo "STOP: Mirai parity failed; do not run Mirai study arms." >&2; exit 1; }
+python3 -m unittest discover -s tools/mirai-s -p test_parity.py -v
+```
+
+For the complete pinned fork build, compute capability check (`nvidia-smi --query-gpu=compute_cap`, requiring >= 8.0), server lifecycle and mandatory stop before study arms, use [the GPU command block](../hybrid-bench/RESULTS-hybrid-c-r2-261101.md#gpu-host-mirai-study-commands-unrun) from `m3-study-mirai`. Its outputs stay under `$STUDY_HOME`. Requalify changed builds; the historical result is bound to `5464a4fa`.

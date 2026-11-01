@@ -11,6 +11,8 @@ Mirai prototype tools (CPU checks use existing local headers and never download 
 |---|---|---|
 | CMake and C++ compiler | `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF -DGGML_CUDA=OFF` then `cmake --build build --target test-backend-ops llama-hybrid-check-identity -j 2` | `build/bin/` |
 | Backend tests | `OMP_NUM_THREADS=2 nice -n 10 build/bin/test-backend-ops test -b CPU -o MIRAI_MUL_MAT` | Terminal |
+| Fork/port parity | `python3 tools/mirai-s/parity.py collect --help`; `python3 tools/mirai-s/parity.py compare --a .temp/mirai-parity/fork.json --b .temp/mirai-parity/port.json` | JSON and logs under `.temp/mirai-parity/`; full GPU gate in the [r2 report](tools/hybrid-bench/RESULTS-hybrid-c-r2-261101.md#gpu-host-mirai-study-commands-unrun) |
+| Parity gate CPU tests | `python3 -m unittest discover -s tools/mirai-s -p test_parity.py -v` | Terminal; no GPU or model |
 | Python identity fixtures | `python3 tools/hybrid-bench/test_mirai_identity.py` | Terminal; native cases skipped without local headers |
 | Native header fixtures (glibc) | `python3 tools/hybrid-bench/test_mirai_identity.py --binary build/bin/llama-hybrid-check-identity --headers /path/to/headers --artifacts .temp/mirai-identity` | `.temp/mirai-identity/` |
 | Native model identity | `build/bin/llama-hybrid-check-identity /path/to/model.gguf` | JSON layout and fingerprint, no weight allocation |
