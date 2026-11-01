@@ -409,6 +409,7 @@ def model_identity(path):
 
 def model_identity_from_metadata(meta):
     arch = meta['general.architecture']
+    require('mirai.version' not in meta or arch == 'qwen35', 'Mirai requires dense qwen35 only')
     require(arch in ('qwen35', 'gemma4', 'muse-glimmer'), 'unsupported hybrid architecture')
     def get(key):
         return meta[arch + '.' + key]

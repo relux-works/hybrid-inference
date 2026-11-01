@@ -70,7 +70,8 @@ def test_chunk_transaction(remote, decode, slots, model_hash):
     cases = {'early-state-flag': [envelope(bad, b0)], 'early-native-state': [envelope(h0, b0 + bf[-fixed_bytes:])],
              'final-no-state': wires[:-1] + [envelope(hf, bf[:-fixed_bytes])],
              'out-of-order': [wires[1]], 'duplicate': [wires[0], wires[0]], 'missing': [wires[0], wires[2]],
-             'mixed-version': [envelope(old, b0)]}
+             'mixed-version': [envelope(old, b0)],
+             'chunk-only-body-format': [envelope(dict(h0, body_format='llama-native-chunks-v2'), b0)]}
     # Each invalid transfer returns HTTP 400 and preserves the original file, including cases with valid recomputed checksums.
     for name, candidates in cases.items():
         refused = False

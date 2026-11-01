@@ -160,18 +160,18 @@ class BenchmarkProxyTests(unittest.TestCase):
         self.assertTrue(current['offload'])
         self.assertEqual(current['tokens'], durable + [9, 10, 901, 902])
         new_path = '/v1/sessions/' + current['remote_id']
-        self.assertEqual(events[0][:2], ('GET', old_path))
-        self.assertEqual(events[0][3], 404)
-        self.assertEqual(events[1][:2], ('POST', '/v1/sessions'))
-        self.assertEqual(events[1][3], 200)
-        self.assertEqual(events[2][:2], ('GET', new_path))
-        self.assertEqual(events[2][3], 200)
+        self.assertEqual([(event[0], event[1], event[3]) for event in events[:5]], [
+            ('GET', '/v1/health', 200), ('GET', old_path, 404),
+            ('GET', '/v1/health', 200), ('POST', '/v1/sessions', 200), ('GET', new_path, 200)])
         extends = [event for event in events if event[1].endswith('/extend')]
+        transfer = extends[-1][2]['transfer_id']
+        self.assertRegex(transfer, r'^[0-9a-f]{32}$')
         self.assertEqual(extends, [
             ('POST', new_path + '/extend', dict(n0=0, prefix_hash_n0=prefix_hash([]),
                 tokens=durable, return_delta=False), 202),
             ('POST', new_path + '/extend', dict(n0=len(durable), prefix_hash_n0=prefix_hash(durable),
-                tokens=[9], return_delta=True), 200)])
+                tokens=[9], return_delta=True, delta_version=2, transfer_id=transfer,
+                transfer_n0=len(durable), transfer_n1=len(durable) + 1, chunk_index=0, chunk_count=1), 200)])
         self.assertEqual(events[-1], ('import', current['remote_id']))
         fixture.app.replay()
         fixture.app.replay()

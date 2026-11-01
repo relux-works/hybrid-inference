@@ -59,7 +59,7 @@ Open decisions: resident pool capacity classes and scheduling fairness, retry/ro
 
 ## Chunk transaction, protocol 2
 
-HYBD envelopes use `version: 2` and `body_format: "llama-native-chunks-v2"`. Nodes advertise `delta_version: 2` in health; the proxy requires it before synchronization and reports HTTP 412 with an upgrade message for incompatible health or wire versions. A version-1 envelope is refused before native import. An old client also refuses the version-2 envelope. Upgrade node, proxy and decoder together. The model layout fingerprint and native snapshot file format are unchanged.
+HYBD envelopes use `version: 2` and `body_format: "llama-native-chunks-v3"`. Nodes advertise `delta_version: 2` in health; the proxy requires it before synchronization and reports HTTP 412 with an upgrade message for incompatible health or wire versions. A version-1 envelope is refused before native import. An old client also refuses the version-2 envelope. Upgrade node, proxy and decoder together. Final SWA windows require physical record v2 in both validation and apply; a chunk-only build with body format v2 is refused before native import. The model layout fingerprint and native snapshot file format are unchanged.
 
 Every envelope retains the 512 MiB body cap, the range-dependent header cap, token IDs, model/session identity, prefix hash, and XXH128 plus SHA-256 body checksums. Each critical `/extend` supplies `delta_version: 2`, a fresh `transfer_id`, `transfer_n0`, `transfer_n1`, zero-based `chunk_index`, and positive `chunk_count`. The response repeats that identity and adds boolean `fixed_state`. The count and endpoints are bounded by the transfer's token range. Single-shot exports are one final chunk. Shadow extends still return no delta.
 

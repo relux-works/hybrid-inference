@@ -122,6 +122,14 @@ static void codec_tests(size_t max_ctx) {
     for (int i = 0; i < 4; ++i) { bad += (char) (text.size() >> (8 * i)); }
     bad += text + wire.substr(4 + length);
     rejects("layout", bad, hash, 0, "unsupported delta layout");
+    // HYBD 2 from a chunk-only build has the old body format and must refuse before native parsing.
+    bad_h = hybrid::parse_json(wire.substr(4, length));
+    bad_h["body_format"] = "llama-native-chunks-v2";
+    const auto old_text = bad_h.dump();
+    bad.clear();
+    for (int i = 0; i < 4; ++i) { bad += (char) (old_text.size() >> (8 * i)); }
+    bad += old_text + wire.substr(4 + length);
+    rejects("chunk-only-body-format", bad, hash, 0, "unsupported delta layout");
     auto wrong_tokens = h;
     wrong_tokens["tokens"] = json::array();
     rejects("token-count", hybrid::encode_delta(wrong_tokens, "abc"), hash, 0, "token count mismatch");

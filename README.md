@@ -167,3 +167,5 @@ The local CPU prefill node, shared state-delta codec, correctness checker, and H
 Sliding-window transfer for Gemma 4 and Muse Glimmer is described in [SWA-STATE-DESIGN.md](tools/hybrid/SWA-STATE-DESIGN.md). Build `llama-hybrid-check-swa` with the locked named-target command in the node guide, then run `nice -n 19 build/bin/llama-hybrid-check-swa` for model-free allocated-cache tests. Logs belong under `.temp/`; real-model GPU qualification commands are in the [r16 report](tools/hybrid-bench/RESULTS-hybrid-a-r16-261101.md).
 
 Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.
+
+Combined SWA layout and final-state chunk CPU qualification, invariant checks and exact GPU operator commands are in [the r27 report](tools/hybrid/RESULTS-hybrid-a-r27-261101.md).

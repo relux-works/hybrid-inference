@@ -241,7 +241,7 @@ static void run(llm_arch arch, bool unified) {
     bad_chunks[1] = {(const uint8_t *) bad_window.data(), bad_window.size(), 11};
     require(llama_memory_seq_read_chunks(&cache, hp, bad_chunks, 0, 8, 512) == 0, "SWA invalid final window accepted");
     require(snapshot(cache) == before, "SWA rejected chunks changed cells or state");
-    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 8, 512) == early.size() + final.size(), "SWA chunk transaction failed");
+    require(llama_memory_seq_read_chunks(&cache, hp, chunks, 0, 8, 512) == early.size() + final.size(), "swa_chunk_transaction_equivalence_and_refusals: SWA chunk transaction failed");
     const auto chunked_state = snapshot(cache);
     { reader input(prefix); cache.state_read(input, 0, 0); }
     { const auto one = record({8, 9, 10}, {9, 10, 7, 8}); reader input(one); cache.state_read_append(input, 0, 8, 11, false); }
@@ -600,17 +600,34 @@ static void unified_restore(llama_model * model) {
     }
 }
 
-// Real attention must match the same prefill partition after fresh and nonzero-prefix imports.
 // Both public chunk entry points refuse a v0 final window and preserve fresh or populated slots.
 static void chunk_legacy_window_refused(llama_model * model) {
     const std::vector<llama_token> tokens {3, 4, 5, 6, 7, 3, 4, 5};
     auto node = hybrid::make_context(model, 512);
-    hybrid::prefill(node.get(), tokens);
+    hybrid::prefill(node.get(), tokens, 0);
     auto * memory = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(node.get()));
     require(memory != nullptr, "missing tiny SWA cache");
     for (int n0 : {0, 3}) {
         auto dest = hybrid::make_context(model, 512);
-        if (n0) { hybrid::prefill(dest.get(), {tokens.begin(), tokens.begin() + n0}); }
+        if (n0) { hybrid::prefill(dest.get(), {tokens.begin(), tokens.begin() + n0}, 0); }
+        auto chunk_node = hybrid::make_context(model, 512);
+        auto single = hybrid::make_context(model, 512);
+        if (n0) {
+            hybrid::prefill(chunk_node.get(), {tokens.begin(), tokens.begin() + n0}, 0);
+            hybrid::prefill(single.get(), {tokens.begin(), tokens.begin() + n0}, 0);
+        }
+        std::vector<std::string> bodies;
+        std::vector<llama_state_seq_chunk> chunks;
+        int at = n0;
+        for (int end : {n0 + 1, n0 + 3, 8}) {
+            hybrid::prefill(chunk_node.get(), {tokens.begin() + at, tokens.begin() + end}, at);
+            bodies.push_back(hybrid::export_range(chunk_node.get(), at, end, end == 8));
+            at = end;
+        }
+        for (size_t i = 0; i < bodies.size(); ++i) {
+            const int end = i == 0 ? n0 + 1 : i == 1 ? n0 + 3 : 8;
+            chunks.push_back({(const uint8_t *) bodies[i].data(), bodies[i].size(), end});
+        }
         const auto before = hybrid::save_state(dest.get());
         const auto physical_before = snapshot(*dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(dest.get())));
         writer legacy;
@@ -623,15 +640,35 @@ static void chunk_legacy_window_refused(llama_model * model) {
         require(llama_state_seq_set_data_chunks(dest.get(), {old}, 0, n0) == 0, "swa_chunk_legacy_window_refused: apply accepted v0");
         require(hybrid::save_state(dest.get()) == before && snapshot(*dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(dest.get()))) == physical_before,
                 "swa_chunk_legacy_window_refused: rejected import changed destination");
-        const auto valid = hybrid::export_range(node.get(), n0, tokens.size());
+        // Every proper chunk prefix validates without publishing state; the complete transfer equals one import.
+        for (size_t k = 1; k < chunks.size(); ++k) {
+            int start = n0;
+            for (size_t i = 0; i < k; ++i) {
+                require(llama_state_seq_validate_chunk(dest.get(), chunks[i], 0, start, false) == chunks[i].size,
+                        "swa_chunk_interruption: valid early chunk refused");
+                start = chunks[i].n1;
+            }
+            require(hybrid::save_state(dest.get()) == before, "swa_chunk_interruption: staged prefix changed state");
+            std::cout << "PASS swa_chunk_interruption k=" << k << " n0=" << n0 << '\n';
+        }
+        const auto valid = hybrid::export_range(chunk_node.get(), n0, tokens.size());
+        require(llama_state_seq_validate_chunk(dest.get(), chunks.back(), 0, chunks[1].n1, true) == chunks.back().size,
+                "swa_chunk_v2_window_control: validate refused v2");
+        require(llama_state_seq_set_data_chunks(dest.get(), chunks, 0, n0) > 0, "swa_chunk_v2_window_control: apply refused v2");
         const llama_state_seq_chunk current {(const uint8_t *) valid.data(), valid.size(), (llama_pos) tokens.size()};
-        require(llama_state_seq_validate_chunk(dest.get(), current, 0, n0, true) == valid.size(), "swa_chunk_v2_window_control: validate refused v2");
-        require(llama_state_seq_set_data_chunks(dest.get(), {current}, 0, n0) == valid.size(), "swa_chunk_v2_window_control: apply refused v2");
-        require(physical_state(dest.get()) == physical_state(node.get()), "swa_chunk_v2_window_control: physical layout differs");
+        require(llama_state_seq_set_data_chunks(single.get(), {current}, 0, n0) == valid.size(), "SWA single import failed");
+        require(hybrid::save_state(dest.get()) == hybrid::save_state(single.get()) && physical_state(dest.get()) == physical_state(chunk_node.get()),
+                "swa_chunk_single_equivalence: physical layout or bytes differ");
+        hybrid::prefill(dest.get(), {6}, 8);
+        hybrid::prefill(single.get(), {6}, 8);
+        require(memcmp(llama_get_logits_ith(dest.get(), -1), llama_get_logits_ith(single.get(), -1), 8 * sizeof(float)) == 0,
+                "swa_chunk_single_equivalence: held-token logits differ");
+        std::cout << "PASS swa_chunk_single_equivalence n0=" << n0 << '\n';
         std::cout << "PASS swa_chunk_legacy_window_refused and swa_chunk_v2_window_control n0=" << n0 << '\n';
     }
 }
 
+// Real attention must match the same prefill partition after fresh and nonzero-prefix imports.
 static void inference(const char * path) {
     tiny_model(path);
     auto mp = llama_model_default_params();
