@@ -70,8 +70,11 @@ class FixtureTemplate:
     """Text-only fixture renderers; token replay accepts only captured, aligned spans."""
     def __init__(self, fixture):
         self.fixture = fixture
-        self.props = fixture["props"]
+        self.props = dict(fixture["props"])
         self.label = fixture["label"]
+        # Fixture properties advertise frame delimiters, not redistributed template source.
+        self.props["chat_template"] = ("<|turn> <turn|>" if self.label.startswith("gemma") else
+                                       "<|start|> <|eot|>" if self.label.startswith("muse-glimmer") else "ChatML")
         self.renders = [render for shape in fixture["shapes"].values()
                         for render in shape["renders"].values() if "text" in render]
 
@@ -162,16 +165,20 @@ class FixtureTemplate:
             system = messages[0]["content"].strip() if messages[0]["role"] == "system" else ""
             text = opening + "system\n" + ("<|think|>\n" if thinking else "") + system + closing if system or thinking else ""
             last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
+            previous_role = None
             for index, m in enumerate(messages):
                 role, content = m["role"], (m.get("content") or "").strip()
                 if role in ("system", "tool"):
                     continue
-                text += opening + ("model" if role == "assistant" else role) + "\n"
-                if role == "assistant" and index > last_user:
-                    text += "<|channel>thought\n" + (m.get("reasoning_content", "") + "\n" if m.get("reasoning_content") else "") + "<channel|>"
+                if role != "assistant" or previous_role != "assistant":
+                    text += opening + ("model" if role == "assistant" else role) + "\n"
+                reasoning = m.get("reasoning") or m.get("reasoning_content")
+                if role == "assistant" and index > last_user and (reasoning or last_assistant and index == len(messages) - 1):
+                    text += "<|channel>thought\n" + (reasoning + "\n" if reasoning else "") + "<channel|>"
                 for call in m.get("tool_calls", []):
                     args = ",".join(key + ":<|\"|>" + value + "<|\"|>" for key, value in self.arguments(call).items())
                     text += "<|tool_call>call:" + call["function"]["name"] + "{" + args + "}<tool_call|>"
+                responded = False
                 for follow in messages[index + 1:]:
                     if follow["role"] != "tool":
                         break
@@ -179,11 +186,20 @@ class FixtureTemplate:
                         break
                     name = next((c["function"]["name"] for c in m["tool_calls"] if c.get("id") == follow.get("tool_call_id")), "unknown")
                     text += "<|tool_response>response:" + name + "{value:<|\"|>" + follow["content"] + "<|\"|>}<tool_response|>"
+                    responded = True
                 text += content
-                if not (last_assistant and index == len(messages) - 1):
+                next_role = next((follow["role"] for follow in messages[index + 1:] if follow["role"] != "tool"), None)
+                continues = role == "assistant" and next_role == "assistant" and (not m.get("tool_calls") or responded)
+                if m.get("tool_calls") and not responded:
+                    text += "<|tool_response>"
+                elif not continues and not (responded and not content and next_role is None) and not (last_assistant and index == len(messages) - 1):
                     text += closing
+                previous_role = role
             if agp:
-                text += opening + "model\n" + ("<|channel>thought\n<channel|>" if not thinking else "")
+                if not messages[-1].get("role") == "tool" or not responded:
+                    text += opening + "model\n" + ("<|channel>thought\n<channel|>" if not thinking else "")
+                elif thinking:
+                    text += "<|channel>thought\n"
             return text
         if not self.label.startswith("muse-glimmer"):
             raise ValueError("unknown fixture renderer")

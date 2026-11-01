@@ -1,7 +1,10 @@
 """Replay real decoder captures; aligned token spans are not a general tokenizer."""
 import copy
 import json
+import hashlib
 from pathlib import Path
+import re
+import tempfile
 import unittest
 from unittest import mock
 
@@ -9,6 +12,7 @@ from journal import JournalConflict, Renderer
 from stub_server import FixtureTemplate, State
 import test_proxy
 from proxy import HTTPError
+from template_oracle import TemplateOracle, source_fixture
 
 FIXTURES = Path(__file__).with_name("fixtures") / "templates"
 
@@ -34,6 +38,306 @@ class ReplayNode:
         if status != 200:
             raise AssertionError((status, result))
         return result
+
+
+class ProbeNode(ReplayNode):
+    """Uncaptured frame tests use character pieces, not model tokenizations."""
+    def request(self, method, path, body=None):
+        if path != "/tokenize":
+            return super().request(method, path, body)
+        specials = ["<|turn>", "<turn|>", "<bos>", "<|tool_call>", "<tool_call|>",
+                    "<|tool_response>", "<tool_response|>", '<|"|>', "<|channel>", "<channel|>", "<|think|>"]
+        pieces = []
+        for part in re.split("(" + "|".join(map(re.escape, specials)) + ")", body["content"]):
+            if part in specials:
+                pieces.append(dict(id=1000000 + specials.index(part), piece=part))
+            else:
+                pieces.extend(dict(id=1000 + ord(char), piece=char) for char in part)
+        if body.get("add_special"):
+            pieces.insert(0, dict(id=1000002, piece="<bos>"))
+        return dict(tokens=pieces if body.get("with_pieces") else [p["id"] for p in pieces])
+
+
+class TemplateGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = json.loads((FIXTURES / "gemma4-31b.json").read_text())
+        self.node = ProbeNode(self.fixture)
+        self.addCleanup(self.node.state.close)
+        self.renderer = Renderer(self.node)
+        self.body = dict(messages=copy.deepcopy(self.fixture["shapes"]["system_user_assistant_user"]["messages"]),
+                         chat_template_kwargs=dict(enable_thinking=False))
+
+    def change(self, mutate):
+        original = self.node.request
+        return mock.patch.object(self.node, "request", side_effect=lambda method, path, body=None: mutate(path, body, original(method, path, body)))
+
+    def rendered(self):
+        text = self.renderer.render(self.body)
+        return text, self.renderer.encode(text, initial=True)
+
+    # Every advertised BOS/EOS/source property is required in addition to a valid live family render.
+    def test_family_source_properties(self):
+        self.assertEqual(self.renderer.family(self.body), ("<|turn>", "<turn|>\n"))
+        for key, value in (("bos_token", "wrong"), ("eos_token", "wrong"),
+                           ("chat_template", "<turn|>"), ("chat_template", "<|turn>")):
+            with self.subTest(property=key, value=value), self.change(lambda path, body, result: dict(result, **{key: value}) if path == "/props" else result):
+                with self.assertRaisesRegex(JournalConflict, "unknown template family"):
+                    self.renderer.family(self.body)
+
+    # Family selection rejects a wrong generation header even when the previous messages are identical.
+    def test_family_generation_header(self):
+        self.renderer.family(self.body)
+        def mutate(path, body, result):
+            if path == "/apply-template" and body.get("add_generation_prompt"):
+                return dict(prompt=result["prompt"].removesuffix("<|turn>model\n<|channel>thought\n<channel|>") + "wrong-generation-header")
+            return result
+        with self.change(mutate), self.assertRaisesRegex(JournalConflict, "unknown template family"):
+            self.renderer.family(self.body)
+
+    # Each family-probe transition and the final closing are checked, beyond the initial user header.
+    def test_family_closings(self):
+        self.renderer.family(self.body)
+        for transition in ("assistant", "user", "last"):
+            def mutate(path, body, result):
+                if path != "/apply-template":
+                    return result
+                text = result["prompt"]
+                if transition == "last":
+                    generation = "<|turn>model\n<|channel>thought\n<channel|>" if body.get("add_generation_prompt") else ""
+                    return dict(prompt=(text.removesuffix(generation) if generation else text) + "extra" + generation)
+                if transition == "assistant":
+                    return dict(prompt=text.replace("<turn|>\n<|turn>model", "<turn|>\n<|turn>wrong", 1))
+                return dict(prompt=text.replace("<turn|>\n<|turn>user", "<turn|>\n<|turn>wrong", 1))
+            with self.subTest(transition=transition), self.change(mutate):
+                with self.assertRaisesRegex(JournalConflict, "unknown template family"):
+                    self.renderer.family(self.body)
+
+    # Family generation must preserve the whole preceding render before checking its assistant header.
+    def test_family_generation_prefix(self):
+        self.renderer.family(self.body)
+        with self.change(lambda path, body, result: dict(prompt=result["prompt"].replace("<|turn>user\n", "<|turn>USER\n", 1)) if path == "/apply-template" and body.get("add_generation_prompt") else result):
+            with self.assertRaisesRegex(JournalConflict, "generation prompt changed previous messages"):
+                self.renderer.family(self.body)
+
+    # A user checkpoint requires the live header bytes, not just the preceding token prefix.
+    def test_users_header_text(self):
+        text, tokens = self.rendered()
+        self.assertEqual([b["message_index"] for b in self.renderer.user_boundaries(self.body, text, tokens, start=3)], [3])
+        def mutate(path, body, result):
+            if path == "/apply-template" and len(body["messages"]) == 4 and body["messages"][-1]["content"].startswith("hybrid"):
+                return dict(prompt=result["prompt"].replace("<|turn>user\n" + body["messages"][-1]["content"], "<|turn>user changed\n" + body["messages"][-1]["content"]))
+            return result
+        with self.change(mutate):
+            self.assertEqual(self.renderer.user_boundaries(self.body, text, tokens, start=3), [])
+
+    # An exact token/text suffix must start with the family's closing, not the next user header.
+    def test_append_closing_prefix(self):
+        text, tokens = self.rendered()
+        self.renderer.append(self.body, text, tokens, 3, [71])
+        def mutate(path, body, result):
+            if path == "/apply-template" and len(body["messages"]) == 4:
+                content = body["messages"][2]["content"]
+                return dict(prompt=result["prompt"].replace(content + "<turn|>\n", content))
+            return result
+        with self.change(mutate):
+            text, tokens = self.rendered()
+            with self.assertRaisesRegex(JournalConflict, "exact end-of-turn"):
+                self.renderer.append(self.body, text, tokens, 3, [71])
+
+    def tool_probe(self, change, error):
+        self.body["messages"] = copy.deepcopy(self.fixture["shapes"]["tool_call_and_response"]["messages"])
+        text, tokens = self.rendered()
+        self.renderer.append(self.body, text, tokens, 3, [71])
+        def mutate(path, body, result):
+            if path == "/apply-template" and len(body["messages"]) > 3:
+                arguments = body["messages"][2].get("tool_calls", [{}])[0].get("function", {}).get("arguments", {})
+                if isinstance(arguments, dict) and any(key.startswith("hybrid") for key in arguments):
+                    return dict(prompt=change(result["prompt"], next(iter(arguments))))
+            return result
+        with self.change(mutate), self.assertRaisesRegex(JournalConflict, error):
+            self.renderer.append(self.body, text, tokens, 3, [71])
+
+    # A malformed argument probe cannot be accepted just because its trailing suffix still matches.
+    def test_gemma_tool_probe_count(self):
+        self.tool_probe(lambda text, marker: text.replace(marker, "key", 1), "did not preserve the tool boundary probe")
+
+    # The call terminator itself is checked before slicing off its fixed-width bytes.
+    def test_gemma_tool_probe_closing(self):
+        self.tool_probe(lambda text, marker: text.replace('<|"|>}<tool_call|>', '<|"|>}<tool_cAll|>'), "tool call closing is not supported")
+
+    # Equal starts and reversed starts cannot persist empty or overlapping message ranges.
+    def test_layout_overlap(self):
+        text, tokens = self.rendered()
+        self.renderer.layout(self.body, text, tokens)
+        for prefixes in (("", "", text[:10], text[:20]), ("", text[:20], text[:10], text[:30])):
+            with self.subTest(prefixes=prefixes), mock.patch.object(self.renderer, "message_frame", side_effect=[(p, "") for p in prefixes]):
+                with self.assertRaisesRegex(JournalConflict, "message boundaries overlap"):
+                    self.renderer.layout(self.body, text, tokens)
+
+    # A unique reasoning probe does not permit duplicated content probes.
+    def test_duplicate_assistant_probe(self):
+        self.body["messages"] = self.body["messages"][:3]
+        text, _ = self.rendered()
+        self.renderer.message_frame(self.body, text, 2, self.renderer.family(self.body))
+        def mutate(path, body, result):
+            if path == "/apply-template" and body["messages"][0]["role"] == "system" and body["messages"][-1]["content"].startswith("hybrid"):
+                marker = body["messages"][-1]["content"]
+                return dict(prompt=result["prompt"].replace(marker, marker + marker))
+            return result
+        with self.change(mutate), self.assertRaisesRegex(JournalConflict, "boundary probe"):
+            self.renderer.message_frame(self.body, text, 2, ("<|turn>", "<turn|>\n"))
+
+
+class ContinuedTurnTests(unittest.TestCase):
+    setUp = TemplateGuardTests.setUp
+
+    def ranges(self, body):
+        text = self.renderer.render(body)
+        tokens = self.renderer.encode(text, initial=True)
+        try:
+            layout, _ = self.renderer.layout(body, text, tokens)
+        except JournalConflict as error:
+            self.fail("supported Gemma continuation rejected: " + str(error))
+        raw = self.renderer.token_bytes(text, tokens)
+        def byte(position):
+            return sum(map(len, raw[:position["n"]])) + position["byte_offset"]
+        return [text.encode()[byte(row["start"]):byte(row["end"])].decode() for row in layout]
+
+    # Consecutive assistants own their own content despite sharing one Gemma model turn.
+    def test_consecutive_assistants(self):
+        self.body["messages"].insert(3, dict(role="assistant", content="A2"))
+        segments = self.ranges(self.body)
+        self.assertEqual(segments[2], "<|turn>model\nA1")
+        self.assertEqual(segments[3], "A2<turn|>\n")
+
+    # Call -> tool -> answer -> user retains the response solely in the tool range, with no false overlap.
+    def test_call_tool_answer(self):
+        self.body["messages"] = copy.deepcopy(self.fixture["shapes"]["tool_call_and_response"]["messages"])
+        self.body["messages"].insert(-1, dict(role="assistant", content="A2"))
+        segments = self.ranges(self.body)
+        self.assertIn("call:read", segments[2])
+        self.assertNotIn("T1", segments[2])
+        self.assertIn("T1", segments[3])
+        self.assertNotIn("A2", segments[3])
+        self.assertEqual(segments[4], "A2<turn|>\n")
+
+    # A continued message's reasoning prefix belongs to that message, including the Gemma reasoning alias.
+    def test_continued_reasoning(self):
+        self.body["messages"] = self.body["messages"][:3] + [dict(role="assistant", content="A2", reasoning="R2")]
+        segments = self.ranges(self.body)
+        self.assertEqual(segments[2], "<|turn>model\nA1")
+        self.assertEqual(segments[3], "<|channel>thought\nR2\n<channel|>A2")
+
+    # An empty merged assistant has no byte range; interleaved call content is not a contiguous message range.
+    def test_unrepresentable_messages(self):
+        self.body["messages"].insert(3, dict(role="assistant", content=""))
+        self.body["messages"].insert(4, dict(role="assistant", content="A2"))
+        with self.assertRaisesRegex(JournalConflict, "message boundaries overlap"):
+            text = self.renderer.render(self.body)
+            self.renderer.layout(self.body, text, self.renderer.encode(text, initial=True))
+        self.body["messages"] = copy.deepcopy(self.fixture["shapes"]["tool_call_and_response"]["messages"])
+        self.body["messages"][2]["content"] = "after-tool"
+        with self.assertRaisesRegex(JournalConflict, "interleaves assistant content"):
+            text = self.renderer.render(self.body)
+            self.renderer.layout(self.body, text, self.renderer.encode(text, initial=True))
+
+
+class OracleTests(unittest.TestCase):
+    # Source-free captures keep all derived outputs and bind external template bytes before executing Jinja.
+    def test_sources_external(self):
+        for path in FIXTURES.glob("*.json"):
+            fixture = json.loads(path.read_text())
+            for key in ("chat_template", "chat_template_tool_use"):
+                self.assertNotIn(key, fixture["props"])
+                self.assertIn(key + "_sha256", fixture["props"])
+            loaded = source_fixture(fixture)
+            self.assertEqual(hashlib.sha256(loaded["props"]["chat_template"].encode()).hexdigest(), fixture["props"]["chat_template_sha256"])
+
+    # Absent sources give an explicit skip; a present but changed source is a hard digest failure.
+    def test_source_missing_and_mismatch(self):
+        fixture = json.loads((FIXTURES / "gemma4-31b.json").read_text())
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(unittest.SkipTest, "external template source absent"):
+                source_fixture(fixture, root)
+            (Path(root) / "gemma4-31b.json").write_text(json.dumps(dict(props=dict(chat_template="changed"))))
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                source_fixture(fixture, root)
+
+    # The reviewer oracle matches 88 captures; eight assistant-prefill renders need server assembly and are excluded.
+    def test_oracle_captured_renders(self):
+        oracles = {}
+        count = 0
+        for fixture, name, variant, body, captured in cases():
+            if name == "assistant_last" and not fixture["label"].startswith("qwen"):
+                continue
+            if fixture["label"] not in oracles:
+                oracles[fixture["label"]] = TemplateOracle(fixture)
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                self.assertEqual(oracles[fixture["label"]].render(body), captured["text"])
+                count += 1
+        self.assertEqual(count, 88)
+
+    # Both new Gemma continued-turn shapes match the real template, independently of the frame code.
+    def test_gemma_continued_renders(self):
+        fixture = json.loads((FIXTURES / "gemma4-31b.json").read_text())
+        oracle = TemplateOracle(fixture)
+        for shape, tool in (("system_user_assistant_user", False), ("tool_call_and_response", True)):
+            body = dict(messages=copy.deepcopy(fixture["shapes"][shape]["messages"]), chat_template_kwargs=dict(enable_thinking=False))
+            body["messages"].insert(-1, dict(role="assistant", content="A2"))
+            for agp in (False, True):
+                body["add_generation_prompt"] = agp
+                with self.subTest(tool=tool, agp=agp):
+                    self.assertEqual(FixtureTemplate(fixture).render(body), oracle.render(body))
+
+    # Frame, user and append probes execute the external oracle on the 84 supported captured variants.
+    def test_oracle_probes(self):
+        oracles = {}
+        supported = 0
+        for fixture, name, variant, body, captured in cases():
+            if name == "assistant_last" and not fixture["label"].startswith("qwen"):
+                continue
+            if fixture["label"] not in oracles:
+                oracles[fixture["label"]] = TemplateOracle(fixture)
+            oracle = oracles[fixture["label"]]
+            node = ReplayNode(fixture)
+            self.addCleanup(node.state.close)
+            node.template.props = oracle.fixture["props"]
+            node.template.render = oracle.render
+            renderer = Renderer(node)
+            text = captured["text"]
+            tokens = [p["id"] for p in captured["tokens_add_special"]]
+            with self.subTest(model=fixture["label"], shape=name, variant=variant):
+                if fixture["label"].startswith("gemma") and name == "bench_tool_without_call":
+                    with self.assertRaisesRegex(JournalConflict, "boundary probe"):
+                        renderer.layout(body, text, tokens)
+                    continue
+                expected = ReplayNode(fixture)
+                self.addCleanup(expected.state.close)
+                stub = Renderer(expected)
+                self.assertEqual(renderer.layout(body, text, tokens), stub.layout(body, text, tokens))
+                self.assertEqual(renderer.user_boundaries(body, text, tokens), stub.user_boundaries(body, text, tokens))
+                if name in ("system_user_assistant_user", "reasoning_assistant", "bench_tool_without_call", "tool_call_and_response", "two_rounds"):
+                    past = 5 if name == "two_rounds" else 3
+                    self.assertEqual(renderer.append(body, text, tokens, past, [71]), stub.append(body, text, tokens, past, [71]))
+                supported += 1
+        self.assertEqual(supported, 84)
+
+    # The continued-turn regression exercises real Jinja probes as well as the source-free stub.
+    def test_oracle_continued_frames(self):
+        fixture = json.loads((FIXTURES / "gemma4-31b.json").read_text())
+        oracle = TemplateOracle(fixture)
+        node = ProbeNode(fixture)
+        self.addCleanup(node.state.close)
+        node.template.render = oracle.render
+        node.template.props = oracle.fixture["props"]
+        self.renderer = Renderer(node)
+        for shape in ("system_user_assistant_user", "tool_call_and_response"):
+            body = dict(messages=copy.deepcopy(fixture["shapes"][shape]["messages"]), chat_template_kwargs=dict(enable_thinking=False))
+            body["messages"].insert(-1, dict(role="assistant", content="A2"))
+            segments = ContinuedTurnTests.ranges(self, body)
+            self.assertEqual(segments[-2], "A2<turn|>\n")
+            self.assertNotIn("A1", segments[-2])
+            self.assertNotIn("T1", segments[-2])
 
 
 class TemplateTests(unittest.TestCase):
@@ -240,6 +544,50 @@ class TemplateHTTPTests(unittest.TestCase):
                 rendered = self.app.renderer.render(follow)
                 header = self.app.renderer.user_header(follow, rendered, 3)
                 self.assertEqual(new["tokens"][boundary:boundary + len(header)], header)
+
+    # Continued-turn ranges survive HTTP admission and persistence; IDs here are synthetic character pieces.
+    def test_http_gemma_continued_ranges(self):
+        fixture = self.configure()
+        probe = ProbeNode(fixture)
+        self.addCleanup(probe.state.close)
+        def tokenize(text, initial=False, with_pieces=False):
+            return probe.request("POST", "/tokenize", dict(content=text, add_special=initial, with_pieces=with_pieces))["tokens"]
+        self.decode.app.template_fixture.tokenize = tokenize
+        for shape in ("system_user_assistant_user", "tool_call_and_response"):
+            body = dict(messages=copy.deepcopy(fixture["shapes"][shape]["messages"]), chat_template_kwargs=dict(enable_thinking=False))
+            body["messages"].insert(-1, dict(role="assistant", content="A2"))
+            with self.client.open("POST", "/v1/chat/completions", body) as response:
+                sid = response.headers["X-Hybrid-Session"]
+                response.read()
+            with self.app.reserve(sid):
+                pass
+            session = self.app.store.get(sid)
+            text = self.app.renderer.render(body)
+            raw = self.app.renderer.token_bytes(text, self.app.renderer.encode(text, initial=True))
+            def byte(position):
+                return sum(map(len, raw[:position["n"]])) + position["byte_offset"]
+            ranges = session["journal"]["message_boundaries"]
+            index = len(body["messages"]) - 2
+            row = next(row for row in ranges if row["message_index"] == index)
+            self.assertEqual(text.encode()[byte(row["start"]):byte(row["end"])], b"A2<turn|>\n")
+            self.assertEqual(self.decode.app.info(self.decode.app.slots[session["slot"]])["tokens"], session["tokens"])
+
+    # Gemma's unsupported unmatched tool response is rejected before journal, slot or remote state changes.
+    def test_http_gemma_unmatched_tool_atomic(self):
+        fixture = self.configure()
+        body = dict(messages=copy.deepcopy(fixture["shapes"]["system_user"]["messages"]), chat_template_kwargs=dict(enable_thinking=False))
+        with self.client.open("POST", "/v1/chat/completions", body) as response:
+            sid = response.headers["X-Hybrid-Session"]
+            response.read()
+        with self.app.reserve(sid):
+            pass
+        before = self.snapshot(sid)
+        body["messages"] = before[0]["journal"]["messages"] + copy.deepcopy(fixture["shapes"]["bench_tool_without_call"]["messages"][-2:])
+        with self.assertRaises(HTTPError) as error:
+            self.client.request("POST", "/v1/chat/completions", body, {"X-Hybrid-Session": sid})
+        self.assertEqual(error.exception.status, 409)
+        self.assertIn("boundary probe", error.exception.body.decode())
+        self.assertEqual(self.snapshot(sid), before)
 
     # Unknown frames reject at the intended family guard and preserve the journal, slots and remote prefix.
     def test_unknown_template_atomic(self):

@@ -136,13 +136,28 @@ class Renderer:
         message["content"] = marker
         role = message["role"]
         if role == "assistant":
+            message.pop("reasoning", None)
             message["reasoning_content"] = reasoning
+        previous = next((m for m in reversed(probe["messages"][:index]) if m["role"] != "tool"), {})
+        continued = opening == "<|turn>" and role == "assistant" and previous.get("role") == "assistant"
+        if continued:
+            # A continued model turn has no opening frame. Probe before this message's calls.
+            message.pop("tool_calls", None)
+        if (opening == "<|turn>" and body["messages"][index].get("tool_calls") and
+                (body["messages"][index].get("content") or "").strip() and
+                index + 1 < len(body["messages"]) and body["messages"][index + 1]["role"] == "tool"):
+            raise JournalConflict("template interleaves assistant content and tool responses")
         rendered = self.render(probe)
         markers = [rendered.index(value) for value in (marker, reasoning) if rendered.count(value) == 1]
-        if not markers or (role != "assistant" and rendered.count(marker) != 1):
+        if not markers or rendered.count(marker) > 1 or (role != "assistant" and rendered.count(marker) != 1):
             raise JournalConflict("template did not preserve a message boundary probe")
         prefix = rendered[:min(markers)]
-        if role == "tool" and opening == "<|turn>":
+        if continued:
+            header = "<|channel>thought\n" if rendered.count(reasoning) == 1 and rendered.index(reasoning) == min(markers) else ""
+            if not prefix.endswith(header):
+                raise JournalConflict("template continued model header is not supported")
+            begin = len(prefix) - len(header)
+        elif role == "tool" and opening == "<|turn>":
             begin = prefix.rfind("<|tool_response>")
         elif role == "tool" and opening == "<|im_start|>" and "\n<tool_response>\n" in prefix:
             begin = prefix.rfind("\n<tool_response>\n")
@@ -199,7 +214,7 @@ class Renderer:
         result = []
         for item, (index, role, byte) in enumerate(starts):
             stop = starts[item + 1][2] if item + 1 < len(starts) else end
-            if byte > stop:
+            if byte >= stop:
                 raise JournalConflict("template message boundaries overlap")
             result.append(dict(message_index=index, role=role, start=position(byte), end=position(stop)))
         return result, position(end)

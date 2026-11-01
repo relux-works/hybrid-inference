@@ -80,3 +80,80 @@ Final copied-source evidence: `.temp/hybrid-a-r19-261101/controls-06/`. The driv
 Self-review applied the code-review skill's scope, security, approach, general and tests checklists. Review notes are in `.temp/hybrid-a-r19-261101/review-01.md`; logs and identities remain under that task directory. No supplied attack-surface table or external landing property suite exists in the brief; this is an explicit brief gap. Existing reviewer tests are retained. Out-of-contract rows are the full native/model/GPU validations excluded by the CPU-only/no-model rule, plus the unchanged bench workload requested as proposal-only. This is local review handoff, with no independent review, push or landing claimed.
 
 The GPU host must still establish actual sampled stop IDs and complete streamed IDs; parse/reasoning/tool reconciliation; real tokenizer suffix/prefix behavior beyond captured aligned spans; native checkpoint rollback for all three families; remote transfer/import identity, cache reuse and exact metering; and same-partition numerical/quality equivalence with the real models. Re-run local first-call and append qualification before another full benchmark. Fixture replay does not establish GPU state correctness, throughput or real generation quality.
+
+
+## r20 rework
+
+Additive rework on `b2e75e357ecfa67e67fe6c0583a4556e9ce4bce6` after review r6o. No rewrite, push, downloads, model access or GPU work. Evidence: `.temp/hybrid-a-r20-261101/`. The framing, guard and source-redaction work is ready for review. The authorized bench change remains pending the orchestrator's real tools captures; no workload edit or acceptance is claimed for that part.
+
+Gemma continued assistants now start at their own content/reasoning prefix rather than an earlier `<|turn>` opener. The probe runs before the continued message's calls and preserves the preceding bytes. Both consecutive assistants and call/tool/answer/user have separate, byte-exact ranges. The reasoning alias is covered. Equal starts reject with 409; noncontiguous assistant content rendered after its tool responses also rejects. The stub reproduces continued-turn opening/closing behavior. HTTP tests verify persisted answer ranges and keep unmatched-tool rejection atomic across journal, slots and remote prefix.
+
+All original 96 derived renders and 192 tokenizations are unchanged. Only full `chat_template` and `chat_template_tool_use` properties were replaced by `*_sha256` (null for an absent source). Oracle tests load original capture JSON from `HYBRID_TEMPLATE_FIXTURES`, default `/home/agent/lanes/hybrid/.temp/template-fixtures/`, verify both digests, and explicitly skip absent sources or missing Jinja2. Present mismatched source fails. The adapted r6o oracle matches 88 original renders; eight Gemma/Glimmer assistant-prefill renders require server assembly outside its scope. Live oracle probes agree with the stub for layout/user/append on all 84 supported variants. Both continued-turn shapes also pass real Jinja probes with synthetic character-piece tokenization; this does not qualify real uncaptured tokenizations.
+
+Redaction applies to the current tree. Inherited r19 objects still contain the full sources and are preserved under the no-rewrite instruction. Muse Glimmer redistribution/licensing remains unresolved before publication of that history. No session links or new full template sources are committed.
+
+| Check | Result | Evidence under `.temp/hybrid-a-r20-261101/` |
+|---|---|---|
+| Full proxy unittest discovery | exit 0, 106 tests, no skips | `proxy-02.log` |
+| Bench `test_bench.py` | exit 0, 46 tests, 1 checker-dependent skip | `bench-01.log` |
+| Previously skipped bench identity test with existing `HYBRID_SWA_CHECKER` | exit 0, 1 test, no skips | `bench-checker-01.log` |
+| Eval `test_eval.py` | exit 0, 11 tests, no skips | `eval-01.log` |
+| External-source oracle tests after helper cleanup | exit 0, 6 tests, no skips | `oracle-02.log` |
+| Source-absent oracle control | exit 0, 1 passing fixture-contract test and 5 explicitly explained skips | `source-absent-01.log` |
+| Copied-source template controls | driver exit 0; identity and 3 equivalent mutants survive with exit 0; 30 mutants exit 1 at named assertions | `controls-04/controls.json`, `controls-04.log` |
+| Existing allocated-cache SWA checker (CPU, model-free) | exit 0, 68 PASS; existing binary, no rebuild | `swa-readiness-01.log` |
+| Python compile validation without bytecode writes | exit 0 | `compile-02.log`, `compile_check.py` |
+| Derived-output and original-test preservation audit | exit 0 | `source-audit-01.log`, `source-audit.json` |
+| `git diff --check` | exit 0 | `whitespace-01.log` |
+| `ty check --exit-zero-on-warning --output-format=github`; `editorconfig-checker` | both exit 127, executables absent; checks unrun, no install/download | `type-check-01.log`, `editorconfig-01.log` |
+
+Bench's other 45 tests are reused unchanged, and its checker-dependent test is executed separately under the available binary. All 46 distinct bench tests have green evidence; the skipped invocation itself is not passing evidence for that case. Full native/model/GPU suites are unrun by the CPU-only constraint. Commands, observed start/end times and owned PIDs are in the corresponding `*-process.json`. Every Python check uses disk TMPDIR under task scratch and `PYTHONDONTWRITEBYTECODE=1`; CPU checks use `nice -n 10`. No C++ change requires rebuilding the engine.
+
+Negative tests now isolate each family BOS/EOS/source property, generation header, assistant/user transitions, final closing and generation-prefix preservation; append's closing prefix; both Gemma tool-probe guards; equal/reversed starts; and checkpoint header text. Duplicate assistant content probes also reject even with one reasoning probe. Positive controls precede each negative. No setup error, skip or secondary rejection is credited as an intended kill.
+
+| Mutant | Gate narrowed to | Named failing test | Result / survivor bound |
+|---|---|---|---|
+| `identity` | unchanged source under the same tests | `none (positive survivor)` | survives, exit 0; unchanged source under the same tests |
+| `plain-bytes` | IDs alone cannot prove byte preservation | `TemplateHTTPTests.test_altered_piece_atomic` | killed, exit 1 |
+| `foreign-bos` | piece position alone does not authorize a foreign special | `TemplateHTTPTests.test_foreign_special_atomic` | killed, exit 1 |
+| `double-bos` | BOS identity alone cannot limit its multiplicity | `TemplateHTTPTests.test_double_bos_atomic` | killed, exit 1 |
+| `bos-in-text` | exact IDs alone do not permit a visible and invisible BOS | `TemplateHTTPTests.test_bos_in_text_atomic` | killed, exit 1 |
+| `bos-bytes` | BOS spelling cannot advance a rendered-byte offset | `TemplateTests.test_layout_and_user_boundaries` | killed, exit 1 |
+| `unknown-family` | a failed live-family check cannot select a fallback | `TemplateHTTPTests.test_unknown_template_atomic` | killed, exit 1 |
+| `split-eot` | an exact suffix alone does not prove one ending token | `TemplateHTTPTests.test_split_eot_atomic` | killed, exit 1 |
+| `exact-suffix` | a recognizable ending alone cannot authorize a changed suffix | `TemplateHTTPTests.test_changed_suffix_atomic` | killed, exit 1 |
+| `gemma-tool-stop` | the call terminator cannot replace the decoder response opener | `TemplateTests.test_append` | killed, exit 1 |
+| `generation-history` | exact pieces alone do not protect history from generation prompts | `TemplateHTTPTests.test_generation_rewrites_history_atomic` | killed, exit 1 |
+| `probe-context` | a recognizable header alone does not protect its preceding context | `TemplateHTTPTests.test_probe_rewrites_context_atomic` | killed, exit 1 |
+| `continued-turn-frame` | opening-frame search without continued-model boundaries | `ContinuedTurnTests.test_consecutive_assistants` | killed, exit 1 |
+| `continued-tool-frame` | opening-frame search after an embedded tool response | `ContinuedTurnTests.test_call_tool_answer` | killed, exit 1 |
+| `family-source-props` | live renders without BOS/EOS/source authority | `TemplateGuardTests.test_family_source_properties` | killed, exit 1 |
+| `family-bos` | source framing without the declared BOS | `TemplateGuardTests.test_family_source_properties` | killed, exit 1 |
+| `family-eos` | source framing without the declared EOS | `TemplateGuardTests.test_family_source_properties` | killed, exit 1 |
+| `family-source-opening` | live frames without an opening in the template source | `TemplateGuardTests.test_family_source_properties` | killed, exit 1 |
+| `family-source-closing` | live frames without a closing in the template source | `TemplateGuardTests.test_family_source_properties` | killed, exit 1 |
+| `family-gen-header` | preserved history without a valid generation header | `TemplateGuardTests.test_family_generation_header` | killed, exit 1 |
+| `family-closing-after-last` | valid transitions without an exact final closing | `TemplateGuardTests.test_family_closings` | killed, exit 1 |
+| `family-closing-before-assistant` | initial user framing without a valid assistant transition | `TemplateGuardTests.test_family_closings` | killed, exit 1 |
+| `family-closing-after-assistant` | initial user framing without a valid next-user transition | `TemplateGuardTests.test_family_closings` | killed, exit 1 |
+| `family-generation-prefix` | valid generation header without preserved history | `TemplateGuardTests.test_family_generation_prefix` | killed, exit 1 |
+| `append-closing-prefix` | exact suffix without its closing prefix | `TemplateGuardTests.test_append_closing_prefix` | killed, exit 1 |
+| `gemma-tool-count` | matching tool suffix without an exact probe count | `TemplateGuardTests.test_gemma_tool_probe_count` | killed, exit 1 |
+| `gemma-tool-closing` | matching response suffix without a valid call terminator | `TemplateGuardTests.test_gemma_tool_probe_closing` | killed, exit 1 |
+| `layout-overlap` | valid frames without strict message range ordering | `TemplateGuardTests.test_layout_overlap` | killed, exit 1 |
+| `layout-equal-starts` | ordered frames that still allow an empty message range | `TemplateGuardTests.test_layout_overlap` | killed, exit 1 |
+| `users-header-text` | matching prefix tokens without matching live header bytes | `TemplateGuardTests.test_users_header_text` | killed, exit 1 |
+| `assistant-probe-count` | unique reasoning probe without unique content | `TemplateGuardTests.test_duplicate_assistant_probe` | killed, exit 1 |
+| `frame-nonassistant-count` | non-assistant reasoning is absent; the unique-marker and duplicate-marker guards imply this count | `none (positive survivor)` | survives, exit 0; non-assistant reasoning is absent; the unique-marker and duplicate-marker guards imply this count |
+| `bos-len` | one extra piece plus exact bos_ids + plain_ids already implies one BOS ID | `none (positive survivor)` | survives, exit 0; one extra piece plus exact bos_ids + plain_ids already implies one BOS ID |
+| `plain-equal-branch` | when IDs agree, returned bytes come from the already checked plain pieces | `none (positive survivor)` | survives, exit 0; when IDs agree, returned bytes come from the already checked plain pieces |
+
+`frame-nonassistant-count`, `bos-len` and `plain-equal-branch` remain the three review-named equivalent mutants, with their exact survivor bounds above. Identity/equivalence workers run the 31 source-free fixture/HTTP/guard/continued-turn tests; optional external oracle skips do not invalidate or manufacture their outcomes.
+
+Retained development failures: `templates-02` exited 1 because an empty assistant can own its closing bytes (the corrected witness places it before another continued assistant) and because the oracle count excluded four valid Qwen prefill captures. `controls-01` exited 1: the final-closing and generation-prefix plants tripped secondary guards (invalid), and the before-assistant plant survived. Corrected, property-isolating plants are used in controls-02 through controls-04; no initial mis-targeted kill is claimed. Subsequent oracle-filter cleanup was rerun green in oracle-02 and the delivered control identity is controls-04.
+
+Self-review covers scope, security, general and tests; notes are in `review-01.md`. Every pre-existing test method is retained; all other pre-existing proxy/bench/eval test files are unchanged. README and unresolved-question edits document the external-source tool and remaining capture/licence dependency. No formal attack-surface table or external landing property suite was supplied in the brief (gap); r6o rows R1-R8 are used as review coverage: R1 existing exactness tests; R2 continued-turn/guard/oracle tests; R3 append/tool-prefix tests; R4 unchanged Qwen tests and unchanged bench code; R5 hash-bound oracle comparisons; R6 identity/intended-kill/equivalence controls; R7 tool ranges and atomic unmatched-tool HTTP rejection; R8 source-redaction audit. Out-of-contract evidence remains full native/model/GPU state, actual sampled stops, throughput and numerical/quality qualification, per the CPU-only requirement. Independent review and acceptance remain pending.
+
+### Bench capture dependency
+
+No new capture directory has been supplied or observed in `#hybrid/prototype-go` at this checkpoint. Existing fixtures have no root tools definitions, so they cannot prove the requested workload change. The deterministic candidate is a fresh user request before a matching synthetic assistant call, followed by the unchanged response blob and continuation user; the user delimiter preserves A1's existing closing without rewriting immutable history or adding a sampled decode round. A call inserted directly after A1 would merge the Gemma turn and is unsuitable. Validate the candidate against captured tools renders and exact append before implementation. See the tracked design note `.temp/hybrid-a-r20-261101/bench-plan.md`. Qwen workload bytes remain unchanged at this checkpoint.

@@ -38,11 +38,76 @@ CONTROLS = [
      [('raise JournalConflict("message probe changed its preceding template context")', 'pass')]),
 ]
 
+CONTROLS += [
+    ("continued-turn-frame", "opening-frame search without continued-model boundaries", "ContinuedTurnTests.test_consecutive_assistants",
+     [('continued = opening == "<|turn>"', 'continued = False and opening == "<|turn>"')]),
+    ("continued-tool-frame", "opening-frame search after an embedded tool response", "ContinuedTurnTests.test_call_tool_answer",
+     [('continued = opening == "<|turn>"', 'continued = False and opening == "<|turn>"')]),
+    ("family-source-props", "live renders without BOS/EOS/source authority", "TemplateGuardTests.test_family_source_properties",
+     [('if bos and (props.get("bos_token")', 'if False and (props.get("bos_token")')]),
+    ("family-bos", "source framing without the declared BOS", "TemplateGuardTests.test_family_source_properties",
+     [('props.get("bos_token") != bos', 'False')]),
+    ("family-eos", "source framing without the declared EOS", "TemplateGuardTests.test_family_source_properties",
+     [('props.get("eos_token") != eos', 'False')]),
+    ("family-source-opening", "live frames without an opening in the template source", "TemplateGuardTests.test_family_source_properties",
+     [('opening not in props.get("chat_template", "")', 'False')]),
+    ("family-source-closing", "live frames without a closing in the template source", "TemplateGuardTests.test_family_source_properties",
+     [('closing.strip() not in props.get("chat_template", "")', 'False')]),
+    ("family-gen-header", "preserved history without a valid generation header", "TemplateGuardTests.test_family_generation_header",
+     [('if not generated[len(rendered):].startswith(opening + assistant):', 'if False:')]),
+    ("family-closing-after-last", "valid transitions without an exact final closing", "TemplateGuardTests.test_family_closings",
+     [('rendered.split(next_user)[1] != closing', 'False')]),
+    ("family-closing-before-assistant", "initial user framing without a valid assistant transition", "TemplateGuardTests.test_family_closings",
+     [('not between.startswith(closing + opening + assistant)', 'False')]),
+    ("family-closing-after-assistant", "initial user framing without a valid next-user transition", "TemplateGuardTests.test_family_closings",
+     [('not after_answer.startswith(closing + opening + user)', 'False')]),
+    ("family-generation-prefix", "valid generation header without preserved history", "TemplateGuardTests.test_family_generation_prefix",
+     [('if not generated.startswith(rendered):\n                    raise JournalConflict("generation prompt changed previous messages")', 'if False:\n                    pass')]),
+    ("append-closing-prefix", "exact suffix without its closing prefix", "TemplateGuardTests.test_append_closing_prefix",
+     [(' or tail[:len(closing)] != closing', '')]),
+    ("gemma-tool-count", "matching tool suffix without an exact probe count", "TemplateGuardTests.test_gemma_tool_probe_count",
+     [('if marked.count(marker) != 2:', 'if False:')]),
+    ("gemma-tool-closing", "matching response suffix without a valid call terminator", "TemplateGuardTests.test_gemma_tool_probe_closing",
+     [("if not after.startswith('<|\"|>}<tool_call|><|tool_response>'):", 'if False:')]),
+    ("layout-overlap", "valid frames without strict message range ordering", "TemplateGuardTests.test_layout_overlap",
+     [('if byte >= stop:', 'if False:')]),
+    ("layout-equal-starts", "ordered frames that still allow an empty message range", "TemplateGuardTests.test_layout_overlap",
+     [('if byte >= stop:', 'if byte > stop:')]),
+    ("users-header-text", "matching prefix tokens without matching live header bytes", "TemplateGuardTests.test_users_header_text",
+     [('if text.startswith(prefix + header) and', 'if text.startswith(prefix) and')]),
+    ("assistant-probe-count", "unique reasoning probe without unique content", "TemplateGuardTests.test_duplicate_assistant_probe",
+     [('rendered.count(marker) > 1', 'False')]),
+]
+
+EXPECTED_ASSERTIONS = {
+    "bos-bytes": "byte_offset",
+    "gemma-tool-stop": "self.assertEqual(tail[0], end[0])",
+    "continued-turn-frame": "AssertionError: supported Gemma continuation rejected:",
+    "continued-tool-frame": "AssertionError: supported Gemma continuation rejected:",
+    "users-header-text": "self.assertEqual(self.renderer.user_boundaries(self.body, text, tokens, start=3), [])",
+}
+
+EQUIVALENT_BOUNDS = {
+    "frame-nonassistant-count": "non-assistant reasoning is absent; the unique-marker and duplicate-marker guards imply this count",
+    "bos-len": "one extra piece plus exact bos_ids + plain_ids already implies one BOS ID",
+    "plain-equal-branch": "when IDs agree, returned bytes come from the already checked plain pieces",
+}
+CONTROLS += [
+    ("frame-nonassistant-count", EQUIVALENT_BOUNDS["frame-nonassistant-count"], "",
+     [('(role != "assistant" and rendered.count(marker) != 1)', 'False')]),
+    ("bos-len", EQUIVALENT_BOUNDS["bos-len"], "",
+     [('len(bos_ids) != 1 or ', '')]),
+    ("plain-equal-branch", EQUIVALENT_BOUNDS["plain-equal-branch"], "",
+     [('            if special != plain:\n', '            if False:\n')]),
+]
+
 
 def worker(test, output):
     import journal
     import test_templates
-    suite = unittest.defaultTestLoader.loadTestsFromName("test_templates" + ("." + test if test else ""))
+    suite = (unittest.defaultTestLoader.loadTestsFromName("test_templates." + test) if test else
+             unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName("test_templates." + name) for name in
+                                ("TemplateTests", "TemplateHTTPTests", "TemplateGuardTests", "ContinuedTurnTests")))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     Path(output).write_text(json.dumps(dict(module=str(Path(journal.__file__).resolve()),
         bound_namespace=test_templates.Renderer is journal.Renderer and journal.Renderer.layout.__globals__ is journal.__dict__,
@@ -105,11 +170,11 @@ def main():
                 valid = (result["module"] == row["module"] and result["bound_namespace"] and result["tests"] > 0
                          and not result["errors"] and not result["skipped"])
                 row.update(failures=result["failures"], errors=result["errors"])
-                if name == "identity":
+                if name == "identity" or name in EQUIVALENT_BOUNDS:
                     row["status"] = "survived" if valid and row["exit_code"] == 0 and not result["failures"] else "invalid"
                 else:
                     row["killed"] = valid and row["exit_code"] == 1 and bool(result["failures"]) and all(
-                        test in failure["test"] and ("byte_offset" if name == "bos-bytes" else "self.assertEqual(tail[0], end[0])" if name == "gemma-tool-stop" else "AssertionError: HTTPError not raised") in failure["traceback"] for failure in result["failures"])
+                        test in failure["test"] and EXPECTED_ASSERTIONS.get(name, "AssertionError: JournalConflict not raised" if test.startswith("TemplateGuardTests.") else "AssertionError: HTTPError not raised") in failure["traceback"] for failure in result["failures"])
                     row["status"] = "killed" if row["killed"] else "survived" if valid and row["exit_code"] == 0 else "invalid"
                     if row["killed"]:
                         row["survivor_bound"] = None
@@ -121,7 +186,8 @@ def main():
     (args.output / "controls.json").write_text(json.dumps(rows, indent=2) + "\n")
     for row in rows:
         print(row["mutant"] + ": " + row["status"])
-    return 0 if len(rows) == len(CONTROLS) and rows[0]["status"] == "survived" and all(row["killed"] for row in rows[1:]) else 1
+    return 0 if len(rows) == len(CONTROLS) and rows[0]["status"] == "survived" and all(
+        row["status"] == "survived" if row["mutant"] in EQUIVALENT_BOUNDS else row["killed"] for row in rows[1:]) else 1
 
 
 if __name__ == "__main__":
