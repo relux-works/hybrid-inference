@@ -126,14 +126,15 @@ class Events:
 
 
 class MeasuredNode(Node):
-    def __init__(self, *args, events, **kwargs):
+    def __init__(self, *args, events, session, **kwargs):
         super().__init__(*args, **kwargs)
         self.events = events
+        self.session = session
 
     def request(self, method, path, data=None, headers=None, binary=False):
         started = time.monotonic()
         encoded = json.dumps(data).encode() if isinstance(data, (dict, list)) else data or b''
-        row = dict(kind='protocol', method=method, path=path, upload_body_bytes=len(encoded),
+        row = dict(kind='protocol', session=self.session, method=method, path=path, upload_body_bytes=len(encoded),
                    response_body_bytes=0, status='failed')
         if isinstance(data, dict) and path.endswith('/extend'):
             row.update(n0=data['n0'], n1=data['n0'] + len(data['tokens']),
@@ -174,9 +175,11 @@ class MeasuredProxy(Proxy):
         self.saved = {}
 
     def remote(self, client):
-        return MeasuredNode(self.prefill, client['prefill_token'], self.timeout, events=self.events)
+        return MeasuredNode(self.prefill, client['prefill_token'], self.timeout, events=self.events,
+                            session=getattr(self.current, 'session', None))
 
     def sync(self, session, client, recreate=True):
+        self.current.session = session['id']
         started = time.monotonic()
         n = session['remote_n']
         status = 'failed'
@@ -189,8 +192,9 @@ class MeasuredProxy(Proxy):
                 acknowledged_before=n, acknowledged_after=session['remote_n'], journal_tokens=len(session['tokens']),
                 journal_hash=prefix_hash(session['tokens']), seconds=time.monotonic() - started, status=status)
 
-    def prepare_session(self, *args):
-        result = super().prepare_session(*args)
+    def prepare_session(self, client, body, session, tokens):
+        self.current.session = session['id']
+        result = super().prepare_session(client, body, session, tokens)
         result[0]['_bench']['decision'] = self.current.decision
         return result
 
@@ -306,8 +310,8 @@ def validate_checkpoint(row, heterogeneous, depth):
     require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict weakened exactness')
 
 
-def turn_record(arm, step, meter, ttft, total, journal_hash, events):
-    catchup = [r for r in events if r.get('catchup') and r['status'] == 'ok']
+def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id):
+    catchup = [r for r in events if r.get('session') == session_id and r.get('catchup') and r['status'] == 'ok']
     return dict(arm=arm, turn=step['turn'], requested=step, journal_hash=journal_hash,
         ttft_seconds=ttft, total_seconds=total, decision=meter['decision'],
         depth_before=meter['depth_before'], depth_after=meter['depth_after'], new_tokens=meter['new_tokens'],
@@ -457,7 +461,7 @@ def run(args):
                 require(meter['fallback_reason'] not in ('invalid_delta', 'http_409'), 'protocol mismatch refused offload')
                 require(meter['generated_tokens'] == step['output_tokens'], 'generation length differs from scenario')
                 captured = events.copy()
-                row = turn_record(arm, step, meter, first, total, prefix_hash(current['tokens']), captured[before:])
+                row = turn_record(arm, step, meter, first, total, prefix_hash(current['tokens']), captured[before:], sid)
                 cursors[arm] = len(captured)
                 row['stage'] = 'start' if initial else 'turn'
                 row['ttft_other_seconds'] = None if first is None else first - sum(row[k] for k in
@@ -488,6 +492,7 @@ def run(args):
                             app.decode.request('POST', f"/slots/{current['slot']}?action=restore", dict(filename=filename))
                             app.verified(sid, True)
                     start = time.monotonic()
+                    cursors[arm] = len(events.copy())
                 else:
                     start = time.monotonic()
                     sid, messages = call(arm, 'growing-' + uuid.uuid4().hex, base_messages(app, args.depth), initial, True)

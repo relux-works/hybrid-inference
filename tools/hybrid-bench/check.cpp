@@ -1,6 +1,8 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
+#ifdef LLAMA_HYBRID_SERVER_SNAPSHOTS
 #include "server-common.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -89,14 +91,18 @@ static void prefill_partition(llama_context * ctx, const std::vector<llama_token
     }
 }
 
+#ifdef LLAMA_HYBRID_SERVER_SNAPSHOTS
 static int check_snapshots(const hybrid::json & fixture, llama_model * model, bool gpu, const char * output) {
     const auto tokens = fixture.at("tokens").get<std::vector<llama_token>>();
     const int k = fixture.at("k");
     const auto paths = fixture.at("snapshots").get<std::vector<std::string>>();
     const auto hashes = fixture.at("snapshot_sha256").get<std::vector<std::string>>();
     require(paths.size() == 2 && hashes.size() == 2, "need hybrid and local snapshots");
-    auto hybrid_ctx = context(model, fixture.at("max_ctx"), gpu);
-    auto local_ctx = context(model, fixture.at("max_ctx"), gpu);
+    const int64_t max_ctx = fixture.at("max_ctx");
+    require(max_ctx > 0 && max_ctx <= 1048576 && uint64_t(max_ctx) >= tokens.size() + k + 2,
+            "invalid snapshot context capacity");
+    auto hybrid_ctx = context(model, max_ctx, gpu);
+    auto local_ctx = context(model, max_ctx, gpu);
     llama_context * contexts[] = {hybrid_ctx.get(), local_ctx.get()};
     for (size_t i = 0; i < 2; ++i) {
         require(hybrid::file_hash(paths[i].c_str()) == hashes[i], "snapshot checksum mismatch");
@@ -145,6 +151,7 @@ static int check_snapshots(const hybrid::json & fixture, llama_model * model, bo
     std::cout << result.dump() << '\n';
     return code;
 }
+#endif
 
 int main(int argc, char ** argv) {
     try {
@@ -191,7 +198,11 @@ int main(int argc, char ** argv) {
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         for (auto token : tokens) { require(token >= 0 && token < vocab, "invalid check token"); }
         if (fixture.contains("snapshots")) {
+#ifdef LLAMA_HYBRID_SERVER_SNAPSHOTS
             return check_snapshots(fixture, model.get(), gpu, argv[4]);
+#else
+            throw std::runtime_error("snapshot checker requires LLAMA_BUILD_SERVER=ON");
+#endif
         }
         const int ctx = ((tokens.size() + k + 257) / 256) * 256;
         auto imported = context(model.get(), ctx, gpu);
