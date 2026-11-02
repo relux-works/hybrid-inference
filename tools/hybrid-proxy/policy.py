@@ -20,6 +20,8 @@ class Policy:
     server_rate: float = 2000.0
     link_rate: float = 12_500_000.0
     fixed: float = 0.05
+    import_fixed: float = 0.0
+    import_per_token: float = 0.0
     kv_bytes: float = 32768.0
     state_bytes: float = 157_000_000.0
     eta: float = 0.85
@@ -29,12 +31,12 @@ class Policy:
 
     def __post_init__(self):
         values = [self.server_rate, self.link_rate, self.fixed, self.kv_bytes, self.state_bytes,
-                  self.eta, self.margin, self.hysteresis]
+                  self.eta, self.margin, self.hysteresis, self.import_fixed, self.import_per_token]
         values.extend(v for row in self.local_rates for v in row)
         if (not all(math.isfinite(v) for v in values)
                 or not self.local_rates or any(d < 0 or r <= 0 for d, r in self.local_rates)
                 or min(self.server_rate, self.link_rate, self.eta) <= 0
-                or min(self.fixed, self.kv_bytes, self.state_bytes, self.hysteresis) < 0
+                or min(self.fixed, self.kv_bytes, self.state_bytes, self.hysteresis, self.import_fixed, self.import_per_token) < 0
                 or not 0 <= self.margin < 1 or self.eta > 1):
             raise ValueError("invalid policy rates or bounds")
 
@@ -49,7 +51,7 @@ class Policy:
         if not math.isfinite(link) or link <= 0:
             raise ValueError("invalid measured link rate")
         local = delta / rate
-        remote = self.fixed + delta * server_factor / self.server_rate
+        remote = self.fixed + self.import_fixed + delta * (server_factor / self.server_rate + self.import_per_token)
         remote += (delta * self.kv_bytes + self.state_bytes) / (link * self.eta)
         threshold = 1 - self.margin + (self.hysteresis if previous else -self.hysteresis)
         return {"offload": delta > 0 and (self.always or remote < local * threshold),

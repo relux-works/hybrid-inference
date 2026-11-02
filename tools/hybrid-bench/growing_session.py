@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A paired growing session through the real proxy, with live-state checkpoints."""
 import argparse
+from array import array
 import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -27,6 +28,7 @@ from hybrid_bench import PROVENANCE, link_probe, sanitized_info, stream_chat, ve
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
 from proxy import Handler, Node, Proxy
+from policy import Policy
 from store import prefix_hash
 
 QUANTILES = [.10, .25, .50, .75, .90, .99]
@@ -159,15 +161,16 @@ class Events:
 
 
 class MeasuredNode(Node):
-    def __init__(self, *args, events, session, **kwargs):
+    def __init__(self, *args, events, session, source, **kwargs):
         super().__init__(*args, **kwargs)
         self.events = events
         self.session = session
+        self.source = source
 
     def request(self, method, path, data=None, headers=None, binary=False):
         started = time.monotonic()
         encoded = json.dumps(data).encode() if isinstance(data, (dict, list)) else data or b''
-        row = dict(kind='protocol', session=self.session, method=method, path=path, upload_body_bytes=len(encoded),
+        row = dict(kind='protocol', session=self.session, source=self.source, method=method, path=path, upload_body_bytes=len(encoded),
                    response_body_bytes=0, status='failed')
         if isinstance(data, dict) and path.endswith('/extend'):
             row.update(n0=data['n0'], n1=data['n0'] + len(data['tokens']),
@@ -212,7 +215,7 @@ class MeasuredProxy(Proxy):
 
     def remote(self, client):
         return MeasuredNode(self.prefill, client['prefill_token'], self.timeout, events=self.events,
-                            session=getattr(self.current, 'session', None))
+                            session=getattr(self.current, 'session', None), source=getattr(self.current, 'origin', 'background'))
 
     def sync(self, session, client, recreate=True):
         self.current.session = session['id']
@@ -230,7 +233,11 @@ class MeasuredProxy(Proxy):
 
     def prepare_session(self, client, body, session, tokens):
         self.current.session = session['id']
-        result = super().prepare_session(client, body, session, tokens)
+        self.current.origin = 'critical'
+        try:
+            result = super().prepare_session(client, body, session, tokens)
+        finally:
+            self.current.origin = 'background'
         result[0]['_bench']['decision'] = self.current.decision
         return result
 
@@ -307,7 +314,113 @@ def base_messages(app, depth):
     return body['messages']
 
 
-def checkpoint(app, client, root, turn, heterogeneous):
+def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1):
+    previous = True  # the base is explicitly offloaded
+    rows = []
+    for step in plan['sequence']:
+        delta = step['input_tokens'] + plan['framing_tokens'] - 1
+        choice = policy.choose(delta, step['conditioning_depth'], previous, policy.link_rate)
+        outage = bool(disconnect_turn and disconnect_turn <= step['turn'] < disconnect_turn + disconnect_turns)
+        rows.append(dict(turn=step['turn'], outage=outage, **choice))
+        previous = choice['offload'] and not outage
+    counts = dict(policy_local=sum(not r['offload'] and not r['outage'] for r in rows),
+                  policy_offload=sum(r['offload'] and not r['outage'] for r in rows))
+    require(all(counts.values()), 'route preflight refuses degenerate connected policy mix before any arm: ' + str(counts))
+    return dict(rows=rows, counts=counts, link_model='constant configured link; live EMA can change routes')
+
+
+def session_catchup(events, sid):
+    return [r for r in events if r.get('session') == sid and r.get('catchup') and r['status'] == 'ok']
+
+
+def route_counts(calls, events, disconnect):
+    rows = [r for r in calls if r['arm'] == 'hybrid' and r['stage'] == 'turn']
+    def connected(row):
+        return not (disconnect['turn'] and disconnect['turn'] <= row['turn'] < disconnect['turn'] + disconnect['turns'])
+    local = [r for r in rows if connected(r) and not r['decision']['result']['offload'] and not r['fallback_reason'] and r['path'] == 'local']
+    caught = []
+    for row in local:
+        ranges = session_catchup(events, row['session_id'])
+        # A prompt evaluated locally while connected must later be acknowledged by the node while connected.
+        end = row['meter']['prompt_depth']
+        if any(e['n0'] < end and e['n1'] > row['depth_before'] and
+               not any(d['kind'] == 'disconnect' and row['at_seconds'] <= d['at_seconds'] <= e['at_seconds'] for d in events)
+               for e in ranges):
+            caught.append(row['turn'])
+    fallbacks = {}
+    for row in rows:
+        if row['fallback_reason']:
+            reason = row['fallback_reason']
+            fallbacks[reason] = fallbacks.get(reason, 0) + 1
+    return dict(connected_policy_local=len(local),
+        connected_policy_offload=sum(connected(r) and r['decision']['result']['offload'] and r['path'] == 'offload' and not r['fallback_reason'] for r in rows),
+        fallbacks=fallbacks, connected_local_catchup_turns=caught,
+        background_catchup_events=sum(e.get('catchup') is True and e['status'] == 'ok' and e.get('source') == 'background' for e in events))
+
+
+def replay_schedules(trace, turn, depth):
+    client = trace.get('client', {})
+    require(client.get('batch', 256) == 256 and client.get('ubatch', 256) == 256 and
+            client.get('threads', 2) == 2 and client.get('threads_batch', 2) == 2,
+            'factorial replay requires primary local 256/256 and two threads')
+    calls = [r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] <= turn]
+    segments = []
+    def add_segment(n0, n1, kind):
+        if n1 > n0:
+            segments.append(dict(n0=n0, n1=n1, kind=kind))
+    n = 0
+    for row in calls:
+        require(row['depth_before'] == n, 'replay call boundaries do not tile')
+        prompt = row['meter']['prompt_depth']
+        add_segment(n, prompt, 'prompt')
+        add_segment(prompt, row['depth_after'], 'generated')
+        n = row['depth_after']
+    require(n == depth, 'replay checkpoint depth mismatch')
+    imports = [c for row in calls for c in row['meter']['chunks'] if c['status'] == 'imported']
+    require(imports, 'replay has no imported boundary')
+    last_import = imports[-1]['n1']
+    sid = calls[0].get('session_id')
+    if sid is None:
+        sid = next(r['session'] for r in trace['events'] if r.get('catchup') is False and r.get('n0') == 0 and r['status'] == 'ok')
+    node = []
+    n = 0
+    for event in trace['events']:
+        if (event.get('session') != sid or 'n0' not in event or event['status'] != 'ok' or event['n1'] > last_import):
+            continue
+        require(event['n0'] == n, 'node replay ranges do not tile')
+        for start in range(n, event['n1'], 256):
+            node.append(dict(n0=start, n1=min(start + 256, event['n1']), logits=True))
+        n = event['n1']
+    require(n == last_import, 'node replay missing last import')
+    def local(segment):
+        a, b = segment['n0'], segment['n1']
+        chunk = 256 if segment['kind'] == 'prompt' else 1
+        return [dict(n0=i, n1=min(i + chunk, b), logits=(min(i + chunk, b) == b or chunk == 1)) for i in range(a, b, chunk)]
+    schedules = {'A': [], 'B1': [], 'B2': [], 'B': list(node)}
+    for segment in segments:
+        schedules['A'].extend(local(segment))
+        for name, kind in (('B1', 'generated'), ('B2', 'prompt')):
+            if segment['kind'] != kind or segment['n0'] >= last_import:
+                schedules[name].extend(local(segment))
+                continue
+            for batch in node:
+                a, b = max(segment['n0'], batch['n0']), min(segment['n1'], batch['n1'])
+                if b > a:
+                    schedules[name].append(dict(n0=a, n1=b, logits=kind == 'generated' or b == batch['n1']))
+            if segment['n1'] > last_import:
+                schedules[name].extend(local(dict(segment, n0=last_import)))
+        if segment['n1'] > last_import:
+            schedules['B'].extend(local(dict(segment, n0=max(last_import, segment['n0']))))
+    for schedule in schedules.values():
+        n = 0
+        for step in schedule:
+            require(step['n0'] == n and 0 < step['n1'] - n <= 256, 'factorial replay does not tile')
+            n = step['n1']
+        require(n == depth and schedule[-1]['logits'], 'incomplete factorial replay')
+    return schedules
+
+
+def checkpoint(app, client, root, turn, heterogeneous, trace):
     saved = [app.saved[(arm, turn)] for arm in ('hybrid', 'local', 'local_partition')]
     hybrid, local, partition = saved
     require(hybrid['tokens'] == local['tokens'] == partition['tokens'], 'checkpoint journal mismatch between arms')
@@ -317,7 +430,8 @@ def checkpoint(app, client, root, turn, heterogeneous):
     result = scratch / 'result.json'
     private_json(fixture, dict(tokens=local['tokens'], k=64, max_ctx=client['context'],
         model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=heterogeneous,
-        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved]))
+        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
+        replay=replay_schedules(dict(trace, events=app.events.copy()), turn, len(local['tokens']))))
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
     process = start_process(command, scratch, 'checker')
@@ -328,7 +442,7 @@ def checkpoint(app, client, root, turn, heterogeneous):
     require(result.is_file(), 'checkpoint checker produced no metrics; inspect its log')
     row = json.loads(result.read_text())
     require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
-    require(row.get('status_rule') == 'session_partition_mean_or_position_p95', 'checkpoint partition band missing')
+    require(row.get('status_rule') == 'session_mean_kl_zero', 'checkpoint mean band missing')
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
     row.update(turn=turn, checker_exit_code=process.returncode,
                snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
@@ -337,37 +451,97 @@ def checkpoint(app, client, root, turn, heterogeneous):
     return row
 
 
+def validate_raw_positions(row, depth):
+    raw = row['raw_logits']
+    vocab = raw['vocab']
+    require(raw['dtype'] == 'float32-le' and type(vocab) is int and 1 <= vocab <= 1048576,
+            'invalid raw logits shape')
+    files = raw['files']
+    pairs = {'hybrid': ('L', 'H')}
+    if 'partition' in row:
+        pairs['partition'] = ('L', 'P')
+    if 'factorial' in row:
+        for name in row['factorial']:
+            left, right = name.split('-')
+            pairs[name] = (left, right)
+    handles = {}
+    metrics = {name: [] for name in pairs}
+    try:
+        for name in set(n for pair in pairs.values() for n in pair):
+            entry = files[name]
+            path = Path(entry['path'])
+            require(path.stat().st_size == 64 * vocab * 4 and sha256(path) == entry['sha256'],
+                    'raw checkpoint logits size or checksum mismatch')
+            handles[name] = path.open('rb')
+        for i in range(64):
+            vectors, normalizers, argmax = {}, {}, {}
+            for name, handle in handles.items():
+                values = array('f')
+                values.frombytes(handle.read(vocab * 4))
+                if sys.byteorder != 'little':
+                    values.byteswap()
+                require(len(values) == vocab and all(math.isfinite(v) for v in values), 'nonfinite raw logits')
+                peak = max(values)
+                vectors[name] = values
+                normalizers[name] = peak + math.log(math.fsum(math.exp(v - peak) for v in values))
+                argmax[name] = values.index(peak)
+            for name, (left, right) in pairs.items():
+                p, q = vectors[left], vectors[right]
+                pz, qz = normalizers[left], normalizers[right]
+                exact = p.tobytes() == q.tobytes()
+                kl = 0 if exact else max(0, math.fsum(math.exp(x - pz) * (x - pz - y + qz) for x, y in zip(p, q)))
+                metrics[name].append(dict(position=depth + i, exact=exact, top1_agreed=argmax[left] == argmax[right],
+                    kl_nats=kl, max_abs_logit_diff=max(abs(x - y) for x, y in zip(p, q))))
+    finally:
+        for handle in handles.values():
+            handle.close()
+    for name, positions in metrics.items():
+        measured = row if name == 'hybrid' else row['partition'] if name == 'partition' else row['factorial'][name]
+        require(len(measured['positions']) == 64, 'invalid checkpoint position count')
+        for got, expected in zip(measured['positions'], positions):
+            require(type(got['position']) is int and got['position'] == expected['position'] and
+                    type(got['top1_agreed']) is bool and got['top1_agreed'] == expected['top1_agreed'] and
+                    type(got['exact']) is bool and got['exact'] == expected['exact'] and
+                    math.isclose(got['kl_nats'], expected['kl_nats'], rel_tol=1e-8, abs_tol=1e-12) and
+                    got['max_abs_logit_diff'] == expected['max_abs_logit_diff'], 'checkpoint positions contradict raw logits')
+        values = [p['kl_nats'] for p in positions]
+        require(math.isclose(measured['mean_kl_nats'], math.fsum(values) / 64, rel_tol=1e-8, abs_tol=1e-12) and
+                math.isclose(measured['p95_kl_nats'], sorted(values)[60], rel_tol=1e-8, abs_tol=1e-12) and
+                measured['top1_agreed'] == sum(p['top1_agreed'] for p in positions) and
+                measured['exact'] == all(p['exact'] for p in positions) and
+                measured['max_abs_logit_diff'] == max(p['max_abs_logit_diff'] for p in positions),
+                'checkpoint summary contradicts raw logits')
+
+
 def validate_checkpoint(row, heterogeneous, depth):
     require(row['depth'] == depth and row['k'] == 64 and type(row['exact']) is bool and
-            0 <= row['top1_agreed'] <= 64 and math.isfinite(row['mean_kl_nats']) and row['mean_kl_nats'] >= 0 and
-            math.isfinite(row['max_abs_logit_diff']) and row['max_abs_logit_diff'] >= 0,
-            'invalid checkpoint metrics')
+            type(row['top1_agreed']) is int and 0 <= row['top1_agreed'] <= 64 and
+            math.isfinite(row['mean_kl_nats']) and row['mean_kl_nats'] >= 0 and
+            math.isfinite(row['max_abs_logit_diff']) and row['max_abs_logit_diff'] >= 0, 'invalid checkpoint metrics')
     require(not row['exact'] or (row['top1_agreed'] == 64 and row['mean_kl_nats'] == 0 and row['max_abs_logit_diff'] == 0),
             'checkpoint exactness contradicts measured distributions')
+    validate_raw_positions(row, depth)
+    require(type(row['free_running_first_divergence']) is int and -1 <= row['free_running_first_divergence'] < 64,
+            'invalid free-running result')
     accepted = row['exact']
-    if row.get('status_rule') == 'session_partition_mean_or_position_p95':
-        values = [p['local_partition_kl_nats'] for p in row['positions']]
-        require(len(values) == 64 and all(math.isfinite(v) and v >= 0 for v in values), 'invalid local partition positions')
-        band = sum(values) / 64
-        p95 = sorted(values)[60]
-        require(math.isclose(row['local_partition_mean_kl_nats'], band, abs_tol=1e-15) and
-                row['local_partition_p95_kl_nats'] == p95 and row['kl_limit'] == max(band, p95),
-                'invalid local partition band')
+    if row.get('status_rule') == 'session_mean_kl_zero':
+        band = row['partition']['mean_kl_nats']
+        p95 = row['partition']['p95_kl_nats']
+        require(row['local_partition_mean_kl_nats'] == band and row['local_partition_p95_kl_nats'] == p95 and
+                row['kl_limit'] == 0, 'invalid local partition band or zero KL limit')
         ratio = row['kl_to_partition_ratio']
         ratio_status = 'finite' if band > 0 else 'both_zero' if row['mean_kl_nats'] == 0 else 'zero_noise_band'
         require(row['kl_to_partition_ratio_status'] == ratio_status and
                 (math.isclose(ratio, row['mean_kl_nats'] / band, abs_tol=1e-12) if band > 0 else ratio is None),
                 'invalid KL to partition ratio')
-        require(type(row['free_running_first_divergence']) is int and -1 <= row['free_running_first_divergence'] < 64,
-                'invalid free-running result')
         accepted = row['mean_kl_nats'] <= row['kl_limit'] and row['top1_agreed'] >= 63 and row['free_running_first_divergence'] == -1
     status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
     require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict contradicts acceptance rule')
 
 
 def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id):
-    catchup = [r for r in events if r.get('session') == session_id and r.get('catchup') and r['status'] == 'ok']
-    return dict(arm=arm, turn=step['turn'], requested=step, journal_hash=journal_hash,
+    catchup = session_catchup(events, session_id)
+    return dict(arm=arm, turn=step['turn'], requested=step, journal_hash=journal_hash, session_id=session_id,
         ttft_seconds=ttft, total_seconds=total, decision=meter['decision'],
         depth_before=meter['depth_before'], depth_after=meter['depth_after'], new_tokens=meter['new_tokens'],
         generated_tokens=meter['generated_tokens'], path=meter['path'], fallback_reason=meter['fallback_reason'],
@@ -437,15 +611,19 @@ def run(args):
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
     size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
-    require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size,
+    raw_bytes = len(checkpoints) * 7 * 64 * client['model_layout']['vocab_size'] * 4
+    require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size + raw_bytes,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
     events = Events()
-    trace = dict(schema='hybrid-growing-session-v2', status='running', seed=args.seed, start=args.start,
+    trace = dict(schema='hybrid-growing-session-v3', status='running', seed=args.seed, start=args.start,
         depth=args.depth, turns=args.turns, workload=[], calls=[], checkpoints=[],
         provenance=dict(**PROVENANCE, depth_bins=DEPTH_BINS, pause_seconds=PAUSE,
-                        sampling='linear below p50, log-linear above; bounded at last published quantile'),
+                        sampling='linear below p50, log-linear above; bounded at last published quantile',
+                        table_sha256=sha256(Path(__file__).with_name('fixtures') / 'growing-provenance.json'),
+                        table_selector='source=agents.all; new_in_by_depth/gap_seconds/output_per_call',
+                        lower_half_limit='conditional input p25=median/2; measured global p25/median=0.20; tools differ from hybrid_bench p10 floor'),
         client=sanitized_info(client), node=sanitized_info(node), link=dict(label=args.link_label),
         disconnect=dict(turn=args.disconnect_turn, turns=args.disconnect_turns),
         driver=dict(source_sha256=sha256(__file__), proxy_sha256=sha256(Path(__file__).parents[1] / 'hybrid-proxy/proxy.py')),
@@ -507,6 +685,12 @@ def run(args):
         trace.update(depth=args.depth, depth_plan={k: v for k, v in plan.items() if k != 'sequence'},
                      workload=plan['sequence'], local_partition=dict(batch=args.partition_batch, ubatch=args.partition_ubatch))
         trace['policy'] = app.policy_config
+        trace['route_preflight'] = route_preflight(Policy(**app.policy_config), plan, args.disconnect_turn, args.disconnect_turns)
+        trace['engine'] = dict(extend_chunk_tokens=app.extend_chunk_tokens, delta_geometry=geometry,
+            node=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
+            checker=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
+            generation=dict(temperature=0, ignore_eos=True, enable_thinking=False))
+        flush()
         trace['heterogeneous'] = client['backend'] != node['backend']
         credential = config['client_credential']
         with proxy_server(app) as proxy_url:
@@ -531,6 +715,7 @@ def run(args):
                 row = turn_record(arm, step, meter, first, total, prefix_hash(current['tokens']), captured[before:], sid)
                 cursors[arm] = len(captured)
                 row['stage'] = 'start' if initial else 'turn'
+                row['at_seconds'] = time.monotonic() - events.started
                 row['ttft_other_seconds'] = None if first is None else first - sum(row[k] for k in
                     ('server_prefill_seconds', 'transfer_seconds', 'import_seconds', 'local_prefill_seconds', 'local_tail_seconds'))
                 if (arm, step['turn']) in app.saved:
@@ -603,14 +788,15 @@ def run(args):
                         require(row['path'] == 'local', 'offload accepted during disconnection')
                     if reconnect_events is not None and row['path'] == 'offload':
                         recovered = events.copy()[reconnect_events:]
-                        catchup = [r for r in recovered if r.get('catchup') and r['status'] == 'ok']
+                        recovered = [r for r in recovered if r.get('session') == sid]
+                        catchup = session_catchup(recovered, sid)
                         row['resync'] = dict(tokens=sum(r['n1'] - r['n0'] for r in catchup),
                             seconds=sum(r['seconds'] for r in recovered if r['kind'] == 'protocol' and r.get('catchup') is not False),
                             catchup_seconds=sum(r['seconds'] for r in catchup),
                             upload_body_bytes=sum(r['upload_body_bytes'] for r in catchup))
                         reconnect_events = None
                     if arm == 'local_partition' and turn in checkpoints:
-                        result = checkpoint(app, client, root, turn, trace['heterogeneous'])
+                        result = checkpoint(app, client, root, turn, trace['heterogeneous'], trace)
                         trace['checkpoints'].append(result)
                         flush()
                 events.add(kind='window', arm=arm, seconds=time.monotonic() - start)
@@ -620,9 +806,11 @@ def run(args):
                     headers={'Authorization': 'Bearer ' + credential})
                 with urllib.request.urlopen(request, timeout=args.request_timeout):
                     pass
-            paths = {r['path'] for r in trace['calls'] if r['stage'] == 'turn' and r['arm'] == 'hybrid'}
+            counts = route_counts(trace['calls'], events.copy(), trace['disconnect'])
+            trace['route_counts'] = counts
             trace['final_depth'] = previous
-            require(paths == {'local', 'offload'}, 'scenario did not exercise both policy routes')
+            require(counts['connected_policy_local'] and counts['connected_policy_offload'], 'scenario did not exercise both connected policy routes')
+            require(counts['connected_local_catchup_turns'], 'no connected policy-local prompt catch-up')
             require(not args.disconnect_turn or any(r.get('resync') for r in trace['calls']),
                     'no verified offload after reconnection')
             trace['status'] = ('failed' if any(r['status'] == 'failed' for r in trace['checkpoints']) else
@@ -641,7 +829,41 @@ def run(args):
     return trace
 
 
+def replay_from_trace(argv):
+    p = argparse.ArgumentParser(description='Factorial replay from retained private check tokens and public trace boundaries')
+    p.add_argument('--trace', required=True)
+    p.add_argument('--input', required=True)
+    p.add_argument('--turn', required=True, type=int)
+    p.add_argument('--output', required=True)
+    p.add_argument('--checker', required=True)
+    p.add_argument('--model', required=True)
+    p.add_argument('--gpu-layers', type=int, default=0)
+    args = p.parse_args(argv)
+    trace = json.loads(Path(args.trace).read_text())
+    source = read_private(args.input)
+    source = {key: source[key] for key in ('tokens', 'k', 'max_ctx', 'model_sha256', 'backend')}
+    source['replay'] = replay_schedules(trace, args.turn, len(source['tokens']))
+    root = Path(args.output).resolve()
+    require(not root.exists() and root.parent.is_dir(), 'replay output must be a new directory')
+    require(shutil.disk_usage(root.parent).free > 28e9 + 4 * 64 * trace['client'].get('model_layout', {}).get('vocab_size', 1048576) * 4,
+            'insufficient disk for replay logits above floor')
+    root.mkdir(mode=0o700)
+    private_json(root / 'input.json', source)
+    command = [Path(args.checker).resolve(), Path(args.model).resolve(), root / 'input.json', 'unused', root / 'result.json', args.gpu_layers]
+    process = start_process(command, root, 'checker')
+    try:
+        code = process.wait()
+    finally:
+        stop_process(process)
+    private_json(root / 'command.json', dict(command=[str(v) for v in command], pid=process.pid, exit_code=code,
+        trace_sha256=sha256(args.trace), retained_input_sha256=sha256(args.input)))
+    require(code == 0, 'factorial replay failed; see checker log')
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'replay':
+        return replay_from_trace(sys.argv[2:])
     if len(sys.argv) == 4 and sys.argv[1] == 'relay':
         asyncio.run(relay(int(sys.argv[2]), sys.argv[3]))
         return 0

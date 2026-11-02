@@ -1,0 +1,176 @@
+{
+  "source": {
+    "path": "data/measurements/ivmbp-2026-10-30/stats.json",
+    "sha256": "8c5f1f2c44e344b78d32d0b4c216d0ebdf2ecdae3cde0f1a983cb329e488e2a7",
+    "selector": "agents.all"
+  },
+  "new_in_by_depth": {
+    "<50k": {
+      "p50": 406.0,
+      "p90": 6215.0,
+      "mean": 1864.2,
+      "n": 93596
+    },
+    "50-100k": {
+      "p50": 197.0,
+      "p90": 5344.0,
+      "mean": 1547.8,
+      "n": 359291
+    },
+    "100-200k": {
+      "p50": 98.0,
+      "p90": 2329.0,
+      "mean": 876.7,
+      "n": 728595
+    },
+    "200k+": {
+      "p50": 222.0,
+      "p90": 1448.0,
+      "mean": 729.2,
+      "n": 324279
+    }
+  },
+  "gap_seconds": {
+    "p10": 0.2,
+    "p25": 3.8,
+    "p50": 7.8,
+    "p75": 17.9,
+    "p90": 34.8,
+    "p99": 340.0,
+    "mean": 129.7,
+    "n": 1511502
+  },
+  "output": {
+    "p10": 54.0,
+    "p25": 113.0,
+    "p50": 229.0,
+    "p75": 530.0,
+    "p90": 1135.0,
+    "p99": 4506.0,
+    "mean": 511.9,
+    "n": 1524671
+  },
+  "target_client": {
+    "source_file": "hybrid-bench-apple-m3-max-128g-q27b-q4km-q8kv-20261101T224904.jsonl",
+    "source_sha256": "35cde7b088eaec95166544d83f20ade79aaaa6d3d2132fe260bd43234df488dd",
+    "archive": "13bff62f (kit1.6.0, c21284cd, checkpoints0)",
+    "delta_turns": [
+      {
+        "level": 16000,
+        "delta": 512,
+        "prefill_tok_s": 171.4
+      },
+      {
+        "level": 16000,
+        "delta": 2000,
+        "prefill_tok_s": 175.8
+      },
+      {
+        "level": 16000,
+        "delta": 10000,
+        "prefill_tok_s": 161.9
+      },
+      {
+        "level": 50000,
+        "delta": 512,
+        "prefill_tok_s": 96.9
+      },
+      {
+        "level": 50000,
+        "delta": 2000,
+        "prefill_tok_s": 100.7
+      },
+      {
+        "level": 50000,
+        "delta": 10000,
+        "prefill_tok_s": 93.3
+      },
+      {
+        "level": 100000,
+        "delta": 512,
+        "prefill_tok_s": 54.9
+      },
+      {
+        "level": 100000,
+        "delta": 2000,
+        "prefill_tok_s": 59.6
+      },
+      {
+        "level": 100000,
+        "delta": 10000,
+        "prefill_tok_s": 47.3
+      },
+      {
+        "level": 150000,
+        "delta": 512,
+        "prefill_tok_s": 27.9
+      },
+      {
+        "level": 150000,
+        "delta": 2000,
+        "prefill_tok_s": 30.8
+      },
+      {
+        "level": 150000,
+        "delta": 10000,
+        "prefill_tok_s": 29.7
+      },
+      {
+        "level": 200000,
+        "delta": 512,
+        "prefill_tok_s": 21.9
+      },
+      {
+        "level": 200000,
+        "delta": 2000,
+        "prefill_tok_s": 26.3
+      },
+      {
+        "level": 200000,
+        "delta": 10000,
+        "prefill_tok_s": 20.7
+      },
+      {
+        "level": 249000,
+        "delta": 512,
+        "prefill_tok_s": 18.8
+      },
+      {
+        "level": 249000,
+        "delta": 2000,
+        "prefill_tok_s": 20.7
+      },
+      {
+        "level": 249000,
+        "delta": 10000,
+        "prefill_tok_s": 16.5
+      }
+    ]
+  },
+  "import_cost": {
+    "baseline": {
+      "gate": "measured",
+      "tokens": 39504,
+      "seconds": 42.4,
+      "bytes": 2004023525,
+      "source": "FACTS.md section3; pre-import-speed-v2 M3 Max 5G first call; actual old four-state-copy wire bytes",
+      "fixed_s": 0,
+      "seconds_token": 0.0010733090319967598,
+      "limitation": "One point cannot identify both intercept and slope; fixed0 is an assumption, not measured. Other Apple clients use this token rate as an estimate."
+    },
+    "import_speed_v2": {
+      "gate": "pending",
+      "source": "Mac gate not received; CPU 2.1-2.6x is not a Mac measurement"
+    },
+    "cuda_pr9": {
+      "gate": "measured",
+      "fixed_s": 1.618657356721653,
+      "seconds_token": 0.0004953084013066794,
+      "source": {
+        "path": "data/measurements/run14-2026-11-02/pr9/hybrid-bench-r13-27b-cuda-20261101T132757015879Z.jsonl",
+        "sha256": "b88f8fb440db84abbd48b9d5a606e07ec672b3ed11f16b73fef4a66ece82a634"
+      },
+      "limitation": "OLS across positive Q4 PR9 CUDA call imports; old repeated-state chunks; same PRO6000 hosts node and client; not a WAN rate or Mac calibration."
+    }
+  }
+}

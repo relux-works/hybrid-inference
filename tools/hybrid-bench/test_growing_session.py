@@ -1,4 +1,6 @@
 """Growing-session sampling and protocol refusal controls, without model downloads."""
+import copy
+from array import array
 import json
 from pathlib import Path
 import tempfile
@@ -33,28 +35,32 @@ class ScenarioTests(unittest.TestCase):
             with self.assertRaisesRegex(Refusal, 'D0=100000.*no turns truncated'):
                 growing.depth_plan(depth, 1000, 1, 10875, 4506, 340, 13)
 
-    # The session band accepts its boundary, but excess KL, top1<63, or any free-running divergence fails.
-    def test_checkpoint_partition_band(self):
+    # A single zero mean-KL limit rejects numerical excess at every checkpoint, irrespective of the partition tail.
+    @mock.patch.object(growing, "validate_raw_positions")
+    def test_checkpoint_partition_band(self, raw):
         values = [.001] * 60 + [.003] * 4
         mean = sum(values) / 64
-        row = dict(depth=1000, k=64, exact=False, top1_agreed=63, mean_kl_nats=.003,
+        row = dict(depth=1000, k=64, exact=False, top1_agreed=63, mean_kl_nats=0,
             max_abs_logit_diff=.8, status='passed', exit_code=0, free_running_first_divergence=-1,
             positions=[dict(local_partition_kl_nats=v) for v in values],
-            local_partition_mean_kl_nats=mean, local_partition_p95_kl_nats=.003, kl_limit=.003,
-            kl_to_partition_ratio=.003 / mean, kl_to_partition_ratio_status='finite',
-            status_rule='session_partition_mean_or_position_p95')
+            local_partition_mean_kl_nats=mean, local_partition_p95_kl_nats=.003, kl_limit=0,
+            partition=dict(mean_kl_nats=mean, p95_kl_nats=.003),
+            kl_to_partition_ratio=0, kl_to_partition_ratio_status='finite',
+            status_rule='session_mean_kl_zero')
         growing.validate_checkpoint(row, False, 1000)
         for fields in (dict(top1_agreed=62), dict(free_running_first_divergence=63),
-                       dict(mean_kl_nats=.003001, kl_to_partition_ratio=.003001 / mean)):
+                       dict(mean_kl_nats=.003001, kl_to_partition_ratio=.003001 / mean),
+                       dict(mean_kl_nats=.0001, kl_to_partition_ratio=.0001 / mean)):
             with self.assertRaises(Refusal):
                 growing.validate_checkpoint(dict(row, **fields), False, 1000)
             growing.validate_checkpoint(dict(row, **fields, status='failed', exit_code=3), False, 1000)
-        for fields in (dict(kl_limit=.01), dict(positions=[]), dict(local_partition_p95_kl_nats=.004),
-                       dict(kl_to_partition_ratio=1)):
+        for fields in (dict(kl_limit=.01), dict(local_partition_p95_kl_nats=.004),
+                       dict(kl_to_partition_ratio=2)):
             with self.assertRaises(Refusal):
                 growing.validate_checkpoint(dict(row, **fields), False, 1000)
         zero = dict(row, mean_kl_nats=0, local_partition_mean_kl_nats=0, local_partition_p95_kl_nats=0,
             positions=[dict(local_partition_kl_nats=0)] * 64, kl_limit=0,
+            partition=dict(mean_kl_nats=0, p95_kl_nats=0),
             kl_to_partition_ratio=None, kl_to_partition_ratio_status='both_zero')
         growing.validate_checkpoint(zero, False, 1000)
         with self.assertRaises(Refusal):
@@ -73,9 +79,10 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual((hybrid['catchup_tokens'], hybrid['catchup_seconds'], hybrid['catchup_upload_bytes']), (5, 2, 20))
 
     # Tiny KL and unchanged top-1 cannot satisfy exactness; malformed or weakened checker verdicts refuse.
-    def test_checkpoint_exactness_gate(self):
+    @mock.patch.object(growing, "validate_raw_positions")
+    def test_checkpoint_exactness_gate(self, raw):
         row = dict(depth=1000, k=64, exact=True, top1_agreed=64, mean_kl_nats=0,
-                   max_abs_logit_diff=0, status='passed', exit_code=0)
+                   max_abs_logit_diff=0, status='passed', exit_code=0, free_running_first_divergence=-1)
         growing.validate_checkpoint(row, False, 1000)
         failed = dict(row, exact=False, mean_kl_nats=.0001, max_abs_logit_diff=.1, status='failed', exit_code=3)
         growing.validate_checkpoint(failed, False, 1000)
@@ -84,6 +91,104 @@ class ScenarioTests(unittest.TestCase):
                         dict(row, k=63), dict(row, top1_agreed=63)):
             with self.assertRaises(Refusal):
                 growing.validate_checkpoint(changed, False, 1000)
+
+    # The r7r positions/summary mutant, max-diff lie, shifted positions and altered raw bytes cannot pass independent validation.
+    def test_checkpoint_raw_logits_reject_r7r_mutant(self):
+        from bench_common import sha256
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = {}
+            for name in ('L', 'H'):
+                path = root / (name + '.f32')
+                path.write_bytes(array('f', [2, 0] * 64).tobytes())
+                files[name] = dict(path=str(path), sha256=sha256(path))
+            row = dict(depth=1000, k=64, exact=True, top1_agreed=64, mean_kl_nats=0, p95_kl_nats=0,
+                max_abs_logit_diff=0, free_running_first_divergence=-1, status='passed', exit_code=0,
+                positions=[dict(position=1000+i, exact=True, top1_agreed=True, kl_nats=0, max_abs_logit_diff=0) for i in range(64)],
+                raw_logits=dict(dtype='float32-le', vocab=2, files=files))
+            growing.validate_checkpoint(row, False, 1000)
+            mutants = []
+            mutant = copy.deepcopy(row)
+            for p in mutant['positions']:
+                p.update(kl_nats=9.9, top1_agreed=False)
+            mutants.append(mutant)
+            mutants.append(dict(row, max_abs_logit_diff=12345))
+            mutant = copy.deepcopy(row)
+            mutant['positions'][0]['position'] += 1
+            mutants.append(mutant)
+            mutants.append(dict(row, mean_kl_nats=.01))
+            mutants.append(dict(row, top1_agreed=63))
+            for mutant in mutants:
+                with self.assertRaisesRegex(Refusal, 'contradict'):
+                    growing.validate_checkpoint(mutant, False, 1000)
+            path.write_bytes(array('f', [1, 0] * 64).tobytes())
+            with self.assertRaisesRegex(Refusal, 'checksum'):
+                growing.validate_checkpoint(row, False, 1000)
+            # Non-exact valid logits exercise the KL calculation, rather than an always-rejecting or equality-only validator.
+            files['H']['sha256'] = sha256(path)
+            # KL(softmax([2,0]) || softmax([1,0])) = 0.0671307544531327 nats.
+            kl = 0.0671307544531327
+            changed = dict(row, exact=False, mean_kl_nats=kl, p95_kl_nats=kl, max_abs_logit_diff=1, status='failed', exit_code=3,
+                positions=[dict(position=1000+i, exact=False, top1_agreed=True, kl_nats=kl, max_abs_logit_diff=1) for i in range(64)])
+            growing.validate_checkpoint(changed, False, 1000)
+
+    # The checked-in measured table binds each depth bin and all pause/output quantiles to the source selector.
+    def test_sampling_table_provenance(self):
+        table = json.loads((Path(__file__).parent / 'fixtures/growing-provenance.json').read_text())
+        self.assertEqual(table['source']['sha256'], growing.PROVENANCE['sha256'])
+        self.assertEqual([(r[1],r[2]) for r in growing.DEPTH_BINS],
+            [(v['p50'],v['p90']) for v in table['new_in_by_depth'].values()])
+        keys = ['p10','p25','p50','p75','p90','p99']
+        self.assertEqual(growing.PAUSE,[table['gap_seconds'][k] for k in keys])
+        self.assertEqual(growing.OUTPUT,[table['output'][k] for k in keys])
+
+    # Equal-rate and always-remote plans refuse before arms; the bounded smoke has connected policy-local and offload decisions.
+    def test_route_preflight_rejects_degenerate(self):
+        plan = growing.depth_plan(128, 12, 281, 48, 128, 0, 14, 4096)
+        for policy in (Policy(local_rates=[[0,2000]], server_rate=2000), Policy(always=True)):
+            with self.assertRaisesRegex(Refusal, 'degenerate connected policy mix before any arm'):
+                growing.route_preflight(policy, plan, 4, 2)
+        result = growing.route_preflight(Policy(local_rates=[[0,10]], fixed=4, link_rate=1e12), plan, 4, 2)
+        self.assertEqual(result['counts'], dict(policy_local=2, policy_offload=8))
+        self.assertAlmostEqual(sum(r['output_tokens'] for r in plan['sequence']) / plan['growth'], .6386422976501306)
+
+    # Outage fallbacks alone never establish policy-local coverage; only this session's connected catch-up counts.
+    def test_route_count_separates_outage_fallback(self):
+        def call(turn, local=False, fallback=None):
+            return dict(arm='hybrid', stage='turn', turn=turn, path='local' if local or fallback else 'offload',
+                decision=dict(result=dict(offload=not local)), fallback_reason=fallback, depth_before=100,
+                meter=dict(prompt_depth=120), session_id='hybrid', at_seconds=turn)
+        calls = [call(1), call(4, fallback='transport')]
+        events = [dict(kind='protocol', session='other', catchup=True, status='ok', n0=100, n1=130, at_seconds=3)]
+        counts = growing.route_counts(calls, events, dict(turn=4, turns=2))
+        self.assertEqual(counts['connected_policy_local'], 0)
+        self.assertEqual(counts['fallbacks'], {'transport':1})
+        calls.append(call(2, local=True))
+        self.assertEqual(growing.route_counts(calls, events, dict(turn=4, turns=2))['connected_local_catchup_turns'], [])
+        events[0]['session'] = 'hybrid'
+        self.assertEqual(growing.route_counts(calls, events, dict(turn=4, turns=2))['connected_local_catchup_turns'], [2])
+        # A reconnect-only catch-up cannot stand in for the connected path.
+        events[0]['at_seconds'] = 6
+        events.append(dict(kind='disconnect', at_seconds=4))
+        self.assertEqual(growing.route_counts(calls, events, dict(turn=4, turns=2))['connected_local_catchup_turns'], [])
+
+    # Factorial cells preserve whole flat batches only in B and reject missing node ranges before a checker starts.
+    def test_factorial_schedule_boundaries(self):
+        calls = [dict(arm='hybrid', turn=0, depth_before=0, depth_after=8, session_id='h',
+            meter=dict(prompt_depth=4, chunks=[dict(n0=0,n1=3,status='imported')])),
+            dict(arm='hybrid', turn=1, depth_before=8, depth_after=12, session_id='h',
+            meter=dict(prompt_depth=10, chunks=[dict(n0=8,n1=9,status='imported')]))]
+        events = [dict(session='h', status='ok', n0=a, n1=b) for a,b in ((0,3),(3,8),(8,9))]
+        trace = dict(calls=calls, events=events)
+        cells = growing.replay_schedules(trace,1,12)
+        with self.assertRaisesRegex(Refusal, 'primary local 256/256'):
+            growing.replay_schedules(dict(trace, client=dict(batch=64, ubatch=32)),1,12)
+        self.assertIn(dict(n0=4,n1=8,logits=True), cells['B1'])
+        self.assertIn(dict(n0=3,n1=8,logits=True), cells['B'])
+        self.assertNotIn(dict(n0=3,n1=8,logits=True), cells['B1'])
+        self.assertIn(dict(n0=0,n1=3,logits=True), cells['B2'])
+        with self.assertRaisesRegex(Refusal, 'do not tile'):
+            growing.replay_schedules(dict(trace,events=events[1:]),1,12)
 
     # Both depth bands use their published quantiles; caps and a fixed seed remain visible and reproducible.
     def test_conditioned_sequence_and_caps(self):

@@ -37,6 +37,15 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.choose(1, 0, link_rate=float("inf"))
 
+    # Import intercept and slope enter the remote estimate once; invalid costs cannot silently reverse the policy.
+    def test_import_cost(self):
+        base = Policy().choose(100, 0)
+        charged = Policy(import_fixed=1.6, import_per_token=.00052).choose(100, 0)
+        self.assertAlmostEqual(charged['offload_seconds'] - base['offload_seconds'], 1.652)
+        for fields in ({'import_fixed':-1}, {'import_per_token':float('nan')}, {'import_per_token':-.1}):
+            with self.assertRaises(ValueError):
+                Policy(**fields)
+
     def test_hysteresis_and_depth(self):
         policy = Policy(local_rates=((0, 100), (1000, 10)), server_rate=1000,
                         fixed=0.8, kv_bytes=0, state_bytes=0)

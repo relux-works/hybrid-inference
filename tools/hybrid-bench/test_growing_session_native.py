@@ -56,6 +56,33 @@ def checkpoint_controls(build, model, root):
             print('PASS ' + name + ': exit ' + str(code), flush=True)
 
 
+def preflight_controls(state, root, config):
+    commands = []
+    for name, policy in (('all-local', dict(config['policy'], local_rates=[[0,2000]])),
+                         ('all-remote', dict(config['policy'], always=True))):
+        policy_file = root / (name + '-policy.json')
+        private_json(policy_file, policy)
+        output = root / name
+        command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
+            '--output', str(output), '--depth', '128', '--turns', '12', '--disconnect-turn', '4',
+            '--disconnect-turns', '2', '--max-new', '48', '--max-output', '128', '--pause-cap', '0', '--seed', '281',
+            '--policy', str(policy_file), '--link-label', 'CPU preflight negative control']
+        with (root / (name + '.log')).open('wb') as log:
+            process = subprocess.Popen(command, stdout=log, stderr=log)
+            (root / (name + '.pid')).write_text(str(process.pid) + '\n')
+            try:
+                code = process.wait()
+            finally:
+                stop_process(process)
+        commands.append(dict(name=name, command=command, pid=process.pid, exit_code=code))
+        private_json(root / ('preflight-' + name + '-command.json'), commands[-1])
+        trace = json.loads((output / 'trace.json').read_text())
+        # A real decoder/tokenizer is allowed to initialize, but neither base nor measured arm may execute.
+        require(code == 2 and trace['calls'] == [] and trace['status'] == 'aborted' and
+                'degenerate connected policy mix before any arm' in trace['reason'], 'preflight refused for an unrelated reason')
+        print('PASS preflight ' + name + ': exit2, zero arm calls', flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir', required=True)
@@ -86,13 +113,14 @@ def main():
         private_json(state / 'client-info.json', client)
         private_json(state / 'proxy-config.json', config)
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
+        preflight_controls(state, root, config)
         commands = []
         for start in ('cold', 'pre-staged'):
             output = root / start
             command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
                 '--output', str(output), '--depth', '128', '--turns', '12', '--disconnect-turn', '4',
-                '--disconnect-turns', '2', '--max-new', '64', '--max-output', '2', '--pause-cap', '0',
-                '--start', start, '--link-label', 'CPU loopback, explicit smoke caps']
+                '--disconnect-turns', '2', '--max-new', '48', '--max-output', '128', '--pause-cap', '1.1', '--seed', '281',
+                '--start', start, '--link-label', 'CPU loopback; sampled output capped128/input48 seed281; synthetic policy']
             with (root / (start + '.log')).open('wb') as log:
                 process = subprocess.Popen(command, stdout=log, stderr=log)
                 (root / (start + '.pid')).write_text(str(process.pid) + '\n')
@@ -105,7 +133,9 @@ def main():
             # Three live sessions preserve their journals through both routes and the actual relay outage.
             require(len(calls) == 36 and trace['status'] in ('passed', 'failed'), 'incomplete three-arm session')
             hybrid = [r for r in calls if r['arm'] == 'hybrid']
-            require({r['path'] for r in hybrid} == {'local', 'offload'}, 'missing routing branch')
+            require(trace['route_counts']['connected_policy_local'] >= 2 and trace['route_counts']['connected_policy_offload'] >= 1, 'missing connected policy routing branch')
+            require(trace['route_counts']['connected_local_catchup_turns'], 'connected local catch-up missing')
+            require(trace['route_counts']['background_catchup_events'], 'background replay path missing')
             require(all(r['path'] == 'local' for r in hybrid if 4 <= r['turn'] < 6), 'offload during outage')
             require(any(r.get('resync', {}).get('tokens', 0) > 0 for r in hybrid), 'no recovered journal catch-up')
             require([r['turn'] for r in trace['checkpoints']] == [10, 12], 'checkpoint missing')
@@ -120,7 +150,7 @@ def main():
                     len(trace['workload']) == 12, 'depth plan or sequence changed')
             print('OBSERVED ' + start + ': ' + trace['status'] + '; driver exit ' + str(code), flush=True)
         require(sha256(model) == digest, 'model file changed')
-    require(all(r['exit_code'] == 0 for r in commands), 'same-backend session partition criterion is not qualified')
+    require(all(r['exit_code'] == 0 for r in commands), 'same-backend zero mean-KL criterion is not qualified')
     print('PASS all native growing-session checks; CPU only, no downloads', flush=True)
 
 
