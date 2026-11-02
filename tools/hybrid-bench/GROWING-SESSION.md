@@ -130,13 +130,13 @@ Repeat with `--start cold` and a new output directory to include initial fill. U
 
 ### R43 merged-head admission
 
-Use the signed `m3-growing-session` r43 merge of reviewed `57e3a23229` with main `9348ecd6bcae02b99dca938b84b6ff312306ba5e`, including PRs #14, #15 and #16. The [r43 results and landing note](RESULTS-hybrid-b-r36-261102.md#r43-current-main-merge-before-the-mac-run) identify the exact tested merge head; `.temp/r43/delivery.json` and `.temp/r43/landing-note.md` bind the final local handoff head. The operator supplies that full SHA as `R43_HEAD` on both hosts. Rebuild node, proxy, decoder and checker together; old prefill/client build receipts and policies do not establish qualification of the merged code.
+Use the signed `m3-growing-session` r43 merge of reviewed `57e3a23229` with main `9348ecd6bcae02b99dca938b84b6ff312306ba5e`, including PRs #14, #15 and #16. The exact tested source merge is `e0573bb2a3d0812d1eaa0b55cfa34a7b5f01fef5`; its qualification successor changes documentation only. The [r43 results and landing note](RESULTS-hybrid-b-r36-261102.md#r43-current-main-merge-before-the-mac-run) identify the exact tested merge head; `.temp/r43/delivery.json` and `.temp/r43/landing-note.md` bind the final local handoff head. The operator supplies that full SHA as `R43_HEAD` on both hosts. Rebuild node, proxy, decoder and checker together; old prefill/client build receipts and policies do not establish qualification of the merged code.
 
 ```sh
 # On both operator hosts, after importing the signed local branch through the operator's SSH channel:
 test "$(git rev-parse HEAD)" = "$R43_HEAD"
 git merge-base --is-ancestor 9348ecd6bcae02b99dca938b84b6ff312306ba5e HEAD
-git merge-base --is-ancestor 57e3a23229 HEAD
+git merge-base --is-ancestor e0573bb2a3d0812d1eaa0b55cfa34a7b5f01fef5 HEAD
 git log -1 --format='%H %G?'
 ```
 

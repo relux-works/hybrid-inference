@@ -679,3 +679,92 @@ Failed/corrected controls are retained. The first new native regression exits1 b
 At 2026-11-02T06:43:50.285400+00:00, cleanup verified every recorded task runtime PID inactive, removed the owned build tree and remaining native snapshots/deltas/slot states and expired fixture credentials. Minimum observed free disk was **28.653256704 GB**; cleanup readback **30.737817600 GB**. Logs, hashes, exact token journals, raw-logit evidence and command/PID/exit records remain private under `.temp/r42/`; sealed byte-identical files may share inodes. Incoming rehearsal files, models, other branches/worktrees and foreign processes are preserved.
 
 All four requested task rows are covered by the reproduction, independent streaming/cap controls, native multi-chunk/offload/recovery regression, and fresh r41 smoke/report. No surface table was supplied (brief gap); no requested row is excluded. Runtime/test scope outside tools/hybrid-bench is the owning proxy snapshot/recovery implementation and tests, with its operator documentation; root README links the new command and the existing unresolved-questions entry now states the r41 gate. Private scope/security/general/tests/approach self-review is `self-review.md`. Ready for review; the GPU rehearsal must be repeated on the reviewed signed head before hardware acceptance.
+
+
+## r43: current-main merge before the Mac run
+
+Run `hybrid-b-r43-261102` continues the owner-designated r36 worktree and `m3-growing-session`. The signed source merge is **`e0573bb2a3d0812d1eaa0b55cfa34a7b5f01fef5`**, with exact parents `57e3a23229103e2a3ed50fd578137e47eef993dc` and `9348ecd6bcae02b99dca938b84b6ff312306ba5e`. The qualification successor changes this report and the runbook only. The final local branch tip, signatures, exact title/body and source-bundle digest are recorded after signing in [the local landing note](../../.temp/r43/landing-note.md) and `.temp/r43/delivery.json`. No push or hosted PR was performed.
+
+### Conflicts and compatibility resolutions
+
+There were exactly three conflicted paths, one conflict region in each:
+
+| Path | Resolution |
+|---|---|
+| `README.md` | Retain the growing-session commands/gate and main's import profiling, SWA/final-state chunk and vLLM guidance. |
+| `UNRESOLVED_QUESTIONS.md` (add/add) | Retain both topic sets; reconcile the stale experiment paragraph to the reviewed r41 report-only free-divergence rule. |
+| `tools/hybrid-bench/check.cpp` | Combine main's `swa_full=false` with experiment-configured thread count. |
+
+The automatic proxy merge retains main's protocol2 transaction, aligned exports/local tails and r42 streamed snapshot capture/recovery. The semantic resolution in the added CHAIN probe uses `delta_import` to stage attention-only chunks and apply the complete transfer only after the final recurrent/SWA fixed-state chunk. A borrowed view reads the live wire, then the transaction owns that wire through apply; no temporary view or body copy is used in that probe. Missing final chunks refuse before decode, snapshot/roundtrip/component operations or probe completion. Main's core importer, accelerated hashing, server and vLLM sources are unchanged from9348ecd6.
+
+The r42 regression now checks that the original committed prefix stays unchanged through all non-final stages, followed by one final commit. It preserves the original entrypoint and adds native complete/missing-final/interrupted/corrupt CHAIN cases. The complete four-chunk CHAIN comparison is a bounded one-position full-vocabulary observation; the admission smoke below keeps the original64-position checks. The full Python driver, native gate block and all ten exact-control definitions are byte-identical to reviewed57e3a232 (`unchanged-gate.json`); original reviewer test names and unit source files remain (`preserved-reviewer-tests.json`). No acceptance threshold or control was weakened.
+
+### Diff comparison
+
+The original reviewed patch is `git diff --binary 528724c9..57e3a232`. An independent alternate index was seeded at pinned main, that patch was applied with3-way handling, and only the three conflict resolutions plus native regression/runbook/report resolutions were admitted. Expected and actual complete source trees match **`587709a85d75df7564fb8b2b0d1cc774dcea2ecb`**; the main-to-source-merge binary patch SHA-256 is **`f9e4da26aded8ec26a48e06d31803270ccff7b0b5c8c42f3e2c710d929edc2d5`** (`comparison-04.log`, `source-merge-comparison.json`, `source-main-to-merge.patch`). This checks every automatically merged file, not just conflict markers. The main-to-candidate path set equals the original17 reviewed branch paths.
+
+The complete `src/`, `tools/server/`, `vendor/` and `tools/hybrid-vllm/` trees equal main; `tools/hybrid/` differs only by the reviewed server-aware checker CMake linkage. The final comparison repeats the alternate-index equality including the two documentation files in the qualification successor (`merge-comparison.json`, `main-to-candidate.patch`). It binds `git diff 9348ecd6..HEAD` to the reviewed patch plus those explicit resolutions.
+
+### CPU validation
+
+Evidence root: `.temp/r43/`. Each named command has a direct-process argv/PID/actual-exit record and numbered log. CMake4.4.4, GCC15.2.0, Python3.14.4, Release/native CPU, CUDA/Metal/Vulkan OFF. Builds were serial under the shared model-cache lock, after `pgrep -u agent cc1plus` returned1 and `uptime` was recorded; compilation used nice19 and at most-j4. The separate clean reference checkout was exact9348ecd6. No GPU or model download. Every child used on-disk `TMPDIR` and `PYTHONDONTWRITEBYTECODE=1`.
+
+| Command / suite | Actual result | Evidence stem |
+|---|---|---|
+| Candidate configure / two serial target builds / native vLLM helper | 0 /0 /0 /0 | `cpu-01-build-record`, `cpu-02-build-record` |
+| Clean pinned-main reference build, corrected attempt | 0 | `reference-build-driver-02`, `cpu-reference-02-build-record` |
+| Benchmark discovery, final test source and SWA enabled | 0;107 tests, six optional native-header skips | `bench-02` |
+| Native header identity, covers all six skips | 0;12 tests | `identity-01` |
+| Proxy discovery | 0;126 tests | `proxy-01` |
+| vLLM CPU adapter/converter/launch/native serialization | 0;67 tests, one optional torch skip | `vllm-01` |
+| Codec, SWA allocated-cache/tiny-model and server components | 0 each | `codec-01`, `swa-01`, `server-components-01` |
+| Q4/Q8 fresh+append four-chunk import, interruption/rollback and wire lifetime | 0 each | `chunks-q4-01`, `chunks-q8-01` |
+| Automatic and forced-portable full-file hash and NI harness | 0 each;4+8 cases in each mode | `auto-hash-01`, `auto-hash-ni-01`, `portable-hash-01`, `portable-hash-ni-01` |
+| Independent main/candidate native import identity | 0;Q4/Q8 x512/8192 xfresh/append, full state and64-position full-vocabulary logits equal | `import-identity-01`, `reference-build-identity.json` |
+| Capacity/neighbor preservation and malformed/SWA guards | 0 each | `capacity-01`, `guards-01` |
+| Real native HTTP/proxy and transaction/restart tests | 0 each | `native-http-01`, `remote-chunks-01` |
+| Focused integrated chunk/noise and reference scoring | 0 each;original intended2/3/heterogeneous5 subcommands retained | `integrated-chunk-01`, `integrated-noise-01`, `reference-native-01` |
+| Four-chunk pre-stage, two-chunk next offload, streamed ahead-state recovery | 0;repeated in full harness | `multi-native-02`, `native-01/multi-chunk/` |
+| Full admission harness / cold / pre-staged | 0 /0 /0;four checkpoints0 | `native-01`, `native-01/commands.json` |
+| Nine original instrument controls / two route preflights | Three0 +six intended2 /two intended2, zero calls | `native-01/checkpoint-controls/`, `preflight-*-command.json` |
+| Source/binary/raw/hash/journal/gate/flag/route audit | 0 | `audit-01`, `measurements.json` |
+| Gate identity/reviewer names/Python AST-ASCII/model naming/whitespace/runbook shell syntax | 0 each | Corresponding numbered logs; nine shell blocks syntax-checked only |
+
+The exact main/candidate import comparison uses task-local version2 envelope headers with native bodies/checksums unchanged (`golden-conversion.json`); shared golden files/models were never edited. NumPy2.4.2 was installed from the cached wheel with `--only-binary=:all: --no-deps` into a task-local venv, as the vLLM guide requires. It was removed after the suite. No torch/vLLM/GPU installation was attempted. The optional torch-CPU case and real tensor gather/CUDA arithmetic remain unrun; CPU fake-backend/NumPy/native serialization evidence does not qualify a vLLM GPU.
+
+The complete multi-chunk replay exits0 and exactly matches node-partition replay at its bounded observation. `chunk_replay_controls:missing-final`, `:decode-before-final` and `:corrupt` each actually exit2 with the named missing-final/checksum refusal and no result file. Fresh/append native chunk tests additionally retain original-prefix/neighbor bytes, late-apply rollback, stale staging and owned-wire lifetime controls. The above513MiB synthetic snapshot transport test is included in benchmark discovery. Existing r41 discrimination evidence is reused only for the byte-identical gate/control functions; the full native checks are fresh.
+
+### Fresh r41 smoke
+
+Both starts have39 calls (base plus12 turns for each of three arms), paired exact journals, connected policy-local and offload routing, connected prompt catch-up/background replay, two outage turns and recovered catch-up. The fixture is the existing local0.8B Q4_0 model,4096 context, seed281, D0=128, input cap48/output cap128 and synthetic policy. It is not the40-turn production Mac workload.
+
+| Start | Turn / depth | L-H mean KL | p95 KL | Max logit difference | Top-1 /64 | Free divergence | True fidelity flags | Exit |
+|---|---|---|---|---|---|---|---|---|
+| cold | 10 / 1679 | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | 64 | -1 | mean_kl_nats, p95_kl_nats | 0 |
+| cold | 12 / 2043 | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | 63 | 0 | none | 0 |
+| pre-staged | 10 / 1679 | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | 64 | -1 | mean_kl_nats, p95_kl_nats | 0 |
+| pre-staged | 12 / 2043 | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | 63 | 0 | none | 0 |
+
+All ten controls pass at all four checkpoints: NODE-B, RESTORE-B, BSTATE-B, NODE_RANGE-B, OWN_NATIVE-A, OWN_RANGE-A, CHAIN-H, CHAIN_ATTENTION-B, CHAIN_RECURRENT-H and A-L. The audit re-hashes full raw files, checks each exact-control pair's identical SHA, paired journals, event captures and independent fidelity flags. L-H top-1>=63/64 is the sole L-H gate. Free divergence0 at turn12 is retained as an observation and does not fail r41. Full L-H and A-B1/A-B2/A-B/B-H metrics remain in `measurements.json` and native results.
+
+### Resource exception and cleanup
+
+**The owner's28GB disk floor was breached.** The actual minimum was27,640,320,000bytes (27.64032GB) while raw checkpoint output overlapped the independent reference build and HTTP tests. The reference build's own guard stopped its recorded process tree at28,286,640,128bytes (driver1); another runtime writer continued. This is a failed operational control, not a passing resource-admission result.
+
+Closed-file writer census, independent source/destination SHA checks and hardlink replacement of only closed, byte-identical task raw files recovered space without removing numerical evidence. Early raw dedup reclaimed1,589,248,000bytes; completed HTTP states added441,202,680bytes. The corrected observer deduplicates closed files before result publication and preserves the original minimum. Consumed cold captures were removed only after the cold child exited and its trace/checkpoints validated; their hashes remain in `cold-state-cleanup.json`. No foreign process/state/model was changed. The resource breach cannot be retroactively described as compliance.
+
+Corrected-phase minimum: **31427072000bytes**. Final cleanup readback: **33199738880bytes**. Owned builds, remaining large native states and expired fixture credentials were removed after source/binary/hash/PID evidence was captured; raw logits, command records, logs and hashes remain. All recorded task runtime/build PIDs are inactive. The temporary pinned-main worktree and NumPy venv were removed.
+
+Other failed/corrected attempts remain recorded: the first new replay harness exits1 because `private_json` is create-only and its command ledger was reused; per-case ledgers correct that harness setup, and `multi-native-02` plus the full harness pass. The first independent patch application refuses the add/add root document; handling that declared conflict separately produces only the expected README/checker conflicts and full tree equality. Neither failure is counted as a product pass. The reference build's disk-stop failure and later successful resume are both retained.
+
+### Mac runbook and landing note
+
+The [r43 Mac admission section](GROWING-SESSION.md#r43-merged-head-admission) pins the source merge, requires rebuilding all roles together, verifies ancestry/source/GGUF/library identity and protocol2/final-state chunks, and preserves per-chunk streamed snapshots, outage/resync and all ten controls. Native CUDA remains the node for this scenario; inclusion of PR#16 does not silently select vLLM. Mac economics require a new multi-point M3 import fit on this source. The owner's earlier GPU40-turn rehearsal and4.3s mean import are prior-head context, not a merged-head or M3 measurement. Tokens move only over the operator's SSH channel into0600 files; no token values in messages, arguments, exports or bundles.
+
+Landing title: **Merge current main into the growing-session Mac rehearsal**
+
+Landing body: Merge reviewed growing-session57e3a232 with main9348ecd6, retaining PR#14 atomic final-state chunks/SWA, PR#15 borrowed imports/fast hashing and PR#16 node code. Resolve the three documented conflicts, replay CHAIN through atomic imports and preserve the r41 gate/ten controls. Fresh CPU suites, independent main/candidate import identities, multi-chunk/offload/recovery and cold/pre-staged admission pass. The Mac runbook requires fresh merged-source calibration and operator-only SSH credential delivery. Report the27.64032GB disk-floor breach explicitly; no GPU/Mac, model download, push or hosted PR was performed.
+
+Exact signed merge head: **`e0573bb2a3d0812d1eaa0b55cfa34a7b5f01fef5`**. The docs-only qualification successor and its exact final branch head are bound in `.temp/r43/delivery.json` and [the landing note](../../.temp/r43/landing-note.md) after signing; use that final head for operator checkout. Both commits preserve the reviewed signed objects.
+
+Private scope/security/general/tests review: `.temp/r43/self-review.md`. No formal surface table or separate landing-property suite was supplied (brief gap); no requested row is excluded. ty/editorconfig-checker/clang-format are unavailable and unrun. Full hosted/all-backend CI, GPU/Metal, production27B/SWA,100k/deep, real vLLM GPU gather and physical-link performance remain unrun. Ready for independent review with the operational disk exception explicit; CPU admission does not qualify the Mac run.
