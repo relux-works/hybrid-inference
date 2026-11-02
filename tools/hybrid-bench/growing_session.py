@@ -441,7 +441,7 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     scratch.mkdir(mode=0o700)
     fixture = scratch / 'input.json'
     result = scratch / 'result.json'
-    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'],
+    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'], acceptance_rule='session_append_replay_exact',
         model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=heterogeneous,
         snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
         replay=replay_schedules(dict(trace, events=app.events.copy()), turn, len(local['tokens'])))
@@ -458,7 +458,7 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     require(result.is_file(), 'checkpoint checker produced no metrics; inspect its log')
     row = json.loads(result.read_text())
     require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
-    require(row.get('status_rule') == 'session_mean_kl_zero', 'checkpoint mean band missing')
+    require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
     row.update(turn=turn, checker_exit_code=process.returncode,
                snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
@@ -579,6 +579,36 @@ def validate_raw_positions(row, depth):
                 'checkpoint summary contradicts raw logits')
 
 
+def append_replay_controls(row):
+    controls = {}
+    pairs = [('NODE', 'B'), ('RESTORE', 'B'), ('BSTATE', 'B'), ('NODE_RANGE', 'B'),
+             ('OWN_NATIVE', 'A'), ('OWN_RANGE', 'A'), ('CHAIN', 'H'),
+             ('CHAIN_ATTENTION', 'B'), ('CHAIN_RECURRENT', 'H')]
+    require(set(name for name, _ in pairs) <= row.get('probes', {}).keys() and
+            'A-L' in row.get('factorial', {}), 'missing append replay controls')
+
+    def exact(metric):
+        return (metric['exact'] is True and metric['max_abs_logit_diff'] == 0 and metric['mean_kl_nats'] == 0 and
+                metric['top1_agreed'] == 64 and metric['free_running_first_divergence'] == -1)
+
+    for name, reference in pairs:
+        probe = row['probes'][name]
+        equal = exact(probe[reference])
+        states = probe['roundtrips']
+        if name not in ('NODE', 'CHAIN'):
+            equal = equal and bool(states)
+            for state in states:
+                if name in ('RESTORE', 'BSTATE'):
+                    equal = equal and state.get('bytes_equal', state.get('snapshot_bytes_equal')) is True
+                elif name in ('CHAIN_ATTENTION', 'CHAIN_RECURRENT'):
+                    equal = equal and state['recurrent_equal'] is True
+                else:
+                    equal = equal and state['bytes_equal'] is True
+        controls[name + '-' + reference] = equal
+    controls['A-L'] = exact(row['factorial']['A-L'])
+    return controls
+
+
 def validate_checkpoint(row, heterogeneous, depth):
     require(row['depth'] == depth and row['k'] == 64 and type(row['exact']) is bool and
             type(row['top1_agreed']) is int and 0 <= row['top1_agreed'] <= 64 and
@@ -590,17 +620,24 @@ def validate_checkpoint(row, heterogeneous, depth):
     require(type(row['free_running_first_divergence']) is int and -1 <= row['free_running_first_divergence'] < 64,
             'invalid free-running result')
     accepted = row['exact']
-    if row.get('status_rule') == 'session_mean_kl_zero':
+    if row.get('status_rule') in ('session_mean_kl_zero', 'session_append_replay_exact'):
         band = row['partition']['mean_kl_nats']
         p95 = row['partition']['p95_kl_nats']
         require(row['local_partition_mean_kl_nats'] == band and row['local_partition_p95_kl_nats'] == p95 and
-                row['kl_limit'] == 0, 'invalid local partition band or zero KL limit')
+                row['kl_limit'] == (0 if row['status_rule'] == 'session_mean_kl_zero' else None),
+                'invalid local partition band or KL limit')
         ratio = row['kl_to_partition_ratio']
         ratio_status = 'finite' if band > 0 else 'both_zero' if row['mean_kl_nats'] == 0 else 'zero_noise_band'
         require(row['kl_to_partition_ratio_status'] == ratio_status and
                 (math.isclose(ratio, row['mean_kl_nats'] / band, abs_tol=1e-12) if band > 0 else ratio is None),
                 'invalid KL to partition ratio')
-        accepted = row['mean_kl_nats'] <= row['kl_limit'] and row['top1_agreed'] >= 63 and row['free_running_first_divergence'] == -1
+        if row['status_rule'] == 'session_mean_kl_zero':
+            accepted = row['mean_kl_nats'] <= row['kl_limit'] and row['top1_agreed'] >= 63 and row['free_running_first_divergence'] == -1
+    if row.get('status_rule') == 'session_append_replay_exact':
+        controls = append_replay_controls(row)
+        require(row['gate_controls'] == controls and row['kl_limit'] is None, 'checkpoint replay gate contradicts controls')
+        accepted = (all(controls.values()) and row['top1_agreed'] >= 63 and
+                    (row['free_running_first_divergence'] == -1 or row['free_running_first_divergence'] >= 8))
     status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
     require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict contradicts acceptance rule')
 
@@ -678,12 +715,12 @@ def run(args):
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
     size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
-    raw_bytes = len(checkpoints) * (16 if args.state_probes else 7) * 64 * client['model_layout']['vocab_size'] * 4
+    raw_bytes = len(checkpoints) * 16 * 64 * client['model_layout']['vocab_size'] * 4
     require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size + raw_bytes,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
-    state_dir = root / 'node-states' if args.state_probes else None
+    state_dir = root / 'node-states'
     if state_dir is not None:
         state_dir.mkdir(mode=0o700)
     events = Events(state_dir)

@@ -37,6 +37,8 @@ def checkpoint_controls(build, model, root):
         probe_fixture = dict(fixture, replay=replay, probes=probes)
         cases = [('same_backend_checkpoint_exactness', fixture, 0, None),
                  ('own_state_roundtrips', probe_fixture, 0, None),
+                 ('test_manifest_above_8MiB', fixture, 0, None),
+                 ('test_manifest_above_64MiB_refuses', fixture, 2, 'check input exceeds limit'),
                  ('probe_incomplete_refusal', dict(probe_fixture, probes=[dict(name='INCOMPLETE', steps=[dict(decode=schedule[:-1])])]),
                   2, 'incomplete state probe journal or final logits'),
                  ('probe_duplicate_refusal', dict(probe_fixture, probes=[dict(probes[0], name='A')]), 2, 'duplicate state probe name'),
@@ -47,6 +49,12 @@ def checkpoint_controls(build, model, root):
         for name, source, expected, reason in cases:
             source_path, result_path = controls / (name + '.json'), controls / (name + '.result.json')
             private_json(source_path, source)
+            # Valid JSON above the old cap still scores; an input above the new bound refuses before parsing.
+            if name == 'test_manifest_above_8MiB':
+                source_path.write_bytes(b' ' * (9 * 1024 * 1024) + source_path.read_bytes())
+            elif name == 'test_manifest_above_64MiB_refuses':
+                with source_path.open('wb') as oversized:
+                    oversized.truncate(64 * 1024 * 1024 + 1)
             command = [str(build / 'bin/llama-hybrid-bench-check'), str(model), str(source_path), str(snapshot), str(result_path), '0']
             with (controls / (name + '.log')).open('wb') as log:
                 process = subprocess.Popen(command, stdout=log, stderr=log)
@@ -169,7 +177,7 @@ def main():
                     len(trace['workload']) == 12, 'depth plan or sequence changed')
             print('OBSERVED ' + start + ': ' + trace['status'] + '; driver exit ' + str(code), flush=True)
         require(sha256(model) == digest, 'model file changed')
-    require(all(r['exit_code'] == 0 for r in commands), 'same-backend zero mean-KL criterion is not qualified')
+    require(all(r['exit_code'] == 0 for r in commands), 'append replay/component/token criterion is not qualified')
     print('PASS all native growing-session checks; CPU only, no downloads', flush=True)
 
 

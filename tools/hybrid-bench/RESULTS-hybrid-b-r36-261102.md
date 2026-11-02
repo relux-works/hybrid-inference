@@ -384,3 +384,104 @@ native-prestaged-01: observed 2026-11-02T02:58:34.959318+00:00 to 2026-11-02T03:
 Audit01 failed 1 because it read exit_code from trace instead of the command ledger; corrected audit02 reads the persisted actual command exit and passes. A late additional affinity read failed its minimum-live-actor assertion after the processes had exited; it supplies no new mask evidence. The during-run qualification identity remains the affinity evidence. These failures do not replace or weaken any product gate.
 
 Cleanup at 2026-11-02T03:09:01Z: all 82 recorded task PIDs inactive; both task-owned build trees removed (118424498 bytes). Minimum sampled free disk 29188509696 bytes (29.19 GB); cleanup free 36195479552 bytes. Live node snapshots/deltas, hashed raw logits, tokens, traces and logs remain private for review; identical logit files are hardlinked without changing bytes. Signed local delivery only; no push, GPU or model download.
+
+## r40: mechanism-based append-import gate
+
+Run `hybrid-b-r40-261102`, continuing signed r39 `796425fe` on `m3-growing-session`. The orchestrator has selected the acceptance contract below after the cause was isolated. This section supersedes the r38/r39 L-H zero-KL gate, while retaining those historical measurements and failures. CPU only; no GPU, downloads, push or production protocol change.
+
+### Mechanism and paper wording
+
+Append import keeps the client's historical attention KV rows, appends only the node's new KV range, and replaces the full recurrent state. The node computed that range over its own catch-up history. Batch evaluation and token-by-token evaluation can produce different historical attention KV, so the resulting hybrid state combines local history with a node suffix. Replaying the exact append chain reproduces the live hybrid continuation bit-exactly (CHAIN-H, maximum logit difference 0). Replacing attention KV alone selects the coherent node path B; replacing recurrent state alone leaves H unchanged. This explains why agreement with a differently evaluated fully local path L cannot be required to have zero mean KL for append import.
+
+The gate requires exact CHAIN-H at every checkpoint and the complete r39 component controls: NODE-B, RESTORE-B, BSTATE-B, NODE_RANGE-B, OWN_NATIVE-A, OWN_RANGE-A, CHAIN_ATTENTION-B, CHAIN_RECURRENT-H and A-L. Exact here means all 64 full-vocabulary position vectors have identical float32 bytes, maximum difference 0, KL 0, top-1 64/64 and no independent greedy divergence over 64 positions. Restore/range/own roundtrips must preserve state bytes; BSTATE must match the live node snapshot bytes; both replacements must show equal recurrent bytes before replacement. Attention-byte differences are reported, rather than required on every backend. Model/journal/hash checks remain mandatory.
+
+L-H has a separate token-integrity guard: top-1 at least 63/64 and no free-running divergence among tokens 0 through 7. Divergence at index 8 or later is allowed and reported. L-H mean KL, nearest-rank p95 and maximum absolute logit difference remain visible at every checkpoint as the measured cost of append import. They do not decide correctness. Both native checker and Python driver use `status_rule=session_append_replay_exact`, `kl_limit=null`, with each identity in `gate_controls`; Python independently rederives the teacher-forced metrics from hashed raw logits. Missing evidence aborts; a measured failed control or token guard gives exit 3. Existing two-snapshot exactness and legacy zero-band fixtures retain their original rules. CUDA-to-Metal remains heterogeneous, exit 5/uncalibrated.
+
+State probes are mandatory in the driver, including live authenticated node snapshots and returned deltas. `--state-probes` remains accepted for old commands. These captures add HTTP/disk overhead and are not a performance result. The [GPU and Mac runbooks](GROWING-SESSION.md) repeat every control at every checkpoint, use pinned target-client delta rates, require routing preflight before the arms, and require a measured multi-point M3 import fit for Mac economics. The CPU fixture policy remains a labelled synthetic routing control.
+
+### Alternative: refresh the full attention KV
+
+A full attention refresh after catch-up removes the mixed history. It restores exactness to the same-partition full-node local replay B; equality to differently batched A/L additionally needs matching evaluation arithmetic. Refreshing node KV alone cannot make two distinct arithmetic schedules identical. This is an alternative state contract, not a change implemented here.
+
+The illustrative 27B q8_0 attention geometry is 16 attention layers x 2 (K/V) x 4 KV heads x 256 dimensions x 34/32 bytes = **34816 bytes/token**. The dimensions are read from the checked-in exact-header fixture; `.temp/r40/geometry.json` also recomputes the complete seed-1/40-turn deep admission plan with the measured 14 framing tokens per turn.
+
+| Per-offload depth | Full attention payload, bytes | Decimal GB | GiB |
+|---|---:|---:|---:|
+| 100000 | 3481600000 | 3.481600000 | 3.242492676 |
+| Deep start 216064 | 7522484224 | 7.522484224 | 7.005859375 |
+
+For subsequent offloads, use actual depth x 34816. These are tensor payload bytes only; add recurrent state (about 157000000 bytes), native row/layout metadata, envelope/hash framing and network overhead. With the illustrative 157000000-byte recurrent payload, the combined tensor payload would be about 3638600000 bytes at 100k and 7679484224 bytes at the deep start, before framing. Because append already sends the suffix, the incremental attention cost of full refresh is `(depth - imported_tokens) x 34816` bytes. No full-state bandwidth or M3 speedup is inferred from these payload calculations.
+
+### Large snapshot control
+
+Repeating BSTATE at 27B/100k exposed a pre-existing driver limit: its byte comparison loaded the whole native node snapshot through the 513 MiB delta reader. Required hardware snapshots are several GB. Only the comparison now streams through a 64 KiB buffer against the already materialized local native state, without another full snapshot copy; the delta-file bound remains unchanged. Checker startup keeps small exact/changed/truncated controls. An isolated fixture larger than the old cap checks exact equality, a changed final byte and truncation. Restoring the old cap fails `test_large_snapshot_matches`; no GPU/model is needed. The complete 40-turn replay/probe manifests also exceed the original 8 MiB JSON cap: synthetic all-offload plans with the full sampled growth serialize 21934079 bytes at 100k and 23101435 bytes at deep. These are CPU schedule-size controls, not inference or state truth. The bounded JSON cap is now 64 MiB, with nesting 32 retained. A 9 MiB valid exact-checkpoint input passes, the original checker refuses it at 8 MiB, and a 64 MiB+1 input refuses with no metrics. These instrument limits change no evaluation, import or acceptance arithmetic.
+
+### CPU results and validation
+
+The frozen live-run checker completed both three-session starts. The final checker differs only in streamed snapshot byte comparison, its startup controls and the JSON input bound; exact reconstruction of the original source hash proves that boundary (`late-delta-final-01.log`). Both final-checker replay runs recompute all 13 A/B1/B2/B/probe observation vectors from the retained live journals, node snapshots and deltas. Their raw SHA-256 values and all shared numerical/state fields equal the live-run vectors, including CHAIN equal to live H. The frozen live processes remain on CPU 0,1. Final replay 10 starts there and then moves to CPU 4,5 to avoid CPU contention (all thread masks and the transition are recorded); replay 12 uses CPU 2,3. Both keep two compute/two batch threads, and bit identity is checked rather than assumed. Final replay-only native exits are 0; they are not fresh live H/L/P captures. The full live-driver gate integration is from the frozen initial binary. The final replay binary predates the last JSON-cap-only change; its gate, import and arithmetic code is identical, and the final rebuilt binary passes the above 8 MiB exact-checkpoint admission control. All source/binary identities and exact command/PID logs are retained.
+
+| Start | Turn / depth | L-H mean KL | L-H p95 KL | L-H max abs dlogit | Top-1 | First free divergence | Gate / native exit |
+|---|---:|---:|---:|---:|---:|---:|---|
+| cold | 10 / 1679 | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | 64/64 | -1 | passed / 0 |
+| cold | 12 / 2043 | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | 63/64 | 0 | failed / 3 |
+| pre-staged | 10 / 1679 | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | 64/64 | -1 | passed / 0 |
+| pre-staged | 12 / 2043 | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | 63/64 | 0 | failed / 3 |
+
+KL is nats/token; p95 is nearest rank. **Every checkpoint passes all ten replay/component identities, including CHAIN-H with max difference 0. Turn 10 passes despite positive L-H KL. Turn 12 fails solely because free-running divergence is at index 0, inside the first-eight-token guard; top-1 remains 63/64.** Both drivers therefore exit 3 and the whole native harness exits 1. This is a preserved measured token failure, not a passing-equivalence claim or a reason to suppress KL. Each start has 39 calls, exact paired journals, two connected policy-local turns, eight policy offloads, two transport fallbacks, connected prompt catch-up and background replay. A/L and every factorial/probe result reproduce r39. CPU 0.8B/q8_0/context 4096 and this synthetic policy do not qualify 27B/100k/deep or GPU/Mac economics.
+
+| Start | Observed UTC interval | trace.json SHA-256 |
+|---|---|---|
+| cold | 2026-11-02T03:21:36.345545+00:00 to 2026-11-02T03:35:29.146325+00:00 | `d47a5ca631cb3aa366635bd92eee2d3c8342faf329c4692d57bed07fdc07da6b` |
+| pre-staged | 2026-11-02T03:35:29.542092+00:00 to 2026-11-02T04:02:25.811971+00:00 | `d596eac5779f8e2c799e0e6f49b7251ff89baea71b4d00d3b0e7f5f558c5126f` |
+
+All validation ran as standalone processes with real exits, on-disk TMPDIR and bytecode disabled. Build commands were nice 19/-j4 under the shared lock. Evidence/commands are in `.temp/r40/validation-ledger.json`, each native `command(s).json`, the build records, and `measurements.json`.
+
+| Validation | Actual exit / scope | Evidence under .temp/r40 |
+|---|---|---|
+| CPU server ON/server OFF configure/build and final checker rebuilds | 0 | cpu-*-build-record.json |
+| Bench discovery | 0; 89 tests, 6 header-environment skips | bench-regression-01.log |
+| Proxy discovery | 0; 74 tests | proxy-regression-01.log |
+| Explicit native identity | 0; 12 tests, covering all 6 discovery skips | identity-02.log |
+| Recurrent malformed/state-preservation suite | 0 | recurrent-01.log |
+| Legacy ON/OFF and final ON delta/noise/corruption suites | 0 overall; intended child 2/3 retained | legacy-01.log, legacy-off-01.log, legacy-final-01.log |
+| Exact live-state, own native/range identity; checksum/journal/capacity/incomplete/duplicate refusals | 0 exact/roundtrip; intended 2 refusals | native-01/checkpoint-controls/commands.json |
+| Native all-local/all-offload routing preflights | intended 2 each, zero arm calls | native-01/preflight-*-command.json |
+| Snapshot server OFF, missing append controls, invalid replay tiling | intended 2 each, no metrics; final binaries | extra-controls-final/commands.json |
+| Retained r37 replay 10/12 | 0 each | retained-replay-*/command.json |
+| Final native replay of both complete probe sets | 0 each; 13 vectors per checkpoint identical | final-check-*/verification.json |
+| Final native exact/own roundtrip/manifest and refusal controls | 0 positive; intended 2 refusals | controls-final-01.log |
+| Large snapshot exact/changed/truncated controls | 0 | snapshot-compare-03.log |
+| Complete 40-turn manifest size planning; above 8 MiB native positive / above 64 MiB refusal | 0 planning; native 0 / intended 2 | manifest-forecast.json, manifest-controls/commands.json |
+| Full cold/pre-staged session gate | driver 3 each, harness 1; turn 12 first-eight guard | native-01.log, native-01/commands.json |
+| Final artifact, journal, component, identity and route audit | 0 | audit-01.log, measurements.json |
+| AST, ASCII additions, shell syntax and whitespace | 0 | style-final-01.log, whitespace-final-03.log |
+
+Initial identity selection failed 1 because the header directory was wrong; retained exact-header fixtures corrected it. Initial retained replay invocation failed 2 for missing --trace/--turn; full corrected commands pass. The first geometry probe failed 1 because max_new=0 caps all input; default 10875 gives the declared deep start. The first isolated stream-test compile failed 1 for a missing cstdint include in its test preamble; the product already had the type. A preliminary old-cap plant refused before a named test and is not credited; the corrected plant explicitly fails test_large_snapshot_matches. These attempts are preserved separately. Full upstream CI, ty and editorconfig-checker were not run; the latter two are absent. No dependency install, model download, GPU run, PR, push or scientific/hardware acceptance is claimed.
+
+### Narrowing mutants
+
+| Mutant | What it narrows the gate to | Named failing test | Actual child exit |
+|---|---|---|---:|
+| append-replay-mismatch-admitted | CHAIN-H exactness cannot be omitted | test_checkpoint_append_replay_mismatch_fails | 1 |
+| append-LH-KL-zero-required | positive L-H KL alone must pass | test_checkpoint_append_positive_kl_passes | 1 |
+| append-early-divergence-admitted | free token 7 must fail; token 8 may pass | test_checkpoint_append_token_boundaries | 1 |
+| append-roundtrip-bytes-ignored | own/range byte identity is mandatory | test_checkpoint_append_component_controls | 1 |
+| probe-raw-validation-disabled | probe metrics must agree with raw vectors | test_checkpoint_raw_logits_reject_r7r_mutant | 1 |
+| node-boundary-race-admitted | live snapshot must match the critical extend | test_node_snapshot_capture_refuses_boundary_race | 1 |
+| generated-cell-decodes | B1 changes generated partition only | test_factorial_schedule_boundaries | 1 |
+| partition-mean-authorizes | legacy partition band cannot authorize positive KL | test_checkpoint_partition_band | 1 |
+| raw-validation-disabled | raw vectors must reject falsified positions | test_checkpoint_raw_logits_reject_r7r_mutant | 1 |
+| degenerate-route-admitted | preflight requires both connected policy routes | test_route_preflight_rejects_degenerate | 1 |
+| foreign-catchup-counted | catch-up belongs to the measured session | test_catchup_attribution | 1 |
+| depth-source-drift | sampling matches pinned provenance | test_sampling_table_provenance | 1 |
+| legacy-exactness-weakened | legacy exactness remains strict | test_checkpoint_exactness_gate | 1 |
+| native-replay-mismatch-admitted | compiled checker gate must reject replay loss | test_append_replay_mismatch_fails | -6 |
+| native-LH-KL-zero-required | compiled checker gate must accept positive L-H KL alone | test_append_positive_LH_KL_passes | -6 |
+| old-manifest-cap | full replay/probe JSON must fit above 8 MiB | test_manifest_above_8MiB | 2 |
+| old-size-cap | full snapshot comparison must work above delta-file bound | test_large_snapshot_matches | 1 |
+
+All 17 listed mutants are killed at the named test; there are no survivors in this bounded set. Identity controls exit 0. The two compiled gate mutants use exact extracted production gate functions and verdict block on the retained real positive-KL turn 10 result; abort -6 is the intended named failed assertion with core dumps disabled. They are isolated gate controls, not fresh inference runs. The Python gate tests explicitly isolate raw validation; the unchanged r7r raw-vector test covers that independent instrument. No broad mutation-coverage claim is made.
+
+No surface table was supplied (brief gap). No requested row is excluded. The owner-selected gate is implemented and ready for review; the remaining token/hardware failures are explicitly recorded.
+
+Cleanup at 2026-11-02T04:07:17Z: all 115 recorded task PIDs are inactive. All three task build trees (209602643 bytes), compiled mutants and expired fixture credentials were removed. Minimum sampled free disk was 29538697216 bytes (29.539 GB); cleanup readback was 30843768832 bytes. Private node snapshots/deltas, journals, raw logits, hashes and logs remain available for review; only sealed byte-identical outputs share inodes. No push.

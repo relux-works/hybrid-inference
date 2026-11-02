@@ -14,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 static void require(bool ok, const char * message) {
@@ -43,6 +44,25 @@ static std::string read_file(const char * path, size_t limit = 513 * 1024 * 1024
     require(source.tellg() >= 0 && uint64_t(source.tellg()) <= limit, "check input exceeds limit");
     source.seekg(0);
     return {std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
+}
+
+static bool snapshot_state_matches(std::istream & source, size_t n, const std::string & state) {
+    require(state.size() >= 8 && n <= (std::numeric_limits<size_t>::max() - 12) / 4, "invalid state probe native state");
+    const size_t offset = 12 + 4 * n;
+    source.seekg(0, std::ios::end);
+    const auto size = source.tellg();
+    require(size >= 0 && uint64_t(size) >= offset, "invalid state probe snapshot size");
+    if (uint64_t(size) - offset != state.size() - 8) { return false; }
+    source.seekg(offset, std::ios::beg);
+    char buffer[65536];
+    for (size_t at = 8; at < state.size();) {
+        const size_t count = std::min(sizeof(buffer), state.size() - at);
+        source.read(buffer, count);
+        require(source.gcount() == std::streamsize(count), "cannot read state probe snapshot");
+        if (std::memcmp(buffer, state.data() + at, count) != 0) { return false; }
+        at += count;
+    }
+    return true;
 }
 
 static double compare(const float * p, const float * q, int n) {
@@ -77,6 +97,43 @@ static bool within_repeat_floor(bool exact, bool repeat_exact, double kl, double
 
 static bool within_session_band(double kl, double mean, int agreed, int k, int divergence) {
     return kl <= mean && agreed >= k - 1 && divergence == -1;
+}
+
+// Exact replay and component identities gate append import; L-H KL is a measured cost.
+static hybrid::json append_replay_controls(const hybrid::json & result) {
+    hybrid::json controls = hybrid::json::object();
+    auto exact = [](const hybrid::json & row) {
+        return row.at("exact").get<bool>() && row.at("max_abs_logit_diff") == 0 && row.at("mean_kl_nats") == 0 &&
+            row.at("top1_agreed") == 64 && row.at("free_running_first_divergence") == -1;
+    };
+    const auto & probes = result.at("probes");
+    for (const auto & pair : std::vector<std::pair<std::string, std::string>>{
+            {"NODE", "B"}, {"RESTORE", "B"}, {"BSTATE", "B"}, {"NODE_RANGE", "B"},
+            {"OWN_NATIVE", "A"}, {"OWN_RANGE", "A"}, {"CHAIN", "H"},
+            {"CHAIN_ATTENTION", "B"}, {"CHAIN_RECURRENT", "H"}}) {
+        const auto & probe = probes.at(pair.first);
+        bool equal = exact(probe.at(pair.second));
+        const auto & states = probe.at("roundtrips");
+        if (pair.first != "NODE" && pair.first != "CHAIN") {
+            equal &= !states.empty();
+            for (const auto & state : states) {
+                if (pair.first == "RESTORE" || pair.first == "BSTATE") {
+                    equal &= state.contains("bytes_equal") ? state.at("bytes_equal").get<bool>() : state.at("snapshot_bytes_equal").get<bool>();
+                } else if (pair.first == "CHAIN_ATTENTION" || pair.first == "CHAIN_RECURRENT") {
+                    equal &= state.at("recurrent_equal").get<bool>();
+                } else {
+                    equal &= state.at("bytes_equal").get<bool>();
+                }
+            }
+        }
+        controls[pair.first + "-" + pair.second] = equal;
+    }
+    controls["A-L"] = exact(result.at("factorial").at("A-L"));
+    return controls;
+}
+
+static bool append_tokens_agree(int agreed, int divergence) {
+    return agreed >= 63 && (divergence == -1 || divergence >= 8);
 }
 
 static double seconds_since(std::chrono::steady_clock::time_point start) {
@@ -307,12 +364,9 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
                 } else if (step.contains("compare_snapshot")) {
                     const std::string path = step.at("compare_snapshot");
                     require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe snapshot checksum mismatch");
-                    const auto snapshot = read_file(path.c_str());
-                    require(n <= (snapshot.size() - std::min<size_t>(12, snapshot.size())) / 4 && snapshot.size() >= 12,
-                            "invalid state probe snapshot size");
+                    std::ifstream snapshot(path, std::ios::binary);
                     const auto state = hybrid::save_state(ctx.get());
-                    require(state.size() >= 8, "invalid state probe native state");
-                    states.push_back({{"n", n}, {"snapshot_bytes_equal", state.substr(8) == snapshot.substr(12 + 4 * n)}});
+                    states.push_back({{"n", n}, {"snapshot_bytes_equal", snapshot_state_matches(snapshot, n, state)}});
                 } else if (step.contains("replace")) {
                     const std::string path = step.at("snapshot");
                     require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe snapshot checksum mismatch");
@@ -385,6 +439,15 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             result["status_rule"] = "session_mean_kl_zero";
             accepted = within_session_band(mean, 0, result.at("top1_agreed"), k, result.at("free_running_first_divergence"));
         }
+        if (fixture.contains("acceptance_rule")) {
+            require(fixture.at("acceptance_rule") == "session_append_replay_exact" && k == 64,
+                    "invalid append replay acceptance rule or width");
+            result["gate_controls"] = append_replay_controls(result);
+            accepted = append_tokens_agree(result.at("top1_agreed"), result.at("free_running_first_divergence"));
+            for (const auto & control : result.at("gate_controls")) { accepted &= control.get<bool>(); }
+            result["status_rule"] = "session_append_replay_exact";
+            result["kl_limit"] = nullptr;
+        }
         const bool heterogeneous = fixture.value("heterogeneous", false);
         result["status"] = heterogeneous ? "heterogeneous" : accepted ? "passed" : "failed";
         result["exit_code"] = heterogeneous ? 5 : accepted ? 0 : 3;
@@ -411,7 +474,15 @@ int main(int argc, char ** argv) {
                 !within_session_band(.003, .001, 64, 64, -1) && !within_session_band(.0001, 0, 64, 64, -1) &&
                 !within_session_band(.001, .001, 62, 64, -1) && !within_session_band(.001, .001, 64, 64, 63),
                 "session mean acceptance control failed");
-        const auto fixture = hybrid::json::parse(read_file(argv[2], 8 * 1024 * 1024), [](int depth, hybrid::json::parse_event_t, hybrid::json &) {
+        // Snapshot byte checks preserve equality and reject changed or truncated payloads.
+        std::istringstream snapshot_equal("0123456789012345xyz"), snapshot_changed("0123456789012345xyw"), snapshot_short("0123456789012345xy");
+        const std::string native_state = "01234567xyz";
+        require(snapshot_state_matches(snapshot_equal, 1, native_state) && !snapshot_state_matches(snapshot_changed, 1, native_state) &&
+                !snapshot_state_matches(snapshot_short, 1, native_state), "snapshot byte comparison control failed");
+        // First-eight free tokens and 63/64 teacher-forced top-1 are independent of L-H KL.
+        require(append_tokens_agree(63, -1) && append_tokens_agree(64, 8) && !append_tokens_agree(62, -1) &&
+                !append_tokens_agree(64, 7), "append token acceptance control failed");
+        const auto fixture = hybrid::json::parse(read_file(argv[2], 64 * 1024 * 1024), [](int depth, hybrid::json::parse_event_t, hybrid::json &) {
             require(depth <= 32, "check JSON nesting too deep");
             return true;
         });

@@ -108,6 +108,92 @@ class ScenarioTests(unittest.TestCase):
         with self.assertRaises(Refusal):
             growing.validate_checkpoint(dict(zero, mean_kl_nats=.000001, kl_to_partition_ratio_status='zero_noise_band'), False, 1000)
 
+    @staticmethod
+    def append_gate_row():
+        exact = dict(exact=True, top1_agreed=64, mean_kl_nats=0, max_abs_logit_diff=0,
+                     free_running_first_divergence=-1)
+        pairs = [('NODE', 'B'), ('RESTORE', 'B'), ('BSTATE', 'B'), ('NODE_RANGE', 'B'),
+                 ('OWN_NATIVE', 'A'), ('OWN_RANGE', 'A'), ('CHAIN', 'H'),
+                 ('CHAIN_ATTENTION', 'B'), ('CHAIN_RECURRENT', 'H')]
+        probes = {name: {reference: dict(exact), 'roundtrips': []} for name, reference in pairs}
+        for name in ('RESTORE', 'NODE_RANGE', 'OWN_NATIVE', 'OWN_RANGE'):
+            probes[name]['roundtrips'] = [dict(bytes_equal=True)]
+        probes['BSTATE']['roundtrips'] = [dict(snapshot_bytes_equal=True)]
+        for name in ('CHAIN_ATTENTION', 'CHAIN_RECURRENT'):
+            probes[name]['roundtrips'] = [dict(recurrent_equal=True, attention_equal=False)]
+        return dict(exact, depth=1000, k=64, status='passed', exit_code=0,
+            status_rule='session_append_replay_exact', kl_limit=None, probes=probes,
+            partition=dict(mean_kl_nats=0, p95_kl_nats=0), local_partition_mean_kl_nats=0, local_partition_p95_kl_nats=0,
+            kl_to_partition_ratio=None, kl_to_partition_ratio_status='both_zero',
+            factorial={'A-L': dict(exact)}, gate_controls={name+'-'+ref: True for name, ref in pairs} | {'A-L': True})
+
+    # Isolate the acceptance rule; the separate raw-logit regression validates every measured distribution.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_checkpoint_append_positive_kl_passes(self, raw):
+        row = self.append_gate_row()
+        growing.validate_checkpoint(row, False, 1000)
+        row.update(exact=False, mean_kl_nats=.25, p95_kl_nats=.9, max_abs_logit_diff=7, kl_to_partition_ratio_status='zero_noise_band')
+        growing.validate_checkpoint(row, False, 1000)
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(dict(row, status='failed', exit_code=3), False, 1000)
+        growing.validate_checkpoint(dict(row, status='heterogeneous', exit_code=5), True, 1000)
+
+    # A real non-exact CHAIN-H result fails even at zero KL; it cannot be hidden by a forged gate summary.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_checkpoint_append_replay_mismatch_fails(self, raw):
+        row = self.append_gate_row()
+        row['probes']['CHAIN']['H'].update(exact=False, max_abs_logit_diff=.001)
+        with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+            growing.validate_checkpoint(row, False, 1000)
+        row['gate_controls']['CHAIN-H'] = False
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(row, False, 1000)
+        growing.validate_checkpoint(dict(row, status='failed', exit_code=3), False, 1000)
+
+    # Every component/roundtrip identity and A-L is required; missing evidence and changed bytes cannot pass.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_checkpoint_append_component_controls(self, raw):
+        base = self.append_gate_row()
+        growing.validate_checkpoint(base, False, 1000)
+        for name, reference in [('NODE', 'B'), ('RESTORE', 'B'), ('BSTATE', 'B'), ('NODE_RANGE', 'B'),
+                                ('OWN_NATIVE', 'A'), ('OWN_RANGE', 'A'), ('CHAIN_ATTENTION', 'B'), ('CHAIN_RECURRENT', 'H')]:
+            row = copy.deepcopy(base)
+            row['probes'][name][reference]['exact'] = False
+            row['gate_controls'][name+'-'+reference] = False
+            with self.assertRaisesRegex(Refusal, 'verdict'):
+                growing.validate_checkpoint(row, False, 1000)
+            growing.validate_checkpoint(dict(row, status='failed', exit_code=3), False, 1000)
+        for name, field in [('RESTORE','bytes_equal'), ('BSTATE','snapshot_bytes_equal'), ('NODE_RANGE','bytes_equal'),
+                            ('OWN_NATIVE','bytes_equal'), ('OWN_RANGE','bytes_equal'), ('CHAIN_ATTENTION','recurrent_equal'),
+                            ('CHAIN_RECURRENT','recurrent_equal')]:
+            row = copy.deepcopy(base)
+            row['probes'][name]['roundtrips'][0][field] = False
+            with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+                growing.validate_checkpoint(row, False, 1000)
+        row = copy.deepcopy(base)
+        row['factorial']['A-L']['exact'] = False
+        with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+            growing.validate_checkpoint(row, False, 1000)
+        row = copy.deepcopy(base)
+        del row['probes']['NODE']
+        with self.assertRaisesRegex(Refusal, 'missing append replay'):
+            growing.validate_checkpoint(row, False, 1000)
+
+    # 63/64 top-1 and divergence exactly at index8 pass; index0..7 or 62/64 fail, with unchanged replay controls.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_checkpoint_append_token_boundaries(self, raw):
+        row = self.append_gate_row()
+        row.update(exact=False, mean_kl_nats=.01, max_abs_logit_diff=1, top1_agreed=63, kl_to_partition_ratio_status='zero_noise_band')
+        for divergence in (-1, 8, 63):
+            growing.validate_checkpoint(dict(row, free_running_first_divergence=divergence), False, 1000)
+        for divergence in range(8):
+            bad = dict(row, free_running_first_divergence=divergence)
+            with self.assertRaisesRegex(Refusal, 'verdict'):
+                growing.validate_checkpoint(bad, False, 1000)
+            growing.validate_checkpoint(dict(bad, status='failed', exit_code=3), False, 1000)
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(dict(row, top1_agreed=62), False, 1000)
+
     # Other sessions' background replay cannot be charged to the local baseline or the current hybrid turn.
     def test_catchup_attribution(self):
         meter = dict(decision={}, depth_before=100, depth_after=104, new_tokens=3, generated_tokens=1,
