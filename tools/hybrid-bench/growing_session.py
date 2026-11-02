@@ -35,6 +35,8 @@ DEPTH_BINS = [(50000, 406, 6215), (100000, 197, 5344), (200000, 98, 2329), (1048
 OUTPUT = [54, 113, 229, 530, 1135, 4506]
 PAUSE = [.2, 3.8, 7.8, 17.9, 34.8, 340]
 SYSTEM = 'Read synthetic tool results. Reply with decimal digits only.'
+NATIVE_CONTEXT = 262144
+DEPTH_MARGIN = 2048
 
 
 def sample(points, u):
@@ -45,19 +47,50 @@ def sample(points, u):
     return points[-1][1]
 
 
-def scenario(depth, turns=40, seed=1, max_new=10875, max_output=4506, pause_cap=340):
+def scenario(depth, turns=40, seed=1, max_new=10875, max_output=4506, pause_cap=340, framing=16):
     rng = random.Random(seed)
     rows = []
     for turn in range(1, turns + 1):
         row = sample_turn(rng, depth, turn, seed, max_new, max_output, pause_cap)
         rows.append(row)
-        # ChatML framing is measured at runtime; this estimate selects the next depth bin only.
-        depth += row['input_tokens'] + row['output_tokens'] + 16
+        depth += row['input_tokens'] + row['output_tokens'] + framing
     return rows
 
 
+def depth_plan(depth, turns, seed, max_new, max_output, pause_cap, framing, capacity=NATIVE_CONTEXT):
+    def plan(start):
+        rows = scenario(start, turns, seed, max_new, max_output, pause_cap, framing)
+        growth = sum(r['input_tokens'] + r['output_tokens'] + framing for r in rows)
+        return dict(d0=start, growth=growth, final_depth=start + growth, margin=DEPTH_MARGIN,
+                    capacity=capacity, framing_tokens=framing, sequence=rows)
+    if depth == 'deep':
+        require(plan(100000)['final_depth'] + DEPTH_MARGIN <= capacity,
+                'sampled sequence cannot fit at D0=100000 with 2048 margin; no turns truncated')
+        for start in range((capacity - DEPTH_MARGIN) // 1024 * 1024, 0, -1024):
+            result = plan(start)
+            if result['final_depth'] + DEPTH_MARGIN <= capacity:
+                return result
+        raise Refusal('no positive deep start fits; no turns truncated')
+    result = plan(depth)
+    require(result['final_depth'] + DEPTH_MARGIN <= capacity,
+            'sampled sequence cannot fit at D0=' + str(depth) + ' with 2048 margin; no turns truncated')
+    return result
+
+
+def template_framing(app):
+    messages = [dict(role='system', content=SYSTEM), dict(role='user', content=' x'),
+                dict(role='assistant', content='0'), dict(role='user', content=' x')]
+    body = dict(messages=messages, chat_template_kwargs=dict(enable_thinking=False))
+    text = app.renderer.render(body)
+    ids = app.renderer.encode(text, initial=True)
+    tail, _, _, _ = app.renderer.append(body, text, ids, 3, [])
+    require(len(app.renderer.encode(' x')) == 1,
+            'fixture text must encode to one token per repetition')
+    return len(tail) - 1
+
+
 def sample_turn(rng, depth, turn, seed, max_new, max_output, pause_cap):
-    _, median, p90 = next(row for row in DEPTH_BINS if depth < row[0])
+    _, median, p90 = next((row for row in DEPTH_BINS if depth < row[0]), DEPTH_BINS[-1])
     new = round(sample([(0, 0), (.5, median), (.9, p90)], rng.random()))
     output = max(1, round(sample([(0, 0)] + list(zip(QUANTILES, OUTPUT)), rng.random())))
     pause = sample([(0, 0)] + list(zip(QUANTILES, PAUSE)), rng.random())
@@ -142,6 +175,9 @@ class MeasuredNode(Node):
         try:
             result = super().request(method, path, data, headers, binary)
             row.update(status='ok', response_body_bytes=self.last_bytes)
+            if row.get('catchup'):
+                require(self.last_prefill_ms is not None, 'node catch-up evaluation timing missing')
+                row['node_prefill_seconds'] = float(self.last_prefill_ms) / 1000
             if method == 'GET' and isinstance(result, dict) and 'prefix_hash' in result:
                 row.update(n=result['n'], prefix_hash=result['prefix_hash'])
             return result
@@ -272,15 +308,16 @@ def base_messages(app, depth):
 
 
 def checkpoint(app, client, root, turn, heterogeneous):
-    hybrid, local = [app.saved[(arm, turn)] for arm in ('hybrid', 'local')]
-    require(hybrid['tokens'] == local['tokens'], 'checkpoint journal mismatch between arms')
+    saved = [app.saved[(arm, turn)] for arm in ('hybrid', 'local', 'local_partition')]
+    hybrid, local, partition = saved
+    require(hybrid['tokens'] == local['tokens'] == partition['tokens'], 'checkpoint journal mismatch between arms')
     scratch = root / ('check-' + str(turn))
     scratch.mkdir(mode=0o700)
     fixture = scratch / 'input.json'
     result = scratch / 'result.json'
     private_json(fixture, dict(tokens=local['tokens'], k=64, max_ctx=client['context'],
         model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=heterogeneous,
-        snapshots=[hybrid['path'], local['path']], snapshot_sha256=[hybrid['sha256'], local['sha256']]))
+        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved]))
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
     process = start_process(command, scratch, 'checker')
@@ -291,11 +328,12 @@ def checkpoint(app, client, root, turn, heterogeneous):
     require(result.is_file(), 'checkpoint checker produced no metrics; inspect its log')
     row = json.loads(result.read_text())
     require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
+    require(row.get('status_rule') == 'session_partition_mean_or_position_p95', 'checkpoint partition band missing')
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
     row.update(turn=turn, checker_exit_code=process.returncode,
-               snapshot_sha256=[hybrid['sha256'], local['sha256']])
-    for saved in (hybrid, local):
-        Path(saved['path']).unlink()
+               snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
+    for item in saved:
+        Path(item['path']).unlink()
     return row
 
 
@@ -306,8 +344,25 @@ def validate_checkpoint(row, heterogeneous, depth):
             'invalid checkpoint metrics')
     require(not row['exact'] or (row['top1_agreed'] == 64 and row['mean_kl_nats'] == 0 and row['max_abs_logit_diff'] == 0),
             'checkpoint exactness contradicts measured distributions')
-    status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if row['exact'] else ('failed', 3)
-    require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict weakened exactness')
+    accepted = row['exact']
+    if row.get('status_rule') == 'session_partition_mean_or_position_p95':
+        values = [p['local_partition_kl_nats'] for p in row['positions']]
+        require(len(values) == 64 and all(math.isfinite(v) and v >= 0 for v in values), 'invalid local partition positions')
+        band = sum(values) / 64
+        p95 = sorted(values)[60]
+        require(math.isclose(row['local_partition_mean_kl_nats'], band, abs_tol=1e-15) and
+                row['local_partition_p95_kl_nats'] == p95 and row['kl_limit'] == max(band, p95),
+                'invalid local partition band')
+        ratio = row['kl_to_partition_ratio']
+        ratio_status = 'finite' if band > 0 else 'both_zero' if row['mean_kl_nats'] == 0 else 'zero_noise_band'
+        require(row['kl_to_partition_ratio_status'] == ratio_status and
+                (math.isclose(ratio, row['mean_kl_nats'] / band, abs_tol=1e-12) if band > 0 else ratio is None),
+                'invalid KL to partition ratio')
+        require(type(row['free_running_first_divergence']) is int and -1 <= row['free_running_first_divergence'] < 64,
+                'invalid free-running result')
+        accepted = row['mean_kl_nats'] <= row['kl_limit'] and row['top1_agreed'] >= 63 and row['free_running_first_divergence'] == -1
+    status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
+    require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict contradicts acceptance rule')
 
 
 def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id):
@@ -323,6 +378,7 @@ def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id)
         local_tail_seconds=(meter['local_prompt_ms'] or 0) / 1000 if meter['path'] == 'offload' else 0,
         reconciliation_seconds=meter['reconciliation_ms'] / 1000,
         catchup_tokens=sum(r['n1'] - r['n0'] for r in catchup), catchup_seconds=sum(r['seconds'] for r in catchup),
+        catchup_node_seconds=sum(r.get('node_prefill_seconds', 0) for r in catchup),
         catchup_upload_bytes=sum(r['upload_body_bytes'] for r in catchup),
         decode_tokens_per_second=(meter['generated_tokens'] - 1) * 1000 / meter['decode_ms']
             if meter.get('decode_ms') and meter['generated_tokens'] > 1 else None,
@@ -334,7 +390,10 @@ def parser():
     p.add_argument('--client-state', required=True, help='read-only launcher metadata; launches its own decoder')
     p.add_argument('--node-info')
     p.add_argument('--output', required=True, help='new private artifact directory')
-    p.add_argument('--depth', type=int, default=100000)
+    p.add_argument('--depth', type=lambda value: 'deep' if value == 'deep' else int(value), default=100000,
+                   help='100000 or deep (derived native-capacity start); small integers for CPU controls')
+    p.add_argument('--partition-batch', type=int, default=64)
+    p.add_argument('--partition-ubatch', type=int, default=32)
     p.add_argument('--turns', type=int, default=40)
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
@@ -351,7 +410,8 @@ def parser():
 
 
 def run(args):
-    require(64 <= args.depth <= 1000000 and 1 <= args.turns <= 1000, 'invalid depth or turn count')
+    require((args.depth == 'deep' or 64 <= args.depth <= NATIVE_CONTEXT) and 1 <= args.turns <= 1000, 'invalid depth or turn count')
+    require(1 <= args.partition_ubatch <= args.partition_batch <= 4096, 'invalid partition batch/ubatch')
     require(0 <= args.disconnect_turn <= args.turns and args.disconnect_turns >= 1 and
             (not args.disconnect_turn or args.disconnect_turn + args.disconnect_turns <= args.turns),
             'outage must leave at least one reconnected turn')
@@ -368,19 +428,21 @@ def run(args):
     for binary in ('llama-server', 'llama-hybrid-bench-check'):
         require(sha256(Path(client['build_dir']) / 'bin' / binary) == client['binaries'][binary], 'client binary changed: ' + binary)
     require(not root.exists() and root.parent.is_dir(), 'output must be a new directory in an existing parent')
-    workload = scenario(args.depth, args.turns, args.seed, args.max_new, args.max_output, args.pause_cap)
-    require(args.depth + sum(r['input_tokens'] + r['output_tokens'] + 32 for r in workload) + 256 <=
-            min(client['context'], node['context']), 'context cannot fit the full sequence and checkpoints; no clamping')
+    capacity = min(client['context'], node['context'], NATIVE_CONTEXT)
+    require(max(client['context'], node['context']) <= NATIVE_CONTEXT, 'native 262144 context only; no YaRN')
+    require(args.depth != 'deep' or capacity == NATIVE_CONTEXT, 'deep arm needs native 262144 context on both roles')
+    require(args.partition_batch != client.get('batch', 256) and args.partition_ubatch != client.get('ubatch', 256),
+            'partition baseline needs different batch and ubatch')
     checkpoints = set(range(10, args.turns + 1, 10)) | {args.turns}
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
     size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
-    require(shutil.disk_usage(root.parent).free > floor + (len(checkpoints) + 4) * size,
+    require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
     events = Events()
-    trace = dict(schema='hybrid-growing-session-v1', status='running', seed=args.seed, start=args.start,
+    trace = dict(schema='hybrid-growing-session-v2', status='running', seed=args.seed, start=args.start,
         depth=args.depth, turns=args.turns, workload=[], calls=[], checkpoints=[],
         provenance=dict(**PROVENANCE, depth_bins=DEPTH_BINS, pause_seconds=PAUSE,
                         sampling='linear below p50, log-linear above; bounded at last published quantile'),
@@ -439,6 +501,11 @@ def run(args):
         config['clients'] = {k: dict(v) for k, v in config['clients'].items()}
         app = MeasuredProxy(config, str(root / 'proxy.sqlite'), events, checkpoints)
         app.cleanup_prefill = upstream
+        plan = depth_plan(args.depth, args.turns, args.seed, args.max_new, args.max_output, args.pause_cap,
+                          template_framing(app), capacity)
+        args.depth = plan['d0']
+        trace.update(depth=args.depth, depth_plan={k: v for k, v in plan.items() if k != 'sequence'},
+                     workload=plan['sequence'], local_partition=dict(batch=args.partition_batch, ubatch=args.partition_ubatch))
         trace['policy'] = app.policy_config
         trace['heterogeneous'] = client['backend'] != node['backend']
         credential = config['client_credential']
@@ -451,7 +518,7 @@ def run(args):
                 app.phase = dict(arm=arm, turn=step['turn'])
                 body = dict(messages=messages, max_tokens=step['output_tokens'], temperature=0,
                             seed=step['seed'], ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
-                mode = 'offload' if initial and arm == 'hybrid' else arm
+                mode = 'offload' if initial and arm == 'hybrid' else 'local' if arm == 'local_partition' else arm
                 sid, message, meter, first, total = stream_chat(proxy_url, credential, body, mode, sid, args.request_timeout)
                 verify_meter(meter, previous.get(arm, 0), mode)
                 previous[arm] = meter['depth_after']
@@ -469,21 +536,35 @@ def run(args):
                 if (arm, step['turn']) in app.saved:
                     row['checkpoint_save_seconds'] = app.saved[(arm, step['turn'])]['save_seconds']
                 trace['calls'].append(row)
+                if arm != 'hybrid':
+                    reference = next(r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] == step['turn'])
+                    require(row['journal_hash'] == reference['journal_hash'], 'paired journal hashes differ')
                 flush()
                 return sid, messages + [message]
 
             initial = dict(turn=0, output_tokens=1, seed=args.seed)
+            def stage_base(arm):
+                sid, messages = call(arm, 'growing-' + uuid.uuid4().hex, base_messages(app, args.depth), initial, True)
+                current = app.store.get(sid)
+                filename = arm + '-base.bin'
+                started = time.monotonic()
+                app.decode.request('POST', f"/slots/{current['slot']}?action=save", dict(filename=filename))
+                base[arm] = (sid, messages, filename)
+                events.add(kind='pre_stage', arm=arm, journal_hash=prefix_hash(current['tokens']),
+                           bytes=(app.slot_path / filename).stat().st_size, seconds=time.monotonic() - started)
+
             if args.start == 'pre-staged':
                 for arm in ('hybrid', 'local'):
-                    sid, messages = call(arm, 'growing-' + uuid.uuid4().hex, base_messages(app, args.depth), initial, True)
-                    current = app.store.get(sid)
-                    filename = arm + '-base.bin'
-                    started = time.monotonic()
-                    app.decode.request('POST', f"/slots/{current['slot']}?action=save", dict(filename=filename))
-                    base[arm] = (sid, messages, filename)
-                    events.add(kind='pre_stage', arm=arm, journal_hash=prefix_hash(current['tokens']),
-                               bytes=(app.slot_path / filename).stat().st_size, seconds=time.monotonic() - started)
-            for arm in ('hybrid', 'local'):
+                    stage_base(arm)
+            for arm in ('hybrid', 'local', 'local_partition'):
+                if arm == 'local_partition':
+                    stop_process(decoder)
+                    alternate = dict(client, batch=args.partition_batch, ubatch=args.partition_ubatch)
+                    decoder = start_process(decoder_command(alternate, config, urllib.parse.urlsplit(config['decode_url']).port,
+                        root / 'slots', token_file), root, 'decode-partition')
+                    wait_health(config['decode_url'], '/health', decoder, timeout=args.request_timeout, token=config['decode_token'])
+                    if args.start == 'pre-staged':
+                        stage_base(arm)
                 if arm in base:
                     sid, messages, filename = base[arm]
                     with app.reserve(sid):
@@ -497,14 +578,11 @@ def run(args):
                     start = time.monotonic()
                     sid, messages = call(arm, 'growing-' + uuid.uuid4().hex, base_messages(app, args.depth), initial, True)
                 reconnect_events = None
-                rng = random.Random(args.seed)
-                steps = (sample_turn(rng, previous[arm], turn, args.seed, args.max_new, args.max_output, args.pause_cap)
-                         for turn in range(1, args.turns + 1)) if arm == 'hybrid' else iter(trace['workload'])
+                steps = iter(trace['workload'])
                 for step in steps:
-                    if arm == 'hybrid':
-                        trace['workload'].append(step)
-                    require(previous[arm] + step['input_tokens'] + step['output_tokens'] + 256 <=
-                            min(client['context'], node['context']), 'growing context exhausted; no clamping')
+                    require(previous[arm] == step['conditioning_depth'], 'actual depth differs from sampled plan')
+                    require(previous[arm] + step['input_tokens'] + step['output_tokens'] + plan['framing_tokens'] + DEPTH_MARGIN <=
+                            capacity, 'growing context exhausted; no clamping')
                     turn = step['turn']
                     if arm == 'hybrid' and turn == args.disconnect_turn:
                         events.add(kind='disconnect', turn=turn, pid=bridge.pid)
@@ -519,6 +597,8 @@ def run(args):
                     time.sleep(step['pause_seconds'])
                     sid, messages = call(arm, sid, messages + [dict(role='user', content=' x' * step['input_tokens'])], step)
                     row = trace['calls'][-1]
+                    require(row['new_tokens'] == step['input_tokens'] + plan['framing_tokens'],
+                            'actual template growth differs from sampled plan; no clamping')
                     if arm == 'hybrid' and args.disconnect_turn <= turn < args.disconnect_turn + args.disconnect_turns and args.disconnect_turn:
                         require(row['path'] == 'local', 'offload accepted during disconnection')
                     if reconnect_events is not None and row['path'] == 'offload':
@@ -529,17 +609,19 @@ def run(args):
                             catchup_seconds=sum(r['seconds'] for r in catchup),
                             upload_body_bytes=sum(r['upload_body_bytes'] for r in catchup))
                         reconnect_events = None
-                    if arm == 'local' and turn in checkpoints:
+                    if arm == 'local_partition' and turn in checkpoints:
                         result = checkpoint(app, client, root, turn, trace['heterogeneous'])
                         trace['checkpoints'].append(result)
                         flush()
                 events.add(kind='window', arm=arm, seconds=time.monotonic() - start)
+                require(previous[arm] == plan['final_depth'], 'final depth differs from sampled plan')
                 # Closing the replay marker precedes DELETE; no later background work may recreate the session.
                 request = urllib.request.Request(proxy_url + '/v1/sessions/' + sid, method='DELETE',
                     headers={'Authorization': 'Bearer ' + credential})
                 with urllib.request.urlopen(request, timeout=args.request_timeout):
                     pass
             paths = {r['path'] for r in trace['calls'] if r['stage'] == 'turn' and r['arm'] == 'hybrid'}
+            trace['final_depth'] = previous
             require(paths == {'local', 'offload'}, 'scenario did not exercise both policy routes')
             require(not args.disconnect_turn or any(r.get('resync') for r in trace['calls']),
                     'no verified offload after reconnection')

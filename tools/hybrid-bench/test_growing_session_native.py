@@ -102,8 +102,8 @@ def main():
             require(code in (0, 3), start + ': experiment aborted; inspect the retained trace and log')
             trace = json.loads((output / 'trace.json').read_text())
             calls = [r for r in trace['calls'] if r['stage'] == 'turn']
-            # Live growing state must survive both routes, the actual relay outage, and exact 64-token checks.
-            require(len(calls) == 24 and trace['status'] in ('passed', 'failed'), 'incomplete paired session')
+            # Three live sessions preserve their journals through both routes and the actual relay outage.
+            require(len(calls) == 36 and trace['status'] in ('passed', 'failed'), 'incomplete three-arm session')
             hybrid = [r for r in calls if r['arm'] == 'hybrid']
             require({r['path'] for r in hybrid} == {'local', 'offload'}, 'missing routing branch')
             require(all(r['path'] == 'local' for r in hybrid if 4 <= r['turn'] < 6), 'offload during outage')
@@ -111,11 +111,16 @@ def main():
             require([r['turn'] for r in trace['checkpoints']] == [10, 12], 'checkpoint missing')
             require(all(r['k'] == 64 for r in trace['checkpoints']), 'wrong checkpoint width')
             require(node.request('GET', '/v1/sessions') == [], 'remote sessions leaked')
-            require(all(r['journal_hash'] == l['journal_hash'] for r, l in zip(
-                hybrid, [r for r in calls if r['arm'] == 'local'])), 'paired journals differ')
+            for arm in ('local', 'local_partition'):
+                local = [r for r in calls if r['arm'] == arm]
+                require(all(r['journal_hash'] == l['journal_hash'] for r, l in zip(hybrid, local)), 'paired journals differ')
+                require(all(r['path'] == 'local' and r['catchup_tokens'] == 0 and r['wire_bytes'] == 0 for r in local),
+                        'local baseline used remote work')
+            require(trace['depth_plan']['final_depth'] == trace['final_depth']['hybrid'] and
+                    len(trace['workload']) == 12, 'depth plan or sequence changed')
             print('OBSERVED ' + start + ': ' + trace['status'] + '; driver exit ' + str(code), flush=True)
         require(sha256(model) == digest, 'model file changed')
-    require(all(r['exit_code'] == 0 for r in commands), 'same-backend mixed-route exactness is not qualified')
+    require(all(r['exit_code'] == 0 for r in commands), 'same-backend session partition criterion is not qualified')
     print('PASS all native growing-session checks; CPU only, no downloads', flush=True)
 
 

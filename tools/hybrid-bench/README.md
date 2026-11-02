@@ -281,4 +281,6 @@ The existing CMake target `llama-hybrid-score` builds the scorer; `llama-hybrid-
 
 ## Growing sessions
 
-`python3 tools/hybrid-bench/growing_session.py --help` describes the paired growing-session driver. The [scenario, JSON schema, CPU commands and CUDA/Mac runbooks](GROWING-SESSION.md) cover its real policy/journal path, pre-staging, PID-owned outage relay and live 64-token checkpoint scoring. Output is private `OUTPUT/trace.json` with native inputs, SQLite, slots, logs and PID receipts beside it; export only the documented trace. [r36 results](RESULTS-hybrid-b-r36-261102.md) records the current strict CPU exactness failure and the unresolved 250k context-capacity decision.
+`python3 tools/hybrid-bench/growing_session.py --help` describes the growing-session driver and both local references. The [scenario, JSON schema, CPU commands and CUDA/Mac runbooks](GROWING-SESSION.md) cover its real policy/journal path, pre-staging, PID-owned outage relay and live 64-token checkpoint scoring. Output is private `OUTPUT/trace.json` with native inputs, SQLite, slots, logs and PID receipts beside it; export only the documented trace. [The r37 section of the results](RESULTS-hybrid-b-r36-261102.md) records the measured criterion, CPU outcomes and controls.
+
+Use `--depth deep` for the derived start within native 262144 context. A second local session at different batch/ubatch supplies the checkpoint noise band; its commands, trace fields and limits are in the runbook.

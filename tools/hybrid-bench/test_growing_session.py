@@ -15,6 +15,51 @@ import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # Deep admission chooses the largest fitting 1024 boundary, preserves every turn, and rejects overflow at100k.
+    def test_native_depth_plan(self):
+        plan = growing.depth_plan('deep', 40, 1, 10875, 4506, 340, 13)
+        self.assertEqual(plan['d0'] % 1024, 0)
+        self.assertEqual(len(plan['sequence']), 40)
+        self.assertLessEqual(plan['final_depth'] + 2048, 262144)
+        self.assertEqual(plan['growth'], sum(r['input_tokens'] + r['output_tokens'] + 13 for r in plan['sequence']))
+        for depth in range(plan['d0'] + 1024, 262144, 1024):
+            rows = growing.scenario(depth, framing=13)
+            self.assertGreater(depth + sum(r['input_tokens'] + r['output_tokens'] + 13 for r in rows) + 2048, 262144)
+        shallow = growing.depth_plan(100000, 40, 1, 10875, 4506, 340, 13)
+        self.assertEqual(shallow['d0'], 100000)
+        boundary = growing.depth_plan('deep', 1, 1, 0, 1, 0, 13, 100000 + 14 + 2048)
+        self.assertEqual(boundary['d0'], 99328)
+        for depth in ('deep', 100000):
+            with self.assertRaisesRegex(Refusal, 'D0=100000.*no turns truncated'):
+                growing.depth_plan(depth, 1000, 1, 10875, 4506, 340, 13)
+
+    # The session band accepts its boundary, but excess KL, top1<63, or any free-running divergence fails.
+    def test_checkpoint_partition_band(self):
+        values = [.001] * 60 + [.003] * 4
+        mean = sum(values) / 64
+        row = dict(depth=1000, k=64, exact=False, top1_agreed=63, mean_kl_nats=.003,
+            max_abs_logit_diff=.8, status='passed', exit_code=0, free_running_first_divergence=-1,
+            positions=[dict(local_partition_kl_nats=v) for v in values],
+            local_partition_mean_kl_nats=mean, local_partition_p95_kl_nats=.003, kl_limit=.003,
+            kl_to_partition_ratio=.003 / mean, kl_to_partition_ratio_status='finite',
+            status_rule='session_partition_mean_or_position_p95')
+        growing.validate_checkpoint(row, False, 1000)
+        for fields in (dict(top1_agreed=62), dict(free_running_first_divergence=63),
+                       dict(mean_kl_nats=.003001, kl_to_partition_ratio=.003001 / mean)):
+            with self.assertRaises(Refusal):
+                growing.validate_checkpoint(dict(row, **fields), False, 1000)
+            growing.validate_checkpoint(dict(row, **fields, status='failed', exit_code=3), False, 1000)
+        for fields in (dict(kl_limit=.01), dict(positions=[]), dict(local_partition_p95_kl_nats=.004),
+                       dict(kl_to_partition_ratio=1)):
+            with self.assertRaises(Refusal):
+                growing.validate_checkpoint(dict(row, **fields), False, 1000)
+        zero = dict(row, mean_kl_nats=0, local_partition_mean_kl_nats=0, local_partition_p95_kl_nats=0,
+            positions=[dict(local_partition_kl_nats=0)] * 64, kl_limit=0,
+            kl_to_partition_ratio=None, kl_to_partition_ratio_status='both_zero')
+        growing.validate_checkpoint(zero, False, 1000)
+        with self.assertRaises(Refusal):
+            growing.validate_checkpoint(dict(zero, mean_kl_nats=.000001, kl_to_partition_ratio_status='zero_noise_band'), False, 1000)
+
     # Other sessions' background replay cannot be charged to the local baseline or the current hybrid turn.
     def test_catchup_attribution(self):
         meter = dict(decision={}, depth_before=100, depth_after=104, new_tokens=3, generated_tokens=1,
@@ -69,7 +114,8 @@ class ScenarioTests(unittest.TestCase):
     def test_invalid_run_is_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'absent'
-            for fields in ({'disconnect_turn': 40}, {'turns': 0}, {'pause_cap': -1}, {'disk_floor_gb': 27}):
+            for fields in ({'disconnect_turn': 40}, {'turns': 0}, {'pause_cap': -1}, {'disk_floor_gb': 27},
+                           {'partition_ubatch': 65, 'partition_batch': 64}):
                 args = growing.parser().parse_args(['--client-state', 'absent', '--output', str(output), '--link-label', 'CPU'])
                 vars(args).update(fields)
                 with mock.patch.object(growing, 'start_process') as start, mock.patch.object(growing, 'read_private') as read:

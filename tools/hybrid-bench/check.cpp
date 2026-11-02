@@ -56,6 +56,10 @@ static bool within_repeat_floor(bool exact, bool repeat_exact, double kl, double
     return repeat_exact ? exact : diff <= repeat_diff && kl <= repeat_kl;
 }
 
+static bool within_session_band(double kl, double mean, double p95, int agreed, int k, int divergence) {
+    return kl <= std::max(mean, p95) && agreed >= k - 1 && divergence == -1;
+}
+
 static double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
@@ -97,14 +101,16 @@ static int check_snapshots(const hybrid::json & fixture, llama_model * model, bo
     const int k = fixture.at("k");
     const auto paths = fixture.at("snapshots").get<std::vector<std::string>>();
     const auto hashes = fixture.at("snapshot_sha256").get<std::vector<std::string>>();
-    require(paths.size() == 2 && hashes.size() == 2, "need hybrid and local snapshots");
+    const bool measured_band = paths.size() == 3;
+    require((paths.size() == 2 || measured_band) && hashes.size() == paths.size(), "need hybrid, local and optional partition snapshots");
     const int64_t max_ctx = fixture.at("max_ctx");
     require(max_ctx > 0 && max_ctx <= 1048576 && uint64_t(max_ctx) >= tokens.size() + k + 2,
             "invalid snapshot context capacity");
     auto hybrid_ctx = context(model, max_ctx, gpu);
     auto local_ctx = context(model, max_ctx, gpu);
-    llama_context * contexts[] = {hybrid_ctx.get(), local_ctx.get()};
-    for (size_t i = 0; i < 2; ++i) {
+    auto partition_ctx = measured_band ? context(model, max_ctx, gpu) : hybrid::context_ptr();
+    llama_context * contexts[] = {hybrid_ctx.get(), local_ctx.get(), partition_ctx.get()};
+    auto restore = [&](size_t i) {
         require(hybrid::file_hash(paths[i].c_str()) == hashes[i], "snapshot checksum mismatch");
         size_t count = 0;
         require(llama_state_seq_load_file(contexts[i], paths[i].c_str(), 0, nullptr, 0, &count) > 0 &&
@@ -117,11 +123,13 @@ static int check_snapshots(const hybrid::json & fixture, llama_model * model, bo
                 "snapshot token journal mismatch");
         // The last sampled token was saved before reconciliation, so its evaluation restores checkpoint logits.
         hybrid::prefill(contexts[i], {tokens.back()}, loaded.size());
-    }
+    };
+    for (size_t i = 0; i < paths.size(); ++i) { restore(i); }
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     int agreed = 0;
     bool exact = true;
-    double sum = 0, difference = 0;
+    double sum = 0, difference = 0, partition_sum = 0;
+    std::vector<double> partition_values;
     auto positions = hybrid::json::array();
     for (int i = 0; i < k; ++i) {
         const auto * h = llama_get_logits_ith(hybrid_ctx.get(), -1);
@@ -135,16 +143,52 @@ static int check_snapshots(const hybrid::json & fixture, llama_model * model, bo
         agreed += top1;
         sum += value;
         difference = std::max(difference, diff);
-        positions.push_back({{"position", tokens.size() + i}, {"exact", equal}, {"top1_agreed", top1}, {"kl_nats", value}});
+        hybrid::json position = {{"position", tokens.size() + i}, {"exact", equal}, {"top1_agreed", top1}, {"kl_nats", value}};
+        if (measured_band) {
+            const double noise = compare(l, llama_get_logits_ith(partition_ctx.get(), -1), vocab);
+            partition_sum += noise;
+            partition_values.push_back(noise);
+            position["local_partition_kl_nats"] = noise;
+            position["kl_to_partition_ratio"] = noise > 0 ? hybrid::json(value / noise) : hybrid::json(nullptr);
+            hybrid::prefill(partition_ctx.get(), {next}, tokens.size() + i);
+        }
+        positions.push_back(position);
         hybrid::prefill(hybrid_ctx.get(), {next}, tokens.size() + i);
         hybrid::prefill(local_ctx.get(), {next}, tokens.size() + i);
     }
+    // Replay independent greedy continuations from the same checkpoints, without teacher forcing.
+    restore(0);
+    restore(1);
+    int first_divergence = -1;
+    for (int i = 0; i < k; ++i) {
+        const auto h = hybrid::greedy(hybrid_ctx.get(), model);
+        const auto l = hybrid::greedy(local_ctx.get(), model);
+        if (h != l && first_divergence < 0) { first_divergence = i; }
+        hybrid::prefill(hybrid_ctx.get(), {h}, tokens.size() + i);
+        hybrid::prefill(local_ctx.get(), {l}, tokens.size() + i);
+    }
+    const double partition_mean = partition_sum / k;
+    std::sort(partition_values.begin(), partition_values.end());
+    const double p95 = measured_band ? partition_values[size_t(std::ceil(.95 * k)) - 1] : 0;
+    const double limit = std::max(partition_mean, p95);
+    const bool accepted = measured_band ? within_session_band(sum / k, partition_mean, p95, agreed, k, first_divergence) : exact;
     const bool heterogeneous = fixture.value("heterogeneous", false);
-    const int code = heterogeneous ? 5 : exact ? 0 : 3;
-    const hybrid::json result = {{"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
+    const int code = heterogeneous ? 5 : accepted ? 0 : 3;
+    hybrid::json result = {{"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
         {"exact", exact}, {"top1_agreed", agreed}, {"mean_kl_nats", sum / k}, {"max_abs_logit_diff", difference},
         {"positions", positions}, {"reference", "KL(local || hybrid), live snapshots, local greedy teacher forcing"},
-        {"status", heterogeneous ? "heterogeneous" : exact ? "passed" : "failed"}, {"exit_code", code}};
+        {"free_running_first_divergence", first_divergence},
+        {"status", heterogeneous ? "heterogeneous" : accepted ? "passed" : "failed"}, {"exit_code", code}};
+    if (measured_band) {
+        result["local_partition_mean_kl_nats"] = partition_mean;
+        result["local_partition_p95_kl_nats"] = p95;
+        result["kl_limit"] = limit;
+        result["kl_to_partition_ratio"] = partition_mean > 0 ? hybrid::json(sum / k / partition_mean) : hybrid::json(nullptr);
+        result["kl_to_partition_ratio_status"] = partition_mean > 0 ? "finite" : sum == 0 ? "both_zero" : "zero_noise_band";
+        result["status_rule"] = "session_partition_mean_or_position_p95";
+    } else {
+        result["status_rule"] = "same_snapshot_exact";
+    }
     std::ofstream target(output);
     target << result.dump(2) << '\n';
     require(target.good(), "cannot write checkpoint result");
@@ -163,6 +207,11 @@ int main(int argc, char ** argv) {
         require(within_repeat_floor(true, true, 0, 0, 0, 0) && !within_repeat_floor(false, true, 0, 0, 0, 0) &&
                 within_repeat_floor(false, false, .01, .1, .01, .1) && !within_repeat_floor(false, false, .02, .1, .01, .1) &&
                 !within_repeat_floor(false, false, .01, .2, .01, .1), "measured floor control failed");
+        // The session rule accepts either measured bound and rejects KL excess, top-1 loss, or free-running divergence.
+        require(within_session_band(.003, .001, .003, 63, 64, -1) && within_session_band(.003, .003, .001, 64, 64, -1) &&
+                within_session_band(0, 0, 0, 64, 64, -1) && !within_session_band(.0001, 0, 0, 64, 64, -1) &&
+                !within_session_band(.003001, .001, .003, 64, 64, -1) && !within_session_band(.001, .001, .003, 62, 64, -1) &&
+                !within_session_band(.001, .001, .003, 64, 64, 63), "session partition acceptance control failed");
         const auto fixture = hybrid::json::parse(read_file(argv[2], 8 * 1024 * 1024), [](int depth, hybrid::json::parse_event_t, hybrid::json &) {
             require(depth <= 32, "check JSON nesting too deep");
             return true;
