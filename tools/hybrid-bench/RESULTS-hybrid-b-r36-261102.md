@@ -485,3 +485,119 @@ All 17 listed mutants are killed at the named test; there are no survivors in th
 No surface table was supplied (brief gap). No requested row is excluded. The owner-selected gate is implemented and ready for review; the remaining token/hardware failures are explicitly recorded.
 
 Cleanup at 2026-11-02T04:07:17Z: all 115 recorded task PIDs are inactive. All three task build trees (209602643 bytes), compiled mutants and expired fixture credentials were removed. Minimum sampled free disk was 29538697216 bytes (29.539 GB); cleanup readback was 30843768832 bytes. Private node snapshots/deltas, journals, raw logits, hashes and logs remain available for review; only sealed byte-identical outputs share inodes. No push.
+
+## r41: the reviewer-specified gate
+
+Run `hybrid-b-r41-261102`, based on signed `e3814bac` on `m3-growing-session`, implements r7t F2 exactly. This supersedes the r40 free-divergence clause; historical r40 exit 3 remains recorded above. CPU only, existing local Qwen3.5-0.8B Q4_0, q8_0 KV, no GPU/model download/push. The fresh admission harness and both starts exit **0**. This is ready for review; no independent acceptance of r41 is claimed.
+
+All ten `gate_controls` remain exact: NODE-B, RESTORE-B, BSTATE-B, NODE_RANGE-B, OWN_NATIVE-A, OWN_RANGE-A, CHAIN-H, CHAIN_ATTENTION-B, CHAIN_RECURRENT-H and A-L. Their native/Python implementation bodies and Python raw-logit validator are byte-identical to r40, with proof hashes in `.temp/r41/qualification-identity.json`. Byte roundtrips, live BSTATE bytes, recurrent equality before both replacements, journal/model/snapshot/delta hashes, and full raw-logit re-derivation are unchanged. L-H teacher-forced top-1>=63/64 is the sole L-H sanity gate. L-H free divergence is always reported and never an exit condition. Exact-control independent greedy equality remains required.
+
+Each exported checkpoint adds report-only `fidelity_flag`, computed after validation. L-H is compared strictly with all three noise cells A-B1, A-B2 and A-B, like-for-like per statistic: mean/p95/max greater, top-1 smaller, free index earlier (-1 ranks as positive infinity). Equal to any noise cell leaves the relevant flag false. Neither a flag nor any L-H KL/max/free value can change the verdict. The native checker observes free continuations; the independent raw audit validates teacher-forced distributions and cannot re-derive free continuations.
+
+### Admission measurements
+
+Audit observed at 2026-11-02T05:10:39.685660+00:00; runtime source and binary SHA-256 identities are retained in qualification-identity.json.
+
+Both cold and pre-staged have 39 calls, checkpoints at depth 1679/2043 (turn 10/12), all ten exact controls green, exact paired journals, connected policy-local/offload, outage fallback, connected prompt catch-up and background replay. The native harness runs the unchanged raw-logit validator at every checkpoint. Hashes, controls, flags, routes and source/binary identities are additionally audited in `.temp/r41/measurements.json`. The table includes each actual checkpoint, its three noise cells and B-H; KL is nats/token, p95 is nearest rank, top-1 is out of 64, free=-1 means none.
+
+| Start | Turn / depth | Cell | Mean KL | p95 KL | Max abs dlogit | Top-1 | Free |
+|---|---|---|---:|---:|---:|---:|---:|
+| cold | 10 / 1679 | L-H | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | 64/64 | -1 |
+| cold | 10 / 1679 | A-B1 | 0.00018071129068 | 0.000879184946625 | 0.866317749023 | 64/64 | -1 |
+| cold | 10 / 1679 | A-B2 | 8.29298923694e-05 | 0.000546047878833 | 1.11637067795 | 64/64 | -1 |
+| cold | 10 / 1679 | A-B | 0.000563020461777 | 0.00121762819219 | 0.942632198334 | 64/64 | -1 |
+| cold | 10 / 1679 | B-H | 7.71985333402e-05 | 0.000302589110353 | 0.792877197266 | 64/64 | -1 |
+| cold | 12 / 2043 | L-H | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | 63/64 | 0 |
+| cold | 12 / 2043 | A-B1 | 0.000248037221206 | 0.000306196323783 | 0.70611333847 | 64/64 | -1 |
+| cold | 12 / 2043 | A-B2 | 0.00041999735555 | 0.00138579233125 | 0.869745731354 | 63/64 | 0 |
+| cold | 12 / 2043 | A-B | 0.000245036923118 | 0.000767767496852 | 0.624326705933 | 64/64 | -1 |
+| cold | 12 / 2043 | B-H | 0.000274473850817 | 0.00101512660845 | 0.771906852722 | 63/64 | 0 |
+| pre-staged | 10 / 1679 | L-H | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | 64/64 | -1 |
+| pre-staged | 10 / 1679 | A-B1 | 0.00018071129068 | 0.000879184946625 | 0.866317749023 | 64/64 | -1 |
+| pre-staged | 10 / 1679 | A-B2 | 8.29298923694e-05 | 0.000546047878833 | 1.11637067795 | 64/64 | -1 |
+| pre-staged | 10 / 1679 | A-B | 0.000563020461777 | 0.00121762819219 | 0.942632198334 | 64/64 | -1 |
+| pre-staged | 10 / 1679 | B-H | 7.71985333402e-05 | 0.000302589110353 | 0.792877197266 | 64/64 | -1 |
+| pre-staged | 12 / 2043 | L-H | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | 63/64 | 0 |
+| pre-staged | 12 / 2043 | A-B1 | 0.000248037221206 | 0.000306196323783 | 0.70611333847 | 64/64 | -1 |
+| pre-staged | 12 / 2043 | A-B2 | 0.00041999735555 | 0.00138579233125 | 0.869745731354 | 63/64 | 0 |
+| pre-staged | 12 / 2043 | A-B | 0.000245036923118 | 0.000767767496852 | 0.624326705933 | 64/64 | -1 |
+| pre-staged | 12 / 2043 | B-H | 0.000274473850817 | 0.00101512660845 | 0.771906852722 | 63/64 | 0 |
+
+| Start | Turn | Mean flag | p95 flag | Max flag | Top-1 flag | Free flag | Native checkpoint exit |
+|---|---:|---|---|---|---|---|---:|
+| cold | 10 | true | true | false | false | false | 0 |
+| cold | 12 | false | false | false | false | false | 0 |
+| pre-staged | 10 | true | true | false | false | false | 0 |
+| pre-staged | 12 | false | false | false | false | false | 0 |
+
+**Turn 10 flags mean+p95 and still passes. Turn 12 flags nothing and passes with top-1 63/64 and free divergence 0.** No ratio or noise-derived tolerance gates either checkpoint.
+
+### Regression and negative evidence
+
+All commands run directly with their real exits, on-disk `TMPDIR=.temp/r41/tmp`, `PYTHONDONTWRITEBYTECODE=1`, and niceness 19 for builds/native/tests. Toolchain is reused CMake 4.4.4 / GCC 15.2.0 / Python 3.14.4. One lane build at a time, `-j4`, shared lock after pgrep/uptime admission. Full commands/PIDs/exits are in `.temp/r41/*.command.json`, `cpu-02-build-record.json`, native `commands.json` and the instrument-control ledgers.
+
+| Validation | Actual exit / result | Log under .temp/r41 |
+|---|---|---|
+| Current CPU configure/build: llama-server, llama-hybrid-prefill, llama-hybrid-bench-check, llama-hybrid-check-identity | 0 / 0 | cpu-02-{configure,build}-01.log |
+| `python3 -m unittest discover -s tools/hybrid-bench -p test_growing_session.py -v` | 0; 25 tests | growing-unit-01.log |
+| `python3 -m unittest discover -s tools/hybrid-bench -p test_*.py -v` | 0; 93 tests, six header-environment skips | bench-01.log |
+| `python3 -m unittest discover -s tools/hybrid-proxy -p test_*.py -v` | 0; 74 tests | proxy-01.log |
+| `test_mirai_identity.py --binary .temp/r41/build/bin/llama-hybrid-check-identity --headers /home/agent/lanes/hybrid/.temp/research/bonsai/gguf-dumps --artifacts .temp/r41/identity-01 -v` | 0; 12 tests, covers all six bench skips | identity-01.log |
+| `test_growing_session_native.py --build-dir .temp/r41/build --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/r41/native-02 --state-probes` | harness 0; cold 0; pre-staged 0; four checkpoints 0 | native-02.log |
+| Same-backend exactness, own roundtrips, valid 9 MiB manifest; >64MiB/incomplete/duplicate/checksum/journal/capacity refusals | three exits 0, six intended exits 2 | native-02/checkpoint-controls/commands.json |
+| All-local/all-remote routing preflights | each intended exit 2, zero arm calls | native-02/{all-local,all-remote}.log |
+| `.temp/r41/mutants.py`; `.temp/r41/native_gate_mutants.py` | harnesses 0; Python identity 0 / 18 mutants 1; compiled identity 0 / four mutants -6 | mutants-01.log; native-mutants-01.log |
+| Runtime-source/native-binary and evidence audit | 0 | audit-01.log; qualification-identity.json; measurements.json |
+| CI model-naming script, source AST/ASCII, whitespace | 0 each | code-style-01.log; syntax-ascii-01.log; whitespace-01.log |
+
+The new tests replace the early-divergence boundary with named `test_checkpoint_append_top1_62_fails` and `test_checkpoint_append_divergence_0_passes` (all valid free indices exercised at 63/64). `test_checkpoint_fidelity_flag_never_changes_exit_code` covers pass 0, fail 3 and heterogeneous 5 under all-false/all-true flags. `test_checkpoint_append_control_free_divergence_fails` requires exact teacher metrics with free 3 to make CHAIN-H false; it kills the reviewer's previously surviving Python control mutant. `test_checkpoint_fidelity_flags` exercises strict all-cell comparisons, equality, directions and -1 ordering.
+
+| Mutant | What it narrows the gate to | Named failing test | Actual exit / survivor bound |
+|---|---|---|---|
+| append-replay-mismatch-admitted | CHAIN-H exactness | test_checkpoint_append_replay_mismatch_fails | 1; killed, none |
+| append-LH-KL-zero-required | Positive L-H KL can pass | test_checkpoint_append_positive_kl_passes | 1; killed, none |
+| append-top1-floor-admitted | 63/64 teacher-forced floor | test_checkpoint_append_top1_62_fails | 1; killed, none |
+| append-free-divergence-gated | L-H divergence 0 remains report-only | test_checkpoint_append_divergence_0_passes | 1; killed, none |
+| fidelity-flag-gated | Flags cannot alter 0/3/5 | test_checkpoint_fidelity_flag_never_changes_exit_code | 1; killed, none |
+| exact-control-free-divergence-ignored | Exact-control independent greedy equality | test_checkpoint_append_control_free_divergence_fails | 1; killed, none |
+| fidelity-any-noise | Strict comparison against every noise cell | test_checkpoint_fidelity_flags | 1; killed, none |
+| fidelity-free-minus1-first | Free=-1 ranks as infinity | test_checkpoint_fidelity_flags | 1; killed, none |
+| append-roundtrip-bytes-ignored | Roundtrip byte identity | test_checkpoint_append_component_controls | 1; killed, none |
+| probe-raw-validation-disabled | Probe raw-logit integrity | test_checkpoint_raw_logits_reject_r7r_mutant | 1; killed, none |
+| node-boundary-race-admitted | Captured node journal boundary | test_node_snapshot_capture_refuses_boundary_race | 1; killed, none |
+| generated-cell-decodes | Separate generated/prompt schedules | test_factorial_schedule_boundaries | 1; killed, none |
+| partition-mean-authorizes | Legacy zero-band rule retained | test_checkpoint_partition_band | 1; killed, none |
+| raw-validation-disabled | Full raw-logit integrity | test_checkpoint_raw_logits_reject_r7r_mutant | 1; killed, none |
+| degenerate-route-admitted | Connected route mix before arms | test_route_preflight_rejects_degenerate | 1; killed, none |
+| foreign-catchup-counted | Session-specific catch-up | test_catchup_attribution | 1; killed, none |
+| depth-source-drift | Pinned workload provenance | test_sampling_table_provenance | 1; killed, none |
+| legacy-exactness-weakened | Unchanged legacy exactness | test_checkpoint_exactness_gate | 1; killed, none |
+| native-replay-mismatch-admitted | Native CHAIN-H exactness | test_append_replay_mismatch_fails | -6; killed, none |
+| native-LH-KL-zero-required | Native positive L-H KL accepted | test_append_positive_LH_KL_passes | -6; killed, none |
+| native-top1-floor-admitted | Native 63/64 floor | test_append_top1_62_fails | -6; killed, none |
+| native-free-divergence-gated | Native divergence 0 accepted | test_append_divergence_0_passes | -6; killed, none |
+
+All 22 plants are killed; none survives. Compiled plants extract the current production helper and verdict block and load the retained real r39 positive-KL result; their expected assertion failures are actual SIGABRT/-6 with core dumps disabled. They are bounded gate tests, not a mutated whole-model inference rerun. No failure is counted without its named assertion.
+
+### Review coverage
+
+| r7t surface row | Current evidence | Narrowing mutant / named failing test |
+|---|---|---|
+| 1. Replay mechanism | All ten controls exact at all four checkpoints; helper bodies unchanged | append-replay-mismatch-admitted / test_checkpoint_append_replay_mismatch_fails |
+| 2. Gate | 62 fails, free 0 passes, flags cannot gate | append-top1-floor-admitted / test_checkpoint_append_top1_62_fails; append-free-divergence-gated / test_checkpoint_append_divergence_0_passes; fidelity-flag-gated / test_checkpoint_fidelity_flag_never_changes_exit_code |
+| 3. F3-F5 and notes | Route preflights refuse before arms; raw validator unchanged; runbooks corrected | degenerate-route-admitted / test_route_preflight_rejects_degenerate; raw-validation-disabled / test_checkpoint_raw_logits_reject_r7r_mutant |
+| 4. Regressions | Bench 93, proxy 74, native identity 12 and fresh smoke green | legacy-exactness-weakened / test_checkpoint_exactness_gate |
+
+Runtime/test rework stays inside tools/hybrid-bench. The only outside path is the existing root README growing-session tool entry, updated because it advertised the obsolete free-divergence gate. No requested row is excluded.
+
+### Runbooks, evidence limits and resource controls
+
+Heterogeneous runs remain exit 5. The Mac runbook names CHAIN-H, A-L, OWN_NATIVE-A and OWN_RANGE-A (OWN_*-A) as client-backend identities expected exact even with a CUDA node; their mismatch is a finding. Cross-backend NODE/RESTORE/BSTATE/NODE_RANGE/CHAIN_ATTENTION-to-B comparisons remain report-only there. Probes are mandatory; stale optional/unchanged-L-H wording is removed.
+
+Full attention refresh is **34,816 B/token** for the 27B q8_0 layout: 16 attention layers x 2 K/V x 4 KV heads x 256 width x 34/32 bytes. At 100,000 tokens that is 3,481,600,000 B (**3.4816 GB**); at 216,064 it is 7,522,484,224 B (**7.5225 GB** rounded). Add recurrent state, row metadata, envelope and transport overhead. A full refresh restores equality to B, not L. Refresh is documented only and not implemented.
+
+The first build admission refused 1 because another lane was compiling; no configure/build ran until that lane stopped. First smoke `native-01` exited 1 after the nine instrument controls when the all-local preflight driver refused 2 on its conservative disk reservation before creating a trace. The following missing-trace error is not route-gate evidence. No criterion or integrity check was weakened: hash-verified sealed duplicate logits were hardlinked, retaining every path and byte, then the entire smoke was rerun fresh as `native-02`. Prior/current dedup records and disk observations are retained. Cleanup01 refused 1 because its PID check included its own helper; no files were removed. Report01 consequently exited 1 on missing cleanup evidence and wrote no section. Cleanup02 excludes only its current helper PID, verifies all other recorded PIDs inactive and exits 0; Report02 follows that successful evidence.
+
+Minimum observed disk throughout r41 was **29.791694848 GB**, above 28 GB. After owned build/mutant executable/expired fixture-credential cleanup, free disk was **31.319572480 GB**. All recorded task runtime PIDs were inactive at cleanup; the task disk observer was stopped first. Source, exact tokens, state/delta evidence, raw logits, SHA identities, command logs and both failed/corrected controls are retained under `.temp/r41/`; identical sealed logits share inodes. The task build tree is deleted.
+
+No requested row is out of contract. All pre-existing tests are retained except the explicitly requested replacement of the old free-divergence boundary test. Private self-review is `.temp/r41/self-review.md`; no board is configured, so the established `.temp/tasks.md` tracks scope/evidence. Missing ty/editorconfig-checker/ec means type/editorconfig tool checks were not run; hosted full-platform CI is unrun. GPU/Metal, 27B, 100k/deep and economics remain unqualified. The bounded CPU admission smoke is green; r41 awaits independent review.

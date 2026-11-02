@@ -179,20 +179,63 @@ class ScenarioTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, 'missing append replay'):
             growing.validate_checkpoint(row, False, 1000)
 
-    # 63/64 top-1 and divergence exactly at index8 pass; index0..7 or 62/64 fail, with unchanged replay controls.
+    # 62/64 teacher-forced top-1 fails with unchanged exact controls, including without free divergence.
     @mock.patch.object(growing, 'validate_raw_positions')
-    def test_checkpoint_append_token_boundaries(self, raw):
+    def test_checkpoint_append_top1_62_fails(self, raw):
         row = self.append_gate_row()
         row.update(exact=False, mean_kl_nats=.01, max_abs_logit_diff=1, top1_agreed=63, kl_to_partition_ratio_status='zero_noise_band')
-        for divergence in (-1, 8, 63):
-            growing.validate_checkpoint(dict(row, free_running_first_divergence=divergence), False, 1000)
-        for divergence in range(8):
-            bad = dict(row, free_running_first_divergence=divergence)
+        growing.validate_checkpoint(row, False, 1000)
+        for divergence in (-1, 0, 7, 63):
+            bad = dict(row, top1_agreed=62, free_running_first_divergence=divergence)
             with self.assertRaisesRegex(Refusal, 'verdict'):
                 growing.validate_checkpoint(bad, False, 1000)
             growing.validate_checkpoint(dict(bad, status='failed', exit_code=3), False, 1000)
+
+    # L-H free divergence at 0 or any later position passes at the 63/64 top-1 floor.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_checkpoint_append_divergence_0_passes(self, raw):
+        row = self.append_gate_row()
+        row.update(exact=False, mean_kl_nats=.01, max_abs_logit_diff=1, top1_agreed=63, kl_to_partition_ratio_status='zero_noise_band')
+        for divergence in (-1, *range(64)):
+            growing.validate_checkpoint(dict(row, free_running_first_divergence=divergence), False, 1000)
         with self.assertRaisesRegex(Refusal, 'verdict'):
-            growing.validate_checkpoint(dict(row, top1_agreed=62), False, 1000)
+            growing.validate_checkpoint(dict(row, free_running_first_divergence=0, status='failed', exit_code=3), False, 1000)
+
+    # Exact-control teacher metrics cannot hide a different independent greedy continuation.
+    def test_checkpoint_append_control_free_divergence_fails(self):
+        row = self.append_gate_row()
+        self.assertTrue(growing.append_replay_controls(row)['CHAIN-H'])
+        row['probes']['CHAIN']['H']['free_running_first_divergence'] = 3
+        self.assertFalse(growing.append_replay_controls(row)['CHAIN-H'])
+
+    # Each flag uses strict comparisons against all three like-for-like cells; no divergence ranks last.
+    def test_checkpoint_fidelity_flags(self):
+        row = dict(mean_kl_nats=3, p95_kl_nats=5, max_abs_logit_diff=7, top1_agreed=61, free_running_first_divergence=0)
+        row['factorial'] = {name: dict(mean_kl_nats=2, p95_kl_nats=4, max_abs_logit_diff=6,
+            top1_agreed=62, free_running_first_divergence=-1) for name in ('A-B1', 'A-B2', 'A-B')}
+        self.assertTrue(all(growing.fidelity_flags(row).values()))
+        for cell in row['factorial'].values():
+            for key in growing.fidelity_flags(row):
+                saved = cell[key]
+                cell[key] = row[key]
+                self.assertFalse(growing.fidelity_flags(row)[key])
+                cell[key] = saved
+        row.update(mean_kl_nats=1, p95_kl_nats=3, max_abs_logit_diff=5, top1_agreed=63, free_running_first_divergence=-1)
+        self.assertFalse(any(growing.fidelity_flags(row).values()))
+        row['factorial']['A-B1']['free_running_first_divergence'] = 0
+        self.assertFalse(growing.fidelity_flags(row)['free_running_first_divergence'])
+
+    # Flags cannot change passing, failing or heterogeneous verdicts, even when every statistic is flagged.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_checkpoint_fidelity_flag_never_changes_exit_code(self, raw):
+        row = self.append_gate_row()
+        keys = ('mean_kl_nats', 'p95_kl_nats', 'max_abs_logit_diff', 'top1_agreed', 'free_running_first_divergence')
+        for flags in ({key: value for key in keys} for value in (False, True)):
+            for top1, heterogeneous, status, code in ((64, False, 'passed', 0), (62, False, 'failed', 3),
+                                                     (64, True, 'heterogeneous', 5), (62, True, 'heterogeneous', 5)):
+                candidate = dict(row, exact=False, top1_agreed=top1, status=status, exit_code=code, fidelity_flag=flags)
+                growing.validate_checkpoint(candidate, heterogeneous, 1000)
+                self.assertEqual(candidate['exit_code'], code)
 
     # Other sessions' background replay cannot be charged to the local baseline or the current hybrid turn.
     def test_catchup_attribution(self):

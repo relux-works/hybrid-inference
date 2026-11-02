@@ -132,8 +132,8 @@ static hybrid::json append_replay_controls(const hybrid::json & result) {
     return controls;
 }
 
-static bool append_tokens_agree(int agreed, int divergence) {
-    return agreed >= 63 && (divergence == -1 || divergence >= 8);
+static bool append_tokens_agree(int agreed) {
+    return agreed >= 63;
 }
 
 static double seconds_since(std::chrono::steady_clock::time_point start) {
@@ -443,7 +443,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             require(fixture.at("acceptance_rule") == "session_append_replay_exact" && k == 64,
                     "invalid append replay acceptance rule or width");
             result["gate_controls"] = append_replay_controls(result);
-            accepted = append_tokens_agree(result.at("top1_agreed"), result.at("free_running_first_divergence"));
+            accepted = append_tokens_agree(result.at("top1_agreed"));
             for (const auto & control : result.at("gate_controls")) { accepted &= control.get<bool>(); }
             result["status_rule"] = "session_append_replay_exact";
             result["kl_limit"] = nullptr;
@@ -479,9 +479,9 @@ int main(int argc, char ** argv) {
         const std::string native_state = "01234567xyz";
         require(snapshot_state_matches(snapshot_equal, 1, native_state) && !snapshot_state_matches(snapshot_changed, 1, native_state) &&
                 !snapshot_state_matches(snapshot_short, 1, native_state), "snapshot byte comparison control failed");
-        // First-eight free tokens and 63/64 teacher-forced top-1 are independent of L-H KL.
-        require(append_tokens_agree(63, -1) && append_tokens_agree(64, 8) && !append_tokens_agree(62, -1) &&
-                !append_tokens_agree(64, 7), "append token acceptance control failed");
+        // Only teacher-forced top-1 gates L-H; free divergence and KL are reported.
+        require(append_tokens_agree(63) && append_tokens_agree(64) && !append_tokens_agree(62),
+                "append token acceptance control failed");
         const auto fixture = hybrid::json::parse(read_file(argv[2], 64 * 1024 * 1024), [](int depth, hybrid::json::parse_event_t, hybrid::json &) {
             require(depth <= 32, "check JSON nesting too deep");
             return true;

@@ -460,7 +460,7 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
     require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
-    row.update(turn=turn, checker_exit_code=process.returncode,
+    row.update(turn=turn, checker_exit_code=process.returncode, fidelity_flag=fidelity_flags(row),
                snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
     for item in saved:
         Path(item['path']).unlink()
@@ -609,6 +609,18 @@ def append_replay_controls(row):
     return controls
 
 
+def fidelity_flags(row):
+    noise = [row['factorial'][name] for name in ('A-B1', 'A-B2', 'A-B')]
+    flags = {key: all(row[key] > cell[key] for cell in noise)
+             for key in ('mean_kl_nats', 'p95_kl_nats', 'max_abs_logit_diff')}
+    flags['top1_agreed'] = all(row['top1_agreed'] < cell['top1_agreed'] for cell in noise)
+    def divergence(metric):
+        value = metric['free_running_first_divergence']
+        return math.inf if value == -1 else value
+    flags['free_running_first_divergence'] = all(divergence(row) < divergence(cell) for cell in noise)
+    return flags
+
+
 def validate_checkpoint(row, heterogeneous, depth):
     require(row['depth'] == depth and row['k'] == 64 and type(row['exact']) is bool and
             type(row['top1_agreed']) is int and 0 <= row['top1_agreed'] <= 64 and
@@ -636,8 +648,7 @@ def validate_checkpoint(row, heterogeneous, depth):
     if row.get('status_rule') == 'session_append_replay_exact':
         controls = append_replay_controls(row)
         require(row['gate_controls'] == controls and row['kl_limit'] is None, 'checkpoint replay gate contradicts controls')
-        accepted = (all(controls.values()) and row['top1_agreed'] >= 63 and
-                    (row['free_running_first_divergence'] == -1 or row['free_running_first_divergence'] >= 8))
+        accepted = all(controls.values()) and row['top1_agreed'] >= 63
     status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
     require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict contradicts acceptance rule')
 
