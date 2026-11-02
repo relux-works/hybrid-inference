@@ -57,8 +57,11 @@ class FastCodecTests(unittest.TestCase):
             for backend in ("reference", "numpy"):
                 bridge.convert(path, target, root / (backend + ".delta"), backend)
             def sha(path):
+                digest = hashlib.sha256()
                 with path.open("rb") as src:
-                    return hashlib.file_digest(src, "sha256").digest()
+                    for chunk in iter(lambda: src.read(1024**2), b""):
+                        digest.update(chunk)
+                return digest.digest()
             self.assertEqual(sha(root / "reference.delta"), sha(root / "numpy.delta"))
             codec = NumpyCodec()
             for dtype in ("float32", "bfloat16"):

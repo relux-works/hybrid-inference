@@ -1,4 +1,4 @@
-"""Strict, CPU-only codec for the vLLM 0.32.0 single-rank Qwen35 bridge."""
+"""Strict native codec for the vLLM 0.32.0 single-rank Qwen35 bridge."""
 
 import argparse
 import array
@@ -65,7 +65,7 @@ def validate(snapshot, target):
     require(type(block) is int and 16 <= block <= 4096 and block % 16 == 0, "wrong block size")
     n0, n1 = snapshot.get("n0"), snapshot.get("n1")
     require(type(n0) is int and type(n1) is int and 0 <= n0 < n1 <= 1_048_576, "invalid token boundary")
-    require(n0 % block == n1 % block == 0, "partial last block")
+    require(n1 % block == 0, "partial last block")
     tokens = snapshot.get("tokens")
     require(isinstance(tokens, list) and len(tokens) == n1 and all(type(t) is int and 0 <= t < target["model_layout"]["vocab_size"] for t in tokens), "invalid token journal")
     layers = snapshot.get("layers", [])
@@ -75,7 +75,7 @@ def validate(snapshot, target):
     require(body_size(n1 - n0) <= MAX_BODY, "delta exceeds body limit; capture smaller prefill chunks")
     for layer in layers:
         if layer["layer"] in ATTENTION:
-            require(layer["kv"]["shape"] == [(n1 - n0) // block, 4, block, 512], "wrong block or head geometry")
+            require(layer["kv"]["shape"] == [(n1 - n0 + n0 % block) // block, 4, block, 512], "wrong block or head geometry")
             require(layer["kv"]["dtype"] in ("bfloat16", "float8_e4m3fn", "float8_e5m2"), "unsupported KV dtype")
             require(len(layer.get("scales", [])) == 2 and all(type(x) in (int, float) and math.isfinite(x) and x > 0 for x in layer["scales"]), "invalid FP8 scales")
             require(layer["kv"]["dtype"] != "bfloat16" or layer["scales"] == [1.0, 1.0], "BF16 scales must be one")
@@ -199,8 +199,10 @@ def write_body(output, snapshot, root, codec=None):
         for i in ATTENTION:
             pack("iQ", 8, 1088)
             rows = (codec.kv_rows if codec else kv_rows)(root, layers[i], snapshot["block_size"], value, snapshot["rotations"][int(value)])
+            skip = n0 % snapshot["block_size"] * 1088
             for row in rows:
-                output.write(row)
+                output.write(row[skip:])
+                skip = max(0, skip - len(row))
     pack("IiIII", 1, n1 - 1, 0, 0, 64)
     for state in (False, True):
         for i in RECURRENT:

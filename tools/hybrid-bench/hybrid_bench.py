@@ -70,7 +70,11 @@ def verify_meter(trace, previous, mode):
     require(mode != 'local' or trace['remote_applied'] == 0, 'local mode unexpectedly offloaded')
     if trace.get('fallback_reason') == 'ram_budget':
         raise Refusal('ram budget refusal (HTTP 503)')
-    require(mode != 'offload' or trace['new_tokens'] <= 1 or
+    block = trace.get('export_block_size', 1)
+    aligned_tail = (type(block) is int and 16 <= block <= 4096 and block % 16 == 0
+                    and trace['prompt_depth'] - 1 < (previous // block + 1) * block
+                    and trace['remote_applied'] == 0 and not trace.get('fallback_reason'))
+    require(mode != 'offload' or trace['new_tokens'] <= 1 or aligned_tail or
             (trace['path'] == 'offload' and not trace.get('fallback_reason')),
             'offload unavailable: request fell back locally; cause=' + str(trace.get('fallback_reason') or 'unknown'))
     if trace['path'] == 'offload':
@@ -155,12 +159,16 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         safe_chunk = extend_chunk_limit(**config.get('delta_geometry', {}))
         chunk = config.get('extend_chunk_tokens', safe_chunk)
         require(type(chunk) is int and 1 <= chunk <= safe_chunk, 'extend chunk exceeds native delta bound')
+        block = config.get('export_block_size', 1)
+        require(type(block) is int and 1 <= block <= chunk, 'invalid node export block size')
+        ends = sorted(set(n // block * block for n in ends if n // block > 0))
+        require(bool(ends), 'checker prompt has no aligned export endpoint')
         n0 = 0
         paths = []
         import struct
         for endpoint in ends:
             while n0 < endpoint:
-                n1 = min(endpoint, n0 + chunk)
+                n1 = min(endpoint, n0 + chunk) // block * block
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
@@ -190,6 +198,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
                                      deltas=paths, max_ctx=client['context'],
+                                     local_tail_start=n0,
                                      noise_chunks=args.noise_chunks, backend=client['backend'], uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
         process = run_checker([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
@@ -203,6 +212,8 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         require(process.returncode in (0, 3, 5), 'equivalence checker failed before valid metrics')
         status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False), client['backend'])
         result.update(exit_code=code, checker_exit_code=process.returncode, status=status,
+                      weight_comparison='heterogeneous' if config.get('hetero_quant') else 'homogeneous',
+                      exported_endpoint=n0, local_tail_tokens=len(tokens) - n0,
                       check_mode='append_chain' if boundaries is not None else 'fresh',
                       append_endpoints=ends, delta_count=len(paths), cross_backend=cross_backend,
                       cross_backend_thresholds_calibrated=False if cross_backend else None,

@@ -161,12 +161,14 @@ int main(int argc, char ** argv) {
             split_ends.insert(split_ends.end(), ends.begin(), ends.end());
             n = n1;
         }
-        require(n == int64_t(tokens.size() - 1), "incomplete check chain");
-        split_ends.push_back(tokens.size());
-        hybrid::prefill(imported.get(), {tokens.back()}, n);
-        hybrid::prefill(split.get(), {tokens.back()}, n);
+        require(n == fixture.value("local_tail_start", int64_t(tokens.size() - 1)) && n < int64_t(tokens.size()), "incomplete check chain");
+        const auto tail_ends = boundaries(tokens.size(), 256, n);
+        split_ends.insert(split_ends.end(), tail_ends.begin(), tail_ends.end());
+        const std::vector<llama_token> tail(tokens.begin() + n, tokens.end());
+        hybrid::prefill(imported.get(), tail, n);
+        hybrid::prefill(split.get(), tail, n);
         const auto repeat_start = std::chrono::steady_clock::now();
-        hybrid::prefill(repeat.get(), {tokens.back()}, n);
+        hybrid::prefill(repeat.get(), tail, n);
         repeat_seconds += seconds_since(repeat_start);
         hybrid::prefill(whole.get(), tokens, 0);
         hybrid::prefill(free_whole.get(), tokens, 0);

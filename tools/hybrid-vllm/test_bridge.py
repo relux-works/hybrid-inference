@@ -75,9 +75,9 @@ class BridgeTests(unittest.TestCase):
 
     # Imports and boundary selection work on a CPU without vLLM, torch or NumPy.
     def test_lazy_imports_and_boundary(self):
-        self.assertNotIn("vllm", sys.modules)
-        self.assertNotIn("torch", sys.modules)
-        self.assertNotIn("numpy", sys.modules)
+        result = subprocess.run([sys.executable, "-B", "-c", "import bridge, exporter, sys; assert not {'vllm', 'torch', 'numpy'} & sys.modules.keys()"],
+                                cwd=Path(__file__).parent, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(exporter.boundary(0, 0, 784, 1568, 784), 784)
         self.assertEqual(exporter.boundary(0, 784, 784, 1568, 784), 1568)
         with self.assertRaisesRegex(bridge.Refusal, "no longer in prefill"):
@@ -311,11 +311,18 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(bridge.Refusal, "unsafe tensor path"):
                 bridge.tensor_bytes(root, spec)
 
-    # Matching patch reruns preserve bytes; unknown or modified source and misplaced hooks refuse.
+    # Patches publish atomically; matching reruns preserve bytes and unknown source or hook locations refuse.
     def test_patch_location(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = Path(directory) / "runner.py"
             runner.write_text("class GPUModelRunner(Base):\n    def execute_model(self):\n        model_output = self._model_forward()\n" + patch_vllm.MARKER + "            pass\n")
+            original = runner.read_bytes()
+            with mock.patch.object(patch_vllm, "RUNNER_SHA256", hashlib.sha256(original).hexdigest()), \
+                    mock.patch.object(patch_vllm.os, "replace", side_effect=OSError("injected publication failure")):
+                with self.assertRaisesRegex(OSError, "publication failure"):
+                    patch_vllm.patch(runner)
+            self.assertEqual(runner.read_bytes(), original)
+            self.assertFalse(list(runner.parent.glob(".hybrid-runner-*")))
             with self.assertRaisesRegex(bridge.Refusal, "differs from inspected"):
                 patch_vllm.patch(runner)
             with mock.patch.object(patch_vllm, "RUNNER_SHA256", hashlib.sha256(runner.read_bytes()).hexdigest()):
@@ -371,6 +378,10 @@ class BridgeTests(unittest.TestCase):
             root = Path(directory)
             config = dict(target=self.target, tokens=req.prompt_token_ids, output=directory)
             scheduled = Namespace(num_scheduled_tokens={"request": 16})
+            for key in ("num_speculative_blocks", "num_prefill_checkpoint_blocks"):
+                with mock.patch.object(MambaSpec, key, 1), self.assertRaisesRegex(bridge.Refusal, "unsupported Mamba cache spec"):
+                    exporter.export_snapshot(runner, scheduled, config, 0)
+                self.assertEqual(list(root.iterdir()), [])
             with self.assertRaisesRegex(bridge.Refusal, "invalid recurrent block ownership"):
                 exporter.export_snapshot(runner, scheduled, config, 0)
             self.assertEqual(list(root.iterdir()), [])

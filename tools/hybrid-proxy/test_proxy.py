@@ -448,7 +448,7 @@ class HTTPTests(unittest.TestCase):
 
     # All four server session operations hide foreign IDs and leave the victim unchanged.
     def test_prefill_namespace(self):
-        a, b = Node(self.url(self.prefill), "a"), Node(self.url(self.prefill), "b")
+        a, b = [Node(self.url(self.prefill), self.config["clients"]["fixture-" + c]["prefill_token"]) for c in ("a", "b")]
         sid = a.request("POST", "/v1/sessions", {"model_sha256": MODEL})["session_id"]
         path = "/v1/sessions/" + sid
         before = a.request("GET", path)
@@ -457,7 +457,8 @@ class HTTPTests(unittest.TestCase):
             with self.subTest(method=method, suffix=suffix), self.assertRaises(HTTPError) as error:
                 b.request(method, path + suffix, data)
             self.assertEqual(error.exception.status, 404)
-        self.assertEqual(a.request("GET", path)["tokens"], before["tokens"])
+        after = a.request("GET", path)
+        self.assertEqual((after["n"], after["prefix_hash"]), (before["n"], before["prefix_hash"]))
         self.assertEqual(b.request("GET", "/v1/sessions"), [])
 
     # Three clients with four sessions each exercise parking and exact per-session journals.

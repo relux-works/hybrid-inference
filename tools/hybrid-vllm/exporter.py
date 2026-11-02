@@ -10,8 +10,8 @@ from bridge import ATTENTION, RECURRENT, SOURCE, body_size, require, validate, M
 
 def boundary(n0, computed, scheduled, prompt_length, block):
     n1 = computed + scheduled
-    require(0 <= n0 <= computed < n1 <= prompt_length, "request is no longer in prefill")
-    require(n0 % block == n1 % block == 0, "partial last block")
+    require(0 <= n0 < n1 <= prompt_length and 0 <= computed < n1, "request is no longer in prefill")
+    require(n1 % block == 0, "partial last block")
     require(body_size(n1 - n0) <= MAX_BODY, "prefill chunk exceeds delta body limit")
     return n1
 
@@ -112,7 +112,7 @@ def export_snapshot(runner, scheduler_output, config, n0):
                     filename = "%02d-kv.bin" % i
                     with (folder / filename).open("xb") as output:
                         write_attention_pages(output, cache, blocks, block, n0, n1)
-                    row.update(kv=dict(file=filename, shape=[(n1 - n0) // block, 4, block, 512], dtype=dtype), scales=scales)
+                    row.update(kv=dict(file=filename, shape=[(n1 - n0 + n0 % block) // block, 4, block, 512], dtype=dtype), scales=scales)
                 else:
                     require(i in RECURRENT and type(spec) is MambaSpec and spec.mamba_cache_mode == "align"
                             and spec.num_speculative_blocks == spec.num_prefill_checkpoint_blocks == 0, "unsupported Mamba cache spec")
@@ -130,9 +130,32 @@ def export_snapshot(runner, scheduler_output, config, n0):
 
 def after_prefill(runner, scheduler_output):
     path = os.environ.get("HYBRID_VLLM_CONFIG")
-    if not path:
+    if not path or not Path(path).exists():
         return
     config = json.loads(Path(path).read_text())
+    if config.get("node_mode"):
+        check_config(runner, config["target"])
+        groups = runner.kv_cache_config.kv_cache_groups
+        require(groups and len({g.kv_cache_spec.block_size for g in groups}) == 1, "cache groups have different block sizes")
+        block = groups[0].kv_cache_spec.block_size
+        require(type(block) is int and 16 <= block <= 4096 and block % 16 == 0, "wrong block size")
+        output = Path(config["output"])
+        output.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if config.get("probe"):
+            (output / "ready.json").write_text(json.dumps(dict(block_size=block)))
+            return
+        require(len(scheduler_output.num_scheduled_tokens) == 1, "bridge requires one live request")
+        rid, count = next(iter(scheduler_output.num_scheduled_tokens.items()))
+        req = runner.requests[rid]
+        require(req.prompt_token_ids == config["tokens"] and not req.output_token_ids, "unexpected node request")
+        n1 = req.num_computed_tokens + count
+        if n1 < len(config["tokens"]):
+            return
+        require(n1 == len(config["tokens"]), "request is no longer in prefill")
+        if config.get("capture", True):
+            export_snapshot(runner, scheduler_output, config, config["n0"])
+        (output / "finished.json").write_text(json.dumps(dict(n=n1, block_size=block)))
+        return
     n0 = getattr(runner, "_hybrid_bridge_n0", 0)
     if n0 == len(config["tokens"]):
         return

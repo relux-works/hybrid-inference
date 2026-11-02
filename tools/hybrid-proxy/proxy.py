@@ -115,6 +115,10 @@ class Proxy:
         self.extend_chunk_tokens = config.get("extend_chunk_tokens", safe_chunk)
         if type(self.extend_chunk_tokens) is not int or not 1 <= self.extend_chunk_tokens <= safe_chunk:
             raise ValueError("extend_chunk_tokens exceeds delta body/header bound")
+        self.export_block_size = config.get("export_block_size", 1)
+        if (type(self.export_block_size) is not int or self.export_block_size < 1
+                or self.export_block_size > self.extend_chunk_tokens):
+            raise ValueError("invalid node export block size")
         self.slots = config.get("slots", 1)
         if self.slots < 1:
             raise ValueError("slots must be positive")
@@ -683,6 +687,7 @@ class Proxy:
             local_n = 0
         # Imported memory has no logits. Decode the final prompt token locally.
         target = tokens[:-1]
+        export_end = len(target) // self.export_block_size * self.export_block_size
         session["_remote_applied"] = 0
         session["_remote_replayed"] = 0
         with self.lock:
@@ -693,6 +698,8 @@ class Proxy:
         session["_bench"] = dict(mode=mode, path="local", depth_before=local_n,
             prompt_depth=len(tokens), server_prefill_ms=None, wire_bytes=0,
             server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None)
+        if self.export_block_size > 1:
+            session["_bench"]["export_block_size"] = self.export_block_size
         if mode == "offload":
             decision["offload"] = len(target) > local_n
         elif mode == "local":
@@ -707,8 +714,9 @@ class Proxy:
                 if session["remote_n"] < local_n:
                     self.sync(session, client)
                 remote = self.remote(client)
-                for n0 in range(local_n, len(target), self.extend_chunk_tokens):
-                    n1 = min(n0 + self.extend_chunk_tokens, len(target))
+                n0 = local_n
+                while n0 < export_end:
+                    n1 = min(n0 + self.extend_chunk_tokens, export_end) // self.export_block_size * self.export_block_size
                     chunk = dict(n0=n0, n1=n1, status="requested", wire_bytes=0, import_ms=0)
                     session["_bench"]["chunks"].append(chunk)
                     delta = remote.request("POST", path + "/extend", {
@@ -746,6 +754,7 @@ class Proxy:
                     if "_turn" in session:
                         session["_turn"]["checkpoints"] = []
                     self.store.save(session)
+                    n0 = n1
         except HTTPError as error:
             reason = f"http_{error.status}"
             if error.status == 503:

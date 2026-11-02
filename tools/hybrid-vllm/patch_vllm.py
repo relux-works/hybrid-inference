@@ -2,7 +2,9 @@
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
+import tempfile
 
 from bridge import require
 
@@ -21,7 +23,17 @@ def patch(path):
     if HOOK in source:
         require(source.count(HOOK) == source.count(HOOK + MARKER) == 1, "runner hook location changed")
         return
-    path.write_text(source.replace(MARKER, HOOK + MARKER))
+    fd, temporary = tempfile.mkstemp(prefix=".hybrid-runner-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(source.replace(MARKER, HOOK + MARKER))
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, path.stat().st_mode & 0o777)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 if __name__ == "__main__":
