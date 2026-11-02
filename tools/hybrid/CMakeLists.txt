@@ -30,7 +30,8 @@ add_executable(llama-hybrid-check-codec check-codec.cpp)
 target_link_libraries(llama-hybrid-check-codec PRIVATE hybrid-state)
 
 add_executable(llama-hybrid-bench-check ../hybrid-bench/check.cpp)
-target_link_libraries(llama-hybrid-bench-check PRIVATE hybrid-state)
+target_link_libraries(llama-hybrid-bench-check PRIVATE hybrid-state server-context)
+target_include_directories(llama-hybrid-bench-check PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
 
 add_executable(llama-hybrid-check-identity check-identity.cpp)
 target_link_libraries(llama-hybrid-check-identity PRIVATE hybrid-state)

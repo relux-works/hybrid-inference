@@ -1,5 +1,6 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
+#include "server-common.h"
 
 #include <algorithm>
 #include <chrono>
@@ -88,6 +89,63 @@ static void prefill_partition(llama_context * ctx, const std::vector<llama_token
     }
 }
 
+static int check_snapshots(const hybrid::json & fixture, llama_model * model, bool gpu, const char * output) {
+    const auto tokens = fixture.at("tokens").get<std::vector<llama_token>>();
+    const int k = fixture.at("k");
+    const auto paths = fixture.at("snapshots").get<std::vector<std::string>>();
+    const auto hashes = fixture.at("snapshot_sha256").get<std::vector<std::string>>();
+    require(paths.size() == 2 && hashes.size() == 2, "need hybrid and local snapshots");
+    auto hybrid_ctx = context(model, fixture.at("max_ctx"), gpu);
+    auto local_ctx = context(model, fixture.at("max_ctx"), gpu);
+    llama_context * contexts[] = {hybrid_ctx.get(), local_ctx.get()};
+    for (size_t i = 0; i < 2; ++i) {
+        require(hybrid::file_hash(paths[i].c_str()) == hashes[i], "snapshot checksum mismatch");
+        size_t count = 0;
+        require(llama_state_seq_load_file(contexts[i], paths[i].c_str(), 0, nullptr, 0, &count) > 0 &&
+                count <= tokens.size() + 4, "invalid checkpoint token count");
+        std::vector<llama_token> packed(count);
+        require(llama_state_seq_load_file(contexts[i], paths[i].c_str(), 0, packed.data(), packed.size(), &count) > 0,
+                "cannot load checkpoint snapshot");
+        const auto loaded = server_tokens::deserialize(packed, false).get_text_tokens();
+        require(loaded.size() == tokens.size() - 1 && std::equal(loaded.begin(), loaded.end(), tokens.begin()),
+                "snapshot token journal mismatch");
+        // The last sampled token was saved before reconciliation, so its evaluation restores checkpoint logits.
+        hybrid::prefill(contexts[i], {tokens.back()}, loaded.size());
+    }
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    int agreed = 0;
+    bool exact = true;
+    double sum = 0, difference = 0;
+    auto positions = hybrid::json::array();
+    for (int i = 0; i < k; ++i) {
+        const auto * h = llama_get_logits_ith(hybrid_ctx.get(), -1);
+        const auto * l = llama_get_logits_ith(local_ctx.get(), -1);
+        const bool equal = std::memcmp(h, l, vocab * sizeof(float)) == 0;
+        const double value = equal ? 0 : compare(l, h, vocab);
+        const double diff = max_difference(l, h, vocab);
+        const auto next = hybrid::greedy(local_ctx.get(), model);
+        const bool top1 = next == hybrid::greedy(hybrid_ctx.get(), model);
+        exact &= equal;
+        agreed += top1;
+        sum += value;
+        difference = std::max(difference, diff);
+        positions.push_back({{"position", tokens.size() + i}, {"exact", equal}, {"top1_agreed", top1}, {"kl_nats", value}});
+        hybrid::prefill(hybrid_ctx.get(), {next}, tokens.size() + i);
+        hybrid::prefill(local_ctx.get(), {next}, tokens.size() + i);
+    }
+    const bool heterogeneous = fixture.value("heterogeneous", false);
+    const int code = heterogeneous ? 5 : exact ? 0 : 3;
+    const hybrid::json result = {{"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
+        {"exact", exact}, {"top1_agreed", agreed}, {"mean_kl_nats", sum / k}, {"max_abs_logit_diff", difference},
+        {"positions", positions}, {"reference", "KL(local || hybrid), live snapshots, local greedy teacher forcing"},
+        {"status", heterogeneous ? "heterogeneous" : exact ? "passed" : "failed"}, {"exit_code", code}};
+    std::ofstream target(output);
+    target << result.dump(2) << '\n';
+    require(target.good(), "cannot write checkpoint result");
+    std::cout << result.dump() << '\n';
+    return code;
+}
+
 int main(int argc, char ** argv) {
     try {
         require(argc == 6, "usage: llama-hybrid-bench-check MODEL TOKENS.json DELTA OUTPUT.json GPU_LAYERS");
@@ -132,6 +190,9 @@ int main(int argc, char ** argv) {
         const bool gpu = backend != "cpu";
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         for (auto token : tokens) { require(token >= 0 && token < vocab, "invalid check token"); }
+        if (fixture.contains("snapshots")) {
+            return check_snapshots(fixture, model.get(), gpu, argv[4]);
+        }
         const int ctx = ((tokens.size() + k + 257) / 256) * 256;
         auto imported = context(model.get(), ctx, gpu);
         auto split = context(model.get(), ctx, gpu);
