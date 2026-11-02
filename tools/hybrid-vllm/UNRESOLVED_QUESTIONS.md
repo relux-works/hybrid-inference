@@ -1,5 +1,9 @@
 # Unresolved GPU qualification
 
+- Node adapter r7: CPU HTTP, scalar bytes and native imports do not qualify CUDA extraction or the automatic torch CUDA arithmetic. Run the B300 node runbook, preserve a small capture for scalar/CUDA byte comparison and report actual imports, KL and timing.
+- The node deliberately resubmits token journals to vLLM's prefix cache. Measure live append cache hits, recomputation after eviction and endpoint-state ownership; fake-backend reuse is only a contract fixture. Source/tokenizer provenance remains operator evidence beyond geometric matching.
+- A node-only adapter cannot change the old proxy's exact requested-end assumption. The implemented optional `export_block_size` capability and checker `local_tail_start` preserve ordinary node behavior, but clients from before this extension cannot consume rounded responses transparently. The native envelope inspected on remote main at 528724c96 is v1; independently developed native-format changes need explicit integration/requalification.
+
 - Does the pinned live GPU runner expose the manager/kernel page mapping and align endpoint ownership exactly as inspected? Record actual block sizes, typed shapes, scales and final capture endpoint. A source-hash or shape refusal requires inspecting that implementation, not weakening the guard.
 - Do conv chronology, post-RoPE attention keys, GDN [V,K] state and grouped-to-tiled head mapping reproduce the client's continuation? Native synthetic import proves serialization only.
 - What KL/top-1/max-logit-difference bounds are appropriate for server FP8 weights -> BF16 or Q4_K_M clients across CUDA/Metal? Existing same-engine exactness is not an acceptance threshold for this experiment.
