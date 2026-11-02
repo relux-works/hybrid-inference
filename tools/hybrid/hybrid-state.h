@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace hybrid {
@@ -25,15 +26,23 @@ struct delta {
     std::string state;
 };
 delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0);
+struct delta_view {
+    json header;
+    std::string_view state;
+};
+// The wire must outlive this view and all tensor writes made from it.
+delta_view read_delta_view(const std::string & wire, const std::string & model_sha256, int64_t n0);
+delta_view read_delta_view(std::string && wire, const std::string & model_sha256, int64_t n0) = delete;
 
 // A pending import owns only host bytes. The live slot changes in apply(), after the final chunk.
 class delta_import {
-    std::vector<delta> chunks;
+    std::vector<std::unique_ptr<std::string>> wires;
+    std::vector<delta_view> chunks;
     std::vector<llama_token> prefix;
     std::vector<llama_token> tokens;
 public:
     void clear();
-    bool stage(llama_context * ctx, llama_seq_id seq_id, const std::string & wire, const std::string & model_hash, const std::string & session_id,
+    bool stage(llama_context * ctx, llama_seq_id seq_id, std::string wire, const std::string & model_hash, const std::string & session_id,
                const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab);
     const std::vector<llama_token> & imported_tokens() const { return tokens; }
     void apply(llama_context * ctx, llama_seq_id seq_id);

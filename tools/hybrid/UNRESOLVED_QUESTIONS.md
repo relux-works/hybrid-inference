@@ -16,3 +16,7 @@ r33: the four-token synthetic CPU model is bit-exact after physical SWA restore.
 r6: CPU version-2 sparse physical records, legacy multi-slot checkpoints and non-prefix indices are covered. Production Glimmer/Gemma GPU bit-exact qualification remains pending; use RESULTS-hybrid-c-r6-261101.md with matched 256/256 node/client partitions and depths crossing both windows. R27 integrates this record with final-state chunks; its production GPU qualification remains pending.
 
 r27 combines both accepted branches and current main locally. CPU qualification is recorded in RESULTS-hybrid-a-r27-261101.md; production GPU SWA and Qwen 27B multi-chunk qualification remain unrun. The previous combined-tree CPU gate is superseded by that report.
+
+Import-speed r35: macOS must build the rebased head and pass auto/CommonCrypto and forced-portable codec/hash suites before landing. The [r35 report](RESULTS-hybrid-b-r34-261101.md#r35-rebase-after-pr-7) gives exact commands; agents1 CPU results do not close this platform gate.
+
+R31 update: the exact r35 source head passed its returned M3 Max CommonCrypto/portable gate on 2026-11-02. The archive hash, actual gate exits and CPU merge qualification are recorded in [the r31 landing section](RESULTS-hybrid-b-r34-261101.md#r31-merge-current-main-for-landing-2026-11-02). R31 adds no new Mac/GPU execution or production timing claim.

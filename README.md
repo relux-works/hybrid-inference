@@ -174,6 +174,8 @@ Sliding-window transfer for Gemma 4 and Muse Glimmer is described in [SWA-STATE-
 
 Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.
 
+Delta import profiling uses `python3 tools/hybrid/profile_import.py` and `build/bin/llama-hybrid-check-client --identity`; commands and output locations are in the [import profiling guide](tools/hybrid/README.md#import-profiling).
+
 Combined SWA layout and final-state chunk CPU qualification, invariant checks and exact GPU operator commands are in [the r27 report](tools/hybrid/RESULTS-hybrid-a-r27-261101.md).
 
-The vLLM node adapter uses the same HYBD v2 final-state chunk protocol with exact aligned exports and local tails; see its [protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [r10 merge evidence](tools/hybrid-vllm/RESULTS-hybrid-d-r7-261101.md#r10-second-main-merge-after-pr-14). CPU adapter/converter checks use a temporary NumPy-only venv; commands and artifacts are in the [adapter tools guide](tools/hybrid-vllm/README.md#tools).
+The vLLM node adapter uses the same HYBD v2 final-state chunk protocol with exact aligned exports, local tails and borrowed native-body readers; see its [protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [r11 merge evidence](tools/hybrid-vllm/RESULTS-hybrid-d-r7-261101.md#r11-third-main-merge-after-pr-15). CPU adapter/converter checks use a temporary NumPy-only venv; commands and artifacts are in the [adapter tools guide](tools/hybrid-vllm/README.md#tools).

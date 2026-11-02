@@ -59,9 +59,12 @@ int main(int argc, char ** argv) {
         llama_memory_hybrid memory(*model, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, 1024, 0,
                                    LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32, 1, 1, 0, false, true);
         int n0 = 0, committed = 0;
-        std::vector<hybrid::delta> pending;
+        std::vector<std::unique_ptr<std::string>> wires;
+        std::vector<hybrid::delta_view> pending;
         for (int arg = 1; arg < argc - 1; ++arg) {
-            auto delta = hybrid::read_delta(read_file(argv[arg]), target.at("model_sha256"), n0);
+            wires.push_back(std::make_unique<std::string>(read_file(argv[arg])));
+            auto delta = hybrid::read_delta_view(*wires.back(), target.at("model_sha256"), n0);
+            require(delta.state.data() == wires.back()->data() + wires.back()->size() - 48 - delta.state.size(), "borrowed reader copied native body");
             require(delta.header.at("layout_fingerprint") == hybrid::layout_fingerprint(target.at("model_layout")), "native fingerprint mismatch");
             const int n1 = delta.header.at("n1");
             const bool final = delta.header.at("fixed_state");
@@ -95,15 +98,16 @@ int main(int argc, char ** argv) {
                     } else {
                         memory.get_mem_attn()->state_write_range(output, 0, part.header.at("n0"), part.header.at("n1"), 0);
                     }
-                    require(output.bytes == part.state.substr(8), "native round-trip byte mismatch");
+                    require(std::string_view(output.bytes) == part.state.substr(8), "native round-trip byte mismatch");
                 }
                 committed = n1;
                 pending.clear();
+                wires.clear();
             }
             n0 = n1;
         }
         require(pending.empty(), "missing final chunk");
-        std::cout << "PASS native envelope, fingerprint, attention/GDN cache import and byte round-trip\n";
+        std::cout << "PASS native envelope, fingerprint, attention/GDN cache import and byte round-trip; borrowed native body views\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "FAIL " << error.what() << '\n';

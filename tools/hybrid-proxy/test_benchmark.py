@@ -511,6 +511,7 @@ class ChunkAndLifecycleTests(unittest.TestCase):
 
     # Different model bytes require explicit matching layout admission; mismatches never reach native import.
     def test_heterogeneous_identity_bridge(self):
+        # Matching layouts permit rebinding; mismatches refuse before changing the decoder slot.
         fixture = self.fixture
         config = dict(fixture.config, node_model_sha256='2' * 64)
         with self.assertRaisesRegex(ValueError, 'sha256 mismatch'):

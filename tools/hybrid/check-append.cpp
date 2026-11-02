@@ -284,13 +284,20 @@ static void chunk_tests(llama_model * model, const std::string & hash, bool fres
     const auto full = hybrid::export_range(source.get(), prefix.size(), all.size());
     require(llama_state_seq_set_data_append(single.get(), (const uint8_t *) full.data(), full.size(), 0, prefix.size(), all.size()) == full.size(), "single import failed");
     hybrid::delta_import pending;
-    for (size_t i = 0; i < wires.size(); ++i) { require(stage(pending, wires[i]) == (i == 3), "wrong final marker"); unchanged(); }
+    // Staged bodies outlive each moved request and caller buffer reuse, through final application.
+    for (size_t i = 0; i < wires.size(); ++i) {
+        auto request = wires[i];
+        require(pending.stage(dest.get(), 0, std::move(request), hash, "chunks", prefix, 512, vocab) == (i == 3), "wrong final marker");
+        request.assign(wires[i].size(), '\0');
+        unchanged();
+    }
     pending.apply(dest.get(), 0);
     require(hybrid::save_state(dest.get()) == hybrid::save_state(single.get()), "chunk/single bytes differ");
     hybrid::prefill(single.get(), {130}, all.size());
     hybrid::prefill(dest.get(), {130}, all.size());
     require(memcmp(llama_get_logits_ith(single.get(), -1), llama_get_logits_ith(dest.get(), -1), vocab * sizeof(float)) == 0, "chunk/single held-token logits differ");
     std::cout << "PASS chunk_single_shot_byte_equivalence and held-token logits\n";
+    std::cout << "PASS chunk_owned_wire_lifetime after request destruction and reuse\n";
 }
 
 int main(int argc, char ** argv) {

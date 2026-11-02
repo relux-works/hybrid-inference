@@ -22,6 +22,8 @@ The server adapter is specified in [NODE-PROTOCOL.md](NODE-PROTOCOL.md), with ex
 | Git, realpath, find, sort, xargs, sha256sum, ldd and setsid | Source/artifact preflight and complete static-build receipt and loader check | Used by `gpu-run.sh build`, then checked before reuse | `BUILD_DIR/binaries.sha256`: sorted bin file hashes plus both receivers' resolved loader closures, following symlinks |
 | torch 2.13.0 and NumPy, CPU only | Independent byte reference for the exporter's actual page gather | `bash tools/hybrid-vllm/gpu-run.sh gather RUN_DIR` | Mandatory first gate; failure stops every GPU subcommand before any build or launch |
 
+The [PRO 6000 r11 runbook](GPU-NODE-RUNBOOK.md#pro-6000-re-smoke-after-pr-15-r11) uses the existing kit161 vLLM environment and cached FP8/Q4 models. It gives exact gather/CUDA-byte-gate, 8k/32k fresh/append and forced multi-chunk commands, selects ports outside all TCP states including TIME_WAIT, and retains logs under `.temp/hybrid-d-r11-pro6000-HEAD/`. No GPU execution is claimed by the CPU merge report.
+
 From the repository root, with the existing CPU libraries built:
 
 ```sh

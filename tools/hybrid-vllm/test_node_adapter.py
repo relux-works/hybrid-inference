@@ -112,7 +112,7 @@ class AdapterTests(unittest.TestCase):
         result = subprocess.run([binary, str(self.root / "a.delta"), str(self.root / "b.delta"), str(self.root / "target.json")], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    # V2 chunks keep committed cache positions unchanged until the final fixed state commits the exact aligned endpoint.
+    # Borrowed V2 chunks preserve exact bytes and committed positions until the final fixed state commits the aligned endpoint.
     def test_chunked_final_fixed_state(self):
         path = self.create()
         wires = []
@@ -138,6 +138,7 @@ class AdapterTests(unittest.TestCase):
         target.write_text(json.dumps(self.target))
         result = subprocess.run([binary, *paths, str(target)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("borrowed native body views", result.stdout)
         result = subprocess.run([binary, *paths[:-1], str(target)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("missing final chunk", result.stderr)

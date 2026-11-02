@@ -322,3 +322,72 @@ Body draft:
 
 
 The exact signed head is written after signing to `.temp/hybrid-d-r10-261102/landing-note.md` and `proof.json`; this avoids a self-referential commit ID in a committed report. Both parents, signature verification and exact committed-tree equality are checked there. Ready for independent review; no publication or landing performed.
+
+## r11: third main merge after PR #15
+
+Run `hybrid-d-r11-261102`, resumed as `hybrid-d-r11b-261102` on 2026-11-02 UTC after the runtime capacity interruption. Branch `m3-vllm-node`; first parent `8ff1e5d17e9574721ca482689f7d7e419ede188c`, described by the brief as accepted by r7u; pinned main second parent `3ac1503dd33f8210e71024ecb9cb39023b646e53`. The owned merge and all five unstaged adapter/runbook files were continued. No abort, push, PR submission, GPU execution or model download was performed. The user explicitly authorizes the signed local merge, requested Codex co-author trailer, landing draft and team summary in this fork.
+
+### Conflicts and integration
+
+There were **zero textual conflicts**. Original `merge-01.log` reports a successful automatic merge; the takeover index has no unmerged entries and is exactly tree `24737a9c49c6e8c5b631736f874617846084364e`. It also equals a separate replay of the reviewed `683caeed..8ff1e5d1` branch patch on main `3ac1503d`.
+
+| Path | Resolution beyond that automatic tree |
+|---|---|
+| `tools/hybrid-vllm/native_check.cpp` | Use `read_delta_view` with heap-owned wire strings retained across all chunks, validation, final import and byte round-trip; require body-pointer identity and preserve the existing PASS prefix. Compare serialized native bytes as a string view. |
+| `tools/hybrid-vllm/test_node_adapter.py` | Bind the existing `test_chunked_final_fixed_state` to the borrowed-reader marker; retain exact bytes, three chunks, missing-final and correctly checksummed early/absent fixed-state controls. |
+| `tools/hybrid-vllm/GPU-NODE-RUNBOOK.md` | Add the exact PRO 6000 re-smoke below, including selection of FP8 weights without accidentally selecting NVFP4 metadata mentioning FP8. |
+| `README.md`, `tools/hybrid-vllm/README.md`, `tools/hybrid-vllm/UNRESOLVED_QUESTIONS.md`, this report | Link the r11 tools, evidence and remaining exact-head GPU landing gate. |
+
+No runtime adaptation outside the synthetic native helper was necessary: main's `delta_import` already owns its request wires, borrows each body, validates staged chunks without changing the slot and applies the whole chain after the final fixed state. The exporter and its scalar byte oracle are unchanged. Main's chunked hash and removed HTTP/proxy body copies are preserved. No model, reader, scheduler, protocol-limit or converter redesign is part of these resolutions.
+
+### CPU validation and recovery evidence
+
+Evidence roots: `.temp/hybrid-d-r11-261102/` and `.temp/hybrid-d-r11b-261102/`. The latter contains `validation-ledger.json`, `reused-green-evidence.json`, `suite-results.json`, `resume-source-identity.json`, `resume-binaries.json`, `build-source-freshness.json`, `retained-test-names.json` and `self-review.md`. Numbered wrapper records carry the real exit, PID, command, environment hash mode and sampled disk floor; bounded fixture controls retain separate command/verdict receipts. No passing r11 gate was rerun with the same source, binary and environment identity. The interrupted append log has no completion receipt and was rerun under a separate evidence root. Timestamp freshness corroborates the retained build; source and binary hashes bind the resumed work. Only documentation changed during r11b.
+
+| Gate and specific claim | Result and evidence |
+|---|---|
+| Static CPU configure/build; mandatory synthetic native helper | Retained exits 0: `build-configure-01`, `build-01`, `build-helper-02`. CMake 4.4.4, GCC 15.2, CUDA OFF, shared libraries OFF; CMake build uses nice10/-j4. No replacement engine build. |
+| Runtime and bridge/node/converter/native-body contracts | Retained runtime 8 tests, full bridge/node 67 tests, codec 4 tests: exits 0. Optional torch arithmetic is skipped because torch is absent. `runtime-tests-01`, `vllm-tests-02`, `codec-tests-01`. |
+| Proxy and benchmark contracts | Proxy 123 tests with no skips in each hash mode; bench 81 tests with six native-header discovery skips, separately covered by 12 no-skip native Mirai tests; all exits 0. `auto/portable-proxy-01`, retained `bench-tests-01`, `native-mirai-identity-01`. |
+| Codec, file hash, SHA-NI/portable hash, server components, SWA, capacity, append and guards | Exit 0 in both modes: `auto/portable-{codec,hash,hash-ni,server-components,swa,capacity,append,guards}-01`. Existing corruption, bounds, atomic staging/rollback, prefix and neighbor invariants remain exercised. |
+| PR15 independent native-state and complete-logit identity | `auto/portable-identity-01`: exit 0; two local Q4/Q8 models x two depths, each fresh and append, with full native state and 64-position full-vocabulary logit hashes equal to the separate main build. |
+| Chunk wires, native state and logits equal pinned main | Each mode has 24 exact file comparisons, including 16 full wire records with XXH128 and SHA256 trailers independently verified and fixed state confined to the final chunk. Across modes: 48 file identities and 32 wire-trailer controls. `auto/portable-chunk-comparisons.json`. |
+| HTTP import, retained-wire lifetime, malformed chunks and continuation | Native chunk and HTTP probe suites exit 0 for Q4 and Q8 in both modes. `auto/portable-http-01` compares actual slot bytes with main, preserves both slots after malformed input and checks 64/64 greedy continuation. `auto/portable-remote-chunks-01` covers interruption, replacement, ordering and final commit. |
+| Import profiler and real chunk integration | URL and protocol-v2 synthetic fresh/append profiling exit 0 in both modes, without a `state_copy` stage or whole-recurrent backup; `auto/portable-profile-*-01`. Integrated chunk cases exit 0 in both modes. |
+| Native reference, heterogeneous study and full integration | `reference-native-01`, `native-hetero-study-01`, `native-integrated-01`: exits 0, including aligned/local-tail and incomplete-chain refusals. |
+| Review and operator checks | Exact runbook Bash syntax, every Python heredoc AST, all adapter Python ASTs, retained reviewer test names and repository model-naming check pass. FP8/NVFP4/ambiguity and local/peer TIME_WAIT controls pass. Diff/ASCII/whitespace checks pass. |
+
+Both hash environments are explicit: automatic with `HYBRID_HASH_PORTABLE` unset, portable with `HYBRID_HASH_PORTABLE=1`. The temporary environment contains NumPy 2.4.2 and bootstrap pip only; no other package was installed. System Python supplies existing proxy/bench dependencies. CPU torch gather and optional torch arithmetic are unrun. Type-check and EditorConfig attempts each exit 127 because `ty` and `editorconfig-checker` are unavailable; they are not passing evidence.
+
+| Mutant | Gate narrowed to | Named failing test | Result / survival bound |
+|---|---|---|---|
+| Replace `read_delta_view` with owning `read_delta` in an isolated helper | Native body must refer to the retained wire, rather than an extracted copy | `AdapterTests.test_chunked_final_fixed_state` | Expected-red test exit 1, native refusal `borrowed reader copied native body`; no setup error or crash. The unchanged production helper's same test passes in retained `vllm-tests-02`. |
+| Flip one byte in an isolated native-state fixture | Complete state-byte equality against pinned main | `test_chunk_import_bytes_match_main: fresh-state.bin` | Expected-red exit 1; identical positive control exit 0. Only the fixture root changes; no wire-trailer claim from this bounded control. |
+
+There are no survivors among these two bounded mutants. `compare-control.json` binds the unchanged comparison logic with only its fixture root redirected; this two-record control makes no wire-trailer coverage claim. Heterogeneous native checker exit 5 remains uncalibrated measurement evidence, while intended negative child exits 2/3 are retained by their positive/negative test harnesses; none is labeled an exactness pass.
+
+Failed/corrected history remains explicit: initial `vllm-tests-01` exits 1 because the helper changed an existing PASS prefix; the corrected suffix and rebuilt helper pass the retained full `vllm-tests-02`. The first validation driver stopped on its own glob matching `.pid` files as directories; the corrected driver preserved all green gates. The old append log is incomplete, not a pass. r11b adds no product-test failure; its expected-red mutants and unavailable-tool exits are separately labeled. An initial source audit incorrectly expected pre-resume resolutions to be new edits; its corrected scope check confirms that only three documentation paths changed after takeover (`final-audit-correction.md`).
+
+No formal surface table was supplied (brief gap); no extra product surface is silently excluded. GPU/live-vLLM extraction and merged-head numerical qualification are excluded by the CPU-only brief and remain landing obligations. No reviewer test name was removed. Self-review covers scope, security, general conventions, server integration and tests; this is not independent acceptance. The local task-board is absent (`goal-get-01`, exit 1), so the established `.temp/tasks.md` remains the tracker; no primary-goal clear is claimed.
+
+Build admission records include `pgrep -u agent cc1plus` and `uptime`; one lane build at a time, nice10 and at most -j4. `TMPDIR` is disk-backed and `PYTHONDONTWRITEBYTECODE=1`. The minimum sampled free disk was 29339815936 bytes, above 28 GB. Task-owned build trees, copied reference binary, helper/control binaries, payloads and NumPy venv are removed after hashing; `cleanup-01.json` and `cleanup-manifest.json` retain removals and disk readback.
+
+### Exact-diff comparison
+
+`reviewed-branch.patch` is the exact reviewed `683caeed..8ff1e5d1` delta, SHA256 `c531fbcdd033926d269ef03290a9144ab8e480c7fd6e71571f1e9e7d3756d86c`. A fresh alternate index starts at main `3ac1503d` and applies that patch with `--cached --3way`, without conflicts. Export only the seven paths above as `r11-resolutions.patch`, then apply it to the replay in another index. The reconstructed tree and its binary main-to-candidate diff must equal the staged candidate and, after signing, `git diff --binary 3ac1503d..HEAD` byte for byte. `proof.json` records both tree IDs, exact head, parent/signature checks, commands, path inventory and patch/diff hashes; `main-to-candidate.patch` retains the reviewable final diff. No unrelated change is included.
+
+### PRO 6000 re-smoke and landing note
+
+The [r11 runbook](GPU-NODE-RUNBOOK.md#pro-6000-re-smoke-after-pr-15-r11) uses `/root/kit161/gpu/work/vllm-venv`, vLLM 0.32.0, cached FP8 weights under `/root/kit161/gpu/work/hf`, `/root/proto/models/Qwen3.8-27B-Q4_K_M.gguf` and CUDA arch `120a-real`. It runs CPU gather, standalone CUDA byte equality and a fresh adapter-bound CUDA gate before readiness, then fresh and append-chain imports near 8k/32k, forced 32k multi-chunk and 64-position KL/top-1. Its port selection excludes all TCP states on both endpoints, including TIME_WAIT, and uses fresh state directories. Uncalibrated checker exit 5 is retained as a measurement, never promoted to an exactness pass. CPU syntax and fixture controls do not close this GPU gate.
+
+PR title: `hybrid: add aligned vLLM node with atomic chunk deltas`
+
+Body draft:
+
+> Add the reviewed vLLM bridge and HTTP node adapter on main 3ac1503d after PR #15. Preserve HYBD v2 / llama-native-chunks-v3, aligned exports and exact local tails, with KV-only intermediate chunks and fixed state only in the final chunk. Import through main's borrowed-reader and chunked-hash path, retaining each wire through atomic final apply.
+>
+> CPU build, runtime, proxy, benchmark, converter/node, native reference/integration and both hash-mode PR15 import suites passed. Independent main comparisons retain native-state, full-logit and exact wire-byte identities. Optional torch/gather checks and unavailable type/EditorConfig tools are disclosed in the r11 report.
+>
+> The merge was assisted by Codex. No push or PR submission was performed. Before landing, independently review this exact signed head and complete its PRO 6000 gather/CUDA-byte-gate, 8k/32k fresh/append, 32k multi-chunk and KL/top-1 re-smoke. Prior B300 evidence belongs to c2f47472 and does not qualify this merge.
+
+Exact signed head: recorded after signing in `.temp/hybrid-d-r11-261102/landing-note.md`, mirrored in `.temp/hybrid-d-r11b-261102/landing-note.md` and `proof.json`. This avoids embedding a commit's own hash in its committed bytes. Those receipts verify both parents, the signature and committed-tree/diff equality. Ready for independent review; publication and landing have not occurred.

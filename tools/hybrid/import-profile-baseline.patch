@@ -1,0 +1,145 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 28fa34c4d5..dc4d89165a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -888,0 +889 @@ void llama_context::synchronize() {
++    llama_io_timer timer("synchronize");
+@@ -3023,0 +3025,3 @@ public:
++        size_t bytes = 0;
++        for (const auto & rinfo : rinfos) { bytes += rinfo.size; }
++        llama_io_timer timer("tensor_write", bytes);
+@@ -3529,0 +3534 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
++    llama_io_timer timer("native", size);
+@@ -3537,0 +3543 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
++        llama_io_timer validation_timer("native_validate", size);
+@@ -3557,3 +3563,7 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
+-    std::vector<uint8_t> backup(state_seq_get_size(seq_id, backup_flags));
+-    if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size()) {
+-        return 0;
++    std::vector<uint8_t> backup;
++    {
++        llama_io_timer backup_timer("backup");
++        backup.resize(state_seq_get_size(seq_id, backup_flags));
++        if (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size()) {
++            return 0;
++        }
+@@ -3570,0 +3581 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
++        llama_io_timer parse_timer("native_parse", size);
+diff --git a/src/llama-io.h b/src/llama-io.h
+index 0aca733107..247a9304a5 100644
+--- a/src/llama-io.h
++++ b/src/llama-io.h
+@@ -5,0 +6,20 @@
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++// Opt-in import timings include nested stages; tensor I/O includes backend waits.
++struct llama_io_timer {
++    const char * stage;
++    size_t bytes;
++    const bool enabled = std::getenv("LLAMA_HYBRID_IMPORT_PROFILE") != nullptr;
++    std::chrono::steady_clock::time_point start;
++    llama_io_timer(const char * stage, size_t bytes = 0) : stage(stage), bytes(bytes) {
++        if (enabled) { start = std::chrono::steady_clock::now(); }
++    }
++    ~llama_io_timer() {
++        if (enabled) {
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++            std::fprintf(stderr, "hybrid_import stage=%s bytes=%zu ms=%.6f\n", stage, bytes, ms);
++        }
++    }
++};
+diff --git a/tools/hybrid/check-client.cpp b/tools/hybrid/check-client.cpp
+index 480369efd9..6eb76f9a99 100644
+--- a/tools/hybrid/check-client.cpp
++++ b/tools/hybrid/check-client.cpp
+@@ -2,0 +3 @@
++#include "hash/hash.h"
+@@ -123,0 +125,24 @@ static void capacity(llama_model * model, const std::string & stem) {
++static void identity(llama_model * model, const std::string & stem) {
++    // Fresh and appended imports preserve every exported state byte and all logits at 64 teacher-forced positions across builds.
++    const auto meta = hybrid::parse_json(read(stem + ".tokens.json"));
++    const int n0 = meta.at("n0"), n1 = meta.at("n1");
++    const auto tokens = meta.at("tokens").get<std::vector<llama_token>>();
++    for (bool fresh : {true, false}) {
++        auto ctx = hybrid::make_context(model, 9216);
++        if (!fresh) { hybrid::load_state(ctx.get(), read(stem + ".prefix.state")); }
++        const auto delta = hybrid::read_delta(read(stem + (fresh ? ".full.delta" : ".delta")), meta.at("model_sha256"), fresh ? 0 : n0);
++        require(append(ctx.get(), delta.state, fresh ? 0 : n0, n1) == delta.state.size(), "identity import failed");
++        const auto imported = hybrid::save_state(ctx.get());
++        std::string logits;
++        for (int i = 0; i < 64; ++i) {
++            hybrid::prefill(ctx.get(), {tokens.at(i % tokens.size())}, n1 + i);
++            const auto * values = llama_get_logits_ith(ctx.get(), -1);
++            require(values != nullptr, "identity logits missing");
++            logits.append(reinterpret_cast<const char *>(values), llama_vocab_n_tokens(llama_model_get_vocab(model)) * sizeof(float));
++        }
++        std::cout << "IDENTITY " << hybrid::json{{"fresh", fresh}, {"n1", n1}, {"state_bytes", imported.size()},
++            {"state_sha256", hash_sha256_hex(imported.data(), imported.size())},
++            {"logit_bytes", logits.size()}, {"logits_sha256", hash_sha256_hex(logits.data(), logits.size())}}.dump() << '\n';
++    }
++}
++
+@@ -134,0 +160 @@ int main(int argc, char ** argv) {
++        else if (mode == "--identity" && argc == 4) { identity(model.get(), argv[3]); }
+diff --git a/tools/hybrid/hybrid-state.cpp b/tools/hybrid/hybrid-state.cpp
+index fd0117c727..c2b7f35be7 100644
+--- a/tools/hybrid/hybrid-state.cpp
++++ b/tools/hybrid/hybrid-state.cpp
+@@ -3,0 +4 @@
++#include "llama-io.h"
+@@ -109,0 +111 @@ static std::string checksums(const std::string & body) {
++    llama_io_timer timer("checksum", body.size());
+@@ -111 +113,4 @@ static std::string checksums(const std::string & body) {
+-    XXH128_canonicalFromHash(&xxh, XXH3_128bits(body.data(), body.size()));
++    {
++        llama_io_timer hash_timer("xxh3", body.size());
++        XXH128_canonicalFromHash(&xxh, XXH3_128bits(body.data(), body.size()));
++    }
+@@ -114 +119,4 @@ static std::string checksums(const std::string & body) {
+-    sha256_hash(digest, reinterpret_cast<const unsigned char *>(body.data()), body.size());
++    {
++        llama_io_timer hash_timer("sha256", body.size());
++        sha256_hash(digest, reinterpret_cast<const unsigned char *>(body.data()), body.size());
++    }
+@@ -149,0 +158 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
++    llama_io_timer timer("codec", wire.size());
+@@ -178 +187,5 @@ delta read_delta(const std::string & wire, const std::string & model_sha256, int
+-    std::string state = wire.substr(4 + size, bytes);
++    std::string state;
++    {
++        llama_io_timer copy_timer("state_copy", bytes);
++        state = wire.substr(4 + size, bytes);
++    }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ef7550b0b5..100efa8bbd 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,0 +21 @@
++#include "llama-io.h"
+@@ -6881 +6882,4 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
+-        task.slot_action.delta = req.body;
++        {
++            llama_io_timer timer("task_copy", req.body.size());
++            task.slot_action.delta = req.body;
++        }
+diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
+index 38520e387f..c02a742f92 100644
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -3,0 +4 @@
++#include "llama-io.h"
+@@ -704 +705,4 @@ void server_http_context::post(const std::string & path, const server_http_conte
+-        std::string body = req.body;
++        std::string body = [&req]() {
++            llama_io_timer timer("http_body_copy", req.body.size());
++            return req.body;
++        }();
+@@ -734 +738,3 @@ void server_http_context::post(const std::string & path, const server_http_conte
+-        server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
++        server_http_req_ptr request = [&]() {
++            llama_io_timer timer("http_request_copy", body.size());
++            return std::make_unique<server_http_req>(server_http_req{
+@@ -742,0 +749 @@ void server_http_context::post(const std::string & path, const server_http_conte
++        }();

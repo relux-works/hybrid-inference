@@ -29,7 +29,7 @@ du -sb build
 
 Native startup always computes SHA-256 over the entire model file. No cached or supplied digest is trusted. macOS keeps system CommonCrypto. On other x86-64 GCC/Clang builds, SHA-NI compresses whole blocks when CPUID reports SHA, SSSE3 and SSE4.1; a function-level target attribute leaves build flags unchanged. Other CPUs and compilers use the vendored SHA-256. `HYBRID_HASH_PORTABLE=1` forces the vendor path, including on macOS; other values leave automatic dispatch enabled. The SHA-NI path shares the vendor context and finalizer. Every backend retains the 64 KiB default read buffer and existing read-error checks.
 
-`llama-hybrid-check-hash FILE [UPDATE_BYTES | --file-chunk READ_BYTES]` prints JSON with the digest, file size, elapsed hash time, decimal MB/s and observed `backend` (`sha-ni`, `portable`, `commoncrypto` or `portable-stream`). Without a chunk argument it calls the startup hash function. `--file-chunk` (1..65536) tests fragmented native reads on the selected backend. The existing positional chunk (1..1048576) still exercises portable vendor streaming with unaligned input and empty updates. `test_file_hash.py` and its hashlib/sha256sum references are unchanged; its optional model stays read-only. `test_file_hash_ni.py` adds fixed NIST answers, non-periodic random data at every block boundary through 300000 bytes, odd native reads, a sparse 4 GiB + 65 byte fixture, observed dispatch and negative cases on both backends. Fixtures under `.temp/` are removed after each test. Retain logs in a task-scoped `.temp/` directory.
+`llama-hybrid-check-hash FILE [UPDATE_BYTES | --file-chunk READ_BYTES]` prints JSON with the digest, file size, elapsed hash time, decimal MB/s and observed `backend` (`sha-ni`, `portable`, `commoncrypto` or `portable-stream`). Without a chunk argument it calls the startup hash function. `--file-chunk` (1..65536) tests fragmented native reads on the selected backend. The existing positional chunk (1..1048576) still exercises portable vendor streaming with unaligned input and empty updates. `test_file_hash.py` uses hashlib and sha256sum (or shasum on macOS) as references; its optional model stays read-only. `test_file_hash_ni.py` adds fixed NIST answers, non-periodic random data at every block boundary through 300000 bytes, odd native reads, a sparse 4 GiB + 65 byte fixture, observed dispatch and negative cases on both backends. Fixtures under `.temp/` are removed after each test. Retain logs in a task-scoped `.temp/` directory.
 
 ```sh
 mkdir -p .temp/hash-check
@@ -113,6 +113,27 @@ build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.
 ```
 
 `check-append` compares 64 greedy tokens after import to an independent local prefill at the same partition. `check-guards` tests portable single-sequence restore and sliding-window rejection. `check-distributions` compares full-vocabulary teacher-forced probabilities against whole-prompt prefill. `check-client --capacity` tests rollback after validated input exhausts free KV cells; `--measure` reports one append and checks its resulting state outside the measured interval. `check-codec` covers the maximum token range and both header budgets.
+
+## Import profiling
+
+`python3 tools/hybrid/profile_import.py --help` describes the CPU and device replay tool. It uses the actual proxy `Node` receive/request methods and the actual decoder slot import route. Bodies stay in RAM; JSON timings, decoder logs and owned process records go to `--output`. `LLAMA_HYBRID_IMPORT_PROFILE=1` enables native stage timings. Timers are nested; tensor I/O includes backend waits. `HYBRID_HASH_PORTABLE=1` keeps the portable SHA-256 control. The normal path uses SHA-NI when CPUID permits it, CommonCrypto on Apple, and the portable implementation elsewhere. Both checksums still cover every body byte.
+
+```sh
+export TMPDIR="$PWD/.temp/import-profile/tmp" PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR"
+python3 tools/hybrid/profile_import.py --binary current=build/bin/llama-server \
+    --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf \
+    --golden ~/Werkstatt/hybrid-models/golden/prompt-512 \
+    --output .temp/import-profile/fresh
+build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf \
+    --identity ~/Werkstatt/hybrid-models/golden/prompt-512
+```
+
+`--identity` prints SHA-256 identities for every exported state byte and all vocabulary logits at 64 teacher-forced positions, for fresh and appended imports. Compare its `IDENTITY` records across builds. `import-profile-baseline.patch` adds only timers and this diagnostic command to pinned main `a25754271e19cfda2c44c702a52b752cb53cf623`; it preserves the original hashing and copy behavior. Apply it with `git apply --unidiff-zero` only to a separate baseline checkout, or with `git apply --3way --unidiff-zero` to main `528724c9`. [The r34/r35 report](RESULTS-hybrid-b-r34-261101.md) contains paired CPU measurements, limits, cleanup evidence and exact GPU/Mac commands.
+
+File and delta hashing share the internal `sha256_stream` update/finish API over the same vendor, SHA-NI and CommonCrypto state. `file_hash(path, read_bytes, backend)` retains its bounded read size and backend reporting. The hash reference tests use `sha256sum`, or macOS `shasum -a 256` when `sha256sum` is absent. `tools/hybrid-proxy/test_decode.py --reference-slot BASELINE/slots/imported.bin` additionally asserts every HTTP-imported slot byte against a separately built reference; keep the reference snapshot until candidate and mutant checks finish.
+
+`python3 tools/hybrid/test_import_identity.py --before BASELINE/bin/llama-hybrid-check-client --after CANDIDATE/bin/llama-hybrid-check-client --model MODEL.gguf --golden GOLDEN_STEM --artifacts .temp/import-identity` asserts cross-build equality and records commands, PIDs, binary hashes and native logs. Repeat `--model` and `--golden` to select more local fixtures. It downloads nothing; generic unittest discovery skips this opt-in test until explicit build/model arguments are supplied.
 
 ## Configurable-limit qualification
 

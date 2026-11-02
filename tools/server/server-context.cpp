@@ -18,6 +18,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "hybrid-state.h"
+#include "llama-io.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3263,7 +3264,7 @@ private:
                                 slot->hybrid_import.clear();
                             } else {
                                 const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
-                                const bool final = slot->hybrid_import.stage(ctx_tgt, slot->id, task.slot_action.delta, hybrid_model_hash,
+                                const bool final = slot->hybrid_import.stage(ctx_tgt, slot->id, std::move(task.slot_action.delta), hybrid_model_hash,
                                         task.slot_action.session_id, tokens, slot->n_ctx, llama_vocab_n_tokens(vocab));
                                 if (final) {
                                     auto imported_tokens = slot->hybrid_import.imported_tokens();
@@ -6872,7 +6873,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
     task.id = res->rd.get_new_id();
     task.slot_action.id_slot = id_slot;
     if (!info) {
-        task.slot_action.delta = req.body;
+        {
+            llama_io_timer timer("task_copy", req.body.size());
+            task.slot_action.delta = req.body;
+        }
         task.slot_action.abort_delta = abort;
         for (const auto & header : req.headers) {
             std::string name = header.first;

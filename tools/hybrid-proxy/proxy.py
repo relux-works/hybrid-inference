@@ -163,7 +163,7 @@ class Proxy:
         encoded = json.dumps(header, separators=(",", ":")).encode()
         if len(encoded) > 1024**2:
             raise ValueError("heterogeneous header too large")
-        return struct.pack("<I", len(encoded)) + encoded + delta[4 + size:]
+        return b"".join((struct.pack("<I", len(encoded)), encoded, memoryview(delta)[4 + size:]))
 
     def client(self, authorization):
         value = self.clients.get(authorization.removeprefix("Bearer ")) if authorization.startswith("Bearer ") else None

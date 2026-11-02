@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -28,7 +29,8 @@ class FileHashTests(unittest.TestCase):
             for block in iter(lambda: source.read(1024 * 1024), b''):
                 digest.update(block)
         expected = digest.hexdigest()
-        actual = subprocess.run(['sha256sum', str(path)], text=True, capture_output=True, check=True)
+        command = ['sha256sum'] if shutil.which('sha256sum') else ['shasum', '-a', '256']
+        actual = subprocess.run([*command, str(path)], text=True, capture_output=True, check=True)
         self.assertEqual(actual.stdout.split()[0], expected)
         return expected
 
