@@ -127,7 +127,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [cli](tools/cli/README.md)
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
-- [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay and test commands; artifacts in `.temp/hybrid-b-r1-261030/`
+- [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay, captured-template tests, external Jinja2 oracle and mutation controls; exact commands in the linked guide, artifacts in `.temp/<run>/`, oracle sources via `HYBRID_TEMPLATE_FIXTURES`
 - [hybrid benchmark prototype](tools/hybrid-bench/README.md#tools-and-trace-contract) - Deployment, benchmark, tests and cleanup controls with exact commands and artifact locations
 - [GBNF grammars](grammars/README.md)
 
@@ -164,6 +164,10 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 The local CPU prefill node, shared state-delta codec, correctness checker, and HTTP isolation tests are documented in [tools/hybrid/README.md](tools/hybrid/README.md), including exact CMake, flock, Python and run commands. Binaries go to `build/bin/`; logs and task-local tools go to `.temp/`; golden state fixtures go to `~/Werkstatt/hybrid-models/golden/`.
 
+Sliding-window transfer for Gemma 4 and Muse Glimmer is described in [SWA-STATE-DESIGN.md](tools/hybrid/SWA-STATE-DESIGN.md). Build `llama-hybrid-check-swa` with the locked named-target command in the node guide, then run `nice -n 19 build/bin/llama-hybrid-check-swa` for model-free allocated-cache tests. Logs belong under `.temp/`; real-model GPU qualification commands are in the [r16 report](tools/hybrid-bench/RESULTS-hybrid-a-r16-261101.md).
+
 Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.
 
 Delta import profiling uses `python3 tools/hybrid/profile_import.py` and `build/bin/llama-hybrid-check-client --identity`; commands and output locations are in the [import profiling guide](tools/hybrid/README.md#import-profiling).
+
+Combined SWA layout and final-state chunk CPU qualification, invariant checks and exact GPU operator commands are in [the r27 report](tools/hybrid/RESULTS-hybrid-a-r27-261101.md).

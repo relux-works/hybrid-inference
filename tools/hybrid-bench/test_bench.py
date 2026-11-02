@@ -8,6 +8,9 @@ import threading
 import urllib.error
 from types import SimpleNamespace
 import json
+import os
+import subprocess
+import struct
 from pathlib import Path
 import tarfile
 import tempfile
@@ -61,6 +64,150 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(common.Refusal, 'exact-ref build'):
                 manage.build(args, ['llama-hybrid-prefill'], {})
             run.assert_not_called()
+
+    @staticmethod
+    def swa_metadata(arch):
+        values = dict(block_count=8 if arch == 'gemma4' else 4, embedding_length=64,
+            context_length=262144 if arch == 'gemma4' else 131072,
+            **{'attention.head_count': 1, 'attention.head_count_kv': 1,
+               'attention.key_length': 64, 'attention.value_length': 64,
+               'attention.sliding_window': 1024 if arch == 'gemma4' else 2048})
+        if arch == 'gemma4':
+            values.update({'attention.sliding_window_pattern': [1, 1, 0, 1, 1, 0, 1, 0],
+                           'attention.shared_kv_layers': 2,
+                           'attention.key_length_swa': 32, 'attention.value_length_swa': 32})
+        return {'general.architecture': arch, 'vocab_size': 0,
+                'vocab_sha256': hashlib.sha256(b'').hexdigest(),
+                **{arch + '.' + key: value for key, value in values.items()}}
+
+    # Geometry counts only allocated source layers and distinguishes full/window widths and fixed cell bytes.
+    def test_swa_metadata_geometry_and_chunk_budget(self):
+        for arch, full, window_row, window in [('gemma4', 272, 272, 1024), ('muse-glimmer', 136, 408, 2048)]:
+            meta = self.swa_metadata(arch)
+            with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+                plan = common.context_plan(model.name, dict(available_memory_bytes=64 * common.GIB), 4096)
+                identity = common.model_identity(model.name)
+            self.assertEqual(plan['kv_bytes_per_token'], full)
+            self.assertEqual(plan['window_kv_bytes_per_token'], window_row)
+            # Masked ring rows carry metadata only; K/V is bounded by the retained window.
+            self.assertEqual(plan['window_state_bytes'], window * window_row + ((window + 256 + 255) // 256) * 256 * 28 + 16)
+            self.assertEqual(plan['recurrent_state_bytes'], 0)
+            self.assertEqual(identity['model_layout']['sliding_window'], window)
+            fixed = plan['window_state_bytes']
+            bound = extend_chunk_limit(full, 0, fixed)
+            self.assertLessEqual(bound * (full + 24) + fixed + 1024**2, 512 * 1024**2)
+            # An enlarged fixed window, rather than the header bound, constrains this control.
+            fixed = 500 * 1024**2
+            bound = extend_chunk_limit(full, 0, fixed)
+            self.assertLessEqual(bound * (full + 24) + fixed + 1024**2, 512 * 1024**2)
+            self.assertGreater((bound + 1) * (full + 24) + fixed + 1024**2, 512 * 1024**2)
+            with self.assertRaisesRegex(ValueError, 'invalid native delta geometry'):
+                extend_chunk_limit(full, 0, 511 * 1024**2)
+
+    # Production q8_0 geometries must leave room for a nonempty full-attention chunk under 512 MiB.
+    def test_swa_production_geometry_budget(self):
+        for arch, window, count, full_layers, heads, dim, full_heads, full_dim, row in [
+                ('gemma4', 1024, 60, 10, 16, 256, 4, 512, 435200),
+                ('muse-glimmer', 2048, 52, 13, 2, 128, 2, 128, 21216)]:
+            meta = self.swa_metadata(arch)
+            pattern = [(i + 1) % (count // full_layers) != 0 for i in range(count)]
+            meta.update({arch + '.' + key: value for key, value in dict(
+                block_count=count, **{'attention.head_count': 32,
+                'attention.head_count_kv': [heads if sliding else full_heads for sliding in pattern],
+                'attention.key_length': full_dim, 'attention.value_length': full_dim,
+                'attention.key_length_swa': dim, 'attention.value_length_swa': dim,
+                'attention.sliding_window': window, 'attention.sliding_window_pattern': pattern,
+                'attention.shared_kv_layers': 0}).items()})
+            with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+                plan = common.context_plan(model.name, dict(available_memory_bytes=512 * common.GIB,
+                    available_vram_bytes=96 * common.GIB), 8192)
+            self.assertEqual(plan['window_kv_bytes_per_token'], row)
+            fixed = window * row + (window + 256) * 28 + 16
+            self.assertEqual(plan['window_state_bytes'], fixed)
+            bound = extend_chunk_limit(plan['kv_bytes_per_token'], 0, fixed)
+            self.assertGreater(bound, 0)
+            self.assertLessEqual(bound * (plan['kv_bytes_per_token'] + 24) + fixed + 1024**2, 512 * 1024**2)
+            # An actually oversized window must still refuse rather than dropping the fixed-state budget.
+            meta[arch + '.attention.sliding_window'] = window * 16
+            with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+                with self.assertRaisesRegex(common.Refusal, 'window exceeds delta budget'):
+                    common.context_plan(model.name, dict(available_memory_bytes=512 * common.GIB,
+                        available_vram_bytes=96 * common.GIB), 8192)
+
+    # Read both architecture prefixes and a real GGUF boolean mask; per-layer head counts change allocated row sums.
+    def test_swa_gguf_metadata_reader_and_per_layer_heads(self):
+        def string(value):
+            data = value.encode()
+            return struct.pack('<Q', len(data)) + data
+        for arch in ('gemma4', 'muse-glimmer'):
+            meta = self.swa_metadata(arch)
+            meta.pop('vocab_size')
+            meta.pop('vocab_sha256')
+            meta[arch + '.attention.sliding_window_pattern'] = [True, True, False, True, True, False, True, False] if arch == 'gemma4' else [True, True, True, False]
+            wire = b'GGUF' + struct.pack('<IQQ', 3, 0, len(meta) + 1)
+            for key, value in meta.items():
+                wire += string(key)
+                if isinstance(value, str):
+                    wire += struct.pack('<I', 8) + string(value)
+                elif isinstance(value, list):
+                    wire += struct.pack('<IIQ', 9, 7, len(value)) + bytes(value)
+                else:
+                    wire += struct.pack('<II', 4, value)
+            wire += string('tokenizer.ggml.tokens') + struct.pack('<IIQ', 9, 8, 1) + string('token')
+            with tempfile.NamedTemporaryFile() as fixture:
+                Path(fixture.name).write_bytes(wire)
+                actual = common.model_metadata(fixture.name)
+                self.assertEqual(actual[arch + '.attention.sliding_window_pattern'], meta[arch + '.attention.sliding_window_pattern'])
+                identity = common.model_identity(fixture.name)
+                self.assertEqual(identity['model_layout']['vocab_size'], 1)
+                self.assertEqual(identity['model_layout']['vocab_sha256'], hashlib.sha256(struct.pack('<Q', 5) + b'token').hexdigest())
+        meta = self.swa_metadata('gemma4')
+        meta['gemma4.attention.head_count_kv'] = list(range(1, 9))
+        with tempfile.NamedTemporaryFile() as model, mock.patch.object(common, 'model_metadata', return_value=meta):
+            plan = common.context_plan(model.name, dict(available_memory_bytes=64 * common.GIB), 4096)
+        self.assertEqual(plan['kv_bytes_per_token'], 9 * 136)
+        self.assertEqual(plan['window_kv_bytes_per_token'], 12 * 68)
+
+    # Compare native and GGUF-derived fingerprints on the same synthetic geometry and empty vocabulary.
+    @unittest.skipUnless(os.environ.get('HYBRID_SWA_CHECKER'), 'set HYBRID_SWA_CHECKER for allocated-cache identity controls')
+    def test_swa_native_python_identity(self):
+        result = subprocess.run([os.environ['HYBRID_SWA_CHECKER']], check=True, capture_output=True, text=True)
+        native = [json.loads(line[7:]) for line in result.stdout.splitlines() if line.startswith('LAYOUT ')]
+        self.assertEqual(len(native), 4)
+        for identity in native:
+            arch = identity['model_layout']['architecture']
+            meta = self.swa_metadata(arch)
+            meta[arch + '.attention.sliding_window'] = 4
+            if arch == 'muse-glimmer':
+                meta[arch + '.attention.key_length_swa'] = 32
+                meta[arch + '.attention.value_length_swa'] = 32
+            with mock.patch.object(common, 'model_metadata', return_value=meta):
+                python = common.model_identity('fixture')
+            self.assertEqual(python['model_layout'], identity['model_layout'])
+            self.assertEqual(python['layout_fingerprint'], identity['layout_fingerprint'])
+
+    # Window, layer masks and shared-source allocation are part of identity; unknown or malformed layouts refuse.
+    def test_swa_identity_negatives(self):
+        for arch in ('gemma4', 'muse-glimmer'):
+            meta = self.swa_metadata(arch)
+            with mock.patch.object(common, 'model_metadata', return_value=meta):
+                original = common.model_identity('fixture')['layout_fingerprint']
+                for key, value in [('attention.sliding_window', 512), ('attention.head_count_kv', [2] * meta[arch + '.block_count'])]:
+                    changed = dict(meta, **{arch + '.' + key: value})
+                    with mock.patch.object(common, 'model_metadata', return_value=changed):
+                        self.assertNotEqual(common.model_identity('fixture')['layout_fingerprint'], original)
+            invalid = [dict(meta, **{arch + '.attention.sliding_window': 0}),
+                       dict(meta, **{arch + '.attention.sliding_window_pattern': [True]}),
+                       dict(meta, **{arch + '.attention.shared_kv_layers': 100})]
+            for changed in invalid:
+                with mock.patch.object(common, 'model_metadata', return_value=changed):
+                    with self.assertRaises(common.Refusal):
+                        common.model_identity('fixture')
+        with mock.patch.object(common, 'model_metadata', return_value={'general.architecture': 'unknown'}):
+            with self.assertRaisesRegex(common.Refusal, 'unsupported hybrid architecture'):
+                common.context_plan('fixture', {})
+            with self.assertRaisesRegex(common.Refusal, 'unsupported hybrid architecture'):
+                common.model_identity('fixture')
 
     # Both build modes disable UI downloads; offline model-download requests refuse before preflight.
     def test_offline_build_flags(self):
@@ -521,7 +668,7 @@ class CleanupTests(unittest.TestCase):
                 if url != 'http://decoder':
                     return real_http(url, path, *args, **kwargs)
                 if path == '/apply-template':
-                    return dict(prompt='fixture')
+                    return dict(prompt=''.join(m.get('content', '') for m in args[1]['messages']))
                 if path == '/tokenize':
                     return dict(tokens=[1] * (len(args[1]['content']) // 2 if args[1]['content'].startswith(' x') else 3))
                 return dict(tokens=[1] * 132)
@@ -791,6 +938,180 @@ class ProcessControlTests(unittest.TestCase):
                     if child.poll() is None:
                         child.kill()
                         child.wait()
+
+
+
+class SyntheticToolTests(unittest.TestCase):
+    @staticmethod
+    def fixture(label):
+        from test_templates import FIXTURES
+        from stub_server import FixtureTemplate
+        return FixtureTemplate(json.loads((FIXTURES / (label + "-r20.json")).read_text()))
+
+    # Real-backed live probes request calls only when unmatched content disappears, independent of the advertised model name.
+    def test_live_probe(self):
+        for label, expected in (("qwen3.8-27b", False), ("gemma4-31b", True), ("muse-glimmer-30b", False)):
+            template = self.fixture(label)
+            def decode(path, body):
+                self.assertEqual(path, '/apply-template')
+                return dict(prompt=template.render(body))
+            self.assertIs(hybrid_bench.probe_tool_call(decode), expected)
+
+    # Only explicit client rejections trigger fallback; outages and authentication failures propagate without a second render.
+    def test_rejection_and_outage(self):
+        for status in (400, 422, 401, 403, 500, 503):
+            calls = []
+            def decode(path, body):
+                calls.append(body)
+                if len(calls) == 1:
+                    raise urllib.error.HTTPError('http://fixture', status, 'fixture', {}, None)
+                return dict(prompt=body['messages'][-2]['content'])
+            if status in (400, 422):
+                self.assertTrue(hybrid_bench.probe_tool_call(decode))
+                self.assertEqual(len(calls), 2)
+            else:
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    hybrid_bench.probe_tool_call(decode)
+                self.assertEqual(error.exception.code, status)
+                self.assertEqual(len(calls), 1)
+
+    # Duplicated unmatched probes are invalid; dropped/duplicated matched probes refuse instead of admitting an empty workload.
+    def test_probe_preservation_guards(self):
+        for unmatched, matched, reason in ((2, 1, 'duplicated'), (0, 0, 'matched synthetic'), (0, 2, 'matched synthetic')):
+            calls = []
+            def decode(path, body):
+                calls.append(body)
+                marker = body['messages'][-2]['content']
+                return dict(prompt=marker * (unmatched if len(calls) == 1 else matched))
+            with self.assertRaisesRegex(common.Refusal, reason):
+                hybrid_bench.probe_tool_call(decode)
+            self.assertEqual(len(calls), 1 if unmatched == 2 else 2)
+
+    # Both fixed and measured tool payloads keep their size/ID; matching calls never rewrite existing history.
+    def test_payload_and_matching_call(self):
+        for measured in (False, True):
+            for index, step in enumerate(schedule(7, measured)):
+                if step['kind'] != 'tool':
+                    continue
+                payload = ' x' * step['tokens']
+                incoming = hybrid_bench.tool_messages(index, payload, True)
+                self.assertEqual([m['role'] for m in incoming], ['user', 'assistant', 'tool', 'user'])
+                call, = incoming[1]['tool_calls']
+                self.assertEqual(call['id'], incoming[2]['tool_call_id'])
+                self.assertEqual(incoming[2]['content'], payload)
+                self.assertEqual(call['function'], dict(name='read', arguments='{}'))
+
+    # Actual main requests use the live verdict and persist it per tool/depth row, for both capability outcomes.
+    def test_main_call_verdict(self):
+        for label, expected in (("qwen3.8-27b", False), ("gemma4-31b", True)):
+            template = self.fixture(label)
+            config = dict(model_sha256='a' * 64, decode_url='decode', decode_token='fixture',
+                          prefill_url='prefill', client_credential='fixture', clients={'fixture': dict(prefill_token='fixture')})
+            info = dict(model_sha256='a' * 64, context=4096, backend='cpu', proxy_url='proxy')
+            def request(url, path, token='', body=None, **kwargs):
+                if path == '/apply-template':
+                    return dict(prompt=template.render(body))
+                if path == '/tokenize':
+                    text = body['content']
+                    return dict(tokens=[1] * (len(text) // 2 if text.startswith(' x') else 32))
+                return dict(model_sha256='a' * 64, sessions=0)
+            sent = []
+            def stream(url, token, body, mode, sid, timeout):
+                sent.append(body)
+                previous = (len(sent) - 1) * 64
+                trace = dict(prefilled=60, new_tokens=60, replayed_prefix=0, rollback_n=None,
+                             depth_before=previous, prompt_depth=previous + 60, depth_after=previous + 64,
+                             generated_tokens=4, mode=mode, remote_applied=0, path='local')
+                return sid, dict(role='assistant', content='A1'), trace, .1, .2
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'node-info.json').write_text(json.dumps(info))
+                argv = ['hybrid_bench.py', '--client-state', directory, '--output', directory, '--scratch', directory, '--modes', 'local']
+                workload = [dict(kind='depth', depth=128, output=4), dict(kind='tool', tokens=16, depth=128, output=4)]
+                with mock.patch('sys.argv', argv), mock.patch.object(hybrid_bench, 'read_private', side_effect=[config, info]), \
+                        mock.patch.object(hybrid_bench, 'validate_identity'), mock.patch.object(hybrid_bench, 'http', side_effect=request), \
+                        mock.patch.object(hybrid_bench, 'schedule', return_value=iter(workload)), \
+                        mock.patch.object(hybrid_bench, 'stream_chat', side_effect=stream), \
+                        mock.patch.object(hybrid_bench, 'release_session', return_value=True):
+                    self.assertEqual(hybrid_bench.main(), 0)
+                rows = [json.loads(line) for line in next(root.glob('hybrid-bench-*.jsonl')).read_text().splitlines()]
+                self.assertEqual([row['tool_call_added'] for row in rows if row['stage'] == 'call'], [False, expected])
+                self.assertEqual([row['tool_call_added'] for row in rows if row['stage'] == 'tool_probe'], [expected])
+                self.assertEqual(sent[1]['messages'][:-len(hybrid_bench.tool_messages(1, ' x' * 16, expected))],
+                                 sent[0]['messages'] + [dict(role='assistant', content='A1')])
+                self.assertEqual([m['tool_call_id'] for m in sent[1]['messages'] if m['role'] == 'tool'], ['synthetic-1'])
+                self.assertEqual(sum(bool(m.get('tool_calls')) for m in sent[1]['messages']), int(expected))
+
+    # Qwen keeps the old message list and exact serialized streaming request bytes across both complete schedules.
+    def test_qwen_request_bytes(self):
+        template = self.fixture('qwen3.8-27b')
+        add_call = hybrid_bench.probe_tool_call(lambda path, body: dict(prompt=template.render(body)))
+        self.assertFalse(add_call)
+        for measured in (False, True):
+            history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.')]
+            for index, step in enumerate(schedule(7, measured)):
+                if step['kind'] == 'depth':
+                    incoming = [dict(role='user', content=' x' * step['depth'])]
+                    legacy = incoming
+                else:
+                    incoming = hybrid_bench.tool_messages(index, ' x' * step['tokens'], add_call)
+                    legacy = [dict(role='tool', tool_call_id='synthetic-' + str(index), content=' x' * step['tokens']),
+                              dict(role='user', content='Continue with decimal digits.')]
+                body = dict(messages=history + incoming, max_tokens=step['output'], temperature=0, seed=7,
+                            ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
+                old = dict(messages=history + legacy, max_tokens=step['output'], temperature=0, seed=7,
+                           ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
+                self.assertEqual(body, old)
+                self.assertEqual(template.render(body), template.render(old))
+                response = io.BytesIO(b'data: {"hybrid_bench": {}}\n\ndata: [DONE]\n')
+                response.headers = {'X-Hybrid-Session': 'fixture'}
+                with mock.patch.object(hybrid_bench.urllib.request, 'urlopen', return_value=response) as request:
+                    hybrid_bench.stream_chat('http://fixture', 'fixture', body, 'local', 'fixture')
+                self.assertEqual(request.call_args.args[0].data, json.dumps(dict(old, stream=True)).encode())
+                history += legacy + [dict(role='assistant', content='1234')]
+
+    # The inserted user preserves Gemma's prior sampled anchor, and all synthetic response bytes enter the append tail.
+    def test_gemma_append_anchor(self):
+        from test_templates import ProbeNode
+        from journal import Renderer
+        template = self.fixture('gemma4-31b')
+        node = ProbeNode(template.fixture)
+        self.addCleanup(node.state.close)
+        renderer = Renderer(node)
+        history = [dict(role='system', content='SYS'), dict(role='user', content='U1'), dict(role='assistant', content='A1')]
+        for size in (1, 16, 512):
+            payload = ' x' * size
+            body = dict(messages=history + hybrid_bench.tool_messages(1, payload, True), chat_template_kwargs=dict(enable_thinking=False))
+            text = renderer.render(body)
+            self.assertEqual(text.count(payload), 1)
+            self.assertIn('A1<turn|>\n<|turn>user', text)
+            tokens = renderer.encode(text, initial=True)
+            anchor = [71, 72] + renderer.encode('<turn|>')
+            prompt, _, _, tail = renderer.append(body, text, tokens, 3, anchor)
+            self.assertEqual(prompt[:len(anchor)], anchor)
+            start = len(tokens) - len(tail)
+            self.assertIn(payload, b''.join(renderer.token_bytes(text, tokens)[start:]).decode())
+            layout, _ = renderer.layout(body, text, tokens, start=3, token_base=start, anchor_base=len(anchor) - 1)
+            self.assertEqual([r['role'] for r in layout], ['user', 'assistant', 'tool', 'user'])
+
+
+class SyntheticToolOracleTests(unittest.TestCase):
+    # External sources agree with the capability probe and retain fixed/measured-size payloads in the matched Gemma path.
+    def test_real_template_payloads(self):
+        from template_oracle import TemplateOracle
+        for label, expected in (("qwen3.8-27b", False), ("gemma4-31b", True), ("muse-glimmer-30b", False)):
+            template = SyntheticToolTests.fixture(label)
+            oracle = TemplateOracle(template.fixture)
+            self.assertIs(hybrid_bench.probe_tool_call(lambda path, body: dict(prompt=oracle.render(body))), expected)
+            for count in (1, 16, 512, 2048, 10000, 11144):
+                body = dict(messages=[dict(role='system', content='SYS'), dict(role='user', content='U1'), dict(role='assistant', content='A1')] +
+                            hybrid_bench.tool_messages(1, ' x' * count, expected), chat_template_kwargs=dict(enable_thinking=False))
+                text = oracle.render(body)
+                self.assertEqual(text, template.render(body))
+                self.assertIn((' x' * count).strip(), text)
+                if expected:
+                    self.assertIn('A1<turn|>\n<|turn>user', text)
+                    self.assertIn(' x' * count, text)
 
 
 if __name__ == '__main__':

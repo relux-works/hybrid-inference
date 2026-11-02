@@ -104,6 +104,7 @@ std::filesystem::path get_server_exec_path();
 //
 
 std::string random_string();
+llama_pos server_prompt_reuse_threshold(llama_pos pos_next, int32_t n_swa, bool has_new_tokens);
 std::string gen_chatcmplid();
 std::string gen_tool_call_id();
 

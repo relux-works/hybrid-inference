@@ -166,6 +166,7 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_set_data_chunks(llama_seq_id seq_id, const std::vector<llama_state_seq_chunk> & chunks, llama_pos n0, bool validate_only = false, bool final = true);
     size_t state_seq_set_data_append(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_pos n0, llama_pos n1);
 
     bool state_load_file(

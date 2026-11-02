@@ -258,8 +258,10 @@ def main():
                 node_token_file=str(Path(args.token_file).resolve()), client_credential=credential,
                 slot_path=str(state / 'slots'), slots=1, prefill_timeout=args.request_timeout, decode_timeout=args.request_timeout,
                 clients={credential: dict(id=next(iter(tokens)), prefill_token=next(iter(tokens.values())))},
-                policy=dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes']))
+                policy=dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes'] + plan.get('window_state_bytes', 0)))
             config['delta_geometry'] = dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes'])
+            if plan.get('window_state_bytes'):
+                config['delta_geometry']['window_bytes'] = plan['window_state_bytes']
             config.update(hetero_quant=args.hetero_quant, node_model_sha256=expected,
                           layout_fingerprint=identity['layout_fingerprint'],
                           node_layout_fingerprint=(node or {}).get('layout_fingerprint'))

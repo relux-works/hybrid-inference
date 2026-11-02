@@ -12,6 +12,25 @@
 #include <string>
 #include <vector>
 
+// Range export without recurrent or sliding-window state, for non-final transfer chunks.
+#define LLAMA_STATE_SEQ_FLAGS_KV_ONLY 4
+
+struct llama_state_seq_chunk {
+    const uint8_t * data;
+    size_t size;
+    llama_pos n1;
+};
+
+// Apply ordered KV chunks and the last chunk's fixed state atomically. Returns total bytes, or 0.
+LLAMA_API size_t llama_state_seq_set_data_chunks(
+        llama_context * ctx, const std::vector<llama_state_seq_chunk> & chunks,
+        llama_seq_id seq_id, llama_pos n0);
+
+// Validate a single transfer chunk without changing the destination.
+LLAMA_API size_t llama_state_seq_validate_chunk(
+        llama_context * ctx, const llama_state_seq_chunk & chunk,
+        llama_seq_id seq_id, llama_pos n0, bool fixed_state);
+
 // Append a native range state; recurrent state is replaced. Returns size on success, 0 on rejection.
 // Positions must cover [n0, n1), with n0 equal to the destination's current length.
 // A rejected import preserves the destination. Only host state is supported.
@@ -198,7 +217,7 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // Export native sequence state with attention positions [p0, p1) and current recurrent state.
-// p1 must equal the current sequence endpoint. Only flags == 0 is supported.
+// p1 must equal the current sequence endpoint. Flags: 0 or LLAMA_STATE_SEQ_FLAGS_KV_ONLY.
 // With dst == nullptr, return the required size. Return 0 on failure.
 LLAMA_API size_t llama_state_seq_get_data_range(
         llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id,

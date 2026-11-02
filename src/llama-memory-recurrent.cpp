@@ -859,6 +859,17 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     state_write_data(io, cell_ranges_data);
 }
 
+std::function<void()> llama_memory_recurrent::state_meta_restore() {
+    return [this, cells = cells, head = head, used = used, rs_idx = rs_idx, n = n, rs_z = rs_z]() {
+        this->cells = cells;
+        this->head = head;
+        this->used = used;
+        this->rs_idx = rs_idx;
+        this->n = n;
+        this->rs_z = rs_z;
+    };
+}
+
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));

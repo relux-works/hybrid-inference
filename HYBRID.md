@@ -4,7 +4,7 @@ Proof of concept of hybrid inference by Relux Works: Swarm Inference, https://in
 describes the scheme and its economics is https://github.com/relux-works/hybrid-inference-paper.
 
 The idea: a GPU server prefills an agent session and ships the model state to a unified-memory client (a Mac). The
-state is the attention KV of the new positions plus the fixed recurrent state of the linear-attention layers. The
+state is the full-attention KV of the new positions plus either the fixed recurrent state of linear-attention layers or the complete live sliding-window cache. The
 client continues decoding as if it had prefilled locally. The specification is `docs/hybrid/prototype-spec.md`;
 the M0 review verdict is `docs/hybrid/m0-verdict.md`.
 
@@ -19,7 +19,7 @@ request #1, M0.2, append-only sessions, from pull request #2, and M1, node limit
 
 | Path | What |
 |---|---|
-| `src/` (small patch) | `llama_state_seq_get_data_range` exports the attention KV of positions [p0, p1) plus the recurrent state. `llama_state_seq_set_data_append` validates a delta completely before changing anything, appends it and, on failure, restores only the recurrent state and removes the new positions. |
+| `src/` (small patch) | `llama_state_seq_get_data_range` exports full-attention KV of positions [p0, p1) plus recurrent state or the complete sliding window. `llama_state_seq_set_data_append` validates the complete delta, then appends full KV and replaces the fixed state; recoverable failures restore the previous state. |
 | `tools/hybrid/` | Delta codec (section 6 of the specification), prefill node `llama-hybrid-prefill`, native checkers |
 | `tools/server/` (small patch) | `llama-server` endpoints to import a delta into a slot and to read slot state |
 | `tools/hybrid-bench/` | Locked offline-capable launchers, seeded three-mode benchmark, fresh and append-chain numerical checks, sanitized result bundles |
@@ -31,7 +31,7 @@ Use the [M1 operator guide](tools/hybrid-bench/README.md) for node deployment, t
 
 M1 adds `--max-ctx` (default 16,384), `--ram-budget-mib` (512), and `--max-request-mib` (1). The launcher derives limits from the chosen context and memory; these limits bound retained state and request bodies, not RSS or transient inference buffers. The node evicts globally least-recently-used idle sessions, pins active responses, and returns `503` with need/budget when an append cannot fit. Rejection is after inference/serialization and preserves existing sessions. An evicted ID returns `404`; the proxy recreates and replays its exact token journal.
 
-Critical chunks use `(512 MiB - recurrent_bytes - 1 MiB) // (kv_bytes_per_token + 24)`, also limited by `(1 MiB - 4096) // 11` for the JSON header. The 24 bytes are native per-cell metadata for one sequence; the 1 MiB reserve covers fixed serialization overhead. The boundary includes this reserve: one more token violates the reserved planning bound, although it can still fit the raw body cap. The launcher writes separate `delta_geometry` values from GGUF metadata; policy cost estimates do not control this safety bound. Without launcher geometry the proxy and benchmark use a conservative 27B bound (34,816 KV bytes/token, 157,000,000 recurrent bytes), safe also for 0.8B (6,528 KV bytes/token, 20,201,472 recurrent bytes). Explicit chunk sizes above the planning bound refuse startup. These are the supported 0.8B/27B geometries; other geometry needs verified `delta_geometry` before use.
+Critical chunks use `(512 MiB - recurrent_bytes - window_bytes - 1 MiB) // (kv_bytes_per_token + 24)`, also limited by `(1 MiB - 4096) // 11` for the JSON header. The 24 bytes are native per-cell metadata for one sequence; the 1 MiB reserve covers fixed serialization overhead. The boundary includes this reserve: one more token violates the reserved planning bound, although it can still fit the raw body cap. The launcher writes separate `delta_geometry` values from GGUF metadata; policy cost estimates do not control this safety bound. Without launcher geometry the proxy and benchmark use a conservative 27B bound (34,816 KV bytes/token, 157,000,000 recurrent bytes), safe also for 0.8B (6,528 KV bytes/token, 20,201,472 recurrent bytes). Explicit chunk sizes above the planning bound refuse startup. These are the supported 0.8B/27B geometries; other geometry needs verified `delta_geometry` before use.
 
 The benchmark runs identical seeded schedules in local, hybrid and offload modes, records timing and chunk imports, releases sessions and checks fresh plus append-chain state. Native prefill timing is available without `--bench-link`; that flag controls only the optional link probe. The prior CPU 0.8B run near 40k matched 64/64 in both checks, with mean KL 0.00004021 (fresh) and 0.00011765 (append chain), within section 11. See [r11 evidence](tools/hybrid-bench/RESULTS-hybrid-a-r11-261101.md); [r12 revalidation](tools/hybrid-bench/RESULTS-hybrid-a-r12-261101.md) is reported separately. This does not qualify CUDA/Metal or 27B execution.
 
@@ -77,3 +77,7 @@ Not yet done:
 - Commits are signed.
 - This repository does not track upstream automatically. GitHub Actions stay disabled: the tree carries upstream
   workflows that are not meant to run here.
+
+## Sliding-window extension
+
+The local `m3-swa` prototype supports `gemma4` and `muse-glimmer` alongside dense `qwen35`, with metadata-derived full-layer and fixed-window geometry. [The state design](tools/hybrid/SWA-STATE-DESIGN.md) describes upstream serialization and exact transactional rollback. [The r16 report](tools/hybrid-bench/RESULTS-hybrid-a-r16-261101.md) records synthetic CPU evidence and rented-GPU commands. Real Gemma 4/Muse Glimmer inference remains unverified here; same-partition logit calibration is the separate PR 9 change.

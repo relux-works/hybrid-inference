@@ -50,7 +50,9 @@ def synthetic(golden, count, append=False):
     parts.extend((state[offset:offset + 4], struct.pack('<i', n0 + count - 1), state[offset + 8:]))
     body = b''.join(parts)
     tokens = (header['tokens'] if append else []) + [1] * count
-    header.update(n0=n0, n1=n0 + count, tokens=[1] * count, prefix_hash_n1=prefix_hash(tokens),
+    header.update(n0=n0, n1=n0 + count, transfer_n0=n0, transfer_n1=n0 + count,
+                  chunk_index=0, chunk_count=1, fixed_state=True,
+                  tokens=[1] * count, prefix_hash_n1=prefix_hash(tokens),
                   sections=[dict(name='llama_seq_state', offset=0, bytes=len(body))])
     text = json.dumps(header, separators=(',', ':')).encode()
     return b''.join((struct.pack('<I', len(text)), text, body, xxh128(body), hashlib.sha256(body).digest()))
@@ -125,11 +127,12 @@ def measure(node, log_path, wire, pair, label, receive_ms, prefix=None):
     parse_ms = stages['codec'] - stages['checksum'] - stages.get('state_copy', 0) + stages['native_validate'] + stages['native_parse']
     sync_ms = stages.get('synchronize', 0)
     # Synchronize is nested in backup; report backup inclusive and keep the residual independent of that split.
-    named_ms = copy_ms + parse_ms + stages['checksum'] + stages['tensor_write'] + stages['backup']
+    backup_ms = stages.get('backup', 0)
+    named_ms = copy_ms + parse_ms + stages['checksum'] + stages['tensor_write'] + backup_ms
     body_bytes = header['sections'][0]['bytes']
     result = dict(pair=pair, label=label, wire_bytes=len(wire), body_bytes=body_bytes, receive_ms=receive_ms,
                   import_ms=elapsed, copy_ms=copy_ms, parse_ms=parse_ms, checksum_ms=stages['checksum'],
-                  tensor_write_ms=stages['tensor_write'], synchronize_ms=sync_ms, backup_ms=stages['backup'],
+                  tensor_write_ms=stages['tensor_write'], synchronize_ms=sync_ms, backup_ms=backup_ms,
                   transport_dispatch_free_ms=elapsed - named_ms, stages=stages, events=events)
     result['MBps'] = {name[:-3]: body_bytes / (1000 * value) for name, value in result.items()
                       if name.endswith('_ms') and name not in ('synchronize_ms', 'backup_ms') and isinstance(value, (float, int)) and value > 0}

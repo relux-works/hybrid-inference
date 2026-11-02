@@ -279,6 +279,22 @@ def test_equivalence_noise(args):
         assert all(r['last_prefill_boundary'] != result['hybrid_last_prefill_boundary'] for r in result['noise_partitions'])
         print('PASS CPU local noise: ' + json.dumps(result), flush=True)
 
+        # A single final-state transaction has the same exact logits as the existing per-range full-state control.
+        session = prefill.create()
+        chunk_paths = []
+        for index, (n0, n1) in enumerate(((0, 48), (48, 96), (96, 131))):
+            wire = prefill.request('POST', session + '/extend', dict(n0=n0, prefix_hash_n0=prefix_hash(tokens[:n0]),
+                tokens=tokens[n0:n1], return_delta=True, delta_version=2, transfer_id='numerical-chunks',
+                transfer_n0=0, transfer_n1=131, chunk_index=index, chunk_count=3))
+            path = root / f'chunked-{n0}.delta'
+            path.write_bytes(wire)
+            chunk_paths.append(str(path))
+        prefill.request('DELETE', session, expected=204)
+        chunk_code, chunk_result = run('chunked', args.checker_binary, dict(fixture, deltas=chunk_paths))
+        assert chunk_code == 0 and chunk_result['same_partition_exact'] and chunk_result['same_partition_max_abs_logit_diff'] == 0
+        assert chunk_result['same_partition_positions'] == result['same_partition_positions']
+        print('PASS final-state chunk transaction: inherited full-logit checker exact at all eight positions', flush=True)
+
         # The original CPU fields and exit code remain bit-for-bit identical to the unchanged M1 executable.
         if args.baseline_checker:
             baseline_code, baseline = run('baseline', args.baseline_checker)
