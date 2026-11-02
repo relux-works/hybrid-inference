@@ -21,9 +21,25 @@ flock "$LOCK" "$CMAKE" -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_U
 df -B1 --output=avail .
 du -sb build
 # JOBS=2 keeps a shared host responsive; use JOBS=$(nproc) on a dedicated one.
-flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-hybrid-check-swa llama-server
+flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-hash llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-hybrid-check-swa llama-server
 du -sb build
 ```
+
+### Model identity hash checks
+
+Native startup always computes SHA-256 over the entire model file. No cached or supplied digest is trusted. macOS keeps system CommonCrypto. On other x86-64 GCC/Clang builds, SHA-NI compresses whole blocks when CPUID reports SHA, SSSE3 and SSE4.1; a function-level target attribute leaves build flags unchanged. Other CPUs and compilers use the vendored SHA-256. `HYBRID_HASH_PORTABLE=1` forces the vendor path, including on macOS; other values leave automatic dispatch enabled. The SHA-NI path shares the vendor context and finalizer. Every backend retains the 64 KiB default read buffer and existing read-error checks.
+
+`llama-hybrid-check-hash FILE [UPDATE_BYTES | --file-chunk READ_BYTES]` prints JSON with the digest, file size, elapsed hash time, decimal MB/s and observed `backend` (`sha-ni`, `portable`, `commoncrypto` or `portable-stream`). Without a chunk argument it calls the startup hash function. `--file-chunk` (1..65536) tests fragmented native reads on the selected backend. The existing positional chunk (1..1048576) still exercises portable vendor streaming with unaligned input and empty updates. `test_file_hash.py` and its hashlib/sha256sum references are unchanged; its optional model stays read-only. `test_file_hash_ni.py` adds fixed NIST answers, non-periodic random data at every block boundary through 300000 bytes, odd native reads, a sparse 4 GiB + 65 byte fixture, observed dispatch and negative cases on both backends. Fixtures under `.temp/` are removed after each test. Retain logs in a task-scoped `.temp/` directory.
+
+```sh
+mkdir -p .temp/hash-check
+nice -n 10 build/bin/llama-hybrid-check-hash "$MODEL" > .temp/hash-check/measurement-01.json
+HYBRID_HASH_PORTABLE=1 nice -n 10 build/bin/llama-hybrid-check-hash "$MODEL" > .temp/hash-check/portable-01.json
+nice -n 10 python3 tools/hybrid/test_file_hash.py --model "$MODEL" -v > .temp/hash-check/tests-01.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 nice -n 10 python3 tools/hybrid/test_file_hash_ni.py -v > .temp/hash-check/tests-ni-01.log 2>&1
+```
+
+The [r23 SHA-NI report](RESULTS-hybrid-a-r23-261101.md) records three cached 4 GB pairs on Ryzen 7 9700X/GCC 15.2: median 622.11 MB/s portable and 2198.15 MB/s SHA-NI (3.53x), with matching digests and zero disk-input counters. The [r14 hash report](../hybrid-bench/RESULTS-hybrid-a-r14-261101.md) covers the earlier portable optimization. macOS build, digest and timing qualification remains pending.
 
 Create a mode-0600 JSON credentials file mapping client IDs to distinct bearer tokens (16-256 characters). Keep it under `.temp/`; do not commit it. The node reads this file without logging credentials. Every authenticated extend reports `X-Hybrid-Prefill-Ms`, measured around native prefill only; `--bench` enables only the authenticated link probe.
 
