@@ -11,7 +11,7 @@ using json = nlohmann::ordered_json;
 
 json parse_json(const std::string & text, size_t max_bytes = 1024 * 1024);
 std::string prefix_hash(const std::vector<llama_token> & tokens);
-std::string file_hash(const std::string & path);
+std::string file_hash(const std::string & path, size_t read_bytes = 65536, const char ** backend = nullptr);
 json model_layout(const llama_model * model);
 std::string layout_fingerprint(const json & layout);
 std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1);

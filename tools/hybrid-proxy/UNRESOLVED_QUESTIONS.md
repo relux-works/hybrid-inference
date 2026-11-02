@@ -9,5 +9,6 @@
 - A downstream disconnect drains the upstream completion before releasing the slot. Immediate cancellation and cross-process slot ownership are not added. SQLite atomically commits the token/message pair; the decoder and SQLite are separate processes, so process-crash transactions across them remain unqualified. Uncommitted native extensions are discarded and rebuilt from durable tokens rather than adopted into completed message history.
 - Session metadata, request queues, parked files and journals retain the existing unbounded session-table policy. TTL/metadata eviction, maximum concurrent state-transfer memory and O5 double-failure core recovery remain future work.
 - Upstream type/style executables were absent on this host in r10; no dependencies were installed. The r11 report distinguishes executed syntax/format checks from unrun hosted checks.
+- The local-kept latency change removes foreground shadow RPCs; replay can still hold the same session ticket when a new request arrives. GPU/5G savings and contention at long shadow depths need orchestrator measurement; see [r4 measurements](RESULTS-hybrid-d-r4-261101.md). No queue ownership redesign is included.
 
 Historical evidence remains in [fixes-r2-261030.md](fixes-r2-261030.md) and [m01-concurrency-261030.md](m01-concurrency-261030.md).

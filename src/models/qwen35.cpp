@@ -17,6 +17,9 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+        if (full_attn_interval == 0) {
+            throw std::runtime_error("invalid full attention interval");
+        }
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
@@ -34,8 +37,34 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const auto nf = nextn_flags(ml);
-    const int trunk_flags = nf.trunk;
-    const int mtp_flags   = nf.mtp;
+    const int trunk_flags = ml.load_mtp ? nf.trunk : 0;
+    int mtp_flags = nf.mtp;
+
+    // Validate a declared MTP block even when its weights are skipped.
+    if (!ml.load_mtp && hparams.n_layer_nextn > 0) {
+        for (int il = n_layer; il < n_layer_all; ++il) {
+            if (hparams.is_recr(il)) {
+                throw std::runtime_error("recurrent MTP layer is unsupported");
+            }
+            const auto prefix = "blk." + std::to_string(il) + ".";
+            bool present = false;
+            for (const auto & weight : ml.weights_map) {
+                present = present || weight.first.compare(0, prefix.size(), prefix) == 0;
+            }
+            if (present) {
+                mtp_flags &= ~TENSOR_NOT_REQUIRED;
+                const auto fused = tn(LLM_TENSOR_ATTN_QKV, "weight", il).str();
+                if (ml.get_weight(fused.c_str())) {
+                    ml.check_tensor_dims(fused, {n_embd, n_embd_head_k * n_head * 2 + n_embd_k_gqa + n_embd_v_gqa}, true, false);
+                } else for (const auto type : {LLM_TENSOR_ATTN_Q, LLM_TENSOR_ATTN_K, LLM_TENSOR_ATTN_V}) {
+                    const auto qkv_name = tn(type, "weight", il).str();
+                    const int64_t width = type == LLM_TENSOR_ATTN_Q ? n_embd_head_k * n_head * 2 :
+                                          type == LLM_TENSOR_ATTN_K ? n_embd_k_gqa : n_embd_v_gqa;
+                    ml.check_tensor_dims(qkv_name, {n_embd, width}, true, false);
+                }
+            }
+        }
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -68,8 +97,13 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
 
         if (!hparams.is_recr(il)) {
-            // Attention layers
-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+            // Attention layers. Mirai S GGUFs split the output gate off q_proj (attn_gate): Mirai stores the gate
+            // rows in their own trellis block.
+            const bool split_gate = ml.get_weight(tn(LLM_TENSOR_ATTN_GATE, "weight", il).str().c_str()) != nullptr;
+            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * (split_gate ? 1 : 2), n_embd_k_gqa, n_embd_v_gqa, flags);
+            if (split_gate) {
+                layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", il), { n_embd, n_embd_head_k * n_head }, flags);
+            }
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
 
             // Q/K normalization for attention layers
@@ -274,19 +308,43 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
-    // Qwen3Next uses a single Q projection that outputs query + gate
-    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-            n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
-            il, false);
-    cb(Qcur_full, "Qcur_full", il);
+    ggml_tensor * Qcur, * Kcur, * Vcur, * gate;
+    if (model.layers[il].wqkv_gate) {
+        // Mirai S: the output gate is its own weight
+        auto qkv = build_qkv(model.layers[il], cur,
+                n_embd_head, n_head,
+                n_embd_head, n_head_kv,
+                n_embd_head, n_head_kv,
+                il, false);
+        Qcur = ggml_reshape_3d(ctx0, qkv.q, n_embd_head, n_head, n_tokens);
+        Kcur = qkv.k;
+        Vcur = qkv.v;
+        gate = build_lora_mm(model.layers[il].wqkv_gate, cur, model.layers[il].wqkv_gate_s);
+        cb(gate, "gate_reshaped", il);
+    } else {
+        // Qwen3Next uses a single Q projection that outputs query + gate
+        auto [Qcur_full, Kc, Vc] = build_qkv(model.layers[il], cur,
+                n_embd_head * 2, n_head,
+                n_embd_head,     n_head_kv,
+                n_embd_head,     n_head_kv,
+                il, false);
+        cb(Qcur_full, "Qcur_full", il);
+        Kcur = Kc;
+        Vcur = Vc;
+
+        Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+
+        gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, "gate_reshaped", il);
+    }
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
-
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
@@ -297,13 +355,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
-
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
@@ -464,6 +515,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+
+    if (ggml_is_mirai_s(model.layers[il].ssm_out->type) && num_k_heads != num_v_heads) {
+        // Mirai S keeps ssm_out's columns in the checkpoint's order, V heads grouped by K head: undo the tiled order
+        // (head vi * num_k_heads + g -> g * (num_v_heads / num_k_heads) + vi)
+        attn_out_norm = ggml_reshape_4d(ctx0, attn_out_norm, head_v_dim, num_k_heads, num_v_heads / num_k_heads, n_seq_tokens * n_seqs);
+        attn_out_norm = ggml_cont(ctx0, ggml_permute(ctx0, attn_out_norm, 0, 2, 1, 3));
+    }
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);

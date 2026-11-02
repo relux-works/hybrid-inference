@@ -6527,6 +6527,11 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     F8_E4M3 = 43
+    # Mirai S trellis formats (ids kept far from upstream's range). Opaque: rows are interleaved in groups of 32.
+    MS_V4T8 = 90
+    MS_V2T4 = 91
+    MS_V2T6 = 92
+    MS_I3   = 93
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6756,6 +6761,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.F8_E4M3: (1, 1),
+    GGMLQuantizationType.MS_V4T8: (64, 16 + 1),   # per 64-column packet: 16 tape bytes + 1 entry byte
+    GGMLQuantizationType.MS_V2T4: (64, 16 + 2),   # 16 tape bytes + 16-bit entry state
+    GGMLQuantizationType.MS_V2T6: (128, 48 + 2),  # 48 tape bytes + 16-bit entry state
+    GGMLQuantizationType.MS_I3:   (128, 48 + 1),  # two 64-column groups of 3-bit codes + their ladder nibbles
 }
 
 

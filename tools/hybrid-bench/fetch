@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run on the GPU host. Pin downloaded Gutenberg books before prepare.
+exec python3 "$(dirname "$0")/hetero_study.py" fetch "$@"

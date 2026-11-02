@@ -11,6 +11,9 @@ target_include_directories(llama-hybrid-prefill PRIVATE ${PROJECT_SOURCE_DIR}/ve
 add_executable(llama-hybrid-check check.cpp)
 target_link_libraries(llama-hybrid-check PRIVATE hybrid-state)
 
+add_executable(llama-hybrid-check-hash check-hash.cpp)
+target_link_libraries(llama-hybrid-check-hash PRIVATE hybrid-state)
+
 add_executable(llama-hybrid-check-append check-append.cpp)
 target_link_libraries(llama-hybrid-check-append PRIVATE hybrid-state)
 
@@ -28,3 +31,9 @@ target_link_libraries(llama-hybrid-check-codec PRIVATE hybrid-state)
 
 add_executable(llama-hybrid-bench-check ../hybrid-bench/check.cpp)
 target_link_libraries(llama-hybrid-bench-check PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-check-identity check-identity.cpp)
+target_link_libraries(llama-hybrid-check-identity PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-score ../hybrid-bench/score.cpp)
+target_link_libraries(llama-hybrid-score PRIVATE hybrid-state)

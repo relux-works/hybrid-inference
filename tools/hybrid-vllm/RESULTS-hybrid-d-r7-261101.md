@@ -160,3 +160,92 @@ Previous bridge/export and shell/gather plants were also replayed, with historic
 - CUDA arithmetic, live vLLM tensor ownership/cache reuse and FP8-to-Q4 numerical/8k/32k qualification remain outside this CPU-only execution contract and unrun. The synthetic CUDA gate still covers block size 16 and a fresh envelope; live captures and other block sizes need GPU evidence. CPU fake-device admission tests do not close those gates. Existing TOCTOU/exclusive custody and unmodified process-ownership limits remain.
 
 Environment: Python 3.14.4, NumPy 2.4.2, torch 2.10.0+cpu and ty 0.0.88 in an isolated validation venv. CMake uses the verified read-only hybrid-a tool binary because it is absent from PATH. Binary-only, no-cache installs are recorded; no source dependency build was started. TMPDIR remained on disk, PYTHONDONTWRITEBYTECODE=1 throughout. Sampled free disk minimum was 32710434816 bytes (above 28 GB), including guarded concurrent validations. Builds were nice 10 and at most -j4; host build processes were sampled before and during work. Task-local build trees, venv, native binaries and large deltas are removed before signed handoff; shared models/tools are preserved.
+
+
+## r9: current-main merge for landing (2026-11-02)
+
+Continued the owned in-progress merge from the stopped first attempt; no abort or rebase. The reviewed parent is `c2f47472c0e6a5b239c7a00fe70a9a556f5accc1` (bridge/node r6-r8, accepted by r7q). A fresh fetch confirmed `origin/main` and `MERGE_HEAD` at `528724c96894aa5f65e98b329317de59aa694afc`; the merge base is `a3752b04cbd905bf61ffe6d9a4e7df738f26f4c2`. This is local signed delivery only: no push, PR submission or landing.
+
+### Every conflict and resolution
+
+- Textual conflict: `README.md` only. Retain the reviewed bridge/node guides and main's Mirai provenance/tools, local-kept latency and reference-scoring documentation, with a paragraph separator. The original `merge-01.log` and the independent patch replay both identify this one conflict.
+- Semantic composition conflict: main's new `tools/hybrid-bench/score.cpp` requires an imported endpoint of N-1, while the reviewed aligned exporter can end earlier. `hybrid_bench.py` now supplies the actual `local_tail_start` to reference scoring. The scorer requires an integer marker equal to the imported endpoint, evaluates the missing local tail, and retains main's final one-token decode and partition probes. The absent-marker default remains N-1. Wrong/missing boundaries do not authorize implicit local fallback.
+
+The automatic merges of `hybrid_bench.py`, `manage.py`, `proxy.py` and `test_proxy.py` retain both parents' changes. All bridge/adapter/runtime Python, C++, shell and CUDA-gate source bytes remain identical to c2f47472; the reviewed native local-tail checker is also byte-identical. No extra src/include/ggml/server changes were introduced by the resolutions.
+
+### Delta reconstruction
+
+Evidence is in `.temp/hybrid-d-r9-261102/`. `reviewed-branch.patch` is the complete binary patch from a3752b04 to c2f47472. Applying it with a separate Git index and `--cached --3way` to 528724c9 reports only the README conflict. Choosing the retained README resolution produces tree `9d18b479ef68a0ce9ca7ed1850efd4725a375872`, exactly equal to the continued staged merge tree before new resolutions.
+
+`resolutions.patch` captures the complete remaining difference: the README separator, scorer/fixture composition, `test_aligned_reference_tail` and this r9 report. `proof.json` records the independent replay, tree equality and byte equality of the reconstructed `git diff 528724c9..HEAD` with `landing.diff`. Thus the final delta consists of the reviewed branch delta composed onto current main, plus these explicit resolutions and report. The final signed head is recorded in `landing-note.md` and `delivery.json` after signing.
+
+### GPU evidence on the reviewed parent
+
+The orchestrator's B300 smoke completed at 2026-11-02 03:37Z on exact head c2f47472, before this merge. Evidence source: `/home/agent/lanes/hybrid/.temp/node-smoke-b300/b300-bridge-node-evidence.tar.gz`. The retained `stage-node2.log` identifies the head, vLLM 0.32.0, successful codec checks at 03:04:16Z, benchmark exit 5 at 03:37:47Z, and node-run exit 0. The mandatory CUDA byte gate passed before readiness, as reported by the orchestrator. This r9 run inspected existing CPU-readable logs and measurements; it ran no GPU code.
+
+The FP8 vLLM node was behind the adapter, with a llama.cpp Q4_K_M client, standard proxy and bench. All imports succeeded. These are heterogeneous, uncalibrated measurements; checker exit 5 is not an exactness pass.
+
+| Context | Fresh KL, nats/token | Fresh top-1 | Append-chain KL | Append top-1 |
+|---|---|---|---|---|
+| 8k (8196 tokens) | 0.0054964635 | 63/64 | 0.0054964635 | 63/64 |
+| 32k (32806 tokens) | 0.0256115405 | 60/64 | 0.0231588934 | 60/64 |
+
+The exported endpoints were 7840 and 32144, with local tails of 356 and 662 tokens. The CUDA gate, tensor ownership and numerical observations belong to c2f47472, not to a new GPU run on the merged head. These results do not establish calibrated quality thresholds or the full acceptance matrix.
+
+### CPU validation and real exit codes
+
+Commands ran directly without tee, with on-disk `TMPDIR`, `PYTHONDONTWRITEBYTECODE=1`, nice 10 and CMake at -j4. CMake 4.4.4 is the verified existing read-only hybrid-a tool; it is absent from PATH. Exact arguments, PIDs, timestamps, resource observations and exits are retained in each `<label>.json` and `validation-ledger.json`.
+
+| Gate / evidence label | Actual result / exit |
+|---|---|
+| Fresh fetch `fetch-02` | 0; exact requested main |
+| CPU static build `build-02`, resolved scorer rebuild `build-03` | 0 / 0; CUDA and UI downloads disabled |
+| Native helper `build-helper-02` | 0 |
+| Full bridge/script/codec/adapter/runtime discovery `vllm-tests-01` | 1; 58 discovered entries, 54 passed, four NumPy dependency errors; not a green full suite |
+| Runtime-only `runtime-tests-01` | 0; all 8 tests |
+| Proxy discovery `proxy-tests-02` | 0; all 73 tests |
+| Bench discovery after resolution `bench-tests-03` | 0; 68 tests, six native-header skips; explicit header suite below covers those cases |
+| Production torch gather `gather-tests-02` | 1 before tests; torch absent |
+| Reference native suite `reference-native-green-01` | 0; 42 recorded scorer invocations plus real native-node/checker orchestration, no skips |
+| Integrated native bench/proxy `native-integrated-01` | 0; exact imported state, corrupt/checksum controls, timing, replay, budget refusal |
+| Main heterogeneous-study native suite `native-hetero-study-01` | 0; real CPU reference/local/hybrid, resume/identity/negative controls |
+| Existing 18-token local-tail probe `native-tail-probe-02` | Harness 0; positive checker 0 and same-partition exact; wrong/absent boundary each 2, exact refusal and no result |
+| Explicit scalar 64-layer native probe `native-scalar-probe-01` | Harness 0; fresh/append helper 0/0; checksum plant 1 with intended refusal |
+| Mirai Python/native identity `native-mirai-identity-02` | 0; all 12 tests using existing local headers, no skips |
+| Mirai CPU op `native-mirai-op-02` | 0; CPU backend passes |
+| Codec `native-codec-02` | 0; positive and rejection controls |
+| Main file hash / SHA-NI `native-hash-02`, `native-hash-ni-02` | 0 / 0; 4 / 8 tests |
+| Mirai parity `mirai-parity-tests-02`; eval `eval-tests-02` | 0 / 0; 6 / 11 tests |
+| Shell syntax `shell-syntax-01`; diff whitespace `tracked-diff-check-01` | 0 / 0 |
+| Workflow model naming `code-style-01` | 0; 166 mappings |
+
+The reference regression uses an actual 16-token native export with a 19-token context, explicit three-token tail, deterministic repeat and an independent same-weight full-local oracle. Before/after/negative/past-context, float/bool/null and absent markers each produce scorer exit 2 with `incomplete score delta chain`, without result or temporary-output publication. Legacy N-1 orchestration still passes. All original test names from both parents remain present; no reviewer test was removed.
+
+| Narrowing control | Narrows the gate to | Named failing test | Real result / bound |
+|---|---|---|---|
+| Unextended main scorer (retained before resolution) | Only N-1 imports admitted | `test_aligned_reference_tail` in `reference-native-red-02` | Harness 1, native scorer 2, exact incomplete-chain refusal, no output; resolved suite 0 |
+| One-byte native-body plant | Reader accepts changed body bytes | Scalar native checksum case (same rejection as `BridgeTests.test_native_roundtrip`) | Native helper 1, exact checksum refusal; fresh/append positive controls 0 |
+
+Corrections remain visible: first helper link `build-helper-01` exited 1 on an incorrect static-library path, then the actual CMake link layout passed. The stopped first build has no completion record; the first reference attempt was interrupted before the new witness, so neither is green evidence. The deliberate unextended-scorer regression above is expected-red, not passing execution. Broad eval discovery exited 1 on the pre-existing `test_native` module-name collision; the documented `test_eval.py` suite then passed. Six first native attempts were not launched because the admission guard exited 1 on another lane's active compiler; the -02 attempts waited and passed. No foreign process was stopped.
+
+Before every native build/suite, admission records require `pgrep -u agent cc1plus` empty and one-minute load below 8. Builds ran one at a time in this lane and never overlapped another observed build at admission. The sampled minimum free disk after restart was 29398687744 bytes, above the 28 GB floor. Task-owned build trees, helpers and large native payloads are removed after hashing; existing shared tools/models and GPU evidence remain intact.
+
+### Remaining validation scope
+
+NumPy and torch are absent from system Python and the located local environments; no local wheels were found. The no-download rule was preserved. Two bridge cases and the fast-codec/adapter modules require NumPy, and gather requires torch: those exact full-suite gates remain open. The separately labeled scalar probe does not qualify NumPy/torch arithmetic or replace adapter tests. Type-checker and EditorConfig executables are also unavailable; syntax, ASCII, newline, whitespace and workflow naming checks are separate evidence, not substitutes for those tools. No formal surface table was supplied (brief gap). GPU execution on the merged head and the large acceptance matrix remain outside this CPU-only run.
+
+### Landing note (draft only)
+
+PR title: `hybrid: add vLLM node adapter with aligned exports`
+
+Body draft:
+
+> Add the reviewed vLLM bridge and HTTP node adapter (r6-r8, accepted by r7q) on current main 528724c9. Keep aligned exports and local decoder tails, and compose them with main's reference scorer through an exact explicit local-tail boundary. Preserve the scorer's final one-token decode and strict incomplete-chain refusals.
+>
+> CPU builds, runtime, proxy, bench, native reference/integration/study, scalar import, codec, identity and hash checks passed. Full NumPy-dependent bridge/fast-codec/adapter discovery and torch gather remain unverified because those dependencies are unavailable under the no-download rule. The reference regression retains valid legacy behavior and rejects eight invalid or missing boundary variants without output.
+>
+> Existing B300 evidence is bound to c2f47472: vLLM 0.32.0 FP8 node, Q4_K_M client, all imports succeeded; fresh 8k KL 0.0055 with 63/64 top-1, fresh 32k KL 0.0256 with 60/64. CUDA byte admission passed. These are heterogeneous, uncalibrated results, not GPU qualification of this merged head.
+>
+> Integration and conflict resolution were assisted by Codex. No publication was performed. Resolve the dependency validation gaps and review the exact signed merged head before landing.
+
+Branch: `m3-vllm-node`. The exact signed head and this draft are in `.temp/hybrid-d-r9-261102/landing-note.md`, written after signing so the commit does not contain a self-referential ID. No session links are included.
