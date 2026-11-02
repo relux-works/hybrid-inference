@@ -25,6 +25,8 @@ Fresh extends export the largest block-aligned endpoint at or below the requeste
 
 The old proxy requires exactly its requested endpoint, so an unchanged adapter-only interface could not represent a shorter export. The minimal compatible extension is optional `export_block_size` in health/node info/config. The existing launcher propagates it; the proxy asks for aligned chunks and computes the short tail locally. The checker accepts optional `local_tail_start` and evaluates every tail token. Ordinary nodes default to alignment 1. User CLI and benchmark modes remain unchanged. Refusal fallback is still rejected by forced-offload metering; a planned short alignment tail is explicitly visible.
 
+The adapter's `X-Hybrid-Prefill-Ms` is total node preparation (vLLM request, hook capture, conversion and staging cleanup). Do not interpret it as raw vLLM kernel-prefill tok/s. Overall offload TTFT remains the measured user-facing quantity.
+
 The native envelope/body/checksum format is unchanged. Remote main was freshly fetched at 2026-11-02 00:01 UTC: `528724c96894aa5f65e98b329317de59aa694afc` still uses `llama-native-seq-v1`, canonical XXH3-128 plus SHA256 and the same section shape. Other in-flight formats require separate integration.
 
 The node's identity follows the actual cached FP8 source files, with source hashes persisted separately from the BF16 GGUF layout anchor. The Q4 client uses the existing heterogeneous layout admission. `weight_comparison=heterogeneous`, KL and uncalibrated status are preserved in benchmark results. Matching layout alone does not prove source checkpoint/tokenizer provenance.
