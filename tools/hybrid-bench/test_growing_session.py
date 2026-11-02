@@ -17,6 +17,48 @@ import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # Probe plans preserve local prefix KV through append imports; missing or overlapping node evidence refuses.
+    def test_state_probe_plans_require_live_boundaries(self):
+        source = dict(tokens=list(range(12)), replay={name: [dict(n0=0, n1=12, logits=True)] for name in ('A', 'B')})
+        def event(a, b, catchup=False):
+            return dict(session='h', status='ok', n0=a, n1=b, catchup=catchup,
+                        node_snapshot=dict(path='snapshot', sha256='s'), node_delta=dict(path='delta', sha256='d'))
+        trace = dict(calls=[dict(arm='hybrid', turn=1, session_id='h', meter=dict(chunks=[dict(status='imported', n1=9)]))],
+                     events=[event(0, 4), event(4, 7, True), event(7, 9)])
+        plans = {r['name']: r['steps'] for r in growing.state_probe_plans(source, trace, 1)}
+        self.assertEqual(plans['NODE'][0], dict(snapshot='snapshot', sha256='s'))
+        self.assertEqual([next(iter(s)) for s in plans['CHAIN']], ['delta', 'decode', 'delta', 'decode'])
+        self.assertEqual(plans['CHAIN'][1]['decode'], [dict(n0=4, n1=7, logits=True)])
+        self.assertEqual(plans['CHAIN_ATTENTION'][-2]['replace'], 'attention')
+        self.assertEqual(plans['CHAIN_RECURRENT'][-2]['replace'], 'recurrent')
+        for change, reason in (('snapshot', 'missing live node state'), ('delta', 'missing live node delta'),
+                               ('gap', 'node events do not tile')):
+            bad = copy.deepcopy(trace)
+            if change == 'gap': bad['events'][1]['n0'] = 5
+            else: del bad['events'][-1]['node_' + change]
+            with self.assertRaisesRegex(Refusal, reason):
+                growing.state_probe_plans(source, bad, 1)
+
+    # Captures come from GET snapshot after the live extend; a moved node boundary is rejected before file writes.
+    def test_node_snapshot_capture_refuses_boundary_race(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for count in (4, 5):
+                events = growing.Events(Path(directory))
+                node = growing.MeasuredNode('http://unused', events=events, session='h', source='critical')
+                snapshot = b'12345678' + count.to_bytes(4, 'little')
+                with mock.patch.object(growing.Node, 'request', side_effect=[b'delta', snapshot]) as request:
+                    if count == 4:
+                        self.assertEqual(node.request('POST', '/v1/sessions/s/extend',
+                            dict(n0=0, tokens=[1, 2, 3, 4], prefix_hash_n0='h', return_delta=True), binary=True), b'delta')
+                        self.assertEqual(Path(events.copy()[0]['node_snapshot']['path']).read_bytes(), snapshot)
+                        self.assertEqual(request.call_args.args, ('GET', '/v1/sessions/s/snapshot'))
+                    else:
+                        before = set(Path(directory).iterdir())
+                        with self.assertRaisesRegex(Refusal, 'moved past'):
+                            node.request('POST', '/v1/sessions/s/extend',
+                                dict(n0=0, tokens=[1, 2, 3, 4], prefix_hash_n0='h', return_delta=True), binary=True)
+                        self.assertEqual(set(Path(directory).iterdir()), before)
+
     # Deep admission chooses the largest fitting 1024 boundary, preserves every turn, and rejects overflow at100k.
     def test_native_depth_plan(self):
         plan = growing.depth_plan('deep', 40, 1, 10875, 4506, 340, 13)
@@ -107,6 +149,14 @@ class ScenarioTests(unittest.TestCase):
                 positions=[dict(position=1000+i, exact=True, top1_agreed=True, kl_nats=0, max_abs_logit_diff=0) for i in range(64)],
                 raw_logits=dict(dtype='float32-le', vocab=2, files=files))
             growing.validate_checkpoint(row, False, 1000)
+            # Probe comparisons use the same raw-logit audit; a forged exact label must not pass it.
+            probe_row = copy.deepcopy(row)
+            probe_row['raw_logits']['files'].update(A=files['L'], NODE=files['H'])
+            probe_row['probes'] = dict(NODE=dict(A=copy.deepcopy(row)))
+            growing.validate_raw_positions(probe_row, 1000)
+            probe_row['probes']['NODE']['A']['exact'] = False
+            with self.assertRaisesRegex(Refusal, 'contradict'):
+                growing.validate_raw_positions(probe_row, 1000)
             mutants = []
             mutant = copy.deepcopy(row)
             for p in mutant['positions']:

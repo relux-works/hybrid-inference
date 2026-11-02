@@ -167,3 +167,5 @@ The local CPU prefill node, shared state-delta codec, correctness checker, and H
 Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.
 
 Growing-session experiments use `python3 tools/hybrid-bench/growing_session.py`; the [scenario/trace schema and CPU, CUDA and Mac commands](tools/hybrid-bench/GROWING-SESSION.md) document all outputs under a task's `.temp/` directory, live-state checkpoint checks and current qualification gates.
+
+For private state-path diagnostics, add `--state-probes` to that command. It captures the live node's authenticated snapshots and deltas beside the trace and compares native restore, range roundtrips, append-chain replay, and separate attention/recurrent replacements. These probes retain the existing numerical gate.

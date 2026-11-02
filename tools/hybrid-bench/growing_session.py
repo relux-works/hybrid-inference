@@ -146,10 +146,11 @@ async def relay(port, upstream):
 
 
 class Events:
-    def __init__(self):
+    def __init__(self, state_dir=None):
         self.rows = []
         self.lock = threading.Lock()
         self.started = time.monotonic()
+        self.state_dir = state_dir
 
     def add(self, **row):
         with self.lock:
@@ -183,6 +184,18 @@ class MeasuredNode(Node):
                 row['node_prefill_seconds'] = float(self.last_prefill_ms) / 1000
             if method == 'GET' and isinstance(result, dict) and 'prefix_hash' in result:
                 row.update(n=result['n'], prefix_hash=result['prefix_hash'])
+            if self.events.state_dir is not None and path.endswith('/extend') and data.get('return_delta'):
+                snapshot = Node(self.url, self.token, self.timeout).request('GET', path[:-6] + 'snapshot', binary=True)
+                require(len(snapshot) >= 12 and int.from_bytes(snapshot[8:12], 'little') == row['n1'],
+                        'node snapshot moved past the captured import boundary')
+                require(shutil.disk_usage(self.events.state_dir).free > 28e9 + len(snapshot) + len(result),
+                        'disk floor reached before node state capture')
+                stem = self.events.state_dir / uuid.uuid4().hex
+                for key, payload in (('node_snapshot', snapshot), ('node_delta', result)):
+                    target = stem.with_suffix('.' + key)
+                    target.write_bytes(payload)
+                    target.chmod(0o600)
+                    row[key] = dict(path=str(target), sha256=sha256(target))
             return result
         except Exception as error:
             row['error_type'] = type(error).__name__
@@ -428,10 +441,13 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     scratch.mkdir(mode=0o700)
     fixture = scratch / 'input.json'
     result = scratch / 'result.json'
-    private_json(fixture, dict(tokens=local['tokens'], k=64, max_ctx=client['context'],
+    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'],
         model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=heterogeneous,
         snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
-        replay=replay_schedules(dict(trace, events=app.events.copy()), turn, len(local['tokens']))))
+        replay=replay_schedules(dict(trace, events=app.events.copy()), turn, len(local['tokens'])))
+    if app.events.state_dir is not None:
+        source['probes'] = state_probe_plans(source, dict(trace, events=app.events.copy()), turn)
+    private_json(fixture, source)
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
     process = start_process(command, scratch, 'checker')
@@ -451,6 +467,48 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     return row
 
 
+def state_probe_plans(source, trace, turn):
+    depth = len(source['tokens'])
+    calls = [r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] <= turn]
+    sid = calls[0]['session_id']
+    last = [c['n1'] for r in calls for c in r['meter']['chunks'] if c['status'] == 'imported'][-1]
+    events = [e for e in trace['events'] if e.get('session') == sid and e.get('status') == 'ok' and
+              'n0' in e and e['n1'] <= last]
+    require(events and events[-1]['n1'] == last and 'node_snapshot' in events[-1], 'missing live node state')
+
+    def decode(name, start, end):
+        schedule = [dict(s, n0=max(start, s['n0']), n1=min(end, s['n1'])) for s in source['replay'][name]
+                    if min(end, s['n1']) > max(start, s['n0'])]
+        require(schedule and schedule[0]['n0'] == start and schedule[-1]['n1'] == end, 'state probe schedule gap')
+        return dict(decode=schedule)
+
+    node = events[-1]['node_snapshot']
+    snapshot = dict(snapshot=node['path'], sha256=node['sha256'])
+    compare = dict(compare_snapshot=node['path'], sha256=node['sha256'])
+    tail = decode('B', last, depth)
+    restore, chain, n, imported = [], [], 0, 0
+    for event in events:
+        require(event['n0'] == n, 'state probe node events do not tile')
+        restore.extend([decode('B', n, event['n1']), dict(roundtrip='native')])
+        n = event['n1']
+        if not event['catchup']:
+            require('node_delta' in event, 'missing live node delta')
+            if imported < event['n0']:
+                chain.append(decode('A', imported, event['n0']))
+            entry = event['node_delta']
+            chain.append(dict(delta=entry['path'], sha256=entry['sha256']))
+            imported = n
+    require(imported == last, 'state probe delta chain incomplete')
+    plans = [('NODE', [snapshot, tail]), ('RESTORE', restore + [compare, tail]),
+             ('BSTATE', [decode('B', 0, last), compare, tail]),
+             ('NODE_RANGE', [snapshot, dict(roundtrip='range'), tail]), ('CHAIN', chain + [tail])]
+    for component in ('attention', 'recurrent'):
+        plans.append(('CHAIN_' + component.upper(), chain + [dict(snapshot, replace=component), tail]))
+    for mode in ('native', 'range'):
+        plans.append(('OWN_' + mode.upper(), [decode('A', 0, depth - 1), dict(roundtrip=mode), decode('A', depth - 1, depth)]))
+    return [dict(name=name, steps=steps) for name, steps in plans]
+
+
 def validate_raw_positions(row, depth):
     raw = row['raw_logits']
     vocab = raw['vocab']
@@ -464,6 +522,10 @@ def validate_raw_positions(row, depth):
         for name in row['factorial']:
             left, right = name.split('-')
             pairs[name] = (left, right)
+    for name, probe in row.get('probes', {}).items():
+        for reference in ('A', 'B', 'H'):
+            if reference in probe:
+                pairs[name + ':' + reference] = (reference, name)
     handles = {}
     metrics = {name: [] for name in pairs}
     try:
@@ -496,7 +558,11 @@ def validate_raw_positions(row, depth):
         for handle in handles.values():
             handle.close()
     for name, positions in metrics.items():
-        measured = row if name == 'hybrid' else row['partition'] if name == 'partition' else row['factorial'][name]
+        if ':' in name:
+            probe, reference = name.split(':')
+            measured = row['probes'][probe][reference]
+        else:
+            measured = row if name == 'hybrid' else row['partition'] if name == 'partition' else row['factorial'][name]
         require(len(measured['positions']) == 64, 'invalid checkpoint position count')
         for got, expected in zip(measured['positions'], positions):
             require(type(got['position']) is int and got['position'] == expected['position'] and
@@ -568,6 +634,7 @@ def parser():
                    help='100000 or deep (derived native-capacity start); small integers for CPU controls')
     p.add_argument('--partition-batch', type=int, default=64)
     p.add_argument('--partition-ubatch', type=int, default=32)
+    p.add_argument('--state-probes', action='store_true', help='capture private live node states and isolate serialization/import factors')
     p.add_argument('--turns', type=int, default=40)
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
@@ -611,12 +678,15 @@ def run(args):
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
     size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
-    raw_bytes = len(checkpoints) * 7 * 64 * client['model_layout']['vocab_size'] * 4
+    raw_bytes = len(checkpoints) * (16 if args.state_probes else 7) * 64 * client['model_layout']['vocab_size'] * 4
     require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size + raw_bytes,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
-    events = Events()
+    state_dir = root / 'node-states' if args.state_probes else None
+    if state_dir is not None:
+        state_dir.mkdir(mode=0o700)
+    events = Events(state_dir)
     trace = dict(schema='hybrid-growing-session-v3', status='running', seed=args.seed, start=args.start,
         depth=args.depth, turns=args.turns, workload=[], calls=[], checkpoints=[],
         provenance=dict(**PROVENANCE, depth_bins=DEPTH_BINS, pause_seconds=PAUSE,
@@ -690,6 +760,7 @@ def run(args):
             node=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
             checker=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
             generation=dict(temperature=0, ignore_eos=True, enable_thinking=False))
+        trace['engine']['cpu_affinity'] = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
         flush()
         trace['heterogeneous'] = client['backend'] != node['backend']
         credential = config['client_credential']

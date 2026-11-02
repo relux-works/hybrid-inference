@@ -1,5 +1,7 @@
 #include "hybrid-state.h"
 #include "llama-ext.h"
+#include "llama-io.h"
+#include "llama-memory-hybrid.h"
 #ifdef LLAMA_HYBRID_SERVER_SNAPSHOTS
 #include "server-common.h"
 #endif
@@ -16,6 +18,22 @@
 
 static void require(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
+}
+
+class state_counter : public llama_io_write_i {
+    size_t size = 0;
+public:
+    void write(const void *, size_t n) override { size += n; }
+    void write_tensor(ggml_tensor *, size_t, size_t n) override { size += n; }
+    size_t n_bytes() override { return size; }
+};
+
+static size_t attention_state_size(llama_context * ctx) {
+    auto * memory = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    require(memory != nullptr, "state probes require hybrid memory");
+    state_counter counter;
+    memory->get_mem_attn()->state_write(counter, 0, 0);
+    return counter.n_bytes();
 }
 
 static std::string read_file(const char * path, size_t limit = 513 * 1024 * 1024 + 52) {
@@ -65,11 +83,11 @@ static double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
-static hybrid::context_ptr context(llama_model * model, int depth, bool gpu) {
+static hybrid::context_ptr context(llama_model * model, int depth, bool gpu, int threads = 2) {
     auto cp = llama_context_default_params();
     cp.n_ctx = depth;
     cp.n_batch = cp.n_ubatch = 256;
-    cp.n_threads = cp.n_threads_batch = 2;
+    cp.n_threads = cp.n_threads_batch = threads;
     cp.n_seq_max = 1;
     cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -156,8 +174,8 @@ static hybrid::json score_observations(const checkpoint_observation & p, const c
     return result;
 }
 
-static void replay_schedule(llama_context * ctx, const std::vector<llama_token> & tokens, const hybrid::json & schedule) {
-    size_t n = 0;
+static void replay_schedule(llama_context * ctx, const std::vector<llama_token> & tokens, const hybrid::json & schedule, size_t start = 0, bool logits_required = true) {
+    size_t n = start;
     for (const auto & step : schedule) {
         const size_t n0 = step.at("n0"), n1 = step.at("n1");
         require(n0 == n && n1 > n0 && n1 <= tokens.size() && n1 - n0 <= 256, "invalid replay tiling");
@@ -176,7 +194,7 @@ static void replay_schedule(llama_context * ctx, const std::vector<llama_token> 
         require(code == 0, "replay decode failed");
         n = n1;
     }
-    require(n == tokens.size() && schedule.back().at("logits").get<bool>(), "incomplete replay schedule");
+    require(n == tokens.size() && (!logits_required || schedule.back().at("logits").get<bool>()), "incomplete replay schedule");
 }
 
 static int check_checkpoint(const hybrid::json & fixture, llama_model * model, bool gpu, const char * output) {
@@ -185,6 +203,8 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     const int64_t max_ctx = fixture.at("max_ctx");
     require(max_ctx > 0 && max_ctx <= 1048576 && uint64_t(max_ctx) >= tokens.size() + k + 2, "invalid snapshot context capacity");
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int threads = fixture.value("threads", 2);
+    require(threads >= 1 && threads <= 8, "invalid checkpoint threads");
     std::map<std::string, checkpoint_observation> observations;
     hybrid::json result = {{"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
         {"raw_logits", {{"dtype", "float32-le"}, {"vocab", vocab}, {"files", hybrid::json::object()}}}};
@@ -207,7 +227,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
         // Score the live local first so every cell receives the same teacher-forced continuation.
         for (size_t i : {size_t(1), size_t(0), size_t(2)}) {
             if (i >= paths.size()) { continue; }
-            auto ctx = context(model, max_ctx, gpu);
+            auto ctx = context(model, max_ctx, gpu, threads);
             require(hybrid::file_hash(paths[i].c_str()) == hashes[i], "snapshot checksum mismatch");
             size_t count = 0;
             require(llama_state_seq_load_file(ctx.get(), paths[i].c_str(), 0, nullptr, 0, &count) > 0 && count <= tokens.size() + 4,
@@ -228,7 +248,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     }
     if (fixture.contains("replay")) {
         for (const std::string name : {"A", "B1", "B2", "B"}) {
-            auto ctx = context(model, max_ctx, gpu);
+            auto ctx = context(model, max_ctx, gpu, threads);
             replay_schedule(ctx.get(), tokens, fixture.at("replay").at(name));
             record(name, observe(ctx.get(), model, tokens.size(), k, observations.count("L") ? observations.at("L").teacher :
                 name == "A" ? std::vector<llama_token>() : observations.at("A").teacher));
@@ -240,6 +260,108 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
         if (observations.count("H")) {
             result["factorial"]["B-H"] = score_observations(observations.at("B"), observations.at("H"), tokens.size(), k);
             result["factorial"]["A-L"] = score_observations(observations.at("A"), observations.at("L"), tokens.size(), k);
+        }
+    }
+    if (fixture.contains("probes")) {
+        require(fixture.at("probes").is_array() && fixture.at("probes").size() <= 16, "too many state probes");
+        result["probes"] = hybrid::json::object();
+        for (const auto & probe : fixture.at("probes")) {
+            const std::string name = probe.at("name");
+            require(!name.empty() && name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") == std::string::npos,
+                    "invalid state probe name");
+            require(!observations.count(name), "duplicate state probe name");
+            auto ctx = context(model, max_ctx, gpu, threads);
+            size_t n = 0;
+            bool ready = false;
+            hybrid::json states = hybrid::json::array();
+            for (const auto & step : probe.at("steps")) {
+                if (step.contains("decode")) {
+                    const auto & schedule = step.at("decode");
+                    require(!schedule.empty(), "empty state probe decode");
+                    const size_t end = schedule.back().at("n1");
+                    require(end <= tokens.size(), "state probe decode exceeds journal");
+                    replay_schedule(ctx.get(), {tokens.begin(), tokens.begin() + end}, schedule, n, false);
+                    n = end;
+                    ready = schedule.back().at("logits");
+                } else if (step.contains("snapshot") && !step.contains("replace")) {
+                    const std::string path = step.at("snapshot");
+                    require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe snapshot checksum mismatch");
+                    size_t count = 0;
+                    std::vector<llama_token> journal(tokens.size());
+                    require(llama_state_seq_load_file(ctx.get(), path.c_str(), 0, journal.data(), journal.size(), &count) > 0 &&
+                            count <= tokens.size() && std::equal(journal.begin(), journal.begin() + count, tokens.begin()),
+                            "state probe snapshot journal mismatch");
+                    n = count;
+                    ready = false;
+                } else if (step.contains("delta")) {
+                    const std::string path = step.at("delta");
+                    require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe delta checksum mismatch");
+                    const auto delta = hybrid::read_delta(read_file(path.c_str()), fixture.at("model_sha256"), n);
+                    const size_t end = delta.header.at("n1");
+                    require(end <= tokens.size() && delta.header.at("tokens").get<std::vector<llama_token>>() ==
+                            std::vector<llama_token>(tokens.begin() + n, tokens.begin() + end), "state probe delta journal mismatch");
+                    require(llama_state_seq_set_data_append(ctx.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
+                            delta.state.size(), 0, n, end) == delta.state.size(), "state probe delta import failed");
+                    n = end;
+                    ready = false;
+                } else if (step.contains("compare_snapshot")) {
+                    const std::string path = step.at("compare_snapshot");
+                    require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe snapshot checksum mismatch");
+                    const auto snapshot = read_file(path.c_str());
+                    require(n <= (snapshot.size() - std::min<size_t>(12, snapshot.size())) / 4 && snapshot.size() >= 12,
+                            "invalid state probe snapshot size");
+                    const auto state = hybrid::save_state(ctx.get());
+                    require(state.size() >= 8, "invalid state probe native state");
+                    states.push_back({{"n", n}, {"snapshot_bytes_equal", state.substr(8) == snapshot.substr(12 + 4 * n)}});
+                } else if (step.contains("replace")) {
+                    const std::string path = step.at("snapshot");
+                    require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe snapshot checksum mismatch");
+                    auto other = context(model, max_ctx, gpu, threads);
+                    size_t count = 0;
+                    std::vector<llama_token> journal(tokens.size());
+                    require(llama_state_seq_load_file(other.get(), path.c_str(), 0, journal.data(), journal.size(), &count) > 0 &&
+                            count == n && std::equal(journal.begin(), journal.begin() + count, tokens.begin()),
+                            "state probe replacement journal mismatch");
+                    auto state = hybrid::save_state(ctx.get());
+                    const auto reference = hybrid::save_state(other.get());
+                    const size_t split = 8 + attention_state_size(ctx.get());
+                    require(split == 8 + attention_state_size(other.get()) && state.size() == reference.size() && split <= state.size(),
+                            "state probe component layout mismatch");
+                    const std::string component = step.at("replace");
+                    require(component == "attention" || component == "recurrent", "invalid state probe component");
+                    states.push_back({{"n", n}, {"replace", component},
+                        {"attention_equal", state.substr(8, split - 8) == reference.substr(8, split - 8)},
+                        {"recurrent_equal", state.substr(split) == reference.substr(split)}});
+                    if (component == "attention") { state.replace(8, split - 8, reference, 8, split - 8); }
+                    else { state.replace(split, state.size() - split, reference, split, reference.size() - split); }
+                    hybrid::load_state(ctx.get(), state);
+                    ready = false;
+                } else if (step.contains("roundtrip")) {
+                    const auto before = hybrid::save_state(ctx.get());
+                    const std::string mode = step.at("roundtrip");
+                    if (mode == "native") {
+                        hybrid::load_state(ctx.get(), before);
+                    } else {
+                        require(mode == "range" && n > 0, "invalid state probe roundtrip");
+                        const auto range = hybrid::export_range(ctx.get(), 0, n);
+                        llama_memory_clear(llama_get_memory(ctx.get()), true);
+                        require(llama_state_seq_set_data_append(ctx.get(), reinterpret_cast<const uint8_t *>(range.data()),
+                                range.size(), 0, 0, n) == range.size(), "state probe roundtrip import failed");
+                    }
+                    states.push_back({{"n", n}, {"roundtrip", mode}, {"bytes_equal", before == hybrid::save_state(ctx.get())}});
+                    ready = false;
+                } else {
+                    throw std::runtime_error("unknown state probe step");
+                }
+            }
+            require(n == tokens.size() && ready, "incomplete state probe journal or final logits");
+            record(name, observe(ctx.get(), model, n, k, observations.at("A").teacher));
+            result["probes"][name]["roundtrips"] = states;
+            for (const std::string reference : {"A", "B", "H"}) {
+                if (observations.count(reference)) {
+                    result["probes"][name][reference] = score_observations(observations.at(reference), observations.at(name), n, k);
+                }
+            }
         }
     }
     if (!observations.count("H")) {

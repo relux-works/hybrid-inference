@@ -314,3 +314,73 @@ cold observed 2026-11-02T02:01:57.951687+00:00 to 2026-11-02T02:09:25.442199+00:
 pre-staged observed 2026-11-02T02:09:25.948977+00:00 to 2026-11-02T02:16:41.961695+00:00; trace SHA256 `8eafc59958cd6cf283a466cbf3572fab3290866e275168932ef8dcdd3d3dc71a`.
 
 Cleanup at 2026-11-02T02:19:58.734801+00:00: all recorded task-native/build PIDs inactive, both owned build trees and raw native snapshots/expired credentials removed. Final raw logits, retained input tokens/schedules, trace/results/logs/hash manifests remain private for review. Minimum observed free disk 31096446976 bytes (31.096 GB), above 28 GB; cleanup free 32000200704 bytes. The model and source worktree remain. Full CUDA/Metal/long-context inference and upstream CI are unrun under the CPU-only task scope.
+
+## r39: residual source isolated by live node state and append imports
+
+Run `hybrid-b-r39-261102`, based on signed r38 `f37962493a`, on the same `m3-growing-session` worktree. Evidence: `.temp/r39/measurements.json`, `qualification-identity.json`, `native-affinity-01/cold/check-{10,12}/`, and retained r38 raw logits. CPU only; existing Qwen3.5-0.8B-Q4_0, SHA-256 `444406ddd926550c724ec18d5120a9d40ded44908a063b0e66e9a7e5464c652c`, context 4096, q8_0 K/V, f32 recurrent state, flash attention, 256/256 primary partition. No GPU, model download, numeric-gate change or push.
+
+The residual source is **mixed attention-cache provenance after append import**. The client keeps old KV rows computed locally, imports only the node's new KV range, and replaces the full recurrent state. Node catch-up recomputes old generated/outage tokens in batches, but that recomputed historical node KV is not transferred back. B uses the node path for the complete prefix; H retains the mixture. Replaying local evaluation and the actual delta imports reproduces H exactly. Replacing only its attention KV with the node snapshot makes the replay exact with B; replacing recurrent state alone leaves it exact with H. At the final import boundaries 1550/1914, recurrent bytes are already equal and attention bytes differ.
+
+The smallest explanation for the entire CPU observation is evaluation-partition arithmetic **plus retaining the resulting different historical attention KV during append import**. Batch arithmetic alone was insufficient in r38 because its B cell replaced the provenance of that history. This run names the residual mechanism; it does not make L-H numerically acceptable.
+
+KL and p95 are nats/token over 64 complete 248320-logit distributions. Pair labels specify KL(left || right); an exact cell also has max logit difference 0, top-1 agreement 64/64 and no free-running divergence. Both checkpoints use the same local greedy teacher IDs.
+
+| Factor changed / comparison | KL10 | p9510 | max10 | Exact10 | KL12 | p9512 | max12 | Exact12 |
+|---|---:|---:|---:|:---:|---:|---:|---:|:---:|
+| L-H, original gate | 0.000637837220046 | 0.00186315189913 | 0.964870452881 | no | 0.00027947834459 | 0.00100390301939 | 0.737212657928 | no |
+| B-H, matched 2/2 threads and CPU affinity | 7.71985333402e-05 | 0.000302589110353 | 0.792877197266 | no | 0.000274473850817 | 0.00101512660845 | 0.771906852722 | no |
+| Live node state + identical tail vs B | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+| Save/load each node extend vs B | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+| Own range export/import vs A | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+| Imported full node state vs B | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+| Actual append-chain replay vs H | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+| Replace attention KV alone vs B | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+| Replace recurrent state alone vs H | 0 | 0 | 0 | yes | 0 | 0 | 0 | yes |
+
+A-L, A-A, OWN_NATIVE-A and BSTATE-B are also exact at both checkpoints. BSTATE's complete native bytes equal the node snapshot at each last-import boundary. Each native restore in RESTORE and each OWN_NATIVE/OWN_RANGE/NODE_RANGE roundtrip is byte identity, in one process, followed by exact continuation relative to its corresponding unchanged reference. Export/import is not an extra lossy q8 quantization step.
+
+### Node truth, threads, KV and remaining factors
+
+The final diagnostic uses snapshots captured by the **live hybrid node process immediately after its critical extend**, through the existing authenticated snapshot endpoint, with the returned delta and SHA-256 hashes. It does not substitute a client reconstruction for node truth. A boundary-race control rejects a snapshot that has advanced beyond the extend, before writing files. An earlier isolated node replay of the retained r38 boundaries supplied the same turn 10 result; its CHAIN raw bytes equal the retained live r38 H bytes. The live captured run repeats that result at both checkpoints.
+
+The existing node/client/checker compute and batch counts were already 2/2. Pinning their parent to CPUs 0,1 gives all three the same inherited mask. `qualification-identity.json` records observed live PID/thread masks, including the checker; every recorded worker mask is 0,1. The complete factorial dictionaries and A/B/H raw hashes match r38 at both checkpoints. No thread-split or affinity contribution is needed to explain this residual. This does not claim universal invariance to thread counts or CPU models.
+
+Both sides request q8_0 K/V and the same model-derived Hadamard attention rotation; the live node/checker log K rotation 256 and V rotation 64, and the native loader enforces that layout on imported client state. `llama-kv-cache.cpp` enables rotation for quantized head geometry and verifies K/V rotation dimensions and types when restoring; `hybrid-state.cpp` exports native q8_0 ranges. Whole-node native/range restore agrees exactly with a same-partition local B context. Own-state byte identity and the malformed/valid append controls bound the import claim.
+
+The local tail is held identical in every comparison. The recurrent-only replacement is a negative causal control: it changes no bytes or logits because the fixed state already matches the final node checkpoint. Attention-only replacement selects the residual independently of tail or fixed-state placement. B retains the node's per-chunk logits flags, while A retains local prompt-end flags; both reproduce their own live references. Since the complete hybrid import path now reproduces H, further tail/logits/build flag variants are unnecessary for naming the residual. Node, client and checker came from one CMake Release/CPU/native build and shared the same backend libraries; target flags and binary/source hashes are retained. No core, kernel, transfer-format or production protocol fix was introduced.
+
+CUDA is unrun. This is not established as thread-dependent CPU matmul noise, so a change to GPU reductions is not assumed to remove it. The GPU rehearsal must repeat NODE-B, CHAIN-H, the roundtrips and both component replacements, alongside L-H/A-L. If batch and token paths yield different historical KV there, append import retains the same provenance mechanism. The existing uniform mean-KL-zero, top-1>=63/64 and free 64 gate remains authoritative.
+
+### Validation and finite bounds
+
+Bench: 85 tests exit 0 (six optional native-header skips); the separate native identity run executes all 12 tests with the existing exact header dumps, exit 0. Proxy: 74 tests exit 0. Final own-state/native controls pass with intended refusals for incomplete final logits, duplicate probe names, snapshot checksum, token journal, and capacity (each actual exit 2, no successful result). Node snapshot boundary-race and missing/gapped live-evidence tests are green. Native malformed recurrent append controls exit 0, including valid appends before/after rejections and byte-preserved neighbor state.
+
+Server-ON/OFF CPU builds exit 0; both legacy noise/corruption suites exit 0, retaining checksum refusal 2 and checksum-valid corruption/lossy failures 3. Server-OFF snapshot and malformed replay tiling each refuse with actual exit 2 and their intended reason. The first legacy invocation refused an already-existing artifact directory with exit 1 before inference; corrected `legacy-02` runs green. These are not hidden passing attempts.
+
+Nine narrowing mutants are killed, each by an assertion in the named test below; identity is green. No survivor is used as evidence.
+
+| Mutant | Property narrowed | Named failing test | Actual exit |
+|---|---|---|---:|
+| probe-raw-validation-disabled | probe fields must agree with raw logits | test_checkpoint_raw_logits_reject_r7r_mutant | 1 |
+| node-boundary-race-admitted | a snapshot must match the just-extended boundary | test_node_snapshot_capture_refuses_boundary_race | 1 |
+| generated-cell-decodes | B1 must change the generated partition only | test_factorial_schedule_boundaries | 1 |
+| partition-mean-authorizes | positive partition noise cannot authorize KL | test_checkpoint_partition_band | 1 |
+| raw-validation-disabled | raw evidence must reject falsified positions | test_checkpoint_raw_logits_reject_r7r_mutant | 1 |
+| degenerate-route-admitted | both connected policy routes are required | test_route_preflight_rejects_degenerate | 1 |
+| foreign-catchup-counted | catch-up belongs to its own session | test_catchup_attribution | 1 |
+| depth-source-drift | sampling parameters match recorded provenance | test_sampling_table_provenance | 1 |
+| legacy-exactness-weakened | legacy exactness remains enforced | test_checkpoint_exactness_gate | 1 |
+
+Native source coverage is finite: existing 0.8B, two checkpoints at depths 1679/2043, 64 teacher-forced and independent greedy positions, one CPU build/backend. This is not 27B/100k/deep or CUDA/Metal qualification. Raw-logit validation independently rederives per-position KL/top1/max/exactness and aggregates, including probe comparisons; free-running verdicts remain native observations. No brief surface table was supplied (brief gap); every requested factor is accounted for above. GPU/model downloads are outside the user's explicit scope. All previously committed reviewer/unit tests retain their names; no requested CPU row is silently excluded.
+
+The runtime checker and driver were frozen for the live captures. The native harness gained additional roundtrip/refusal controls after the first cold launch; those final controls were run separately, and the pre-staged regression uses the final harness. Paths/line numbers printed in the first harness traceback can reflect that test-file update; recorded exit codes and measured JSON are the evidence. Numerical equivalence remains unqualified.
+
+Both final starts complete 39 calls and both 64-position checkpoints: two connected policy-local turns, eight connected offloads, two transport fallbacks, connected prompt catch-up at turn 1 and nine background catch-ups. Both actual drivers exit 3; both native harnesses exit 1 at the unchanged zero-KL criterion. Their complete factorial dictionaries and A/B/H raw identities equal r38. `audit-02.log` exits 0, verifies both starts, journals/routes, all referenced private state/logit hashes, named probe exactness/component predicates, and source/binary identity. No passing-equivalence handoff is claimed.
+
+native-affinity-01: observed 2026-11-02T02:40:27.731703+00:00 to 2026-11-02T02:56:42.999345+00:00; trace SHA-256 `fa93e162e7ce87f1cdf206130c013d30406079a320c669a9bb7d82ce2bcf97b9`.
+
+native-prestaged-01: observed 2026-11-02T02:58:34.959318+00:00 to 2026-11-02T03:04:17.009433+00:00; trace SHA-256 `fba8528d2b8a7a3ffb44b9e116dbda80e32f9f28459ff1c4f844315b45621196`.
+
+Audit01 failed 1 because it read exit_code from trace instead of the command ledger; corrected audit02 reads the persisted actual command exit and passes. A late additional affinity read failed its minimum-live-actor assertion after the processes had exited; it supplies no new mask evidence. The during-run qualification identity remains the affinity evidence. These failures do not replace or weaken any product gate.
+
+Cleanup at 2026-11-02T03:09:01Z: all 82 recorded task PIDs inactive; both task-owned build trees removed (118424498 bytes). Minimum sampled free disk 29188509696 bytes (29.19 GB); cleanup free 36195479552 bytes. Live node snapshots/deltas, hashed raw logits, tokens, traces and logs remain private for review; identical logit files are hardlinked without changing bytes. Signed local delivery only; no push, GPU or model download.

@@ -4,7 +4,9 @@ Growing-session r38 supersedes r37's partition-band acceptance rule. The factori
 
 Native deep start remains resolved as the largest1024-token start that fits all sampled growth plus 2048 margin within 262144. No250k start, dropped turn, hidden cap or YaRN substitution is introduced.
 
-Exact production decode catch-up still needs a durable evaluation-schedule contract. The r38 checker reconstructs schedules from experiment traces for attribution; it does not change the flat production replay protocol. Residual full-node-replay versus live-hybrid KL leaves node save/restore, import and recurrent-state semantics as follow-up factors. These controls do not select one of them as the root cause.
+The r39 CPU probes identify the residual B-H source as mixed attention-cache provenance: append imports retain older local KV rows, append node KV for the new range, and replace recurrent state with the node's state. The live node snapshot and B are exact; own-state roundtrips are identity; replaying the actual append chain reproduces H. Replacing attention KV alone makes that chain exact with B, while replacing recurrent state alone leaves it exact with H. See the r39 section of the growing-session results for both checkpoints and the matched-thread/affinity controls.
+
+Exact production catch-up still needs an owner-selected evaluation/state contract. The diagnostic replay does not change the flat production protocol or replace old client KV. Batch/token evaluation differences plus retaining their different historical KV explain these CPU observations; making L-H exact requires addressing that contract rather than relaxing the gate. CUDA/Metal must repeat the state-path controls; a GPU is not assumed to remove the mechanism.
 
 Canonical M3 Max delta-prefill rates and the measured PR9 CUDA import OLS are retained with source hashes. The single M3 import point42.4 s/39504tokens cannot identify both an intercept and slope. The CUDA rehearsal uses its labelled measured CUDA import fit with target-M3 routing rates; M3 import economics require a measured M3 fit. Import-speed-v2 CPU speedups are not a measured M3 fit.
 

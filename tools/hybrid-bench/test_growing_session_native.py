@@ -28,7 +28,18 @@ def checkpoint_controls(build, model, root):
         decoder.request('POST', '/slots/0?action=save', dict(filename=snapshot.name))
         fixture = dict(tokens=tokens, k=64, max_ctx=4096, model_sha256=sha256(model), backend='cpu',
                        snapshots=[str(snapshot), str(snapshot)], snapshot_sha256=[sha256(snapshot)] * 2)
+        schedule = [dict(n0=i, n1=min(i + 256, len(prompt)), logits=min(i + 256, len(prompt)) == len(prompt))
+                    for i in range(0, len(prompt), 256)]
+        schedule += [dict(n0=i, n1=i + 1, logits=True) for i in range(len(prompt), len(tokens))]
+        replay = {name: schedule for name in ('A', 'B1', 'B2', 'B')}
+        probes = [dict(name='OWN_' + mode.upper(), steps=[dict(decode=schedule[:-1]), dict(roundtrip=mode),
+                   dict(decode=schedule[-1:])]) for mode in ('native', 'range')]
+        probe_fixture = dict(fixture, replay=replay, probes=probes)
         cases = [('same_backend_checkpoint_exactness', fixture, 0, None),
+                 ('own_state_roundtrips', probe_fixture, 0, None),
+                 ('probe_incomplete_refusal', dict(probe_fixture, probes=[dict(name='INCOMPLETE', steps=[dict(decode=schedule[:-1])])]),
+                  2, 'incomplete state probe journal or final logits'),
+                 ('probe_duplicate_refusal', dict(probe_fixture, probes=[dict(probes[0], name='A')]), 2, 'duplicate state probe name'),
                  ('checksum_refusal', dict(fixture, snapshot_sha256=['0' * 64, sha256(snapshot)]), 2, 'snapshot checksum mismatch'),
                  ('journal_refusal', dict(fixture, tokens=[(tokens[0] + 1) % 1000] + tokens[1:]), 2, 'snapshot token journal mismatch'),
                  ('context_capacity_refusal', dict(fixture, max_ctx=1048577), 2, 'invalid snapshot context capacity')]
@@ -53,6 +64,10 @@ def checkpoint_controls(build, model, root):
                 # Two restores of the same live state are an exactness instrument control, not a mixed-route equivalence claim.
                 result = json.loads(result_path.read_text())
                 require(result['exact'] and result['top1_agreed'] == 64 and result['mean_kl_nats'] == 0, 'exact checkpoint control failed')
+                if name == 'own_state_roundtrips':
+                    # Native and transfer-format roundtrips preserve bytes and all 64 continuation distributions.
+                    require(all(p['A']['exact'] and all(s['bytes_equal'] for s in p['roundtrips'])
+                                for p in result['probes'].values()), 'own state roundtrip is not identity')
             print('PASS ' + name + ': exit ' + str(code), flush=True)
 
 
@@ -89,6 +104,8 @@ def main():
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
     p.add_argument('--controls-only', action='store_true')
+    p.add_argument('--state-probes', action='store_true')
+    p.add_argument('--start', choices=('both', 'cold', 'pre-staged'), default='both')
     args = p.parse_args()
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
@@ -115,12 +132,14 @@ def main():
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
         preflight_controls(state, root, config)
         commands = []
-        for start in ('cold', 'pre-staged'):
+        for start in (('cold', 'pre-staged') if args.start == 'both' else (args.start,)):
             output = root / start
             command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
                 '--output', str(output), '--depth', '128', '--turns', '12', '--disconnect-turn', '4',
                 '--disconnect-turns', '2', '--max-new', '48', '--max-output', '128', '--pause-cap', '1.1', '--seed', '281',
                 '--start', start, '--link-label', 'CPU loopback; sampled output capped128/input48 seed281; synthetic policy']
+            if args.state_probes:
+                command.append('--state-probes')
             with (root / (start + '.log')).open('wb') as log:
                 process = subprocess.Popen(command, stdout=log, stderr=log)
                 (root / (start + '.pid')).write_text(str(process.pid) + '\n')

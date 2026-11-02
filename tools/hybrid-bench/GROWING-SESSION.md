@@ -157,3 +157,33 @@ This runs the four fresh controls without snapshots. It cannot recompute B-H aft
 ```sh
 nice -n 19 python3 tools/hybrid-bench/growing_session.py replay --trace "$TRACE" --input "$CHECK_INPUT" --turn 10 --output .temp/growing/replay10 --model "$MODEL" --checker .temp/growing/build/bin/llama-hybrid-bench-check
 ```
+
+## Isolate state paths
+
+Add `--state-probes` to the full driver to capture the node's own native snapshot immediately after each successful critical extend, through the existing authenticated GET snapshot endpoint. The snapshot journal must end at that extend's n1; a concurrent boundary change refuses before files are written. The matching delta response is retained too. Files under `OUTPUT/node-states/` contain private tokens/state and must not be exported with a public trace. Protocol events link their paths and SHA-256 hashes. Capture adds HTTP and disk overhead, so its wall time is diagnostic rather than a performance measurement.
+
+Each checkpoint still runs A/B1/B2/B and the unchanged L-H gate. Its optional `probes` object adds the following controls, all with the same 64 local teacher IDs and independently restored greedy continuations. Probe scores use KL(reference || probe); references are A, B and H. Raw logits receive the same size/hash, per-position and aggregate validation as the original cells.
+
+| Probe | State path before the unchanged local tail |
+|---|---|
+| NODE | Load the live node snapshot at the last imported boundary |
+| BSTATE | Compute B locally and compare native bytes with that snapshot |
+| RESTORE | Add native save/load at every observed node extend boundary |
+| NODE_RANGE | Load node state, export its complete range and import it back in one process |
+| OWN_NATIVE / OWN_RANGE | Round-trip A's own state immediately before its final token; compare bytes and continuation with A |
+| CHAIN | Replay local evaluation between the original critical imports, importing the actual live delta files |
+| CHAIN_ATTENTION | Replace only CHAIN's attention KV with node KV at the final import boundary |
+| CHAIN_RECURRENT | Replace only CHAIN's recurrent state at that boundary |
+
+Component controls compare attention and recurrent bytes separately before replacement. The native state writer determines the attention boundary; no model-specific byte offset is assumed. Every replacement checks the model, journal and component layout. The tail, logits schedule, KV type and backend remain fixed. A probe must reach the complete journal and evaluate final logits; empty, incomplete, duplicate-name, corrupt or mismatched evidence refuses. `roundtrips.bytes_equal` is a byte comparison, separate from numerical continuation exactness.
+
+On agents1, use the existing CPU build and model only:
+
+```sh
+mkdir -p .temp/growing/state-native
+taskset -c 0,1 nice -n 19 python3 tools/hybrid-bench/test_growing_session_native.py --build-dir .temp/growing/build --model "$MODEL" --artifacts .temp/growing/state-native --state-probes --start cold
+```
+
+Choose two allowed CPUs on another Linux host. All three processes inherit that affinity and use two compute/two batch threads; `engine.cpu_affinity` records the driver's inherited mask. Inspect the live process masks when collecting evidence. State capture and the extra logits increase disk use; the initial reservation includes all 16 observation files per checkpoint and capture checks the 28 GB floor before writing. Keep private evidence or deduplicate identical artifacts, then delete the task-owned build trees.
+
+CUDA rehearsal must repeat NODE/B, CHAIN/H, own-state roundtrips and both component replacements, in addition to L-H and A-L. An exact CPU node/replay match does not predict exact CUDA batching or eliminate mixed KV provenance. If batch and token evaluation produce different KV entries on CUDA, retaining old local entries while replacing node recurrent state can preserve the same mechanism. No CUDA result or positive numerical tolerance follows from CPU diagnostics.
