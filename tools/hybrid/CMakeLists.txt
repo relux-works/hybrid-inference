@@ -37,6 +37,9 @@ if (LLAMA_BUILD_SERVER)
     target_compile_definitions(llama-hybrid-bench-check PRIVATE LLAMA_HYBRID_SERVER_SNAPSHOTS)
 endif()
 
+add_executable(llama-hybrid-check-swa check-swa.cpp)
+target_link_libraries(llama-hybrid-check-swa PRIVATE hybrid-state)
+
 add_executable(llama-hybrid-check-identity check-identity.cpp)
 target_link_libraries(llama-hybrid-check-identity PRIVATE hybrid-state)
 

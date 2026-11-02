@@ -144,6 +144,7 @@ static hybrid::context_ptr context(llama_model * model, int depth, bool gpu, int
     auto cp = llama_context_default_params();
     cp.n_ctx = depth;
     cp.n_batch = cp.n_ubatch = 256;
+    cp.swa_full = false;
     cp.n_threads = cp.n_threads_batch = threads;
     cp.n_seq_max = 1;
     cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
@@ -330,8 +331,12 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             auto ctx = context(model, max_ctx, gpu, threads);
             size_t n = 0;
             bool ready = false;
+            bool pending_delta = false;
+            hybrid::delta_import pending;
+            std::vector<llama_token> committed;
             hybrid::json states = hybrid::json::array();
             for (const auto & step : probe.at("steps")) {
+                require(!pending_delta || step.contains("delta"), "missing final state probe chunk");
                 if (step.contains("decode")) {
                     const auto & schedule = step.at("decode");
                     require(!schedule.empty(), "empty state probe decode");
@@ -353,12 +358,19 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
                 } else if (step.contains("delta")) {
                     const std::string path = step.at("delta");
                     require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe delta checksum mismatch");
-                    const auto delta = hybrid::read_delta(read_file(path.c_str()), fixture.at("model_sha256"), n);
+                    auto wire = read_file(path.c_str());
+                    const auto delta = hybrid::read_delta_view(wire, fixture.at("model_sha256"), n);
                     const size_t end = delta.header.at("n1");
                     require(end <= tokens.size() && delta.header.at("tokens").get<std::vector<llama_token>>() ==
                             std::vector<llama_token>(tokens.begin() + n, tokens.begin() + end), "state probe delta journal mismatch");
-                    require(llama_state_seq_set_data_append(ctx.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
-                            delta.state.size(), 0, n, end) == delta.state.size(), "state probe delta import failed");
+                    if (!pending_delta) { committed.assign(tokens.begin(), tokens.begin() + n); }
+                    const bool final = pending.stage(ctx.get(), 0, std::move(wire), fixture.at("model_sha256"),
+                        delta.header.at("session_id"), committed, max_ctx, llama_vocab_n_tokens(llama_model_get_vocab(model)));
+                    if (final) {
+                        pending.apply(ctx.get(), 0);
+                        pending.clear();
+                    }
+                    pending_delta = !final;
                     n = end;
                     ready = false;
                 } else if (step.contains("compare_snapshot")) {
@@ -408,6 +420,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
                     throw std::runtime_error("unknown state probe step");
                 }
             }
+            require(!pending_delta, "missing final state probe chunk");
             require(n == tokens.size() && ready, "incomplete state probe journal or final logits");
             record(name, observe(ctx.get(), model, n, k, observations.at("A").teacher));
             result["probes"][name]["roundtrips"] = states;
@@ -531,15 +544,22 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> continuation, free_continuation;
         const auto paths = fixture.value("deltas", std::vector<std::string>{argv[3]});
         require(!paths.empty(), "missing check deltas");
+        hybrid::delta_import pending;
+        std::vector<llama_token> committed;
         for (const auto & path : paths) {
-            const auto delta = hybrid::read_delta(read_file(path.c_str()), model_hash, n);
+            const auto wire = read_file(path.c_str());
+            const auto delta = hybrid::read_delta(wire, model_hash, n);
             const int64_t n1 = delta.header.at("n1");
             require(n1 <= int64_t(tokens.size() - 1), "check delta endpoint mismatch");
             require(delta.header.at("tokens").get<std::vector<llama_token>>() ==
                     std::vector<llama_token>(tokens.begin() + n, tokens.begin() + n1), "check delta tokens mismatch");
             require(delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "check prefix mismatch");
-            require(llama_state_seq_set_data_append(imported.get(), reinterpret_cast<const uint8_t *>(delta.state.data()),
-                    delta.state.size(), 0, n, n1) == delta.state.size(), "check delta import failed");
+            const bool final = pending.stage(imported.get(), 0, wire, model_hash, delta.header.at("session_id").get<std::string>(), committed, ctx, vocab);
+            if (final) {
+                pending.apply(imported.get(), 0);
+                committed = pending.imported_tokens();
+                pending.clear();
+            }
             hybrid::prefill(split.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
             const auto repeat_start = std::chrono::steady_clock::now();
             hybrid::prefill(repeat.get(), {tokens.begin() + n, tokens.begin() + n1}, n);
@@ -548,12 +568,15 @@ int main(int argc, char ** argv) {
             split_ends.insert(split_ends.end(), ends.begin(), ends.end());
             n = n1;
         }
-        require(n == int64_t(tokens.size() - 1), "incomplete check chain");
-        split_ends.push_back(tokens.size());
-        hybrid::prefill(imported.get(), {tokens.back()}, n);
-        hybrid::prefill(split.get(), {tokens.back()}, n);
+        require(committed.size() == size_t(n), "missing final check chunk");
+        require(n == fixture.value("local_tail_start", int64_t(tokens.size() - 1)) && n < int64_t(tokens.size()), "incomplete check chain");
+        const auto tail_ends = boundaries(tokens.size(), 256, n);
+        split_ends.insert(split_ends.end(), tail_ends.begin(), tail_ends.end());
+        const std::vector<llama_token> tail(tokens.begin() + n, tokens.end());
+        hybrid::prefill(imported.get(), tail, n);
+        hybrid::prefill(split.get(), tail, n);
         const auto repeat_start = std::chrono::steady_clock::now();
-        hybrid::prefill(repeat.get(), {tokens.back()}, n);
+        hybrid::prefill(repeat.get(), tail, n);
         repeat_seconds += seconds_since(repeat_start);
         hybrid::prefill(whole.get(), tokens, 0);
         hybrid::prefill(free_whole.get(), tokens, 0);

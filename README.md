@@ -3,6 +3,12 @@
 
 Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_CURL=OFF`, then build the named targets listed in the [node guide](tools/hybrid/README.md). The [M1 operator guide](tools/hybrid-bench/README.md) provides deployment, client setup and benchmark commands; its launchers always disable the unused UI download.
 
+## Prototype tools
+
+The [vLLM bridge guide](tools/hybrid-vllm/README.md) lists the Python exporter/converter, native CPU reader test, exact entry points and `.temp/` artifact locations. Its [design](tools/hybrid-vllm/DESIGN.md) contains the GPU-host plan; only CPU conversion and synthetic native import are qualified here.
+
+The [vLLM node protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [B300 node runbook](tools/hybrid-vllm/GPU-NODE-RUNBOOK.md) cover the HTTP adapter, aligned exports, local decoder tails and supervised deployment. Live CUDA extraction and heterogeneous numerical equivalence remain qualification gates.
+
 Mirai S trellis support is ported from [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s); see [format and provenance](tools/mirai-s/README.md). CPU and CUDA kernels are included; Metal is unsupported.
 
 Mirai prototype tools (CPU checks use existing local headers and never download weights):
@@ -127,7 +133,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [cli](tools/cli/README.md)
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
-- [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay and test commands; artifacts in `.temp/hybrid-b-r1-261030/`
+- [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay, captured-template tests, external Jinja2 oracle and mutation controls; exact commands in the linked guide, artifacts in `.temp/<run>/`, oracle sources via `HYBRID_TEMPLATE_FIXTURES`
 - [hybrid benchmark prototype](tools/hybrid-bench/README.md#tools-and-trace-contract) - Deployment, benchmark, tests and cleanup controls with exact commands and artifact locations
 - [GBNF grammars](grammars/README.md)
 
@@ -164,8 +170,15 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 The local CPU prefill node, shared state-delta codec, correctness checker, and HTTP isolation tests are documented in [tools/hybrid/README.md](tools/hybrid/README.md), including exact CMake, flock, Python and run commands. Binaries go to `build/bin/`; logs and task-local tools go to `.temp/`; golden state fixtures go to `~/Werkstatt/hybrid-models/golden/`.
 
+Sliding-window transfer for Gemma 4 and Muse Glimmer is described in [SWA-STATE-DESIGN.md](tools/hybrid/SWA-STATE-DESIGN.md). Build `llama-hybrid-check-swa` with the locked named-target command in the node guide, then run `nice -n 19 build/bin/llama-hybrid-check-swa` for model-free allocated-cache tests. Logs belong under `.temp/`; real-model GPU qualification commands are in the [r16 report](tools/hybrid-bench/RESULTS-hybrid-a-r16-261101.md).
+
 Reference-model teacher-forced scoring uses `build/bin/llama-hybrid-score` and `python3 tools/hybrid-bench/hybrid_bench.py reference`. Exact build/run/test commands and output paths are in the [benchmark operator guide](tools/hybrid-bench/README.md#reference-model-teacher-forced-scoring). References and logs belong in private task directories under `.temp/`; sanitized measurements are written to the requested JSON result and benchmark bundle.
 
 Growing-session experiments use `python3 tools/hybrid-bench/growing_session.py`; the [scenario/trace schema and CPU, CUDA and Mac commands](tools/hybrid-bench/GROWING-SESSION.md) document all outputs under a task's `.temp/` directory, live-state checkpoint checks and current qualification gates. The model-free snapshot streaming regression is `python3 tools/hybrid-bench/test_snapshot_stream.py -v`; temporary state goes under the on-disk `TMPDIR` and is removed after the test.
 
 Growing-session qualification always captures private state-path controls; `--state-probes` remains an accepted compatibility flag. It captures the live node's authenticated snapshots and deltas beside the trace and compares native restore, range roundtrips, append-chain replay, and separate attention/recurrent replacements. R41 gates all ten exact replay/component controls and L-H top-1>=63/64. L-H KL/p95/max/free divergence and the per-statistic fidelity_flag against schedule noise remain report-only; heterogeneous runs stay exit 5.
+Delta import profiling uses `python3 tools/hybrid/profile_import.py` and `build/bin/llama-hybrid-check-client --identity`; commands and output locations are in the [import profiling guide](tools/hybrid/README.md#import-profiling).
+
+Combined SWA layout and final-state chunk CPU qualification, invariant checks and exact GPU operator commands are in [the r27 report](tools/hybrid/RESULTS-hybrid-a-r27-261101.md).
+
+The vLLM node adapter uses the same HYBD v2 final-state chunk protocol with exact aligned exports, local tails and borrowed native-body readers; see its [protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [r11 merge evidence](tools/hybrid-vllm/RESULTS-hybrid-d-r7-261101.md#r11-third-main-merge-after-pr-15). CPU adapter/converter checks use a temporary NumPy-only venv; commands and artifacts are in the [adapter tools guide](tools/hybrid-vllm/README.md#tools).

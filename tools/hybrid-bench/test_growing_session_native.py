@@ -109,6 +109,56 @@ def preflight_controls(state, root, config):
         print('PASS preflight ' + name + ': exit2, zero arm calls', flush=True)
 
 
+
+def chunk_replay_controls(build, model, output, tokens, extends):
+    root = output / 'chunk-replay'
+    root.mkdir(mode=0o700)
+    end = extends[-1]['n1']
+    tokens = tokens[:end + 1]
+    schedule = [dict(n0=e['n0'], n1=e['n1'], logits=True) for e in extends]
+    tail = dict(decode=[dict(n0=end, n1=len(tokens), logits=True)])
+    steps = [dict(delta=e['node_delta']['path'], sha256=e['node_delta']['sha256']) for e in extends]
+    fixture = dict(tokens=tokens, k=1, max_ctx=4096, model_sha256=sha256(model), backend='cpu',
+                   replay={name: schedule + tail['decode'] for name in ('A', 'B1', 'B2', 'B')})
+    corrupt = root / 'corrupt.delta'
+    wire = bytearray(Path(steps[0]['delta']).read_bytes())
+    wire[-1] ^= 1
+    corrupt.write_bytes(wire)
+    corrupt.chmod(0o600)
+    # A complete final-state transfer matches native node replay; missing, interrupted and corrupt transfers refuse without a result.
+    cases = [('complete', steps + [tail], None),
+             ('missing-final', steps[:-1], 'missing final state probe chunk'),
+             ('decode-before-final', steps[:-1] + [tail], 'missing final state probe chunk'),
+             ('corrupt', [dict(delta=str(corrupt), sha256=sha256(corrupt))] + steps[1:] + [tail], 'delta checksum mismatch')]
+    commands = []
+    try:
+        for name, plan, reason in cases:
+            source, result = root / (name + '.json'), root / (name + '.result.json')
+            private_json(source, dict(fixture, probes=[dict(name='CHAIN', steps=plan)]))
+            command = [str(build / 'bin/llama-hybrid-bench-check'), str(model), str(source),
+                       steps[0]['delta'], str(result), '0']
+            with (root / (name + '.log')).open('wb') as log:
+                process = subprocess.Popen(command, stdout=log, stderr=log)
+                (root / (name + '.pid')).write_text(str(process.pid) + '\n')
+                try:
+                    code = process.wait()
+                finally:
+                    stop_process(process)
+            commands.append(dict(name=name, command=command, pid=process.pid, exit_code=code))
+            private_json(root / (name + '.command.json'), commands[-1])
+            require(code == (2 if reason else 0), name + ': wrong chunk replay verdict')
+            if reason:
+                require(reason in (root / (name + '.log')).read_text() and not result.exists(),
+                        name + ': unrelated chunk replay refusal')
+            else:
+                score = json.loads(result.read_text())['probes']['CHAIN']['B']
+                require(score['exact'] and score['top1_agreed'] == 1 and score['max_abs_logit_diff'] == 0 and
+                        score['free_running_first_divergence'] == -1, 'complete chunk replay differs from node replay')
+            print('PASS chunk replay ' + name + ': exit ' + str(code), flush=True)
+    finally:
+        corrupt.unlink(missing_ok=True)
+
+
 def multi_chunk_prestage(build, model, root, config):
     output = root / 'multi-chunk'
     output.mkdir(mode=0o700)
@@ -126,8 +176,11 @@ def multi_chunk_prestage(build, model, root, config):
         def ordered(node, method, path, data=None, headers=None, binary=False):
             if path.endswith('/extend') and data.get('return_delta'):
                 info = original('GET', '/slots/0/info')
-                require(info['n'] == data['n0'] and info['prefix_hash'] == data['prefix_hash_n0'],
-                        'next chunk requested before matching local acknowledgement')
+                committed = data['transfer_n0']
+                journal = app.store.get('multi-chunk-prestage')['tokens']
+                require(info['n'] == committed and info['tokens'] == journal[:committed] and
+                        info['prefix_hash'] == prefix_hash(journal[:committed]),
+                        'non-final chunk changed the committed native prefix')
             return remote_request(node, method, path, data, headers, binary)
         def observed(method, path, data=None, headers=None, binary=False):
             result = original(method, path, data, headers, binary)
@@ -140,7 +193,7 @@ def multi_chunk_prestage(build, model, root, config):
                 meters = []
                 sid = 'multi-chunk-prestage'
                 for turn in (0, 1):
-                    # Actual native imports must be acknowledged at n1 before any later chunk is requested.
+                    # Non-final chunks stay staged; only the final chunk commits the complete transfer.
                     body = dict(messages=messages, max_tokens=1, temperature=0, ignore_eos=True,
                                 chat_template_kwargs=dict(enable_thinking=False))
                     start = len(events.copy())
@@ -148,16 +201,15 @@ def multi_chunk_prestage(build, model, root, config):
                         sid, answer, meter, _, _ = stream_chat(url, config['client_credential'], body, 'offload', sid, 120)
                     meters.append(meter)
                     chunks = meter['chunks']
-                    require(len(chunks) >= (3 if turn == 0 else 1) and all(c['status'] == 'imported' for c in chunks),
+                    require(len(chunks) >= (3 if turn == 0 else 1) and [c['status'] for c in chunks] == ['staged'] * (len(chunks) - 1) + ['imported'],
                             'multi-chunk pre-stage or subsequent offload did not import every chunk')
                     require(meter['fallback_reason'] is None and meter['local_evaluated'] == 1,
                             'chunk failure was hidden by local fallback')
                     session = app.store.get(sid)
                     prompt = session['tokens']
-                    for chunk in chunks:
-                        require(any(a['n'] == chunk['n1'] and a['tokens'] == prompt[:chunk['n1']] and
-                                    a['prefix_hash'] == prefix_hash(prompt[:chunk['n1']]) for a in applied),
-                                'chunk was not acknowledged at its own position')
+                    require(any(a['n'] == chunks[-1]['n1'] and a['tokens'] == prompt[:chunks[-1]['n1']] and
+                                a['prefix_hash'] == prefix_hash(prompt[:chunks[-1]['n1']]) for a in applied),
+                            'final chunk did not commit the complete token journal')
                     session = app.store.get(sid)
                     require(original('GET', f"/slots/{session['slot']}/info")['tokens'] == session['tokens'],
                             'native journal mismatch')
@@ -171,8 +223,10 @@ def multi_chunk_prestage(build, model, root, config):
                     extends = [e for e in events.copy()[start:] if e.get('n1') is not None and not e.get('catchup')]
                     require(len(extends) == len(chunks) and all(e['status'] == 'ok' and 'node_snapshot' in e for e in extends),
                             'missing per-chunk live snapshot capture')
+                    if turn == 0:
+                        chunk_replay_controls(build, model, output, session['tokens'], extends)
                     messages += [answer, dict(role='user', content=' x' * 80)]
-                    print('PASS native multi-chunk turn ' + str(turn) + ': ' + str(len(chunks)) + ' verified imports', flush=True)
+                    print('PASS native multi-chunk turn ' + str(turn) + ': ' + str(len(chunks)) + ' chunks, one atomic commit', flush=True)
                 # Force the real ahead-state recovery branch after a lost import, with a matching prompt boundary.
                 with app.reserve(sid):
                     session = app.store.get(sid)

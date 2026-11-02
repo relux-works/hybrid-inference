@@ -18,6 +18,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "hybrid-state.h"
+#include "llama-io.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -261,6 +262,7 @@ struct server_batch {
 
 struct server_slot {
     int id;
+    hybrid::delta_import hybrid_import;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -423,6 +425,7 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void reset() {
+        hybrid_import.clear();
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -3253,42 +3256,33 @@ private:
                             throw std::runtime_error("Slot token and memory positions differ; context shifting is unsupported");
                         }
                         if (task.type == SERVER_TASK_TYPE_SLOT_IMPORT_DELTA) {
+                            hybrid::require_supported_architecture(llama_get_model(ctx_tgt));
                             if (hybrid_model_hash.empty()) {
                                 throw std::runtime_error("Hybrid model hash was not initialized at startup");
                             }
-                            auto delta = hybrid::read_delta(task.slot_action.delta, hybrid_model_hash, n);
-                            if (delta.header.at("session_id") != task.slot_action.session_id) {
-                                throw std::runtime_error("Delta session mismatch");
-                            }
-                            auto suffix = delta.header.at("tokens").get<llama_tokens>();
-                            const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
-                            for (auto token : suffix) {
-                                if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
-                                    throw std::runtime_error("Delta token outside vocabulary");
+                            if (task.slot_action.abort_delta) {
+                                slot->hybrid_import.clear();
+                            } else {
+                                const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+                                const bool final = slot->hybrid_import.stage(ctx_tgt, slot->id, std::move(task.slot_action.delta), hybrid_model_hash,
+                                        task.slot_action.session_id, tokens, slot->n_ctx, llama_vocab_n_tokens(vocab));
+                                if (final) {
+                                    auto imported_tokens = slot->hybrid_import.imported_tokens();
+                                    server_tokens imported(imported_tokens, false);
+                                    slot->hybrid_import.apply(ctx_tgt, slot->id);
+                                    slot->prompt.clear();
+                                    slot->prompt.tokens = std::move(imported);
+                                    tokens = std::move(imported_tokens);
+                                    slot->hybrid_import.clear();
                                 }
                             }
-                            if (tokens.size() > (size_t) slot->n_ctx || suffix.size() > (size_t) slot->n_ctx - tokens.size()) {
-                                throw std::runtime_error("Delta exceeds slot context");
-                            }
-                            tokens.insert(tokens.end(), suffix.begin(), suffix.end());
-                            if (hybrid::prefix_hash(tokens) != delta.header.at("prefix_hash_n1")) {
-                                throw std::runtime_error("Delta prefix hash mismatch");
-                            }
-                            // Allocate token bookkeeping before mutating memory.
-                            server_tokens imported(tokens, false);
-                            if (llama_state_seq_set_data_append(ctx_tgt,
-                                    reinterpret_cast<const uint8_t *>(delta.state.data()), delta.state.size(),
-                                    slot->id, n, delta.header.at("n1").get<llama_pos>()) != delta.state.size()) {
-                                throw std::runtime_error("Native delta append rejected; slot preserved");
-                            }
-                            slot->prompt.clear();
-                            slot->prompt.tokens = std::move(imported);
                         }
                         auto res = std::make_unique<server_task_result_slots>();
                         res->id = task.id;
                         res->slots_data = {{"n", tokens.size()}, {"prefix_hash", hybrid::prefix_hash(tokens)}, {"tokens", tokens}};
                         queue_results.send(std::move(res));
                     } catch (const std::exception & err) {
+                        slot->hybrid_import.clear();
                         send_error(task, err.what(), ERROR_TYPE_INVALID_REQUEST);
                     }
                 } break;
@@ -3369,6 +3363,7 @@ private:
                         break;
                     }
 
+                    slot->hybrid_import.clear();
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -3438,6 +3433,7 @@ private:
                         break;
                     }
 
+                    slot->hybrid_import.clear();
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
@@ -4275,10 +4271,8 @@ private:
 
                             // the first evaluated token attends to the positions > pos_eval - n_swa, so a SWA state
                             // starting at pos_eval - n_swa + 1 is enough, while a state without SWA must end before pos_eval
-                            const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
-
                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+                            const auto pos_min_thold = server_prompt_reuse_threshold(pos_next, n_swa, has_new_tokens);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -5917,7 +5911,7 @@ void server_routes::init_routes() {
     };
 
     this->post_slots = [this](const server_http_req & req) {
-        if (req.get_param("action") == "import_delta") {
+        if (req.get_param("action") == "import_delta" || req.get_param("action") == "abort_delta") {
             return handle_slot_delta(req, false);
         }
         auto res = create_response();
@@ -6870,7 +6864,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
         res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
-    if (!info && (req.body.empty() || req.body.size() > hybrid::max_delta_body_bytes + hybrid::max_delta_header_bytes + 52)) {
+    const bool abort = !info && req.get_param("action") == "abort_delta";
+    if (!info && !abort && (req.body.empty() || req.body.size() > hybrid::max_delta_body_bytes + hybrid::max_delta_header_bytes + 52)) {
         res->error(format_error_response("Invalid delta size", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -6878,7 +6873,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
     task.id = res->rd.get_new_id();
     task.slot_action.id_slot = id_slot;
     if (!info) {
-        task.slot_action.delta = req.body;
+        {
+            llama_io_timer timer("task_copy", req.body.size());
+            task.slot_action.delta = req.body;
+        }
+        task.slot_action.abort_delta = abort;
         for (const auto & header : req.headers) {
             std::string name = header.first;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -6886,7 +6885,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
                 task.slot_action.session_id = header.second;
             }
         }
-        if (task.slot_action.session_id.empty()) {
+        if (!abort && task.slot_action.session_id.empty()) {
             res->error(format_error_response("X-Hybrid-Session is required for delta import", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }

@@ -24,7 +24,8 @@ class BenchmarkProxyTests(unittest.TestCase):
         from pathlib import Path
         config = dict(self.fixture.config)
         config['policy'] = dict(kv_bytes=1, state_bytes=0)
-        for geometry in ({}, dict(kv_bytes=6528, state_bytes=20201472)):
+        for geometry in ({}, dict(kv_bytes=6528, state_bytes=20201472),
+                         dict(kv_bytes=272, state_bytes=0, window_bytes=500 * 1024**2)):
             safe = extend_chunk_limit(**geometry)
             config['delta_geometry'] = geometry
             with tempfile.TemporaryDirectory() as directory:
@@ -159,18 +160,18 @@ class BenchmarkProxyTests(unittest.TestCase):
         self.assertTrue(current['offload'])
         self.assertEqual(current['tokens'], durable + [9, 10, 901, 902])
         new_path = '/v1/sessions/' + current['remote_id']
-        self.assertEqual(events[0][:2], ('GET', old_path))
-        self.assertEqual(events[0][3], 404)
-        self.assertEqual(events[1][:2], ('POST', '/v1/sessions'))
-        self.assertEqual(events[1][3], 200)
-        self.assertEqual(events[2][:2], ('GET', new_path))
-        self.assertEqual(events[2][3], 200)
+        self.assertEqual([(event[0], event[1], event[3]) for event in events[:5]], [
+            ('GET', '/v1/health', 200), ('GET', old_path, 404),
+            ('GET', '/v1/health', 200), ('POST', '/v1/sessions', 200), ('GET', new_path, 200)])
         extends = [event for event in events if event[1].endswith('/extend')]
+        transfer = extends[-1][2]['transfer_id']
+        self.assertRegex(transfer, r'^[0-9a-f]{32}$')
         self.assertEqual(extends, [
             ('POST', new_path + '/extend', dict(n0=0, prefix_hash_n0=prefix_hash([]),
                 tokens=durable, return_delta=False), 202),
             ('POST', new_path + '/extend', dict(n0=len(durable), prefix_hash_n0=prefix_hash(durable),
-                tokens=[9], return_delta=True), 200)])
+                tokens=[9], return_delta=True, delta_version=2, transfer_id=transfer,
+                transfer_n0=len(durable), transfer_n1=len(durable) + 1, chunk_index=0, chunk_count=1), 200)])
         self.assertEqual(events[-1], ('import', current['remote_id']))
         fixture.app.replay()
         fixture.app.replay()
@@ -207,7 +208,192 @@ class ChunkAndLifecycleTests(unittest.TestCase):
     setUp = BenchmarkProxyTests.setUp
     tearDown = BenchmarkProxyTests.tearDown
 
-    # Three sequential imports preserve exact tokens and a middle rejection retains a usable verified prefix.
+    # A fresh database reader between chunks sees only committed state; staging cannot drop live turn checkpoints.
+    def test_staged_chunks_do_not_persist_applied_state_or_drop_checkpoints(self):
+        from pathlib import Path
+        from store import Store
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        original = fixture.app.store.get(sid)
+        fixture.app.extend_chunk_tokens = 2
+        owner = fixture.config['clients']['fixture-a']
+        backup = sid + '-test-prefix.bin'
+        fixture.app.decode.request('POST', f"/slots/{original['slot']}?action=save", dict(filename=backup))
+        for journal_turn in (False, True):
+            fixture.app.store.save(original)
+            session = dict(original, remote_id=None, remote_n=0)
+            checkpoint = dict(n=len(original['tokens']), filename='existing-checkpoint.bin')
+            if journal_turn:
+                session['_turn'] = dict(checkpoints=[checkpoint])
+            observed = []
+            durable = []
+            remote = fixture.app.remote(owner)
+            dispatch = remote.request
+            def inspect_next_chunk(method, path, body=None, **kwargs):
+                if path.endswith('/extend') and body.get('return_delta'):
+                    restarted = Store(str(Path(fixture.temp.name) / 'proxy.sqlite'), fixture.app.model)
+                    try:
+                        persisted = restarted.get(sid)
+                    finally:
+                        restarted.close()
+                    if body['chunk_index'] == 0:
+                        durable.append(persisted['remote_n'])
+                    self.assertEqual(persisted['tokens'], original['tokens'])
+                    self.assertEqual(persisted['remote_n'], durable[0])
+                    self.assertEqual(session['_remote_applied'], 0)
+                    if journal_turn:
+                        self.assertEqual(session['_turn']['checkpoints'], [checkpoint])
+                    if body['chunk_index'] > 0:
+                        observed.append(body['chunk_index'])
+                return dispatch(method, path, body, **kwargs)
+            with mock.patch.object(fixture.app, 'remote', return_value=remote), mock.patch.object(remote, 'request', side_effect=inspect_next_chunk):
+                fixture.app.prepare_session(owner, {}, session, original['tokens'] + list(range(20, 27)))
+            self.assertEqual(observed, [1, 2])
+            self.assertEqual(session['_remote_applied'], 6)
+            if journal_turn:
+                self.assertEqual(session['_turn']['checkpoints'], [])
+            fixture.app.decode.request('POST', f"/slots/{session['slot']}?action=restore",
+                                       dict(filename=backup))
+
+    # For several interrupted prefixes, fallback starts from the original slot and the staged host bytes are discarded.
+    def test_interruption_preserves_slot_before_fallback(self):
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        fixture.app.extend_chunk_tokens = 2
+        original = fixture.app.store.get(sid)
+        owner = fixture.config['clients']['fixture-a']
+        before = fixture.app.decode.request('GET', f"/slots/{original['slot']}/info")
+        before.pop('last_used')
+        dispatch = fixture.prefill.app.handle
+        for k in (1, 2, 3):
+            # Use a new remote after each interrupted attempt; its acknowledged prefix may be ahead locally.
+            session = dict(original, remote_id=None, remote_n=0)
+            calls = []
+            def fail_after_k(method, path, query, body, client):
+                if path.endswith('/extend') and body.get('return_delta'):
+                    calls.append(body['n0'])
+                    if len(calls) == k + 1:
+                        return 503, {'error': 'ram budget'}
+                return dispatch(method, path, query, body, client)
+            with mock.patch.object(fixture.prefill.app, 'handle', side_effect=fail_after_k):
+                fixture.app.prepare_session(owner, {}, session, original['tokens'] + list(range(20, 29)))
+            actual = fixture.app.decode.request('GET', f"/slots/{session['slot']}/info")
+            actual.pop('last_used')
+            self.assertEqual(actual, before)
+            self.assertEqual(session['_remote_applied'], 0)
+            self.assertEqual(session['_bench']['fallback_reason'], 'ram_budget')
+            self.assertNotIn(session['slot'], fixture.decode.app.pending)
+
+    # A final import that commits but loses its acknowledgement is restored before fallback, with no partial application counted.
+    def test_lost_final_ack_restores_original_slot(self):
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        session = fixture.app.store.get(sid)
+        fixture.app.extend_chunk_tokens = 2
+        before = fixture.app.decode.request('GET', f"/slots/{session['slot']}/info")
+        before.pop('last_used')
+        dispatch = fixture.app.decode.request
+        seen = []
+        def lose_final(method, path, data=None, headers=None, **kwargs):
+            result = dispatch(method, path, data, headers, **kwargs)
+            if 'action=import_delta' in path:
+                import struct
+                size, = struct.unpack('<I', data[:4])
+                header = json.loads(data[4:4 + size])
+                if header['fixed_state']:
+                    seen.append(result)
+                    raise OSError('lost final acknowledgement')
+            return result
+        with mock.patch.object(fixture.app.decode, 'request', side_effect=lose_final):
+            fixture.app.prepare_session(fixture.config['clients']['fixture-a'], {}, session,
+                                        session['tokens'] + list(range(20, 29)))
+        self.assertEqual(len(seen), 1)
+        self.assertGreater(seen[0]['n'], before['n'])
+        actual = fixture.app.decode.request('GET', f"/slots/{session['slot']}/info")
+        actual.pop('last_used')
+        self.assertEqual(actual, before)
+        self.assertEqual(session['_remote_applied'], 0)
+        self.assertEqual(session['_bench']['fallback_reason'], 'transport')
+        self.assertFalse(list(fixture.app.slot_path.glob('*-delta-backup.bin')))
+
+    # Unconfirmed restore keeps the recovery file, detaches the slot and makes the existing reuse gate reject its native cache.
+    def test_lost_final_ack_restore_failure_retains_recovery(self):
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        session = fixture.app.store.get(sid)
+        owner = fixture.config['clients']['fixture-a']
+        dispatch = fixture.app.decode.request
+        def fail_restore(method, path, data=None, headers=None, **kwargs):
+            if 'action=restore' in path:
+                raise HTTPError(503)
+            result = dispatch(method, path, data, headers, **kwargs)
+            if 'action=import_delta' in path:
+                raise OSError('lost final acknowledgement')
+            return result
+        with mock.patch.object(fixture.app.decode, 'request', side_effect=fail_restore):
+            with self.assertRaises(HTTPError) as error:
+                fixture.app.prepare_session(owner, {}, session, session['tokens'] + [20, 21, 22])
+        self.assertEqual(error.exception.status, 503)
+        self.assertIsNone(fixture.app.store.get(sid)['slot'])
+        self.assertFalse(fixture.app.verified(sid))
+        self.assertTrue((fixture.app.slot_path / (sid + '-delta-backup.bin')).is_file())
+        fixture.app.acquire_slot(session)
+        self.assertEqual(dispatch('GET', f"/slots/{session['slot']}/info")['tokens'], [])
+
+    # Recovery-file cleanup failure cannot turn an acknowledged final import into a reported transfer failure.
+    def test_committed_delta_cleanup_error_keeps_success(self):
+        from pathlib import Path
+        fixture = self.fixture
+        sid, _ = fixture.chat([10, 11, 12, 13])
+        session = fixture.app.store.get(sid)
+        unlink = Path.unlink
+        def retain_backup(path, *args, **kwargs):
+            if path.name.endswith('-delta-backup.bin'):
+                raise OSError('cleanup unavailable')
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', retain_backup):
+            fixture.app.prepare_session(fixture.config['clients']['fixture-a'], {}, session, session['tokens'] + [20, 21, 22])
+        self.assertGreater(session['_remote_applied'], 0)
+        self.assertIsNone(session['_bench']['fallback_reason'])
+        self.assertTrue((fixture.app.slot_path / (sid + '-delta-backup.bin')).is_file())
+
+    # An old node is refused before session creation or delta production; the original slot remains usable.
+    def test_mixed_node_version_refuses_before_extend(self):
+        fixture = self.fixture
+        dispatch = fixture.prefill.app.handle
+        def old_health(method, path, *args):
+            status, value = dispatch(method, path, *args)
+            if path == '/v1/health':
+                value.pop('delta_version', None)
+            return status, value
+        fixture.app.extend_chunk_tokens = 2
+        with mock.patch.object(fixture.prefill.app, 'handle', side_effect=old_health):
+            with self.assertRaises(HTTPError) as error:
+                fixture.chat([1, 2, 3, 4])
+        self.assertEqual(error.exception.status, 412)
+        self.assertIn(b'protocol 2', error.exception.body)
+        self.assertEqual(fixture.decode.app.imports, 0)
+        self.assertEqual(fixture.prefill.app.db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0], 0)
+
+    # A version-1 wire is refused even if node health advertises version 2; the valid wire remains accepted.
+    def test_mixed_wire_version_refuses_before_import(self):
+        import struct
+        from stub_server import encode_delta, MODEL
+        fixture = self.fixture
+        valid = encode_delta(MODEL, 'version-control', [], [1])
+        self.assertEqual(fixture.app.client_delta(valid), valid)
+        size, = struct.unpack('<I', valid[:4])
+        header = json.loads(valid[4:4 + size])
+        header['version'] = 1
+        encoded = json.dumps(header).encode()
+        old = struct.pack('<I', len(encoded)) + encoded + valid[4 + size:]
+        with self.assertRaises(HTTPError) as error:
+            fixture.app.client_delta(old)
+        self.assertEqual(error.exception.status, 412)
+        self.assertIn('protocol 2', str(error.exception))
+        self.assertEqual(fixture.decode.app.imports, 0)
+
+    # Chunks commit only at the end; a middle rejection preserves the pre-transfer slot before local fallback.
     def test_chunks_and_middle_failure(self):
         fixture = self.fixture
         fixture.app.extend_chunk_tokens = 2
@@ -234,7 +420,7 @@ class ChunkAndLifecycleTests(unittest.TestCase):
                 pass
             second = fixture.app.store.get(session['id'])
             self.assertEqual(result['hybrid_bench']['fallback_reason'], 'ram_budget')
-            self.assertEqual([c['status'] for c in result['hybrid_bench']['chunks']], ['imported', 'requested'])
+            self.assertEqual([c['status'] for c in result['hybrid_bench']['chunks']], ['staged', 'requested'])
         self.assertEqual(len(calls), 2)
         self.assertGreater(fixture.decode.app.imports, before_imports)
         fixture.app.replay()
@@ -325,6 +511,7 @@ class ChunkAndLifecycleTests(unittest.TestCase):
 
     # Different model bytes require explicit matching layout admission; mismatches never reach native import.
     def test_heterogeneous_identity_bridge(self):
+        # Matching layouts permit rebinding; mismatches refuse before changing the decoder slot.
         fixture = self.fixture
         config = dict(fixture.config, node_model_sha256='2' * 64)
         with self.assertRaisesRegex(ValueError, 'sha256 mismatch'):

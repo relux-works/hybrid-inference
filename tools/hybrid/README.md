@@ -21,7 +21,7 @@ flock "$LOCK" "$CMAKE" -S . -B build -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_U
 df -B1 --output=avail .
 du -sb build
 # JOBS=2 keeps a shared host responsive; use JOBS=$(nproc) on a dedicated one.
-flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-hash llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-server
+flock "$LOCK" "$CMAKE" --build build -j"${JOBS:-2}" --target llama-hybrid-prefill llama-hybrid-check llama-hybrid-check-hash llama-hybrid-check-append llama-hybrid-check-guards llama-hybrid-check-distributions llama-hybrid-check-client llama-hybrid-check-codec llama-hybrid-check-swa llama-server
 du -sb build
 ```
 
@@ -29,7 +29,7 @@ du -sb build
 
 Native startup always computes SHA-256 over the entire model file. No cached or supplied digest is trusted. macOS keeps system CommonCrypto. On other x86-64 GCC/Clang builds, SHA-NI compresses whole blocks when CPUID reports SHA, SSSE3 and SSE4.1; a function-level target attribute leaves build flags unchanged. Other CPUs and compilers use the vendored SHA-256. `HYBRID_HASH_PORTABLE=1` forces the vendor path, including on macOS; other values leave automatic dispatch enabled. The SHA-NI path shares the vendor context and finalizer. Every backend retains the 64 KiB default read buffer and existing read-error checks.
 
-`llama-hybrid-check-hash FILE [UPDATE_BYTES | --file-chunk READ_BYTES]` prints JSON with the digest, file size, elapsed hash time, decimal MB/s and observed `backend` (`sha-ni`, `portable`, `commoncrypto` or `portable-stream`). Without a chunk argument it calls the startup hash function. `--file-chunk` (1..65536) tests fragmented native reads on the selected backend. The existing positional chunk (1..1048576) still exercises portable vendor streaming with unaligned input and empty updates. `test_file_hash.py` and its hashlib/sha256sum references are unchanged; its optional model stays read-only. `test_file_hash_ni.py` adds fixed NIST answers, non-periodic random data at every block boundary through 300000 bytes, odd native reads, a sparse 4 GiB + 65 byte fixture, observed dispatch and negative cases on both backends. Fixtures under `.temp/` are removed after each test. Retain logs in a task-scoped `.temp/` directory.
+`llama-hybrid-check-hash FILE [UPDATE_BYTES | --file-chunk READ_BYTES]` prints JSON with the digest, file size, elapsed hash time, decimal MB/s and observed `backend` (`sha-ni`, `portable`, `commoncrypto` or `portable-stream`). Without a chunk argument it calls the startup hash function. `--file-chunk` (1..65536) tests fragmented native reads on the selected backend. The existing positional chunk (1..1048576) still exercises portable vendor streaming with unaligned input and empty updates. `test_file_hash.py` uses hashlib and sha256sum (or shasum on macOS) as references; its optional model stays read-only. `test_file_hash_ni.py` adds fixed NIST answers, non-periodic random data at every block boundary through 300000 bytes, odd native reads, a sparse 4 GiB + 65 byte fixture, observed dispatch and negative cases on both backends. Fixtures under `.temp/` are removed after each test. Retain logs in a task-scoped `.temp/` directory.
 
 ```sh
 mkdir -p .temp/hash-check
@@ -74,7 +74,7 @@ Every authenticated session request takes a permit before entering the model sch
 
 `hybrid-state` is the shared CMake library. Include `hybrid-state.h`. `hybrid::encode_delta(header, native_state)` writes an envelope; `hybrid::read_delta(wire, expected_model_sha256, expected_n0)` checks it and returns `.header` and `.state`. Token IDs are available as `result.header.at("tokens").get<std::vector<llama_token>>()`. The import caller must validate the token-derived prefix and native layer layout before admitting a delta to its slot. `hybrid::prefix_hash(tokens)` is SHA-256 of little-endian signed-int32 token IDs.
 
-The wire begins with a 4-byte little-endian JSON byte count (at most `min(1048576, 4096 + 11*(n1-n0))`). JSON carries `magic="HYBD"`, `version=1`, `model_sha256`, `session_id`, `n0`, `n1`, `tokens` (IDs for [n0,n1)), `prefix_hash_n1`, `kv_type="q8_0"`, `state_dtype="f32"`, `body_format="llama-native-seq-v1"`, and `sections=[{name:"llama_seq_state",offset:0,bytes:N}]`. The body is exactly N bytes of pinned native sequence state: 0xaf143cd8 magic, source sequence ID, filtered attention serialization, complete recurrent serialization. Trailer: 16 canonical big-endian XXH3-128 bytes for that section, then 32 raw SHA-256 bytes of the body. Trailing bytes are rejected. The range is validated before computing its budget. The fixed 4096 bytes cover metadata; each nonnegative int32 token needs at most ten digits and one separator. `encode_delta_header(header, state_bytes)` validates this budget without exporting native state; the node preflights it using the largest body-size metadata before inference. Writer and reader enforce the same budget. The framing, fields, single section and checksums are unchanged. When integrating this codec, the decode endpoint must allow 1048576 header bytes in its outer envelope-length cap.
+The wire begins with a 4-byte little-endian JSON byte count (at most `min(1048576, 4096 + 11*(n1-n0))`). JSON carries `magic="HYBD"`, `version=2`, `model_sha256`, `session_id`, `n0`, `n1`, `tokens` (IDs for [n0,n1)), `prefix_hash_n1`, `kv_type="q8_0"`, `state_dtype="f32"`, `body_format="llama-native-chunks-v3"`, and `sections=[{name:"llama_seq_state",offset:0,bytes:N}]`. The body is exactly N bytes of pinned native sequence state: 0xaf143cd8 magic, source sequence ID, filtered attention serialization and, only in the final chunk, complete recurrent or physical SWA-window serialization. Transfer identity, range, index/count and `fixed_state` fields follow the final-state chunk protocol below. Trailer: 16 canonical big-endian XXH3-128 bytes for that section, then 32 raw SHA-256 bytes of the body. Trailing bytes are rejected. The range is validated before computing its budget. The fixed 4096 bytes cover metadata; each nonnegative int32 token needs at most ten digits and one separator. `encode_delta_header(header, state_bytes)` validates this budget without exporting native state; the node preflights it using the largest body-size metadata before inference. Writer and reader enforce the same budget. The framing, fields, single section and checksums are unchanged. When integrating this codec, the decode endpoint must allow 1048576 header bytes in its outer envelope-length cap.
 
 `llama_state_seq_get_data_range(ctx,dst,size,seq,p0,p1,flags)` in `src/llama-ext.h` returns a native range buffer, or its size when `dst == nullptr`. Flags must be zero. Positions satisfy `0 <= p0 < p1`, and `p1` must equal the current sequence endpoint. Historical recurrent endpoints are rejected. Export synchronizes the context and leaves its state unchanged.
 
@@ -114,6 +114,27 @@ build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.
 
 `check-append` compares 64 greedy tokens after import to an independent local prefill at the same partition. `check-guards` tests portable single-sequence restore and sliding-window rejection. `check-distributions` compares full-vocabulary teacher-forced probabilities against whole-prompt prefill. `check-client --capacity` tests rollback after validated input exhausts free KV cells; `--measure` reports one append and checks its resulting state outside the measured interval. `check-codec` covers the maximum token range and both header budgets.
 
+## Import profiling
+
+`python3 tools/hybrid/profile_import.py --help` describes the CPU and device replay tool. It uses the actual proxy `Node` receive/request methods and the actual decoder slot import route. Bodies stay in RAM; JSON timings, decoder logs and owned process records go to `--output`. `LLAMA_HYBRID_IMPORT_PROFILE=1` enables native stage timings. Timers are nested; tensor I/O includes backend waits. `HYBRID_HASH_PORTABLE=1` keeps the portable SHA-256 control. The normal path uses SHA-NI when CPUID permits it, CommonCrypto on Apple, and the portable implementation elsewhere. Both checksums still cover every body byte.
+
+```sh
+export TMPDIR="$PWD/.temp/import-profile/tmp" PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR"
+python3 tools/hybrid/profile_import.py --binary current=build/bin/llama-server \
+    --model ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf \
+    --golden ~/Werkstatt/hybrid-models/golden/prompt-512 \
+    --output .temp/import-profile/fresh
+build/bin/llama-hybrid-check-client ~/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf \
+    --identity ~/Werkstatt/hybrid-models/golden/prompt-512
+```
+
+`--identity` prints SHA-256 identities for every exported state byte and all vocabulary logits at 64 teacher-forced positions, for fresh and appended imports. Compare its `IDENTITY` records across builds. `import-profile-baseline.patch` adds only timers and this diagnostic command to pinned main `a25754271e19cfda2c44c702a52b752cb53cf623`; it preserves the original hashing and copy behavior. Apply it with `git apply --unidiff-zero` only to a separate baseline checkout, or with `git apply --3way --unidiff-zero` to main `528724c9`. [The r34/r35 report](RESULTS-hybrid-b-r34-261101.md) contains paired CPU measurements, limits, cleanup evidence and exact GPU/Mac commands.
+
+File and delta hashing share the internal `sha256_stream` update/finish API over the same vendor, SHA-NI and CommonCrypto state. `file_hash(path, read_bytes, backend)` retains its bounded read size and backend reporting. The hash reference tests use `sha256sum`, or macOS `shasum -a 256` when `sha256sum` is absent. `tools/hybrid-proxy/test_decode.py --reference-slot BASELINE/slots/imported.bin` additionally asserts every HTTP-imported slot byte against a separately built reference; keep the reference snapshot until candidate and mutant checks finish.
+
+`python3 tools/hybrid/test_import_identity.py --before BASELINE/bin/llama-hybrid-check-client --after CANDIDATE/bin/llama-hybrid-check-client --model MODEL.gguf --golden GOLDEN_STEM --artifacts .temp/import-identity` asserts cross-build equality and records commands, PIDs, binary hashes and native logs. Repeat `--model` and `--golden` to select more local fixtures. It downloads nothing; generic unittest discovery skips this opt-in test until explicit build/model arguments are supplied.
+
 ## Configurable-limit qualification
 
 Use a local small hybrid GGUF; no test downloads models. State dumps and private logs must stay in the chosen `.temp/` directory. The deep fixture is an explicit opt-in CPU test and can take substantially longer than the small regressions. For the identity control, add `llama-quantize` to the named targets in the locked incremental build above, then create a local Q8_0 copy with the command below. Re-quantization changes the file and storage precision; it does not recover information lost by the original quantization. The output stays at the selected local model-cache path.
@@ -135,3 +156,34 @@ build/bin/llama-hybrid-check-distributions "$MODEL" "$ARTIFACTS/deep/deep.tokens
 `test_limits.py` checks LRU replay, atomic impossible-budget rejection, concurrent snapshot/extend pinning, all-pinned refusal and disconnect release, inclusive request limits, invalid CLI arguments, and metrics. `--case identity` compares two actual local quantizations. `--case deep` writes the node's 39999-token delta plus a 40000-token prompt; the distribution checker imports that exact delta, checks independent same-partition 64/64 and teacher-forced whole-prompt KL/top-1, and reports free-running divergence. Existing golden continuations remain checked when present; a new HTTP fixture obtains its continuation from the imported context and compares it with independently computed references. Header fixtures accept an exact range/absolute byte budget and reject one byte over in both writer and reader. Long contexts use the largest bounded worst-case-ID chunk rather than assuming a whole context fits one header.
 
 Results and finite limits for the node-limits run are in [RESULTS-hybrid-a-r10-261031.md](RESULTS-hybrid-a-r10-261031.md). Hash and remove native state dumps after validation; keep only content-free numbers, manifests and logs for review.
+
+## Sliding-window models
+
+The prototype admits dense `qwen35`, `gemma4` and `muse-glimmer`; unknown architectures refuse. Gemma 4 and Muse Glimmer use full-attention range KV plus a replacement of the entire live sliding window, rather than recurrent state. [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) records upstream layout, shared layers, validation and rollback. Qwen35 version-1 fingerprints remain unchanged; SWA fingerprints also bind the window, layer masks, source-layer reuse and full/window head sizes. Native model SHA and experimental heterogeneous-quant rules are unchanged. Node contexts use reduced window allocations.
+
+Model-free allocated CPU-cache tests (positive, malformed positions, truncation, tensor layout and failed-apply rollback):
+
+```sh
+nice -n 19 build/bin/llama-hybrid-check-swa
+# Generate a tiny local GGUF, run CPU attention across window/ring boundaries, then remove the GGUF.
+mkdir -p .temp/swa-check
+nice -n 19 build/bin/llama-hybrid-check-swa .temp/swa-check/tiny.gguf
+HYBRID_SWA_CHECKER="$PWD/build/bin/llama-hybrid-check-swa" python3 tools/hybrid-bench/test_bench.py
+```
+
+The second command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. The native checker covers server architecture admission and rollback after a failed context post-check. These tests do not establish real-model or GPU logit equivalence. [The r17 section of the r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md#r17-rebase-and-review-notes) contains pinned rented-GPU commands and offline nextn/MTP inspection; no SWA model is available on this CPU host. Read the nextn/MTP limitations and proposed follow-up in [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) before provisioning a real file.
+
+### Final-state chunk protocol
+
+Node, proxy and decoder must all use HYBD protocol 2. Intermediate deltas contain full KV only; recurrent state or the final SWA window travels once in the last chunk. Slot info stays at the original prefix until that chunk commits. See [NODE-STATE-DESIGN.md](NODE-STATE-DESIGN.md#chunk-transaction-protocol-2).
+
+`build/bin/llama-hybrid-check-append MODEL --chunks` checks four-chunk byte equivalence, interrupted-prefix cells/state/logits and malformed chunk refusals on an existing CPU model. `build/bin/llama-hybrid-check-codec` prints exact synthetic 27B/40k wire arithmetic without loading a large model. `build/bin/llama-hybrid-check-swa` exercises the same chunk transaction on allocated Gemma/Glimmer window fixtures. HTTP and proxy checks are documented in [RESULTS-hybrid-a-r24-261101.md](RESULTS-hybrid-a-r24-261101.md); logs and scratch outputs belong in `.temp/hybrid-a-r24-261101/`.
+
+The [r25 follow-up](RESULTS-hybrid-a-r24-261101.md#r25---r7g-follow-ups) adds fresh-reader staging/checkpoint checks, apply-time SWA rollback controls and first-request recovery from abandoned staging. It also quantifies recovery disk writes and client staging RAM. Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/hybrid-proxy -p 'test_*.py'` for the proxy suite; r25 logs and measurements are under `.temp/hybrid-a-r25-261101/`.
+The Python command also compares native and Python layout fingerprints on identical synthetic geometry. Tests print to stdout; redirect logs to a task-scoped `.temp/` directory. The native checker covers server architecture admission and rollback after a failed context post-check. The optional tiny GGUF test checks CPU same-partition bit-exact logits; production-model and GPU equivalence remain unverified. [The r17 section of the r16 report](../hybrid-bench/RESULTS-hybrid-a-r16-261101.md#r17-rebase-and-review-notes) contains pinned rented-GPU commands and offline nextn/MTP inspection; no production SWA GGUF is available on this CPU host. Read the nextn/MTP limitations and proposed follow-up in [SWA-STATE-DESIGN.md](SWA-STATE-DESIGN.md) before provisioning a real file.
+
+SWA ring-placement and reuse-threshold regression evidence, native-record compatibility and the exact GPU block are recorded in [RESULTS-hybrid-b-r33-261101.md](RESULTS-hybrid-b-r33-261101.md). Rebuild node, decoder and checker together; marked physical records fail closed on older decoders.
+
+SWA record version 2 carries metadata for masked ring rows and K/V only for the retained window. Hybrid imports refuse legacy compacted and version-1 full-payload window records. Rebuild node, decoder and checker together. HYBD envelope version 1 is unchanged. See [the r6 report](RESULTS-hybrid-c-r6-261101.md) for CPU regressions, production size budgets and the unrun GPU block.
+
+The combined SWA/chunk branch uses HYBD 2 with `body_format=llama-native-chunks-v3`. Final SWA windows require physical record v2; earlier chunk-state-only envelopes are refused. See [r27 merge qualification](RESULTS-hybrid-a-r27-261101.md) for resolutions, CPU evidence and unrun combined-head GPU commands.

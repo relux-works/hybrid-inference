@@ -61,6 +61,38 @@ def schedule(seed, measured=False, smoke=False, depths=None):
                        quantile_sample(rng, PROVENANCE['output_per_call']) if measured else 4 if smoke else 64)
 
 
+def tool_messages(index, content, add_call):
+    call_id = 'synthetic-' + str(index)
+    incoming = []
+    if add_call:
+        # A new user turn preserves the preceding sampled assistant's closing delimiter.
+        incoming = [dict(role='user', content='Read the synthetic tool result.'),
+                    dict(role='assistant', content='', tool_calls=[dict(id=call_id, type='function',
+                         function=dict(name='read', arguments='{}'))])]
+    return incoming + [dict(role='tool', tool_call_id=call_id, content=content),
+                       dict(role='user', content='Continue with decimal digits.')]
+
+
+def probe_tool_call(decode):
+    marker = 'hybrid' + uuid.uuid4().hex
+    history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.'),
+               dict(role='user', content='1'), dict(role='assistant', content='2')]
+    def render(add_call):
+        return decode('/apply-template', dict(messages=history + tool_messages(1, marker, add_call),
+                      chat_template_kwargs=dict(enable_thinking=False)))['prompt']
+    try:
+        count = render(False).count(marker)
+    except urllib.error.HTTPError as error:
+        if error.code not in (400, 422):
+            raise
+        count = 0
+    require(count <= 1, 'template duplicated the synthetic tool probe')
+    if count == 1:
+        return False
+    require(render(True).count(marker) == 1, 'template did not preserve the matched synthetic tool probe')
+    return True
+
+
 def verify_meter(trace, previous, mode):
     require(trace['prefilled'] == trace['new_tokens'] and trace['replayed_prefix'] == 0 and trace['rollback_n'] is None,
             'full re-prefill detected: prompt work differs from new tokens')
@@ -70,7 +102,11 @@ def verify_meter(trace, previous, mode):
     require(mode != 'local' or trace['remote_applied'] == 0, 'local mode unexpectedly offloaded')
     if trace.get('fallback_reason') == 'ram_budget':
         raise Refusal('ram budget refusal (HTTP 503)')
-    require(mode != 'offload' or trace['new_tokens'] <= 1 or
+    block = trace.get('export_block_size', 1)
+    aligned_tail = (type(block) is int and 16 <= block <= 4096 and block % 16 == 0
+                    and trace['prompt_depth'] - 1 < (previous // block + 1) * block
+                    and trace['remote_applied'] == 0 and not trace.get('fallback_reason'))
+    require(mode != 'offload' or trace['new_tokens'] <= 1 or aligned_tail or
             (trace['path'] == 'offload' and not trace.get('fallback_reason')),
             'offload unavailable: request fell back locally; cause=' + str(trace.get('fallback_reason') or 'unknown'))
     if trace['path'] == 'offload':
@@ -155,6 +191,10 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         safe_chunk = extend_chunk_limit(**config.get('delta_geometry', {}))
         chunk = config.get('extend_chunk_tokens', safe_chunk)
         require(type(chunk) is int and 1 <= chunk <= safe_chunk, 'extend chunk exceeds native delta bound')
+        block = config.get('export_block_size', 1)
+        require(type(block) is int and 1 <= block <= chunk, 'invalid node export block size')
+        ends = sorted(set(n // block * block for n in ends if n // block > 0))
+        require(bool(ends), 'checker prompt has no aligned export endpoint')
         n0 = 0
         paths = []
         score_paths = []
@@ -165,12 +205,23 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
             scoring_fixture(reference, tokens, reference['m'], client, config, [], reference_path)
         import struct
         for endpoint in ends:
+            transfer_n0 = n0
+            transfer_id = uuid.uuid4().hex
+            chunk_ends = []
+            at = n0
+            while at < endpoint:
+                at = min(endpoint, at + chunk) // block * block
+                chunk_ends.append(at)
+            chunk_count = len(chunk_ends)
+            index = 0
             while n0 < endpoint:
-                n1 = min(endpoint, n0 + chunk)
+                n1 = min(endpoint, n0 + chunk) // block * block
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
-                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True),
+                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2,
+                             transfer_id=transfer_id, transfer_n0=transfer_n0, transfer_n1=endpoint,
+                             chunk_index=index, chunk_count=chunk_count),
                         timeout=args.request_timeout or 120, binary=True)
                 except urllib.error.HTTPError as error:
                     if error.code == 503:
@@ -196,10 +247,12 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 delta_path.write_bytes(data)
                 paths.append(str(delta_path))
                 n0 = n1
+                index += 1
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
                                      deltas=paths, max_ctx=client['context'],
+                                     local_tail_start=n0,
                                      noise_chunks=args.noise_chunks, backend=client['backend'], uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
         process = run_checker([str(binary), client['model_path'], str(token_path), str(paths[0]), str(result_path),
@@ -213,6 +266,8 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         require(process.returncode in (0, 3, 5), 'equivalence checker failed before valid metrics')
         status, code = classify_equivalence(result, cross_backend or config.get('hetero_quant', False), client['backend'])
         result.update(exit_code=code, checker_exit_code=process.returncode, status=status,
+                      weight_comparison='heterogeneous' if config.get('hetero_quant') else 'homogeneous',
+                      exported_endpoint=n0, local_tail_tokens=len(tokens) - n0,
                       check_mode='append_chain' if boundaries is not None else 'fresh',
                       append_endpoints=ends, delta_count=len(paths), cross_backend=cross_backend,
                       cross_backend_thresholds_calibrated=False if cross_backend else None,
@@ -221,6 +276,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         record(result)
         if reference_path:
             score_fixture = scoring_fixture(reference, tokens, reference['m'], client, config, score_paths, reference_path)
+            score_fixture['local_tail_start'] = n0
             score_input, score_output = scratch / 'score.json', scratch / 'score.result.json'
             private_json(score_input, score_fixture)
             score_scratch = scratch / 'reference-scoring'
@@ -477,6 +533,8 @@ def main():
             require(len(decode('/tokenize', dict(content=text, add_special=False))['tokens']) == count,
                     'synthetic filler is not one token per repeat on this model')
             return text
+        add_tool_call = probe_tool_call(decode)
+        rows.append(dict(stage='tool_probe', tool_call_added=add_tool_call))
         for mode in args.modes:
             history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.')]
             sid, previous = 'bench-' + uuid.uuid4().hex, 0
@@ -492,8 +550,7 @@ def main():
                             continue
                         incoming = [dict(role='user', content=synthetic(max(1, target - previous - 24)))]
                     else:
-                        incoming = [dict(role='tool', tool_call_id='synthetic-' + str(index), content=synthetic(step['tokens'])),
-                                    dict(role='user', content='Continue with decimal digits.')]
+                        incoming = tool_messages(index, synthetic(step['tokens']), add_tool_call)
                     messages = history + incoming
                     if count_messages(messages, step['output']) > limit:
                         rows.append(dict(stage='skip', mode=mode, reason='context cap', requested=step, context=limit))
@@ -507,6 +564,7 @@ def main():
                     sid, message, trace, first, total = stream_chat(client['proxy_url'], credential, body, mode, sid, args.request_timeout or 300)
                     verify_meter(trace, previous, mode)
                     row = dict(stage='call', mode=mode, schedule_index=index, requested=step, ttft_seconds=first,
+                               tool_call_added=step['kind'] == 'tool' and add_tool_call,
                                total_seconds=total, decode_tokens_per_second=(trace['generated_tokens'] * 1000 / trace['decode_ms']) if trace.get('decode_ms') else None,
                                **{k: v for k, v in trace.items() if k != 'mode'})
                     rows.append(row)

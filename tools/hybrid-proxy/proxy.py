@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from policy import Policy, extend_chunk_limit
 from concurrency import SessionQueue
@@ -33,6 +34,12 @@ class HTTPError(Exception):
     def __init__(self, status, body=b""):
         self.status, self.body = status, body
         super().__init__(f"upstream HTTP {status}")
+
+
+class DeltaVersionError(HTTPError):
+    def __init__(self):
+        super().__init__(412)
+        self.args = ("unsupported HYBD delta version; upgrade node, proxy and decoder to protocol 2",)
 
 
 class RollbackError(HTTPError):
@@ -156,6 +163,10 @@ class Proxy:
         self.extend_chunk_tokens = config.get("extend_chunk_tokens", safe_chunk)
         if type(self.extend_chunk_tokens) is not int or not 1 <= self.extend_chunk_tokens <= safe_chunk:
             raise ValueError("extend_chunk_tokens exceeds delta body/header bound")
+        self.export_block_size = config.get("export_block_size", 1)
+        if (type(self.export_block_size) is not int or self.export_block_size < 1
+                or self.export_block_size > self.extend_chunk_tokens):
+            raise ValueError("invalid node export block size")
         self.slots = config.get("slots", 1)
         if self.slots < 1:
             raise ValueError("slots must be positive")
@@ -171,14 +182,21 @@ class Proxy:
         self.inflight = {}
 
     def client_delta(self, delta):
-        if not self.hetero_quant:
-            return delta
         if len(delta) < 4:
             raise ValueError("truncated heterogeneous envelope")
         size, = struct.unpack("<I", delta[:4])
         if not 0 < size <= 1024**2 or 4 + size + 48 > len(delta):
             raise ValueError("invalid heterogeneous envelope")
-        header = json.loads(delta[4:4 + size])
+        try:
+            header = json.loads(delta[4:4 + size])
+        except RecursionError:
+            raise ValueError("delta header nesting too deep") from None
+        if not isinstance(header, dict):
+            raise ValueError("invalid delta header")
+        if header.get("version") != 2:
+            raise DeltaVersionError()
+        if not self.hetero_quant:
+            return delta
         if header.get("model_sha256") != self.node_model:
             raise ValueError("heterogeneous delta source mismatch")
         # Rebind only the envelope identity after live layout admission. Native import verifies state and checksums.
@@ -186,7 +204,7 @@ class Proxy:
         encoded = json.dumps(header, separators=(",", ":")).encode()
         if len(encoded) > 1024**2:
             raise ValueError("heterogeneous header too large")
-        return struct.pack("<I", len(encoded)) + encoded + delta[4 + size:]
+        return b"".join((struct.pack("<I", len(encoded)), encoded, memoryview(delta)[4 + size:]))
 
     def client(self, authorization):
         value = self.clients.get(authorization.removeprefix("Bearer ")) if authorization.startswith("Bearer ") else None
@@ -214,8 +232,10 @@ class Proxy:
     def sync(self, session, client, recreate=True):
         """202 is an acknowledgement of queuing, never proof that tokens were applied."""
         node = self.remote(client)
+        health = node.request("GET", "/v1/health")
+        if health.get("delta_version") != 2:
+            raise DeltaVersionError()
         if self.hetero_quant:
-            health = node.request("GET", "/v1/health")
             if health.get("model_sha256") != self.node_model or health.get("layout_fingerprint") != self.layout_fingerprint:
                 raise HTTPError(412)
         if not session["remote_id"]:
@@ -414,7 +434,8 @@ class Proxy:
                     self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": old["id"] + ".bin"})
                     self.store.set_slot(old["id"], None)
                 self.decode.request("POST", f"/slots/{slot}?action=erase", {})
-                rollback = (self.slot_path / (session["id"] + "-resync-backup.bin")).exists()
+                rollback = any((self.slot_path / (session["id"] + suffix)).exists()
+                               for suffix in ("-resync-backup.bin", "-delta-backup.bin"))
                 if session["tokens"] and not rollback:
                     try:
                         self.decode.request("POST", f"/slots/{slot}?action=restore", {"filename": session["id"] + ".bin"})
@@ -445,7 +466,7 @@ class Proxy:
     def acquire_slot(self, session):
         # Called only while the slot lease is pinned and the native slot is idle.
         rollback_pending = any((self.slot_path / (session["id"] + suffix)).exists()
-                               for suffix in ("-resync-backup.bin", "-rewrite-backup.bin"))
+                               for suffix in ("-resync-backup.bin", "-rewrite-backup.bin", "-delta-backup.bin"))
         slot = session["slot"]
         if rollback_pending:
             self.decode.request("POST", f"/slots/{slot}?action=erase", {})
@@ -649,12 +670,12 @@ class Proxy:
                         raise JournalConflict("rewritten prefix cannot retain the checkpoint")
                     prompt = full_tokens
                     token_base, anchor_base = 0, 0
-                header = self.renderer.encode("<|im_start|>user\n")
+                backup = session["id"] + "-rewrite-backup.bin"
+                self.decode.request("POST", f"/slots/{session['slot']}?action=save", {"filename": backup})
+                header = self.renderer.user_header(body, text, index)
                 trial = prompt[:rollback_n + len(header)]
                 if trial[rollback_n:] != header:
                     raise JournalConflict("checkpoint is not at a user boundary")
-                backup = session["id"] + "-rewrite-backup.bin"
-                self.decode.request("POST", f"/slots/{session['slot']}?action=save", {"filename": backup})
                 result = self.decode.request("POST", "/v1/chat/completions", dict(body,
                     prompt_tokens=trial, id_slot=session["slot"], n_predict=0, stream=False,
                     cache_prompt=True, return_tokens=True, verbose=True))
@@ -709,6 +730,33 @@ class Proxy:
             if backup:
                 (self.slot_path / backup).unlink(missing_ok=True)
 
+    @contextmanager
+    def delta_transfer(self, session, slot):
+        state = dict(backup=None)
+        try:
+            yield state
+        except BaseException:
+            if state["backup"]:
+                try:
+                    self.decode.request("POST", f"/slots/{slot}?action=restore", {"filename": state["backup"]})
+                except (OSError, HTTPError, ValueError):
+                    self.verified(session["id"], False)
+                    self.store.set_slot(session["id"], None)
+                    state["backup"] = None  # Retain the recovery file if restore cannot be confirmed.
+                    raise RollbackError() from None
+            session["_remote_applied"] = 0
+            raise
+        finally:
+            try:
+                self.decode.request("POST", f"/slots/{slot}?action=abort_delta", {})
+            except (OSError, HTTPError, ValueError):
+                LOG.warning("delta staging cleanup unavailable session=%s", session["id"])
+            if state["backup"]:
+                try:
+                    (self.slot_path / state["backup"]).unlink(missing_ok=True)
+                except OSError:
+                    LOG.warning("delta recovery file retained session=%s", session["id"])
+
     def prepare_session(self, client, body, session, tokens):
         slot = session["slot"]
         self.store.benchmark_mode(session["id"], client.get("benchmark_mode"))
@@ -721,6 +769,7 @@ class Proxy:
             local_n = 0
         # Imported memory has no logits. Decode the final prompt token locally.
         target = tokens[:-1]
+        export_end = len(target) // self.export_block_size * self.export_block_size
         session["_remote_applied"] = 0
         session["_remote_replayed"] = 0
         with self.lock:
@@ -731,6 +780,8 @@ class Proxy:
         session["_bench"] = dict(mode=mode, path="local", depth_before=local_n,
             prompt_depth=len(tokens), server_prefill_ms=None, wire_bytes=0,
             server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None)
+        if self.export_block_size > 1:
+            session["_bench"]["export_block_size"] = self.export_block_size
         if mode == "offload":
             decision["offload"] = len(target) > local_n
         elif mode == "local":
@@ -746,45 +797,62 @@ class Proxy:
                 if session["remote_n"] < local_n:
                     self.sync(session, client)
                 remote = self.remote(client)
-                for n0 in range(local_n, len(target), self.extend_chunk_tokens):
-                    n1 = min(n0 + self.extend_chunk_tokens, len(target))
-                    chunk = dict(n0=n0, n1=n1, status="requested", wire_bytes=0, import_ms=0)
-                    session["_bench"]["chunks"].append(chunk)
-                    delta = remote.request("POST", path + "/extend", {
-                        "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
-                        "tokens": target[n0:n1], "return_delta": True},
-                        headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
-                    chunk.update(status="received", wire_bytes=remote.last_bytes,
-                        transfer_ms=remote.last_transfer_seconds * 1000,
-                        server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None)
-                    meter = session["_bench"]
-                    meter["wire_bytes"] += chunk["wire_bytes"]
-                    meter["transfer_ms"] += chunk["transfer_ms"]
-                    if chunk["server_prefill_ms"] is not None:
-                        meter["server_prefill_ms"] = (meter["server_prefill_ms"] or 0) + chunk["server_prefill_ms"]
-                    if remote.last_transfer_rate:
-                        with self.lock:
-                            self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
-                    delta = self.client_delta(delta)
-                    import_started = time.monotonic()
-                    self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
-                                        {"Content-Type": "application/octet-stream",
-                                         "X-Hybrid-Session": session["remote_id"]})
-                    chunk["import_ms"] = (time.monotonic() - import_started) * 1000
-                    meter["import_ms"] += chunk["import_ms"]
-                    actual = self.decode.request("GET", f"/slots/{slot}/info")
-                    if (actual["n"] != n1 or actual["prefix_hash"] != prefix_hash(tokens[:n1])
-                            or actual["tokens"] != tokens[:n1]):
-                        self.decode.request("POST", f"/slots/{slot}?action=erase", {})
-                        session["_remote_applied"] = 0
-                        raise ValueError("import prefix mismatch")
-                    chunk["status"] = "imported"
-                    session.update(offload=True, tokens=tokens[:n1], remote_n=n1)
-                    session["_remote_applied"] = n1 - local_n
-                    LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
-                    if "_turn" in session:
-                        session["_turn"]["checkpoints"] = []
-                    self.store.save(session)
+                transfer_id = uuid.uuid4().hex
+                starts = []
+                n0 = local_n
+                while n0 < export_end:
+                    n1 = min(n0 + self.extend_chunk_tokens, export_end) // self.export_block_size * self.export_block_size
+                    starts.append((n0, n1))
+                    n0 = n1
+                with self.delta_transfer(session, slot) as transaction:
+                    for index, (n0, n1) in enumerate(starts):
+                        chunk = dict(n0=n0, n1=n1, status="requested", wire_bytes=0, import_ms=0)
+                        session["_bench"]["chunks"].append(chunk)
+                        delta = remote.request("POST", path + "/extend", {
+                            "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
+                            "tokens": target[n0:n1], "return_delta": True, "delta_version": 2,
+                            "transfer_id": transfer_id, "transfer_n0": local_n, "transfer_n1": export_end,
+                            "chunk_index": index, "chunk_count": len(starts)},
+                            headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
+                        chunk.update(status="received", wire_bytes=remote.last_bytes,
+                            transfer_ms=remote.last_transfer_seconds * 1000,
+                            server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None)
+                        meter = session["_bench"]
+                        meter["wire_bytes"] += chunk["wire_bytes"]
+                        meter["transfer_ms"] += chunk["transfer_ms"]
+                        if chunk["server_prefill_ms"] is not None:
+                            meter["server_prefill_ms"] = (meter["server_prefill_ms"] or 0) + chunk["server_prefill_ms"]
+                        if remote.last_transfer_rate:
+                            with self.lock:
+                                self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
+                        delta = self.client_delta(delta)
+                        import_started = time.monotonic()
+                        if index + 1 == len(starts):
+                            filename = session["id"] + "-delta-backup.bin"
+                            self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": filename})
+                            transaction["backup"] = filename
+                        self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
+                                            {"Content-Type": "application/octet-stream",
+                                             "X-Hybrid-Session": session["remote_id"]})
+                        chunk["import_ms"] = (time.monotonic() - import_started) * 1000
+                        meter["import_ms"] += chunk["import_ms"]
+                        actual = self.decode.request("GET", f"/slots/{slot}/info")
+                        committed = n1 if index + 1 == len(starts) else local_n
+                        if (actual["n"] != committed or actual["prefix_hash"] != prefix_hash(tokens[:committed])
+                                or actual["tokens"] != tokens[:committed]):
+                            session["_remote_applied"] = 0
+                            raise ValueError("import prefix mismatch")
+                        chunk["status"] = "imported" if index + 1 == len(starts) else "staged"
+                        if index + 1 != len(starts):
+                            continue
+                        session.update(offload=True, tokens=tokens[:n1], remote_n=n1)
+                        session["_remote_applied"] = n1 - local_n
+                        LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
+                        if "_turn" in session:
+                            session["_turn"]["checkpoints"] = []
+                        self.store.save(session)
+        except RollbackError:
+            raise
         except HTTPError as error:
             reason = f"http_{error.status}"
             if error.status == 503:
@@ -902,6 +970,7 @@ class Proxy:
         (self.slot_path / (session["id"] + "-resync-backup.bin")).unlink(missing_ok=True)
         if "_turn" not in session or session["_turn"]["rollback_n"] is None:
             (self.slot_path / (session["id"] + "-rewrite-backup.bin")).unlink(missing_ok=True)
+        (self.slot_path / (session["id"] + "-delta-backup.bin")).unlink(missing_ok=True)
         # Replay is asynchronous; the durable suffix beyond remote_n is the journal.
 
 

@@ -1,5 +1,8 @@
 // Codec controls retained from A80013538; synthetic native body does not test engine import.
 #include "hybrid-state.h"
+#include "hash/hash.h"
+#include "hash/xxhash/xxhash.h"
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -9,6 +12,46 @@ static void require(bool ok, const char * message) {
 }
 static json header(const std::string & hash, size_t n0, size_t n1, const std::vector<llama_token> & tokens) {
     return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"tokens", std::vector<llama_token>(tokens.begin() + n0, tokens.begin() + n1)}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
+}
+
+static void wire_size_tests() {
+    // Layout arithmetic, without a 27B allocation, accounts for exactly three omitted native fixed-state records.
+    const uint64_t kv_row = 16 * 4 * (256 + 256) * 34 / 32;
+    const uint64_t recurrent = 48ull * 4 * (128 * 6144 + 3 * (6144 + 2 * 16 * 128));
+    const uint64_t fixed_record = recurrent + 12 + 8 + 2 * 48 * 12;
+    const uint64_t kv_header = 8 + 8 + 16 + 2 * 16 * 12;
+    const int count = 40000, width = 10871;
+    const int chunks = (count + width - 1) / width;
+    uint64_t old_wire = 0, new_wire = 0, old_body = 0, new_body = 0;
+    const std::vector<llama_token> synthetic(count, 100);
+    for (int i = 0, n0 = 0; n0 < count; ++i, n0 += width) {
+        const int n1 = std::min(count, n0 + width);
+        auto h = header(std::string(64, 'a'), n0, n1, synthetic);
+        h["session_id"] = std::string(32, 'a');
+        const uint64_t kv = kv_header + (kv_row + 24) * (n1 - n0);
+        const uint64_t before = kv + fixed_record, after = kv + (i + 1 == chunks ? fixed_record : 0);
+        auto legacy = h;
+        legacy["magic"] = "HYBD";
+        legacy["version"] = 1;
+        legacy["body_format"] = "llama-native-seq-v1";
+        legacy["kv_type"] = "q8_0";
+        legacy["state_dtype"] = "f32";
+        legacy["sections"] = json::array({{{"name", "llama_seq_state"}, {"offset", 0}, {"bytes", before}}});
+        h["transfer_id"] = std::string(32, 'b');
+        h["transfer_n0"] = 0; h["transfer_n1"] = count;
+        h["chunk_index"] = i; h["chunk_count"] = chunks; h["fixed_state"] = i + 1 == chunks;
+        const auto text = hybrid::encode_delta_header(h, after);
+        require(after <= hybrid::max_delta_body_bytes && before <= hybrid::max_delta_body_bytes, "synthetic body over cap");
+        old_wire += 4 + legacy.dump().size() + before + 48;
+        new_wire += 4 + text.size() + after + 48;
+        old_body += before; new_body += after;
+    }
+    require(kv_row == 34816 && recurrent == 156893184 && chunks == 4, "wrong 27B geometry");
+    require(old_body - new_body == 3 * fixed_record, "three fixed records not removed");
+    std::cout << "PASS wire_size_27b_40000 old_body=" << old_body << " new_body=" << new_body
+              << " old_wire=" << old_wire << " new_wire=" << new_wire << " saved_wire=" << old_wire - new_wire
+              << " recurrent_tensor=" << recurrent << " fixed_record=" << fixed_record << '\n';
+
 }
 
 static void codec_tests(size_t max_ctx) {
@@ -29,6 +72,7 @@ static void codec_tests(size_t max_ctx) {
     }
     require(hybrid::layout_fingerprint(layout) == fingerprint, "layout fingerprint unstable");
     std::cout << "PASS layout fingerprint structural mutation controls\n";
+    wire_size_tests();
     const std::string hash(64, 'a');
     auto h = header(hash, 0, 1, {1});
     // The writer admits the inclusive body cap and rejects one byte more before allocating a body.
@@ -52,6 +96,35 @@ static void codec_tests(size_t max_ctx) {
     }
     auto wire = hybrid::encode_delta(h, "abc");
     require(hybrid::read_delta(wire, hash, 0).state == "abc", "codec positive control");
+    // A borrowed decode references the owning envelope; the copying API retains its independent state.
+    const auto view = hybrid::read_delta_view(wire, hash, 0);
+    const auto owned = hybrid::read_delta(wire, hash, 0);
+    require(view.state == owned.state && view.header == owned.header, "borrowed decode differs");
+    require(view.state.data() == wire.data() + wire.size() - 48 - 3, "borrowed decode copied the body");
+    require(owned.state.data() != view.state.data(), "owning decode borrowed the body");
+    std::cout << "PASS test_borrowed_delta_lifetime_and_owning_control\n";
+    // Streaming checksums match the independent portable SHA and one-shot XXH3 across block/chunk boundaries and binary tails.
+    std::vector<size_t> sizes = {65535, 65536, 65537, 131135};
+    for (size_t i = 1; i <= 130; ++i) { sizes.push_back(i); }
+    for (size_t size : sizes) {
+        std::string body(size, '\0');
+        for (size_t i = 0; i < size; ++i) { body[i] = (char) (i * 37 + i / 17); }
+        const auto encoded = hybrid::encode_delta(h, body);
+        const auto digest = hash_sha256_hex(body.data(), body.size());
+        static const char digits[] = "0123456789abcdef";
+        std::string actual;
+        for (size_t i = encoded.size() - 32; i < encoded.size(); ++i) {
+            const auto c = (unsigned char) encoded[i];
+            actual += digits[c >> 4]; actual += digits[c & 15];
+        }
+        XXH128_canonical_t xxh;
+        XXH128_canonicalFromHash(&xxh, XXH3_128bits(body.data(), body.size()));
+        require(digest == actual, "test_streaming_checksum_block_chunk_and_binary_boundaries: SHA-256 differs from portable");
+        require(std::memcmp(&xxh, encoded.data() + encoded.size() - 48, 16) == 0, "streaming XXH3 differs from one-shot");
+        require(hybrid::read_delta(encoded, hash, 0).state == body, "binary checksum round trip failed");
+    }
+    require(hash_sha256_hex("abc", 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 known answer");
+    std::cout << "PASS test_streaming_checksum_block_chunk_and_binary_boundaries\n";
     require(hybrid::prefix_hash({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty prefix hash");
     auto rejects = [&](const std::string & name, const std::string & input, const std::string & model_hash, int64_t n0, const std::string & expected) {
         try { hybrid::read_delta(input, model_hash, n0); }
@@ -70,6 +143,8 @@ static void codec_tests(size_t max_ctx) {
     rejects("trailing", wire + "x", hash, 0, "truncated or trailing");
     auto corrupt = wire; corrupt[corrupt.size() - 49] ^= 1;
     rejects("corrupt-section", corrupt, hash, 0, "checksum mismatch");
+    corrupt = wire; corrupt[corrupt.size() - 48] ^= 1;
+    rejects("corrupt-section-hash", corrupt, hash, 0, "checksum mismatch");
     corrupt = wire; corrupt[corrupt.size() - 1] ^= 1;
     rejects("corrupt-body-hash", corrupt, hash, 0, "checksum mismatch");
     uint32_t length = 0;
@@ -81,6 +156,14 @@ static void codec_tests(size_t max_ctx) {
     for (int i = 0; i < 4; ++i) { bad += (char) (text.size() >> (8 * i)); }
     bad += text + wire.substr(4 + length);
     rejects("layout", bad, hash, 0, "unsupported delta layout");
+    // HYBD 2 from a chunk-only build has the old body format and must refuse before native parsing.
+    bad_h = hybrid::parse_json(wire.substr(4, length));
+    bad_h["body_format"] = "llama-native-chunks-v2";
+    const auto old_text = bad_h.dump();
+    bad.clear();
+    for (int i = 0; i < 4; ++i) { bad += (char) (old_text.size() >> (8 * i)); }
+    bad += old_text + wire.substr(4 + length);
+    rejects("chunk-only-body-format", bad, hash, 0, "unsupported delta layout");
     auto wrong_tokens = h;
     wrong_tokens["tokens"] = json::array();
     rejects("token-count", hybrid::encode_delta(wrong_tokens, "abc"), hash, 0, "token count mismatch");

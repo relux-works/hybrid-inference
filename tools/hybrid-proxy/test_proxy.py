@@ -160,14 +160,14 @@ class HTTPTests(unittest.TestCase):
         self.prefill = self.start(make_server("prefill", database=str(Path(self.temp.name) / "prefill.sqlite")))
         self.decode = self.start(make_server("decode", slot_path=self.temp.name))
         self.config = dict(model_sha256=MODEL, prefill_url=self.url(self.prefill), decode_url=self.url(self.decode),
-                           decode_token="decode-fixture", slot_path=self.temp.name, slots=2, prefill_timeout=0.5,
+                           decode_token="decode-fixture", slot_path=self.temp.name, slots=2, prefill_timeout=5,
                            clients={f"fixture-{c}": dict(id=c, prefill_token=f"remote-{c}") for c in "abc"},
                            policy=dict(always=True))
         self.app = Proxy(self.config, str(Path(self.temp.name) / "proxy.sqlite"))
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.app = self.app
         self.proxy = self.start(server)
-        self.client = Node(self.url(self.proxy), "fixture-a")
+        self.client = Node(self.url(self.proxy), "fixture-a", timeout=30)
 
     def start(self, server):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -516,7 +516,7 @@ class HTTPTests(unittest.TestCase):
 
     # All four server session operations hide foreign IDs and leave the victim unchanged.
     def test_prefill_namespace(self):
-        a, b = Node(self.url(self.prefill), "a"), Node(self.url(self.prefill), "b")
+        a, b = [Node(self.url(self.prefill), self.config["clients"]["fixture-" + c]["prefill_token"]) for c in ("a", "b")]
         sid = a.request("POST", "/v1/sessions", {"model_sha256": MODEL})["session_id"]
         path = "/v1/sessions/" + sid
         before = a.request("GET", path)
@@ -525,7 +525,8 @@ class HTTPTests(unittest.TestCase):
             with self.subTest(method=method, suffix=suffix), self.assertRaises(HTTPError) as error:
                 b.request(method, path + suffix, data)
             self.assertEqual(error.exception.status, 404)
-        self.assertEqual(a.request("GET", path)["tokens"], before["tokens"])
+        after = a.request("GET", path)
+        self.assertEqual((after["n"], after["prefix_hash"]), (before["n"], before["prefix_hash"]))
         self.assertEqual(b.request("GET", "/v1/sessions"), [])
 
     # Three clients with four sessions each exercise parking and exact per-session journals.

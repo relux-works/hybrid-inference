@@ -161,6 +161,145 @@ static void run(llama_model * model, const std::string & model_hash, const std::
     std::cout << "PASS " << stem << " incremental append + held token greedy=64/64\n";
 }
 
+static void chunk_tests(llama_model * model, const std::string & hash, bool fresh) {
+    auto source = hybrid::make_context(model, 512);
+    auto single = hybrid::make_context(model, 512);
+    auto dest = hybrid::make_context(model, 512);
+    const std::vector<llama_token> prefix = fresh ? std::vector<llama_token>{} : std::vector<llama_token>{100, 101, 102, 103};
+    hybrid::prefill(source.get(), prefix, 0);
+    hybrid::prefill(single.get(), prefix, 0);
+    hybrid::prefill(dest.get(), prefix, 0);
+    const auto before = hybrid::save_state(dest.get());
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<float> logits;
+    if (!fresh) {
+        const auto * ptr = llama_get_logits_ith(dest.get(), -1);
+        logits.assign(ptr, ptr + vocab);
+    }
+    std::cout << "RUN chunks fresh=" << fresh << '\n';
+    auto unchanged = [&] {
+        require(hybrid::save_state(dest.get()) == before, "chunk failure changed cells or state");
+        require(fresh || memcmp(logits.data(), llama_get_logits_ith(dest.get(), -1), vocab * sizeof(float)) == 0, "chunk failure changed next-token logits");
+    };
+    std::vector<llama_token> all = prefix;
+    std::vector<std::string> wires, bodies, full_bodies;
+    std::vector<hybrid::json> headers;
+    for (int i = 0; i < 4; ++i) {
+        const int n0 = all.size();
+        const std::vector<llama_token> suffix {110 + i * 4, 111 + i * 4, 112 + i * 4, 113 + i * 4};
+        hybrid::prefill(source.get(), suffix, n0);
+        all.insert(all.end(), suffix.begin(), suffix.end());
+        hybrid::json h = {{"model_sha256", hash}, {"session_id", "chunks"}, {"n0", n0}, {"n1", all.size()},
+            {"tokens", suffix}, {"prefix_hash_n1", hybrid::prefix_hash(all)}, {"transfer_id", "test-transfer"},
+            {"transfer_n0", prefix.size()}, {"transfer_n1", prefix.size() + 16}, {"chunk_index", i}, {"chunk_count", 4}, {"fixed_state", i == 3}};
+        bodies.push_back(hybrid::export_range(source.get(), n0, all.size(), i == 3));
+        full_bodies.push_back(hybrid::export_range(source.get(), n0, all.size()));
+        wires.push_back(hybrid::encode_delta(h, bodies.back()));
+        headers.push_back(h);
+    }
+    auto stage = [&](hybrid::delta_import & pending, const std::string & wire) {
+        return pending.stage(dest.get(), 0, wire, hash, "chunks", prefix, 512, vocab);
+    };
+    // A new transfer starts from the live prefix even when an abandoned transfer left host chunks behind.
+    {
+        hybrid::delta_import pending;
+        stage(pending, wires[0]);
+        stage(pending, wires[1]);
+        auto replacement = headers[0];
+        replacement["transfer_id"] = "replacement-transfer";
+        try { require(!stage(pending, hybrid::encode_delta(replacement, bodies[0])), "replacement committed early"); }
+        catch (const std::exception & error) { throw std::runtime_error(std::string("chunk_stale_transfer_replacement: ") + error.what()); }
+        replacement = headers[1];
+        replacement["transfer_id"] = "replacement-transfer";
+        require(!stage(pending, hybrid::encode_delta(replacement, bodies[1])), "replacement continuation committed early");
+        unchanged();
+        pending.clear();
+        std::cout << "PASS chunk_stale_transfer_replacement cells/state/logits unchanged\n";
+    }
+    // Dropping any proper chunk prefix leaves serialized cells/state and every next-token logit unchanged.
+    for (size_t k : {1, 2, 3}) {
+        hybrid::delta_import pending;
+        for (size_t i = 0; i < k; ++i) { require(!stage(pending, wires[i]), "early chunk committed"); unchanged(); }
+        pending.clear();
+        unchanged();
+        std::cout << "PASS chunk_interruption_k=" << k << " cells/state/logits unchanged\n";
+    }
+    auto reject = [&](const char * name, const std::vector<std::string> & candidates, const char * reason, bool apply = false) {
+        hybrid::delta_import pending;
+        bool rejected = false;
+        try {
+            for (const auto & wire : candidates) { stage(pending, wire); }
+            if (apply) { pending.apply(dest.get(), 0); }
+        } catch (const std::exception & e) {
+            require(std::string(e.what()).find(reason) != std::string::npos, "wrong chunk rejection reason");
+            rejected = true;
+        }
+        require(rejected, name);
+        try { unchanged(); }
+        catch (const std::exception & error) { throw std::runtime_error(std::string(name) + ": " + error.what()); }
+        std::cout << "PASS " << name << " cells/state/logits unchanged\n";
+    };
+    // Malformed framing, identity, order and fixed-state placement reject before the destination can change.
+    reject("chunk_out_of_order", {wires[1]}, "position gap or overlap");
+    reject("chunk_duplicate", {wires[0], wires[0]}, "position gap or overlap");
+    reject("chunk_missing_middle", {wires[0], wires[2]}, "position gap or overlap");
+    reject("chunk_missing_final", {wires[0], wires[1], wires[2]}, "missing final chunk", true);
+    auto h = headers[0];
+    auto parsed = hybrid::read_delta(wires[0], hash, prefix.size()).header;
+    parsed["fixed_state"] = true;
+    reject("chunk_early_state_flag", {replace_header(wires[0], parsed)}, "fixed state must occur only");
+    reject("chunk_early_native_state", {hybrid::encode_delta(headers[0], full_bodies[0])}, "invalid native chunk");
+    parsed = hybrid::read_delta(wires[3], hash, prefix.size() + 12).header;
+    parsed["fixed_state"] = false;
+    reject("chunk_final_state_flag_missing", {wires[0], wires[1], wires[2], replace_header(wires[3], parsed)}, "fixed state must occur only");
+    const auto no_state = hybrid::export_range(source.get(), prefix.size() + 12, all.size(), false);
+    reject("chunk_final_native_state_missing", {wires[0], wires[1], wires[2], hybrid::encode_delta(headers[3], no_state)}, "invalid native chunk");
+    parsed = hybrid::read_delta(wires[1], hash, prefix.size() + 4).header; parsed["version"] = 1;
+    reject("chunk_mixed_version", {wires[0], replace_header(wires[1], parsed)}, "unsupported delta version");
+    h = headers[1]; h["transfer_id"] = "other";
+    reject("chunk_mixed_transfer", {wires[0], hybrid::encode_delta(h, bodies[1])}, "chunk transfer mismatch");
+    auto corrupt = wires[1]; corrupt.back() ^= 1;
+    reject("chunk_checksum", {wires[0], corrupt}, "checksum mismatch");
+    // A replacement still requires chunk zero at the live prefix, the expected session, and a valid checksum.
+    auto replacement = headers[0];
+    replacement["transfer_id"] = "replacement-transfer";
+    const auto replacement_wire = hybrid::encode_delta(replacement, bodies[0]);
+    auto wrong_prefix = hybrid::read_delta(replacement_wire, hash, prefix.size()).header;
+    wrong_prefix["n0"] = prefix.size() + 1;
+    reject("chunk_replacement_wrong_prefix", {wires[0], replace_header(replacement_wire, wrong_prefix)}, "position gap or overlap");
+    auto wrong_session = replacement;
+    wrong_session["session_id"] = "foreign-session";
+    reject("chunk_replacement_wrong_session", {wires[0], hybrid::encode_delta(wrong_session, bodies[0])}, "Delta session mismatch");
+    auto bad_replacement = hybrid::encode_delta(replacement, bodies[0]);
+    bad_replacement.back() ^= 1;
+    reject("chunk_replacement_checksum", {wires[0], bad_replacement}, "checksum mismatch");
+    // A final recurrent endpoint mismatch reaches apply after all KV metadata changes; rollback also preserves logits.
+    auto late = bodies[3];
+    const size_t fixed_offset = no_state.size();
+    const int32_t wrong_pos = all.size();
+    require(fixed_offset + 8 < late.size(), "no recurrent fixture");
+    memcpy(&late[fixed_offset + 4], &wrong_pos, sizeof(wrong_pos));
+    reject("chunk_late_endpoint_rollback", {wires[0], wires[1], wires[2], hybrid::encode_delta(headers[3], late)}, "Native delta chunks rejected", true);
+    // Identical source evaluation yields byte-identical chunked and single-shot imports, then identical held-token logits.
+    const auto full = hybrid::export_range(source.get(), prefix.size(), all.size());
+    require(llama_state_seq_set_data_append(single.get(), (const uint8_t *) full.data(), full.size(), 0, prefix.size(), all.size()) == full.size(), "single import failed");
+    hybrid::delta_import pending;
+    // Staged bodies outlive each moved request and caller buffer reuse, through final application.
+    for (size_t i = 0; i < wires.size(); ++i) {
+        auto request = wires[i];
+        require(pending.stage(dest.get(), 0, std::move(request), hash, "chunks", prefix, 512, vocab) == (i == 3), "wrong final marker");
+        request.assign(wires[i].size(), '\0');
+        unchanged();
+    }
+    pending.apply(dest.get(), 0);
+    require(hybrid::save_state(dest.get()) == hybrid::save_state(single.get()), "chunk/single bytes differ");
+    hybrid::prefill(single.get(), {130}, all.size());
+    hybrid::prefill(dest.get(), {130}, all.size());
+    require(memcmp(llama_get_logits_ith(single.get(), -1), llama_get_logits_ith(dest.get(), -1), vocab * sizeof(float)) == 0, "chunk/single held-token logits differ");
+    std::cout << "PASS chunk_single_shot_byte_equivalence and held-token logits\n";
+    std::cout << "PASS chunk_owned_wire_lifetime after request destruction and reuse\n";
+}
+
 int main(int argc, char ** argv) {
     try {
         if (argc < 3) {
@@ -173,6 +312,7 @@ int main(int argc, char ** argv) {
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], params));
         require(bool(model), "cannot load model");
         const auto hash = hybrid::file_hash(argv[1]);
+        if (argc == 3 && std::string(argv[2]) == "--chunks") { chunk_tests(model.get(), hash, true); chunk_tests(model.get(), hash, false); return 0; }
         for (int i = 2; i < argc; ++i) { run(model.get(), hash, argv[i]); }
         return 0;
     } catch (const std::exception & error) {
