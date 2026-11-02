@@ -381,3 +381,82 @@ git status --short > "$R/logs/status.txt"
 ```
 
 Return the exact SHA, platform/tool versions, build/codec/hash exit codes and complete logs, including `test_dispatch` output `automatic=commoncrypto`, `forced=portable`. The NI harness intentionally selects both modes internally even when invoked from the portable outer mode. The sparse >4 GiB fixture is sparse on disk; retain the disk floor. Preserve logs and binary identities before removing the Mac-owned build tree/worktree. Signature verification requires the machine's configured public signer trust; do not substitute identities. No landing is authorized by an agents1-only green result.
+
+
+## r31: merge current main for landing (2026-11-02)
+
+Exact tested signed merge head: `a0149dc769aff5665cf0ba0cb7ea7c3d4516d896`. Parents, in order: reviewed `dba3c14c8dc27c25ca505acc33e594b48e3a4a3c` and main `683caeed94c64ad69699d5f69a8fb533d4de6737` (PR #14). Remote `b` was fetched from dev-b's local workbench. Both source commits above `528724c96894aa5f65e98b329317de59aa694afc` verify with valid signatures; the reviewed objects were preserved. Muse r7o CPU acceptance is owner-supplied source qualification. R31 self-review and CPU evidence cover the merge resolutions. The following report commit changes documentation only; its exact delivery head is recorded in `.temp/hybrid-a-r31b-261102/delivery.json` and the orchestrator handoff. No push or PR submission was performed.
+
+### Landing title and body
+
+Title: `hybrid : accelerate chunked delta import hashing and remove body copies`
+
+Body: Apply the reviewed streaming SHA-256/XXH3 implementation and borrowed delta reader to protocol-2 chunk imports on current main. Each staged chunk owns its request string until final synchronous application, so body views remain valid without extracting another body copy. Preserve PR #14's atomic staging, abort/replacement handling, SWA layout, and fixed state only in the final chunk. Wire bytes, both checksum trailers, imported state and continuation logits match main.
+
+CPU build, codec, full-file hash, hash-NI, import, chunk/SWA, proxy and profiling gates pass in automatic and forced-portable modes. The reviewed source passed its M3 Max CommonCrypto/portable gate on 2026-11-02. Exact tested merge head: `a0149dc769aff5665cf0ba0cb7ea7c3d4516d896`; signed local delivery only.
+
+### Every conflict and its resolution
+
+Five files had eight conflict regions. `.temp/hybrid-a-r31-261102/conflicts-01.patch` preserves all original regions; `resolutions.md` records the full adaptation ledger.
+
+| File | Resolution |
+| --- | --- |
+| `README.md` | Retain main's combined SWA/chunk qualification link and the branch's import-profiling tool entry. |
+| `src/llama-context.cpp` | Retain main's SWA-aware backup condition inside the existing timing scope; retain main's `read_append` layout/range/endpoint validation inside the parse timing scope. |
+| `tools/hybrid/UNRESOLVED_QUESTIONS.md` | Retain main's qualification limits and the source Mac-gate history; the r31 note records the returned gate. |
+| `tools/hybrid/hybrid-state.cpp` | Retain both memory and timing includes. Keep main's bounded header reader, protocol 2 and body format v3 validation inside the borrowed reader; keep the owning compatibility wrapper. |
+| `tools/server/server-context.cpp` | Retain main's staging, abort, final-only apply and token bookkeeping. Retain the task-copy timing scope and main's abort flag. Replace the superseded one-shot import block with main's transaction. |
+
+Required adaptations outside conflict markers: `delta_import` takes the wire by value and the server moves its task string into it; heap-owned strings keep body-view addresses stable as vectors grow. Clear destroys views before their owners. The existing chunk test now destroys/reuses moved request buffers before application and still requires exact state/logit equality. The HTTP version-refusal fixture uses version 1, since version 2 is valid. The profiling helper describes the new transfer bounds, retains checksum/native-stage timings, and reports zero full recurrent backup on the chunk path; metadata recovery closure overhead stays in the residual. No admission limit, tensor layout, native transaction, checksum, or acceptance threshold was weakened.
+
+### CPU gates and identity evidence
+
+Evidence root: `.temp/hybrid-a-r31-261102/`. Each named command has complete `.log` and `.json` records with argv, actual exit code, PID, environment, times and sampled free disk. CMake 4.4.4 and GCC 15.2.0, Release/non-native AVX2/FMA, CPU only; CUDA/Metal/Vulkan and other GPU backends disabled. Builds were serialized under the shared model-cache lock, checked with `pgrep -u agent cc1plus` and `uptime`, niced to 19 and limited to `-j4`. `TMPDIR` was on disk and `PYTHONDONTWRITEBYTECODE=1`. One candidate build serves the two runtime hash modes; no duplicate build is claimed.
+
+Reference runtime is exact main `683caeed`. Only `check-client.cpp` and `check-append.cpp` were instrumented in the isolated reference worktree to emit observations; `main-test-harness.patch` preserves the exact delta, with no runtime change. The candidate observation checker uses the same source. Legacy installed golden headers were wrapped as protocol 2/body v3; every body and both trailers remain unchanged (`golden-conversion.json`). Q8 identity checks use the same compatible native golden input on both builds; they do not claim equality between Q4 and Q8 inference.
+
+Let `B=.temp/hybrid-a-r31-261102/build/bin`, `R=.temp/hybrid-a-r31-261102`, `M=$HOME/Werkstatt/hybrid-models`, `G=$R/golden`. Every gate below exits 0 in both modes: unset `HYBRID_HASH_PORTABLE`, and `HYBRID_HASH_PORTABLE=1`.
+
+| Command / gate | Result per mode |
+| --- | --- |
+| `$B/llama-hybrid-check-codec` | 25 PASS; original borrowed/owning, streamed digest, header-budget and refusal controls retained. |
+| `python3 tools/hybrid/test_file_hash.py --binary $B/llama-hybrid-check-hash --model $M/Qwen3.5-0.8B-Q4_0.gguf -v` | 4 tests, no skips; real GGUF and independent hashlib/sha256sum digests. |
+| `python3 tools/hybrid/test_file_hash_ni.py --binary $B/llama-hybrid-check-hash -v` | 8 tests, no skips; NIST, boundaries, read errors, dispatch, mutations and sparse 4 GiB + 65-byte fixture. Observed `sha-ni` / `portable`; harness also selects both modes internally. |
+| `$B/test-server-component` | 50 tests, 235 assertions; no failures, exceptions or skips. |
+| `$B/llama-hybrid-check-swa $R/MODE-tiny.gguf` | 192 PASS, including allocated-cache windows, physical layout, rollback, interruption, legacy refusal and chunk/single equivalence. |
+| `$B/llama-hybrid-check-client MODEL --capacity $G/prompt-512` and `$B/llama-hybrid-check-guards MODEL $G/prompt-512` | Capacity failure/neighbor preservation and valid positive control; guards 4/4. |
+| `$B/llama-hybrid-check-append MODEL $G/prompt-512 $G/prompt-2048 $G/prompt-8192` | 54 PASS, including exact refusal state and 64-token greedy continuations at each depth. |
+| `test_import_identity.py --before $R/reference/bin/llama-hybrid-check-client --after $B/llama-hybrid-check-client --model Q4 --model Q8-r16 --golden $G/prompt-512 --golden $G/prompt-8192 --artifacts OUTPUT` | Four model/depth comparisons covering eight fresh/append state and 64-position full-vocabulary logit identities; all exact. |
+| `test_decode.py --binary $B/llama-server --model MODEL --golden $G/prompt-512 --artifacts OUTPUT --reference-slot $R/main-http/slots/imported.bin` | 18 HTTP 400 refusals preserve target/neighbor; actual imported slot bytes equal main; 64/64 greedy continuation. Slot SHA-256 remains `152e2df8583025c1db149573f7e2c538615ab304d995ce355b429caa581b8532`. |
+| `test_remote_append.py --binary $B/llama-server --prefill-binary $B/llama-hybrid-prefill --model MODEL --artifacts OUTPUT` | Real HTTP chunk interruption, malformed order/fixed-state cases, abort, abandoned-transfer replacement and final commit controls pass. |
+| `python3 -m unittest discover -s tools/hybrid-proxy -p 'test_*.py'` | 123 tests, no skips; inherited restart, chunk persistence and recovery checks retained. |
+| `llama-hybrid-check-chunk-identity MODEL --chunks` on Q4/Q8 | Existing chunk checker plus moved-request lifetime regression: 42 PASS per model, fresh/append. Compare main's 24 files byte-for-byte and by SHA-256 per mode, including wire envelopes, final state and held-token logits; 16 chunk trailers also match independent XXH3/hashlib references. Fixed state occurs only in chunk 3 of 4. |
+| `http_probe.py` at depth 8191 on Q4/Q8, fresh/append | 24 checksum refusals per mode, unchanged slot bytes. All valid imported slot digests match main; baseline adds 24 refusals, for 72 total. Only prefix-transfer metadata was adapted from the r35 probe; mutation offsets and rejection assertions are unchanged. |
+| `profile_import.py --url ... --runs 1`, plus synthetic fresh/append at 1024 tokens | Local HTTP golden replay and both synthetic protocol-2 transfers pass; no `state_copy` stage occurs. Smoke runs establish behavior, not a new throughput or RSS claim. |
+| `test_integrated.py ... --case chunk` | PR #14 real short-delta slope and conservative chunk-budget test passes; no 79k-token prefill is claimed. |
+
+`auto-suite-results.json`, `portable-suite-results.json`, `auto/portable-chunk-comparisons.json`, `probe-comparisons.json` and `final-audit.json` bind the results. Each mode has 17 suite gates, plus three profiling smoke gates and the integrated chunk gate. Across modes: 48 direct chunk byte identities, 32 independently checked chunk trailers and eight depth-8191 HTTP import digest identities.
+
+| Mutant | What it narrows the gate to | Named failing test | Result / bound |
+| --- | --- | --- | --- |
+| Flip byte 1024 in an otherwise identical exported native-state fixture | Cross-build comparator must detect a one-byte state mismatch | `test_chunk_import_bytes_match_main: fresh-state.bin` | Expected-red exit 1, killed; identical fixture control exit 0. No survivor. |
+
+Source audit confirms main's native chunk transaction differs only by opt-in timers and `delta_import::apply` is identical. The reviewed `sha256_stream` and streamed checksum function are unchanged; original reviewer control names remain. Source/binary hashes are in `validation-identity.json`; the final audit verifies they still match. No surface table was supplied (brief gap); no requested CPU contract is excluded. Rented GPU, production-model numerical qualification, Mac-over-5G timing, the separate inherited whole-prompt timing diagnostic, RSS and new performance benchmarking are outside this merge's requested CPU gates; no new result is claimed for them. Initial readiness failures and the corrected audit-boundary error remain recorded in `early-failures.md`, rather than counted as green.
+
+### Recovery of interrupted run
+
+Run `hybrid-a-r31b-261102` resumed the unchanged signed merge after the earlier runtime-capacity interruption. At 07:04:25Z, the merge, all 20 recorded source-file hashes and all 32 binary entries matched the earlier validation identity. Accelerated mode already had 17/17 green suite records; portable mode had 11/17, and both integrated chunk commands had complete exit-0 records. Those passing tests were reused. The partial `portable-proxy-01.log` had no exit record and is unrun evidence; the completed replacement is `portable-proxy-02.json` (123 tests, exit 0). The remaining portable native chunk checks, HTTP checksum probes and byte comparator use `-02.json` records; portable profile smoke gates use their first `-01.json` records. Every suite-summary row resolves to its actual command record. No build or source change was needed during recovery.
+
+Fresh recovery evidence is under `.temp/hybrid-a-r31b-261102/`: `resume-identity.json`, `merge-comparison.json`, `mac-verification.json`, `command-audit.json`, and the recovery log. The independent comparison repeats the original alternate-index construction, checks all eight conflict regions in five files, and confirms both tree equality and byte equality of the main-to-merge patch. The compared patch SHA-256 is `6611ea8d7c68761d1740586d8f9f16de43e8fd47161f29675bb3ae5615b7c2db`. The final report delta is checked separately and contains only this results file and the Mac-gate readback note in `UNRESOLVED_QUESTIONS.md`.
+
+### Reviewed diff plus resolutions
+
+`reviewed-branch.patch` is exact `git diff --binary 528724c9..dba3c14c`. Applying it to main's tree using an alternate index reports the same five conflicted files (expected exit 1). Substituting only the nine paths named in `compare-merge-tree.json` with the listed resolutions/adaptations produces tree `5908af162d01d688e02c0561d57be9b95f430874`, exactly the signed merge tree (equality gate exit 0). Thus `git diff 683caeed..a0149dc769aff5665cf0ba0cb7ea7c3d4516d896` is the reviewed branch change carried onto current main plus the enumerated resolutions. The later report commit is verified separately as documentation-only; no unlisted runtime delta is hidden by the comparison.
+
+### Returned Mac gate
+
+On 2026-11-02, M3 Max/macOS 27.2 arm64 passed its Metal-enabled build and both codec/hash modes on exact reviewed head `dba3c14c8dc27c25ca505acc33e594b48e3a4a3c`: codec 23 PASS, full-file hash 4 tests, NI harness 8 tests, no skips; dispatch `automatic=commoncrypto`, `forced=portable`. Configure, build and all six test commands actually exited 0. Final `gate-progress.json` records completion at `2026-11-02T06:34:02.907737+00:00`; its final results, rather than the older running `STATUS.json`, are the gate evidence.
+
+Archive: `/home/agent/lanes/hybrid/.temp/mac-results-261102/r35-mac-gate-evidence.tar.gz`. Verified full SHA-256: `901b27fe465b3a2216efe59144a312b6238b7fde4cfb12a4d68ff14d14f96c2a`; all 53 internal manifest entries match. Mac signature trust limitations and the source-owner amendment remain preserved in the archive; agents1 verifies the source signatures normally. This closes r35's returned CommonCrypto/portable source gate. R31 did not run a new Mac or GPU job; CPU merge tests and the unchanged hash implementation bound reuse of that source qualification.
+
+Cleanup removes the owned main/candidate build trees and native snapshots after preserving identities, patches, logs and manifests. The lowest recorded command sample before report generation was 28,579,352,576 free bytes, above the 28 GB floor (28,000,000,000 bytes); cleanup readback is in `.temp/hybrid-a-r31-261102/cleanup.json`, and the exact signed delivery head is in `.temp/hybrid-a-r31b-261102/delivery.json`. No model files were removed, no downloads or GPU execution were used, and no push was performed. Ready for review/local landing.
