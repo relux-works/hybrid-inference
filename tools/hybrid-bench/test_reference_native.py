@@ -56,6 +56,34 @@ def test_aligned_reference_tail(run, root, config, client, tokens, continuation,
     print('PASS test_aligned_reference_tail: checker5, scorer0, explicit tail3; wrong/missing boundaries exit2 without output', flush=True)
 
 
+def test_chunked_reference_tail(run, root, config, client, tokens, continuation, check_args):
+    # Two KV chunks with final-only fixed state score the exact local tail; an unfinished transfer cannot become a shorter valid chain.
+    prompt = (tokens * 3)[:35]
+    reference = root / 'chunked-reference.bin'
+    run('chunked-reference-write', check_args.reference_model, dict(tokens=prompt, continuation=continuation,
+        max_ctx=512, score_batch=3, model_sha256=check_args.reference_model_sha256, write_reference=str(reference)))
+    scratch = root / 'chunked-hybrid'
+    scratch.mkdir(mode=0o700)
+    args = SimpleNamespace(**vars(check_args))
+    args.reference_logits = str(reference)
+    result = equivalence(dict(config, export_block_size=16, extend_chunk_tokens=17), client, prompt, args, scratch)
+    assert result['exported_endpoint'] == 32 and result['local_tail_tokens'] == 3
+    fixture = json.loads((scratch / 'score.json').read_text())
+    assert len(fixture['deltas']) == 2
+    headers = []
+    for path in fixture['deltas']:
+        with open(path, 'rb') as source:
+            size, = struct.unpack('<I', source.read(4))
+            headers.append(json.loads(source.read(size)))
+    assert [h['fixed_state'] for h in headers] == [False, True]
+    same = run('chunked-same-model', check_args.reference_model,
+               dict(fixture, model_sha256=check_args.reference_model_sha256, hetero_quant=False))
+    assert same['local_to_hybrid']['kl_nats']['max'] < 1e-4
+    run('chunked-missing-final', client['model_path'], dict(fixture, deltas=fixture['deltas'][:-1], local_tail_start=16),
+        2, 'missing final score chunk')
+    print('PASS test_chunked_reference_tail: final-only fixed state, local tail3, independent local oracle; missing final exits2 without output', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', default='build')
@@ -243,6 +271,7 @@ def main():
             assert node.request('GET', '/v1/sessions') == []
         check_args.reference_model = args.reference
         test_aligned_reference_tail(run, root, config, client, tokens, continuation, check_args)
+        test_chunked_reference_tail(run, root, config, client, tokens, continuation, check_args)
         assert node.request('GET', '/v1/sessions') == []
     scored = [r for r in records if r['stage'] == 'reference_scoring']
     assert len(scored) == 3

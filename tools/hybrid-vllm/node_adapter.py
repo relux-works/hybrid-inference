@@ -14,7 +14,7 @@ import threading
 import time
 from typing import cast
 
-from bridge import (MAX_BODY, Refusal, body_size, convert, digest, fingerprint,
+from bridge import (MAX_BODY, Refusal, body_size, chunk_transfer, convert, digest, fingerprint,
                     require, token_hash, validate_layout)
 from node_backend import VllmBackend
 from fast_codec import qualify_node_codec
@@ -49,7 +49,7 @@ class Adapter:
                     last_used=session.last_used, model_sha256=self.target["model_sha256"])
 
     def health(self, owner):
-        value = dict(status="ok" if self.backend.healthy() else "unavailable", **self.target,
+        value = dict(delta_version=2, status="ok" if self.backend.healthy() else "unavailable", **self.target,
                      max_ctx=self.context, n_ctx=self.context, ram_budget_bytes=128 * self.context * 4,
                      max_request_bytes=self.max_request, export_block_size=self.block,
                      backend="vllm", state_storage="prefix-cache-and-token-journal")
@@ -121,13 +121,21 @@ class Adapter:
             return 400, dict(error="invalid tokens, context limit or return_delta"), {}
         if not all(type(t) is int and 0 <= t < self.target["model_layout"]["vocab_size"] for t in tokens):
             return 400, dict(error="token out of vocabulary"), {}
-        if set(body) - {"n0", "prefix_hash_n0", "tokens", "return_delta"}:
+        transfer_keys = {"transfer_id", "transfer_n0", "transfer_n1", "chunk_index", "chunk_count"}
+        if set(body) - {"n0", "prefix_hash_n0", "tokens", "return_delta", "delta_version"} - transfer_keys:
             return 400, dict(error="unsupported execution geometry or historical endpoint"), {}
         all_tokens = session.tokens + tokens
         requested = len(all_tokens)
         n1 = requested // self.block * self.block if return_delta else requested
         if return_delta and (n1 <= n0 or body_size(n1 - n0) > MAX_BODY):
             return 400, dict(error="no aligned endpoint or delta exceeds body limit"), {}
+        if "delta_version" in body:
+            require(type(body["delta_version"]) is int and body["delta_version"] == 2, "unsupported delta version")
+        transfer = {key: body[key] for key in transfer_keys if key in body}
+        if transfer:
+            require(return_delta and n1 == requested, "chunk endpoint must be exact")
+            chunk_transfer(transfer, n0, n1, sid)
+            require(transfer["transfer_n1"] <= self.context and transfer["transfer_n1"] % self.block == 0, "invalid transfer endpoint")
         accepted = all_tokens[:n1]
         started = time.perf_counter()
         with tempfile.TemporaryDirectory(dir=self.scratch) as tmp:
@@ -135,7 +143,7 @@ class Adapter:
             capture = self.backend.prefill(accepted, n0, root, capture=return_delta)
             if return_delta:
                 delta = root / "output.delta"
-                header = convert(capture, self.target, delta, self.codec, sid)
+                header = convert(capture, self.target, delta, self.codec, sid, transfer or None)
                 require(header["n0"] == n0 and header["n1"] == n1 and header["prefix_hash_n1"] == token_hash(accepted), "backend capture boundary mismatch")
                 wire = delta.read_bytes()
             else:

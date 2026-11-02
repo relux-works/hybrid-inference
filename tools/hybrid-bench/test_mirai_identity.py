@@ -110,7 +110,7 @@ class MiraiIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(common.Refusal, 'fingerprint mismatch'):
             common.validate_identity('a' * 64, changed, 'b' * 64, stock, True)
 
-    # This base supports only Qwen35 in Python admission; this change does not admit other architectures.
+    # Mirai headers remain Qwen35-only; stock SWA models use their own admission.
     def test_other_architectures_keep_refusal(self):
         for arch in ('gemma4', 'muse-glimmer', 'qwen35moe'):
             meta = fixture()

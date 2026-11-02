@@ -42,7 +42,7 @@ def run(node, golden, slots):
     session = header["session_id"]
     headers = {"Content-Type": "application/octet-stream", "X-Hybrid-Session": session}
     prefix = Path(str(golden) + ".prefix.state").read_bytes()
-    first = dict(header, n0=0, n1=n0, tokens=tokens[:n0], prefix_hash_n1=prefix_hash(tokens[:n0]))
+    first = dict(header, n0=0, n1=n0, tokens=tokens[:n0], prefix_hash_n1=prefix_hash(tokens[:n0]), transfer_n0=0, transfer_n1=n0)
     node.request("POST", "/slots/0?action=import_delta", envelope(first, prefix), headers)
     # A's one-stream slot snapshot must restore into another slot of a two-stream decode node.
     slot_file = struct.pack("<III", 0x67677371, 4, n0)

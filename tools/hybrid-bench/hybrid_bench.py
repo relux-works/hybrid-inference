@@ -61,6 +61,38 @@ def schedule(seed, measured=False, smoke=False, depths=None):
                        quantile_sample(rng, PROVENANCE['output_per_call']) if measured else 4 if smoke else 64)
 
 
+def tool_messages(index, content, add_call):
+    call_id = 'synthetic-' + str(index)
+    incoming = []
+    if add_call:
+        # A new user turn preserves the preceding sampled assistant's closing delimiter.
+        incoming = [dict(role='user', content='Read the synthetic tool result.'),
+                    dict(role='assistant', content='', tool_calls=[dict(id=call_id, type='function',
+                         function=dict(name='read', arguments='{}'))])]
+    return incoming + [dict(role='tool', tool_call_id=call_id, content=content),
+                       dict(role='user', content='Continue with decimal digits.')]
+
+
+def probe_tool_call(decode):
+    marker = 'hybrid' + uuid.uuid4().hex
+    history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.'),
+               dict(role='user', content='1'), dict(role='assistant', content='2')]
+    def render(add_call):
+        return decode('/apply-template', dict(messages=history + tool_messages(1, marker, add_call),
+                      chat_template_kwargs=dict(enable_thinking=False)))['prompt']
+    try:
+        count = render(False).count(marker)
+    except urllib.error.HTTPError as error:
+        if error.code not in (400, 422):
+            raise
+        count = 0
+    require(count <= 1, 'template duplicated the synthetic tool probe')
+    if count == 1:
+        return False
+    require(render(True).count(marker) == 1, 'template did not preserve the matched synthetic tool probe')
+    return True
+
+
 def verify_meter(trace, previous, mode):
     require(trace['prefilled'] == trace['new_tokens'] and trace['replayed_prefix'] == 0 and trace['rollback_n'] is None,
             'full re-prefill detected: prompt work differs from new tokens')
@@ -173,12 +205,23 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
             scoring_fixture(reference, tokens, reference['m'], client, config, [], reference_path)
         import struct
         for endpoint in ends:
+            transfer_n0 = n0
+            transfer_id = uuid.uuid4().hex
+            chunk_ends = []
+            at = n0
+            while at < endpoint:
+                at = min(endpoint, at + chunk) // block * block
+                chunk_ends.append(at)
+            chunk_count = len(chunk_ends)
+            index = 0
             while n0 < endpoint:
                 n1 = min(endpoint, n0 + chunk) // block * block
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
-                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True),
+                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2,
+                             transfer_id=transfer_id, transfer_n0=transfer_n0, transfer_n1=endpoint,
+                             chunk_index=index, chunk_count=chunk_count),
                         timeout=args.request_timeout or 120, binary=True)
                 except urllib.error.HTTPError as error:
                     if error.code == 503:
@@ -204,6 +247,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 delta_path.write_bytes(data)
                 paths.append(str(delta_path))
                 n0 = n1
+                index += 1
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
@@ -489,6 +533,8 @@ def main():
             require(len(decode('/tokenize', dict(content=text, add_special=False))['tokens']) == count,
                     'synthetic filler is not one token per repeat on this model')
             return text
+        add_tool_call = probe_tool_call(decode)
+        rows.append(dict(stage='tool_probe', tool_call_added=add_tool_call))
         for mode in args.modes:
             history = [dict(role='system', content='Read synthetic tool results. Reply with decimal digits only.')]
             sid, previous = 'bench-' + uuid.uuid4().hex, 0
@@ -504,8 +550,7 @@ def main():
                             continue
                         incoming = [dict(role='user', content=synthetic(max(1, target - previous - 24)))]
                     else:
-                        incoming = [dict(role='tool', tool_call_id='synthetic-' + str(index), content=synthetic(step['tokens'])),
-                                    dict(role='user', content='Continue with decimal digits.')]
+                        incoming = tool_messages(index, synthetic(step['tokens']), add_tool_call)
                     messages = history + incoming
                     if count_messages(messages, step['output']) > limit:
                         rows.append(dict(stage='skip', mode=mode, reason='context cap', requested=step, context=limit))
@@ -519,6 +564,7 @@ def main():
                     sid, message, trace, first, total = stream_chat(client['proxy_url'], credential, body, mode, sid, args.request_timeout or 300)
                     verify_meter(trace, previous, mode)
                     row = dict(stage='call', mode=mode, schedule_index=index, requested=step, ttft_seconds=first,
+                               tool_call_added=step['kind'] == 'tool' and add_tool_call,
                                total_seconds=total, decode_tokens_per_second=(trace['generated_tokens'] * 1000 / trace['decode_ms']) if trace.get('decode_ms') else None,
                                **{k: v for k, v in trace.items() if k != 'mode'})
                     rows.append(row)

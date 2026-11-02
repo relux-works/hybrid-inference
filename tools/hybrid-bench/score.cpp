@@ -201,18 +201,27 @@ static void prefill_arm(llama_context * ctx, const std::vector<llama_token> & to
         hybrid::prefill(ctx, {tokens.begin(), tokens.end() - 1}, 0);
     } else {
         int64_t end = 0;
+        hybrid::delta_import pending;
+        std::vector<llama_token> committed;
         for (const auto & path : paths) {
             const auto size = std::filesystem::file_size(path);
             require(size <= 513 * 1024 * 1024 + 52, "score delta exceeds limit");
             std::ifstream delta_input(path, std::ios::binary);
-            const auto delta = hybrid::read_delta(read_bytes(delta_input, size), source_hash, end);
+            const auto wire = read_bytes(delta_input, size);
+            const auto delta = hybrid::read_delta(wire, source_hash, end);
             const int64_t n1 = delta.header.at("n1");
             require(n1 <= int64_t(n - 1), "score delta endpoint mismatch");
             require(delta.header.at("tokens") == std::vector<llama_token>(tokens.begin() + end, tokens.begin() + n1) &&
                     delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "score delta tokens mismatch");
-            require(llama_state_seq_set_data_append(ctx, reinterpret_cast<const uint8_t *>(delta.state.data()), delta.state.size(), 0, end, n1) == delta.state.size(), "score delta import failed");
+            if (pending.stage(ctx, 0, wire, source_hash, delta.header.at("session_id").get<std::string>(), committed,
+                              llama_n_ctx(ctx), llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))))) {
+                pending.apply(ctx, 0);
+                committed = pending.imported_tokens();
+                pending.clear();
+            }
             end = n1;
         }
+        require(committed.size() == size_t(end), "missing final score chunk");
         require(end == local_tail_start && end < int64_t(n), "incomplete score delta chain");
         hybrid::prefill(ctx, {tokens.begin() + end, tokens.end() - 1}, end);
     }

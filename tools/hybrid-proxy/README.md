@@ -145,4 +145,24 @@ Live node health is checked before sync. Native bytes/checksums and decoder layo
 
 With `benchmark=true`, authenticated `DELETE /v1/sessions/ID` releases that client's current and retired remote sessions and prevents their background recreation. A local-mode marker is persisted before generation, so interruption cannot enable remote replay. Ordinary responses have no benchmark fields and exactly one streaming DONE marker; default GET behavior remains HTTP 501.
 
+## Captured chat-template qualification
+
+The journal probes live message frames for Qwen ChatML, Gemma 4 and Muse Glimmer. It verifies the family against a live user/assistant/user render and, for Gemma and Glimmer, the template source and BOS/EOS properties. Unknown frames reject with 409. Plain token pieces must reproduce every rendered byte. One tokenizer-added BOS is accepted only when its declared single-token ID precedes exactly the plain IDs; its byte width is zero. A visible BOS cannot also be a leading special.
+
+Normal reply boundaries are `<|im_end|>`, `<turn|>` and `<|eot|>`, respectively. Gemma tool replies continue inside a model turn at the sampled `<|tool_response>` opener. Both forms retain a single-token ending check, exact text/token suffix checks and anchor overlap. User checkpoint headers come from the same live message probes.
+
+`fixtures/templates/*.json` retain the derived renders and tokenizations captured from real decoders at b12094-74f8f4c3a. Full template sources are replaced by `chat_template_sha256` and `chat_template_tool_use_sha256` (null when absent). `FixtureTemplate` in `stub_server.py` supplies text renderers and compact frame properties, without loading or redistributing source. Token replay accepts captured text and aligned captured spans only; it is not a model tokenizer. Renderers are checked against all 192 captured renders, including the 96 `-r20` renders, before their marker probes serve as test evidence. The r20 harness accepts the single captured `read` tool definition and reuses its captured system preamble. Other schemas, arbitrary multimodal inputs and uncaptured tokenizations are outside this fixture harness.
+
+Gemma continued assistants share a model turn. Their probes start at their own content/reasoning bytes, before any calls, rather than reusing an earlier turn opener. Call/tool/answer ranges remain separate. Equal starts reject with 409. A call with nonempty content rendered after its tool responses is not contiguous and also rejects.
+
+`template_oracle.py` is a test-only adaptation of the r6o Jinja2 oracle. It reads original capture JSON files from `HYBRID_TEMPLATE_FIXTURES` (default `/home/agent/lanes/hybrid/.temp/template-fixtures/`), verifies both template hashes, and requires an already installed Jinja2. Missing source or Jinja2 gives an explicit unittest skip; a hash mismatch fails. It matches 88 original renders plus all 96 r20 renders and checks live probes on 84 original supported variants plus all 96 r20 variants. Tool conversion restores server wrapper ordering and the observed fixed-schema parameter order lost in the sorted capture JSON; this is not a general schema oracle. Eight Gemma/Glimmer assistant-prefill renders require server assembly outside the oracle. Source-free frame/HTTP/control tests still run when the external sources are absent.
+
+```sh
+mkdir -p .temp/template-tests/tmp
+TMPDIR="$PWD/.temp/template-tests/tmp" nice -n 10 python3 -B -m unittest discover -s tools/hybrid-proxy -p test_templates.py -v
+TMPDIR="$PWD/.temp/template-tests/tmp" nice -n 10 python3 -B tools/hybrid-proxy/template_controls.py --output .temp/template-tests/controls
+```
+
+The controls output directory must be new. It contains copied-source identities, owned process IDs, exact commands, logs, assertion records and `controls.json`. Identity must survive; setup errors, skipped tests and wrong assertion failures receive no kill credit. Results and finite GPU qualification gaps are in [the r19 report](RESULTS-hybrid-a-r19-templates-261101.md). The bench now probes unmatched tool preservation and inserts a matching call, preceded by a fresh user request, only when required. Qwen request bytes are regression-tested unchanged. `tool_call_added` records the verdict in probe and call rows. Controls also copy the adjacent bench Python modules and run the source-free bench contracts; external oracle tests remain optional.
+
 Policy-kept local turns leave shadow synchronization to the existing replay worker. Synchronous synchronization and prefix validation still precede every critical offload. The durable token/message commit, replay acknowledgement checks and fallback remain in place. A request can still wait behind a replay already holding its session ticket. The [local-kept latency report](RESULTS-hybrid-d-r4-261101.md) includes three CPU pairs, trace definitions, negative controls, and GPU commands.

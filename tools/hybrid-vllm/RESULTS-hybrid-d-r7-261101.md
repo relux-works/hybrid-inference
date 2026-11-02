@@ -249,3 +249,76 @@ Body draft:
 > Integration and conflict resolution were assisted by Codex. No publication was performed. Resolve the dependency validation gaps and review the exact signed merged head before landing.
 
 Branch: `m3-vllm-node`. The exact signed head and this draft are in `.temp/hybrid-d-r9-261102/landing-note.md`, written after signing so the commit does not contain a self-referential ID. No session links are included.
+
+
+## r10: second main merge after PR #14
+
+Run: `hybrid-d-r10-261102`, 2026-11-02 UTC. Branch: `m3-vllm-node`. Merge first parent: `2614402ee9e1463f7766b39b8dbc96c03ed629ff`; pinned main second parent: `683caeed94c64ad69699d5f69a8fb533d4de6737`. The working tree started clean. No push, GPU execution or model download was performed. Explicit user instructions authorize this local signed merge, the requested co-author trailer, and the landing-note draft in this fork.
+
+### Every merge conflict and resolution
+
+| Path | Resolution |
+|---|---|
+| `tools/hybrid-bench/check.cpp` | Keep main's staged `delta_import` and committed-final endpoint check, then evaluate the branch's exact `local_tail_start` tail on imported, split and repeat contexts. |
+| `tools/hybrid-bench/manage.py` | Keep both main's window-state policy/geometry accounting and the branch's validated `export_block_size` capability. |
+| `tools/hybrid-proxy/proxy.py` | Keep main's backup/restore/abort transaction and unchanged committed slot during staging. Generate actual aligned chunk ranges; transfer count and final endpoint describe those ranges. Commit the session only after the final chunk, then run the local tail. |
+
+These are the three textual conflicts recorded by `merge-01.log`. Main's native serialization, atomic chunk implementation and physical SWA layout are inherited unchanged; none of their `src/` files required conflict resolution.
+
+Necessary semantic resolutions also update the bridge/adapter to HYBD v2 / `llama-native-chunks-v3`, with bounded, typed transfer metadata. Intermediate native bodies contain KV only; only a standalone or final chunk contains fixed recurrent state. Invalid versions, partial metadata and unaligned explicit transfer endpoints refuse before backend work or journal changes. Transfer IDs use the native reader's UTF-8 byte limit. Health advertises `delta_version=2`.
+
+The benchmark counts the actual rounded chunk boundaries: block16/chunk31/endpoint48 requires three chunks. The reference scorer uses the production staged importer and refuses a chain without final fixed state before evaluating the exact local tail and held token. The allocated-cache adapter helper validates each chunk, checks unchanged committed cache positions during staging, atomically imports the chain and compares each chunk's exported native bytes. Protocol, tools and unresolved-GPU documentation describe the merged contract.
+
+### Validation and limits
+
+Every command, PID, real exit and sampled disk floor is persisted in `.temp/hybrid-d-r10-261102/validation-ledger.json` and the numbered command logs/JSON records. Commands execute directly with disk-backed `TMPDIR`, `PYTHONDONTWRITEBYTECODE=1` and niced CPU work. CPU configure/build/helper gates record `pgrep -u agent cc1plus` and `uptime` admission first; CMake builds use `nice -n 10` and `-j4`, one build at a time. Helper compilation waited for the other lane's compiler to finish. The existing CMake 4.4.4 binary is read from hybrid-a's task tools; no build tool was installed.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Static CPU named-target build; scorer and server-component incremental build; native helper | exit 0 each | `build-configure-01`, `build-01`, `build-final-01`, `build-helper-01` |
+| Runtime | 8 tests, exit 0 | `runtime-tests-02` |
+| Full bridge/node/converter/adapter/process discovery | 67 tests, exit 0; optional torch case skipped | `vllm-tests-01` |
+| Final adapter tests, including 3-chunk native round-trip, checksummed early/missing fixed state and metadata refusals | 7 tests, exit 0 | `adapter-final-tests-01` |
+| Fast codec | 4 tests, exit 0; optional torch case skipped | `codec-tests-01` |
+| Proxy with system Jinja oracle | 123 tests, no skips, exit 0 | `proxy-system-tests-01` |
+| Bench with SWA allocated-cache identity enabled | 81 tests, exit 0; six opt-in native-header discovery skips | `bench-full-tests-01` |
+| Native header fixtures, covering those six discovery skips using existing local headers | 12 tests, no skips, exit 0 | `native-mirai-identity-01` |
+| Physical SWA allocated-cache suite; hybrid chunk transaction suite; server components; native codec | exit 0 each | `native-swa-01`, `native-hybrid-chunks-01`, `native-server-component-01`, `native-codec-01` |
+| Native node/proxy/checker integration; heterogeneous study | exit 0 each | `native-integrated-01`, `native-hetero-study-01` |
+| Reference scoring, including aligned and chunked local tails, independent same-model local oracle, missing-final refusal and all prior boundary cases | exit 0 | `reference-native-01` |
+| File hash and SHA-NI/portable hash suites | exit 0 each | `native-hash-01`, `native-hash-ni-01` |
+| AST, ASCII, newline/whitespace, retained parent test names, shell syntax, exact workflow model naming and diff whitespace | pass; command gates exit 0 | `source-identity.json`, `retained-test-names.json`, `shell-syntax-01`, `code-style-01`, `diff-check-01` |
+
+The NumPy-only venv was created with `python3 -m venv .temp/hybrid-d-r10-261102/venv`, then `venv/bin/python -m pip install --only-binary=:all: --no-deps numpy==2.4.2`. Its package inventory contains NumPy and bootstrap pip only. System Python and the existing local CPU environment have no torch. Gather and optional torch arithmetic were not run, and no torch was installed. System Python supplies the existing Jinja dependency for proxy/bench oracles; the isolated NumPy environment did not install it.
+
+Expected-red and corrected attempts are retained: `adapter-red-01` exits 1 at the old adapter's intended HTTP400 refusal of the new chunk request. Premature `adapter-tests-01` exits 1 with two missing-native-helper setup errors and is uncredited; both subsequent adapter runs pass. Initial venv proxy/bench discovery skips Jinja controls; the system-Python runs cover them. Type and EditorConfig gates each exit 127 because `ty` and `editorconfig-checker` are unavailable. Their packages are outside this run's NumPy-only install authorization, so those gates remain unrun.
+
+| Mutant | Gate narrowed to | Named failing test | Result / survival bound |
+|---|---|---|---|
+| Restore unrounded chunk-count ceiling | Count the actual aligned request ranges | `RuntimeTests.test_checker_aligned_tail` | Assertion failure, exit 1; no setup errors |
+| Emit fixed state in every chunk | Fixed state only in the final chunk | `AdapterTests.test_chunked_final_fixed_state` | Assertion failure, exit 1; no setup errors |
+
+Both in-memory mutants run in isolated processes; no source file was mutated. There are no survivors among these two controls. Correctly checksummed early/absent fixed-state input plants additionally fail the native chunk validator, while the neighboring complete chain imports and round-trips. Existing reviewer test names are retained. No formal surface table was supplied (brief gap). GPU/live vLLM extraction, merged-head numerical qualification, and downloads are outside the explicit CPU-only scope. Earlier B300 evidence remains bound to `c2f47472`, as recorded in r9; it is not a claim about this merge. No further product surface is treated as out of contract.
+
+The sampled minimum free disk during recorded commands was 29,727,318,016 bytes, above 28 GB; the guard abort threshold was 28.1 GB and never triggered. Task-owned build trees, native helper, test payloads and NumPy venv are removed after hashing. `cleanup-01.json` records exact removals and disk readback; logs, JSON outcomes and hashes remain.
+
+### Exact-diff comparison
+
+`reviewed-branch.patch` is the reviewed `c2f47472` delta from its merge base `a3752b04`; SHA256 `649e5e20cf2ad0a7cd8521905a9a61cd2fb83f9e1d48d92160867dcd957e7132`, identical to the r9 reviewed patch. Replay it on pinned main in a separate index and select the reviewed stage-3 blobs for deterministic conflict baselines. Export all remaining differences as `all-resolutions.patch`, including inherited r9 integration and this run's explicit code/test/report resolutions. Applying that patch reconstructs the exact candidate tree; its `683caeed..tree` binary diff must be byte-identical to `git diff --binary 683caeed..HEAD` after signing.
+
+An independent reconstruction starts from the r9 `528724c9..2614402e` landing patch and exports `r10-resolutions.patch`. Both equality checks, tree IDs, path inventories, patch/diff hashes and the exact signed head are in `proof.json`. The original-reviewed algebraic replay has an additional historical README conflict; it is not an extra conflict in this second merge. No unrelated working-tree change was included.
+
+### Updated landing note
+
+PR title: `hybrid: add aligned vLLM node with atomic chunk deltas`
+
+Body draft:
+
+> Add the reviewed vLLM bridge and HTTP node adapter on main 683caeed after PR #14. Emit HYBD v2 / llama-native-chunks-v3 with KV-only intermediate chunks and recurrent fixed state only in the final chunk. Preserve exact aligned exports and local tails in the proxy, native checker and reference scorer, with atomic client import and incomplete-chain refusal.
+>
+> CPU builds and runtime, proxy, bench, converter/adapter, native integration/reference/study, physical SWA, codec, identity and hash checks passed. The full bridge/node suite ran 67 tests with only optional torch arithmetic skipped. Gather was not run because torch was absent; NumPy 2.4.2 was the only installed test dependency. Type and EditorConfig checks could not run because their tools were unavailable.
+>
+> The merge and protocol resolutions were assisted by Codex. No push or PR submission was performed. Existing B300 evidence belongs to c2f47472, and does not qualify this merged head; GPU execution and merged-head numerical qualification remain pending. Review the exact signed head and the persisted reconstruction evidence before landing.
+
+
+The exact signed head is written after signing to `.temp/hybrid-d-r10-261102/landing-note.md` and `proof.json`; this avoids a self-referential commit ID in a committed report. Both parents, signature verification and exact committed-tree equality are checked there. Ready for independent review; no publication or landing performed.

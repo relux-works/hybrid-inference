@@ -199,6 +199,7 @@ struct server_task {
         std::string filename;
         std::string filepath;
         std::string delta;
+        bool abort_delta = false;
         std::string session_id;
     };
     slot_action slot_action;

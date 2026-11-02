@@ -112,6 +112,76 @@ class AdapterTests(unittest.TestCase):
         result = subprocess.run([binary, str(self.root / "a.delta"), str(self.root / "b.delta"), str(self.root / "target.json")], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    # V2 chunks keep committed cache positions unchanged until the final fixed state commits the exact aligned endpoint.
+    def test_chunked_final_fixed_state(self):
+        path = self.create()
+        wires = []
+        for index in range(3):
+            n0, n1 = index * 16, (index + 1) * 16
+            wire = self.node.request("POST", path + "/extend", dict(n0=n0, prefix_hash_n0=prefix_hash(list(range(n0))),
+                tokens=list(range(n0, n1)), return_delta=True, delta_version=2, transfer_id="chunked-adapter",
+                transfer_n0=0, transfer_n1=48, chunk_index=index, chunk_count=3), binary=True)
+            size, = struct.unpack_from("<I", wire)
+            header = json.loads(wire[4:4 + size])
+            self.assertEqual((header["version"], header["body_format"], header["fixed_state"]),
+                             (2, "llama-native-chunks-v3", index == 2))
+            self.assertEqual(header["sections"][0]["bytes"], (156_894_772 if index == 2 else 32 + 32 * 12) + 16 * (34_816 + 24))
+            self.assertEqual(bridge.xxh128_file(io.BytesIO(wire[4 + size:-48])), wire[-48:])
+            wires.append(wire)
+        binary = os.environ["HYBRID_VLLM_NATIVE_CHECK"]
+        paths = []
+        for index, wire in enumerate(wires):
+            file = self.root / (str(index) + ".delta")
+            file.write_bytes(wire)
+            paths.append(str(file))
+        target = self.root / "target.json"
+        target.write_text(json.dumps(self.target))
+        result = subprocess.run([binary, *paths, str(target)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = subprocess.run([binary, *paths[:-1], str(target)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("missing final chunk", result.stderr)
+        # Correctly checksummed extra/absent fixed bytes must fail native validation, not just envelope parsing.
+        size, = struct.unpack_from("<I", wires[0])
+        first_body = wires[0][4 + size:-48]
+        last_size, = struct.unpack_from("<I", wires[-1])
+        last_body = wires[-1][4 + last_size:-48]
+        fixed = last_body[len(first_body):]
+        for name, wire, body in (("early-fixed", wires[0], first_body + fixed), ("missing-fixed", wires[-1], last_body[:-len(fixed)])):
+            size, = struct.unpack_from("<I", wire)
+            header = json.loads(wire[4:4 + size])
+            header["sections"][0]["bytes"] = len(body)
+            encoded = json.dumps(header, separators=(",", ":")).encode()
+            bad = self.root / (name + ".delta")
+            bad.write_bytes(struct.pack("<I", len(encoded)) + encoded + body + bridge.xxh128_file(io.BytesIO(body)))
+            chain = [str(bad), *paths[1:]] if name == "early-fixed" else [*paths[:-1], str(bad)]
+            result = subprocess.run([binary, *chain, str(target)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("invalid native chunk", result.stderr)
+
+    # Invalid transfer metadata is rejected before backend work or journal changes, beside a valid standalone request.
+    def test_chunk_metadata_refusals(self):
+        path = self.create()
+        good = dict(n0=0, prefix_hash_n0=prefix_hash([]), tokens=list(range(16)), return_delta=True,
+                    delta_version=2, transfer_id="valid", transfer_n0=0, transfer_n1=32, chunk_index=0, chunk_count=2)
+        before = self.node.request("GET", path)
+        variants = [dict(good, **{key: value}) for key, value in
+                    (("delta_version", 1), ("delta_version", True), ("transfer_id", ""), ("transfer_id", "x" * 129), ("transfer_id", "\u00e9" * 100),
+                     ("chunk_index", True), ("chunk_index", 2), ("chunk_count", 0), ("chunk_count", 33),
+                     ("transfer_n0", 1), ("transfer_n1", 16), ("transfer_n1", 33), ("return_delta", False))]
+        for key in ("transfer_id", "transfer_n0", "transfer_n1", "chunk_index", "chunk_count"):
+            bad = dict(good)
+            del bad[key]
+            variants.append(bad)
+        for bad in variants:
+            with self.subTest(body=bad), self.assertRaises(HTTPError) as error:
+                self.node.request("POST", path + "/extend", bad, binary=True)
+            self.assertEqual(error.exception.status, 400)
+            self.assertEqual(self.node.request("GET", path), before)
+            self.assertEqual(self.backend.calls, [])
+        self.extend(path, [], list(range(16)))
+        self.assertEqual(self.node.request("GET", path)["n"], 16)
+
     # Bad identity, stale prefixes, invalid tokens, unsupported slots and unaligned historical states leave the journal intact.
     def test_refusals_auth_release(self):
         path = self.create()
@@ -183,7 +253,7 @@ class AdapterTests(unittest.TestCase):
         def native_decode(raw, model, before):
             size, = struct.unpack_from("<I", raw)
             header = json.loads(raw[4:4 + size])
-            self.assertEqual(header["body_format"], "llama-native-seq-v1")
+            self.assertEqual(header["body_format"], "llama-native-chunks-v3")
             self.assertEqual(header["n0"], len(before))
             self.assertEqual(bridge.xxh128_file(io.BytesIO(raw[4 + size:-48])), raw[-48:])
             tokens = before + header["tokens"]

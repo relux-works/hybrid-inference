@@ -1,6 +1,6 @@
 #pragma once
 
-#include "llama.h"
+#include "llama-ext.h"
 #include "llama-graph.h"
 
 #include <map>
@@ -17,9 +17,10 @@ class llama_io_read_i;
 
 // Internal host-state append mode. Use the transactional API in llama-ext.h.
 #define LLAMA_STATE_SEQ_FLAGS_APPEND (1u << 30)
+#define LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT (1u << 29)
 #define LLAMA_STATE_SEQ_FLAGS_VALIDATE (1u << 31)
-static_assert(((LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE) &
-               (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) == 0,
+static_assert(((LLAMA_STATE_SEQ_FLAGS_APPEND | LLAMA_STATE_SEQ_FLAGS_VALIDATE | LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT) &
+               (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_KV_ONLY)) == 0,
               "internal state flags must not overlap public state flags");
 
 struct llama_memory_params {
@@ -167,3 +168,11 @@ struct llama_memory_i {
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
+
+struct llama_state_seq_chunk;
+struct llama_hparams;
+
+// Shared native transaction for context imports and allocated-cache checks.
+LLAMA_API size_t llama_memory_seq_read_chunks(
+        llama_memory_t memory, const llama_hparams & hp, const std::vector<llama_state_seq_chunk> & chunks,
+        llama_seq_id seq_id, llama_pos n0, uint32_t n_ctx, bool validate_only = false, bool final = true);

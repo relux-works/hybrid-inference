@@ -111,7 +111,7 @@ class RuntimeTests(unittest.TestCase):
     # Checker exports end at aligned positions but the fixture retains every prompt token for local tail evaluation.
     def test_checker_aligned_tail(self):
         config = dict(prefill_url="http://fixture", model_sha256="0" * 64, clients={"a": dict(prefill_token="fixture")},
-                      export_block_size=16, extend_chunk_tokens=35)
+                      export_block_size=16, extend_chunk_tokens=31)
         client = dict(context=512, build_dir="build", model_path="fixture.gguf", backend="cpu")
         args = NS(check_tokens=2, noise_chunks=[128], request_timeout=60)
         calls = []
@@ -124,8 +124,11 @@ class RuntimeTests(unittest.TestCase):
             value = json.loads(Path(command[2]).read_text())
             self.assertEqual(value["tokens"], list(range(50)))
             self.assertEqual(value["local_tail_start"], 48)
-            self.assertEqual([c["n0"] for c in calls[1:]], [0, 32])
-            self.assertEqual([len(c["tokens"]) for c in calls[1:]], [32, 16])
+            self.assertEqual([c["n0"] for c in calls[1:]], [0, 16, 32])
+            self.assertEqual([len(c["tokens"]) for c in calls[1:]], [16, 16, 16])
+            self.assertEqual([c["chunk_index"] for c in calls[1:]], [0, 1, 2])
+            self.assertEqual([c["chunk_count"] for c in calls[1:]], [3, 3, 3])
+            self.assertTrue(all(c["transfer_n1"] == 48 and c["delta_version"] == 2 for c in calls[1:]))
             raise Checked
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(hybrid_bench, "http", side_effect=http), \
                 mock.patch.object(hybrid_bench, "run_checker", side_effect=checker), mock.patch.object(hybrid_bench.urllib.request, "urlopen"):

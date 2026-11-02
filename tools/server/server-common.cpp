@@ -49,6 +49,11 @@
 #include <unistd.h>
 #endif
 
+llama_pos server_prompt_reuse_threshold(llama_pos pos_next, int32_t n_swa, bool has_new_tokens) {
+    const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
+    return n_swa > 0 ? std::max(1, pos_eval - n_swa + 2) : std::max(0, pos_eval);
+}
+
 std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
     wchar_t buf[32768] = { 0 };  // Large buffer to handle long paths

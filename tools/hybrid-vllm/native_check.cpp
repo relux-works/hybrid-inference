@@ -21,25 +21,6 @@ static std::string read_file(const char * path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-class reader : public llama_io_read_i {
-public:
-    explicit reader(const std::string & bytes) : bytes(bytes) {}
-    void read(void * dst, size_t n) override {
-        require(n <= bytes.size() - offset, "truncated native state");
-        memcpy(dst, bytes.data() + offset, n);
-        offset += n;
-    }
-    void read_tensor(ggml_tensor * tensor, size_t at, size_t n) override {
-        require(n <= bytes.size() - offset, "truncated native tensor");
-        ggml_backend_tensor_set(tensor, bytes.data() + offset, at, n);
-        offset += n;
-    }
-    size_t n_bytes() override { return offset; }
-private:
-    const std::string & bytes;
-    size_t offset = 8;
-};
-
 class writer : public llama_io_write_i {
 public:
     std::string bytes;
@@ -77,24 +58,51 @@ int main(int argc, char ** argv) {
         }
         llama_memory_hybrid memory(*model, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, 1024, 0,
                                    LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32, 1, 1, 0, false, true);
-        int n0 = 0;
+        int n0 = 0, committed = 0;
+        std::vector<hybrid::delta> pending;
         for (int arg = 1; arg < argc - 1; ++arg) {
-            const auto delta = hybrid::read_delta(read_file(argv[arg]), target.at("model_sha256"), n0);
-            require(delta.state.size() >= 8, "truncated native sequence header");
+            auto delta = hybrid::read_delta(read_file(argv[arg]), target.at("model_sha256"), n0);
             require(delta.header.at("layout_fingerprint") == hybrid::layout_fingerprint(target.at("model_layout")), "native fingerprint mismatch");
-            uint32_t magic;
-            memcpy(&magic, delta.state.data(), sizeof(magic));
-            require(magic == 0xaf143cd8, "native sequence magic mismatch");
             const int n1 = delta.header.at("n1");
+            const bool final = delta.header.at("fixed_state");
             require(n1 > n0 && n1 <= 1024, "synthetic native check limited to 1024 tokens");
-            reader input(delta.state);
-            memory.state_read(input, 0, LLAMA_STATE_SEQ_FLAGS_APPEND);
-            require(input.n_bytes() == delta.state.size() && memory.seq_pos_max(0) == n1 - 1, "native endpoint mismatch");
-            writer output;
-            memory.state_write_range(output, 0, n0, n1, 0);
-            require(output.bytes == delta.state.substr(8), "native round-trip byte mismatch");
+            require(delta.header.at("chunk_index") == pending.size(), "chunk order mismatch");
+            if (pending.empty()) {
+                require(delta.header.at("transfer_n0") == committed, "transfer start mismatch");
+            } else {
+                for (const auto * key : {"session_id", "transfer_id", "transfer_n0", "transfer_n1", "chunk_count"}) {
+                    require(delta.header.at(key) == pending.front().header.at(key), "transfer identity mismatch");
+                }
+            }
+            const llama_state_seq_chunk chunk {reinterpret_cast<const uint8_t *>(delta.state.data()), delta.state.size(), n1};
+            require(llama_memory_seq_read_chunks(&memory, hp, {chunk}, 0, n0, 1024, true, final) == delta.state.size(), "invalid native chunk");
+            require(memory.seq_pos_max(0) == committed - 1 && memory.get_mem_attn()->seq_pos_max(0) == committed - 1,
+                    "staged chunk changed memory");
+            pending.push_back(std::move(delta));
+            if (final) {
+                std::vector<llama_state_seq_chunk> chunks;
+                size_t bytes = 0;
+                for (const auto & part : pending) {
+                    chunks.push_back({reinterpret_cast<const uint8_t *>(part.state.data()), part.state.size(), part.header.at("n1")});
+                    bytes += part.state.size();
+                }
+                require(llama_memory_seq_read_chunks(&memory, hp, chunks, 0, committed, 1024, false, true) == bytes, "native chunk import failed");
+                require(memory.seq_pos_max(0) == n1 - 1, "native endpoint mismatch");
+                for (const auto & part : pending) {
+                    writer output;
+                    if (part.header.at("fixed_state").get<bool>()) {
+                        memory.state_write_range(output, 0, part.header.at("n0"), part.header.at("n1"), 0);
+                    } else {
+                        memory.get_mem_attn()->state_write_range(output, 0, part.header.at("n0"), part.header.at("n1"), 0);
+                    }
+                    require(output.bytes == part.state.substr(8), "native round-trip byte mismatch");
+                }
+                committed = n1;
+                pending.clear();
+            }
             n0 = n1;
         }
+        require(pending.empty(), "missing final chunk");
         std::cout << "PASS native envelope, fingerprint, attention/GDN cache import and byte round-trip\n";
         return 0;
     } catch (const std::exception & error) {

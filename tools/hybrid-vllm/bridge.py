@@ -85,8 +85,22 @@ def validate(snapshot, target):
             require(layer["conv"]["dtype"] in ("bfloat16", "float32") and layer["state"]["dtype"] in ("bfloat16", "float32"), "unsupported state dtype")
 
 
-def body_size(count):
-    return 156_894_772 + count * (34_816 + 24)
+def body_size(count, fixed_state=True):
+    return 416 + (156_894_356 if fixed_state else 0) + count * (34_816 + 24)
+
+
+def chunk_transfer(transfer, n0, n1, session_id):
+    if transfer is None:
+        transfer = dict(transfer_id=session_id, transfer_n0=n0, transfer_n1=n1, chunk_index=0, chunk_count=1)
+    require(set(transfer) == {"transfer_id", "transfer_n0", "transfer_n1", "chunk_index", "chunk_count"}, "incomplete chunk metadata")
+    require(isinstance(transfer["transfer_id"], str) and 0 < len(transfer["transfer_id"].encode("utf-8")) <= 128, "invalid transfer id")
+    for key in ("transfer_n0", "transfer_n1", "chunk_index", "chunk_count"):
+        require(type(transfer[key]) is int and 0 <= transfer[key] <= 2**31 - 1, "invalid chunk metadata")
+    begin, end = transfer["transfer_n0"], transfer["transfer_n1"]
+    index, count = transfer["chunk_index"], transfer["chunk_count"]
+    require(begin <= n0 < n1 <= end and 0 < count <= end - begin and index < count
+            and (index != 0 or begin == n0) and (end == n1 if index + 1 == count else end > n1), "invalid chunk boundary")
+    return dict(transfer, fixed_state=index + 1 == count)
 
 
 def tensor_bytes(root, spec):
@@ -186,7 +200,7 @@ def recurrent_row(root, layer, state, layout):
     return f32_bytes(data[t * 10240 + c] if layout == "SD" else data[c * 3 + t] for c in channels for t in range(3))
 
 
-def write_body(output, snapshot, root, codec=None):
+def write_body(output, snapshot, root, codec=None, fixed_state=True):
     n0, n1 = snapshot["n0"], snapshot["n1"]
     def pack(fmt, *args):
         output.write(struct.pack("<" + fmt, *args))
@@ -203,6 +217,8 @@ def write_body(output, snapshot, root, codec=None):
             for row in rows:
                 output.write(row[skip:])
                 skip = max(0, skip - len(row))
+    if not fixed_state:
+        return
     pack("IiIII", 1, n1 - 1, 0, 0, 64)
     for state in (False, True):
         for i in RECURRENT:
@@ -235,25 +251,27 @@ def xxh128_file(source):
         library.XXH3_freeState(state)
 
 
-def convert(snapshot_path, target, destination, backend="numpy", session_id="vllm-prototype"):
+def convert(snapshot_path, target, destination, backend="numpy", session_id="vllm-prototype", transfer=None):
     snapshot_path, destination = Path(snapshot_path), Path(destination)
     require(snapshot_path.stat().st_size <= 16 * 1024**2, "capture manifest too large")
     snapshot = json.loads(snapshot_path.read_text())
     validate(snapshot, target)
     n0, n1 = snapshot["n0"], snapshot["n1"]
-    header = dict(magic="HYBD", version=1, body_format="llama-native-seq-v1", kv_type="q8_0", state_dtype="f32",
+    transfer = chunk_transfer(transfer, n0, n1, session_id)
+    fixed_state = transfer["fixed_state"]
+    header = dict(magic="HYBD", version=2, body_format="llama-native-chunks-v3", kv_type="q8_0", state_dtype="f32",
                   model_sha256=target["model_sha256"], layout_fingerprint=target["layout_fingerprint"],
                   session_id=session_id, n0=n0, n1=n1, tokens=snapshot["tokens"][n0:],
                   prefix_hash_n1=token_hash(snapshot["tokens"]),
-                  sections=[dict(name="llama_seq_state", offset=0, bytes=body_size(n1 - n0))])
+                  sections=[dict(name="llama_seq_state", offset=0, bytes=body_size(n1 - n0, fixed_state))], **transfer)
     encoded = json.dumps(header, separators=(",", ":")).encode()
     require(len(encoded) <= min(1024**2, 4096 + 11 * (n1 - n0)), "delta header exceeds range budget")
     # Publish only a fully converted, checksummed file; failures preserve an existing destination.
     from fast_codec import codec_for
     codec = codec_for(backend)
     with tempfile.TemporaryFile(dir=destination.parent) as body:
-        write_body(body, snapshot, snapshot_path.parent, codec)
-        require(body.tell() == body_size(n1 - n0), "native body size mismatch")
+        write_body(body, snapshot, snapshot_path.parent, codec, fixed_state)
+        require(body.tell() == body_size(n1 - n0, fixed_state), "native body size mismatch")
         body.seek(0)
         checksums = xxh128_file(body)
         fd, temp = tempfile.mkstemp(prefix=".vllm-delta-", dir=destination.parent)
