@@ -278,3 +278,7 @@ PYTHONDONTWRITEBYTECODE=1 nice -n 10 python3 tools/hybrid-bench/test_hetero_stud
 ```
 
 The existing CMake target `llama-hybrid-score` builds the scorer; `llama-hybrid-prefill` and `llama-server` provide import and tokenization. curl is used only by fetch. Native logs, commands, exit codes and numeric witnesses live under `--artifacts`; model-free unit tests use their private temporary fixtures. No new Python packages or test framework are required.
+
+## Growing sessions
+
+`python3 tools/hybrid-bench/growing_session.py --help` describes the paired growing-session driver. The [scenario, JSON schema, CPU commands and CUDA/Mac runbooks](GROWING-SESSION.md) cover its real policy/journal path, pre-staging, PID-owned outage relay and live 64-token checkpoint scoring. Output is private `OUTPUT/trace.json` with native inputs, SQLite, slots, logs and PID receipts beside it; export only the documented trace. [r36 results](RESULTS-hybrid-b-r36-261102.md) records the current strict CPU exactness failure and the unresolved 250k context-capacity decision.
