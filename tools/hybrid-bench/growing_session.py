@@ -697,6 +697,17 @@ def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id)
         meter=meter)
 
 
+def checkpoint_turns(value, turns):
+    if value is None:
+        return set(range(10, turns + 1, 10)) | {turns}
+    parts = value.split(',')
+    require(all(part.isascii() and part.isdecimal() for part in parts), 'invalid checkpoint turns: use comma-separated integers')
+    selected = [int(part) for part in parts]
+    require(selected and selected == sorted(set(selected)) and all(1 <= turn <= turns for turn in selected),
+            'invalid checkpoint turns: require increasing unique turns within 1..turns')
+    return set(selected)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--client-state', required=True, help='read-only launcher metadata; launches its own decoder')
@@ -708,6 +719,7 @@ def parser():
     p.add_argument('--partition-ubatch', type=int, default=32)
     p.add_argument('--state-probes', action='store_true', help='capture private live node states and isolate serialization/import factors')
     p.add_argument('--turns', type=int, default=40)
+    p.add_argument('--checkpoint-turns', help='increasing comma-separated checkpoint turns; default every 10 turns and final')
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
     p.add_argument('--disconnect-turn', type=int, default=20, help='one-based, zero disables')
@@ -724,6 +736,7 @@ def parser():
 
 def run(args):
     require((args.depth == 'deep' or 64 <= args.depth <= NATIVE_CONTEXT) and 1 <= args.turns <= 1000, 'invalid depth or turn count')
+    checkpoints = checkpoint_turns(args.checkpoint_turns, args.turns)
     require(1 <= args.partition_ubatch <= args.partition_batch <= 4096, 'invalid partition batch/ubatch')
     require(0 <= args.disconnect_turn <= args.turns and args.disconnect_turns >= 1 and
             (not args.disconnect_turn or args.disconnect_turn + args.disconnect_turns <= args.turns),
@@ -746,7 +759,6 @@ def run(args):
     require(args.depth != 'deep' or capacity == NATIVE_CONTEXT, 'deep arm needs native 262144 context on both roles')
     require(args.partition_batch != client.get('batch', 256) and args.partition_ubatch != client.get('ubatch', 256),
             'partition baseline needs different batch and ubatch')
-    checkpoints = set(range(10, args.turns + 1, 10)) | {args.turns}
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
     size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9

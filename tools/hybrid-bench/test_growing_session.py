@@ -18,6 +18,35 @@ import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # Invalid selections fail before private metadata reads, process launch or output writes.
+    def test_checkpoint_turns_invalid_is_atomic(self):
+        for value in ('', '0', '-1', '41', '20,20', '40,20', '20,', 'x', '1.5', ' 20', '２０'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'absent'
+                args = growing.parser().parse_args(['--client-state', 'absent', '--output', str(output),
+                    '--link-label', 'CPU', '--checkpoint-turns', value])
+                with mock.patch.object(growing, 'read_private') as read, mock.patch.object(growing, 'start_process') as start:
+                    with self.assertRaisesRegex(Refusal, 'invalid checkpoint turns'):
+                        growing.run(args)
+                    read.assert_not_called()
+                    start.assert_not_called()
+                self.assertFalse(output.exists())
+        self.assertEqual(growing.checkpoint_turns('20,40', 40), {20, 40})
+        self.assertEqual(growing.checkpoint_turns('7', 40), {7})
+
+    # The default orchestration emits identical plan bytes to r43 for all permitted run lengths.
+    # Live trace timestamps, UUIDs and the driver source hash are intentionally outside this control.
+    def test_checkpoint_turns_default_run_byte_identical(self):
+        args = growing.parser().parse_args(['--client-state', 'unused', '--output', 'unused', '--link-label', 'CPU'])
+        self.assertIsNone(args.checkpoint_turns)
+        for turns in range(1, 1001):
+            legacy = set(range(10, turns + 1, 10)) | {turns}
+            current = growing.checkpoint_turns(args.checkpoint_turns, turns)
+            def run_plan(selected):
+                return json.dumps([(arm, turn, turn in selected) for arm in ('hybrid', 'local', 'local_partition')
+                    for turn in range(1, turns + 1)], separators=(',', ':')).encode()
+            self.assertEqual(run_plan(current), run_plan(legacy))
+
     # Probe plans preserve local prefix KV through append imports; missing or overlapping node evidence refuses.
     def test_state_probe_plans_require_live_boundaries(self):
         source = dict(tokens=list(range(12)), replay={name: [dict(n0=0, n1=12, logits=True)] for name in ('A', 'B')})
