@@ -6,9 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest import mock
 
 from bench_common import model_identity, private_json, require, sha256
-from growing_session import stop_process
+from growing_session import (Events, MeasuredNode, MeasuredProxy, base_messages, proxy_server, stop_process)
+from hybrid_bench import stream_chat
+from store import prefix_hash
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid'))
 from test_limits import Node
@@ -106,18 +109,109 @@ def preflight_controls(state, root, config):
         print('PASS preflight ' + name + ': exit2, zero arm calls', flush=True)
 
 
+def multi_chunk_prestage(build, model, root, config):
+    output = root / 'multi-chunk'
+    output.mkdir(mode=0o700)
+    states = output / 'node-states'
+    states.mkdir(mode=0o700)
+    events = Events(states)
+    with native_server(build / 'bin/llama-server', model, output / 'decoder', checkpoints=0) as (decoder, slots):
+        app = MeasuredProxy(dict(config, decode_url=decoder.url, decode_token='', slot_path=str(slots), slots=1,
+            extend_chunk_tokens=64, prefill_timeout=120, snapshot_disk_reserve_bytes=28_000_000_000),
+            str(output / 'proxy.sqlite'), events, set())
+        app.cleanup_prefill = config['prefill_url']
+        applied = []
+        original = app.decode.request
+        remote_request = MeasuredNode.request
+        def ordered(node, method, path, data=None, headers=None, binary=False):
+            if path.endswith('/extend') and data.get('return_delta'):
+                info = original('GET', '/slots/0/info')
+                require(info['n'] == data['n0'] and info['prefix_hash'] == data['prefix_hash_n0'],
+                        'next chunk requested before matching local acknowledgement')
+            return remote_request(node, method, path, data, headers, binary)
+        def observed(method, path, data=None, headers=None, binary=False):
+            result = original(method, path, data, headers, binary)
+            if method == 'GET' and path.endswith('/info'):
+                applied.append(result.copy())
+            return result
+        try:
+            with mock.patch.object(app.decode, 'request', side_effect=observed), proxy_server(app) as url:
+                messages = base_messages(app, 256)
+                meters = []
+                sid = 'multi-chunk-prestage'
+                for turn in (0, 1):
+                    # Actual native imports must be acknowledged at n1 before any later chunk is requested.
+                    body = dict(messages=messages, max_tokens=1, temperature=0, ignore_eos=True,
+                                chat_template_kwargs=dict(enable_thinking=False))
+                    start = len(events.copy())
+                    with mock.patch.object(MeasuredNode, 'request', new=ordered):
+                        sid, answer, meter, _, _ = stream_chat(url, config['client_credential'], body, 'offload', sid, 120)
+                    meters.append(meter)
+                    chunks = meter['chunks']
+                    require(len(chunks) >= (3 if turn == 0 else 1) and all(c['status'] == 'imported' for c in chunks),
+                            'multi-chunk pre-stage or subsequent offload did not import every chunk')
+                    require(meter['fallback_reason'] is None and meter['local_evaluated'] == 1,
+                            'chunk failure was hidden by local fallback')
+                    session = app.store.get(sid)
+                    prompt = session['tokens']
+                    for chunk in chunks:
+                        require(any(a['n'] == chunk['n1'] and a['tokens'] == prompt[:chunk['n1']] and
+                                    a['prefix_hash'] == prefix_hash(prompt[:chunk['n1']]) for a in applied),
+                                'chunk was not acknowledged at its own position')
+                    session = app.store.get(sid)
+                    require(original('GET', f"/slots/{session['slot']}/info")['tokens'] == session['tokens'],
+                            'native journal mismatch')
+                    if turn == 0:
+                        with app.reserve(sid):
+                            original('POST', '/slots/0?action=save', dict(filename='pre-staged.bin'))
+                            original('POST', '/slots/0?action=erase', {})
+                            original('POST', '/slots/0?action=restore', dict(filename='pre-staged.bin'))
+                            require(original('GET', '/slots/0/info')['tokens'] == session['tokens'],
+                                    'pre-staged base restore changed its journal')
+                    extends = [e for e in events.copy()[start:] if e.get('n1') is not None and not e.get('catchup')]
+                    require(len(extends) == len(chunks) and all(e['status'] == 'ok' and 'node_snapshot' in e for e in extends),
+                            'missing per-chunk live snapshot capture')
+                    messages += [answer, dict(role='user', content=' x' * 80)]
+                    print('PASS native multi-chunk turn ' + str(turn) + ': ' + str(len(chunks)) + ' verified imports', flush=True)
+                # Force the real ahead-state recovery branch after a lost import, with a matching prompt boundary.
+                with app.reserve(sid):
+                    session = app.store.get(sid)
+                    ahead = session['tokens'] + app.renderer.encode(' x' * 16)
+                    remote = app.remote(config['clients'][config['client_credential']])
+                    path = app.sync(session, config['clients'][config['client_credential']])
+                    remote.request('POST', path + '/extend', dict(n0=len(session['tokens']),
+                        prefix_hash_n0=prefix_hash(session['tokens']), tokens=ahead[len(session['tokens']):], return_delta=True), binary=True)
+                    app.resync(session, config['clients'][config['client_credential']], ahead + [ahead[-1]])
+                    actual = original('GET', f"/slots/{session['slot']}/info")
+                    require(actual['tokens'] == ahead and actual['prefix_hash'] == prefix_hash(ahead) and
+                            session['tokens'] == ahead and session['remote_n'] == len(ahead), 'native streamed resync failed')
+                print('PASS native streamed ahead-state recovery', flush=True)
+                private_json(output / 'meters.json', meters)
+        finally:
+            private_json(output / 'events.json', events.copy())
+    # The regression has consumed these states; retain byte identities without using the smoke's disk reservation.
+    removed = []
+    for path in output.rglob('*'):
+        if path.is_file() and path.suffix in ('.node_snapshot', '.node_delta', '.bin'):
+            removed.append(dict(path=str(path), bytes=path.stat().st_size, sha256=sha256(path)))
+            path.unlink()
+    private_json(output / 'cleanup.json', removed)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir', required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
     p.add_argument('--controls-only', action='store_true')
+    p.add_argument('--multi-chunk-only', action='store_true')
     p.add_argument('--state-probes', action='store_true')
     p.add_argument('--start', choices=('both', 'cold', 'pre-staged'), default='both')
     args = p.parse_args()
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
-    checkpoint_controls(build, model, root)
+    if not args.multi_chunk_only:
+        checkpoint_controls(build, model, root)
     if args.controls_only:
         return
     identity = model_identity(model)
@@ -138,6 +232,9 @@ def main():
         private_json(state / 'client-info.json', client)
         private_json(state / 'proxy-config.json', config)
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
+        multi_chunk_prestage(build, model, root, config)
+        if args.multi_chunk_only:
+            return
         preflight_controls(state, root, config)
         commands = []
         for start in (('cold', 'pre-staged') if args.start == 'both' else (args.start,)):

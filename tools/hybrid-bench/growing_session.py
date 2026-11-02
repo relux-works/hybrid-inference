@@ -185,23 +185,47 @@ class MeasuredNode(Node):
             if method == 'GET' and isinstance(result, dict) and 'prefix_hash' in result:
                 row.update(n=result['n'], prefix_hash=result['prefix_hash'])
             if self.events.state_dir is not None and path.endswith('/extend') and data.get('return_delta'):
-                snapshot = Node(self.url, self.token, self.timeout).request('GET', path[:-6] + 'snapshot', binary=True)
-                require(len(snapshot) >= 12 and int.from_bytes(snapshot[8:12], 'little') == row['n1'],
-                        'node snapshot moved past the captured import boundary')
-                require(shutil.disk_usage(self.events.state_dir).free > 28e9 + len(snapshot) + len(result),
-                        'disk floor reached before node state capture')
                 stem = self.events.state_dir / uuid.uuid4().hex
-                for key, payload in (('node_snapshot', snapshot), ('node_delta', result)):
-                    target = stem.with_suffix('.' + key)
-                    target.write_bytes(payload)
-                    target.chmod(0o600)
-                    row[key] = dict(path=str(target), sha256=sha256(target))
+                snapshot, delta = (stem.with_suffix('.' + key) for key in ('node_snapshot', 'node_delta'))
+                try:
+                    budget = int(shutil.disk_usage(self.events.state_dir).free - 28e9 - len(result))
+                    capture = MeasuredNode(self.url, self.token, self.timeout, events=self.events,
+                                           session=self.session, source=self.source)
+                    capture.download(path[:-6] + 'snapshot', snapshot, budget)
+                    with snapshot.open('rb') as source:
+                        header = source.read(12)
+                    require(len(header) == 12 and int.from_bytes(header[8:12], 'little') == row['n1'],
+                            'node snapshot moved past the captured import boundary')
+                    delta.write_bytes(result)
+                    for key, target in (('node_snapshot', snapshot), ('node_delta', delta)):
+                        target.chmod(0o600)
+                        row[key] = dict(path=str(target), sha256=sha256(target))
+                except BaseException:
+                    snapshot.unlink(missing_ok=True)
+                    delta.unlink(missing_ok=True)
+                    raise
+            return result
+        except Exception as error:
+            row['status'] = 'failed'
+            row['error_type'] = type(error).__name__
+            raise
+        finally:
+            row['seconds'] = time.monotonic() - started
+            self.events.add(**row)
+
+    def download(self, path, destination, max_bytes):
+        started = time.monotonic()
+        row = dict(kind='protocol', session=self.session, source=self.source, method='GET', path=path,
+                   upload_body_bytes=0, status='failed')
+        try:
+            result = super().download(path, destination, max_bytes)
+            row['status'] = 'ok'
             return result
         except Exception as error:
             row['error_type'] = type(error).__name__
             raise
         finally:
-            row['seconds'] = time.monotonic() - started
+            row.update(response_body_bytes=self.last_bytes, seconds=time.monotonic() - started)
             self.events.add(**row)
 
 
@@ -762,6 +786,7 @@ def run(args):
     base = {}
     try:
         config = dict(config, benchmark=True, slots=1, slot_path=str(root / 'slots'),
+                      snapshot_disk_reserve_bytes=int(floor),
                       decode_url='http://127.0.0.1:' + str(free_port()),
                       prefill_timeout=args.request_timeout, decode_timeout=args.request_timeout)
         if args.policy:

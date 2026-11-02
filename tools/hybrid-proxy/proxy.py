@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import os
+import shutil
 import struct
 from pathlib import Path
 import threading
@@ -69,6 +70,7 @@ class Node:
                 raise HTTPError(error.code, error.read(MAX_JSON)) from None
 
     def request(self, method, path, data=None, headers=None, binary=False):
+        self.last_bytes = 0
         try:
             with self.open(method, path, data, headers) as response:
                 limit = MAX_DELTA if binary else MAX_JSON
@@ -84,6 +86,42 @@ class Node:
                 return body if binary else (json.loads(body) if body else None)
         except http.client.HTTPException as error:
             raise OSError("upstream HTTP connection interrupted") from error
+
+    def download(self, path, destination, max_bytes):
+        """Full snapshots have a disk budget independent of the bounded delta envelope."""
+        self.last_bytes = 0
+        destination = Path(destination)
+        started = None
+        try:
+            with self.open("GET", path) as response:
+                started = time.monotonic()
+                length = response.headers.get("Content-Length")
+                length = int(length) if length is not None else None
+                if max_bytes < 0 or (length is not None and not 0 <= length <= max_bytes):
+                    raise ValueError("snapshot exceeds disk budget")
+                created = False
+                try:
+                    with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+                        created = True
+                        while data := response.read(65536):
+                            self.last_bytes += len(data)
+                            if self.last_bytes > max_bytes:
+                                raise ValueError("snapshot exceeds disk budget")
+                            output.write(data)
+                        if length is not None and self.last_bytes != length:
+                            raise OSError("upstream HTTP connection interrupted")
+                        output.flush()
+                        os.fsync(output.fileno())
+                except BaseException:
+                    if created:
+                        destination.unlink(missing_ok=True)
+                    raise
+            return self.last_bytes
+        except http.client.HTTPException as error:
+            raise OSError("upstream HTTP connection interrupted") from error
+        finally:
+            self.last_transfer_seconds = max(time.monotonic() - started, 1e-6) if started is not None else 0
+            self.last_transfer_rate = self.last_bytes / self.last_transfer_seconds if self.last_bytes and started is not None else None
 
 
 class Proxy:
@@ -108,6 +146,9 @@ class Proxy:
         self.slot_path.mkdir(parents=True, exist_ok=True)
         self.prefill = config["prefill_url"]
         self.timeout = config.get("prefill_timeout", 0.5)
+        self.snapshot_disk_reserve = config.get("snapshot_disk_reserve_bytes", 0)
+        if type(self.snapshot_disk_reserve) is not int or self.snapshot_disk_reserve < 0:
+            raise ValueError("invalid snapshot disk reserve")
         self.decode = Node(config["decode_url"], config.get("decode_token", ""), config.get("decode_timeout", 120))
         self.store = Store(database, self.model)
         self.policy = Policy(**config.get("policy", {}))
@@ -231,8 +272,8 @@ class Proxy:
         node = self.remote(client)
         path = "/v1/sessions/" + urllib.parse.quote(session["remote_id"], safe="")
         info = node.request("GET", path)
-        LOG.warning("resync session=%s local_hash=%s remote_hash=%s", session["id"],
-                    prefix_hash(session["tokens"]), info.get("prefix_hash"))
+        LOG.warning("resync session=%s local_n=%d remote_n=%d local_hash=%s remote_hash=%s", session["id"],
+                    len(session["tokens"]), info["n"], prefix_hash(session["tokens"]), info.get("prefix_hash"))
         if info["model_sha256"] != self.node_model:
             raise HTTPError(409)
         if (0 <= info["n"] <= len(session["tokens"])
@@ -245,7 +286,6 @@ class Proxy:
         if self.hetero_quant:
             # Whole snapshots carry the node identity; recover this ahead prefix by local continuation.
             raise HTTPError(503)
-        snapshot = node.request("GET", path + "/snapshot", binary=True)
         filename = session["id"] + "-resync.bin"
         backup = session["id"] + "-resync-backup.bin"
         temporary = self.slot_path / (filename + ".tmp")
@@ -253,10 +293,8 @@ class Proxy:
         saved = False
         keep_backup = False
         try:
-            with open(temporary, "wb") as output:
-                output.write(snapshot)
-                output.flush()
-                os.fsync(output.fileno())
+            node.download(path + "/snapshot", temporary,
+                          (shutil.disk_usage(self.slot_path).free - self.snapshot_disk_reserve) // 2)
             os.replace(temporary, self.slot_path / filename)
             self.decode.request("POST", slot + "?action=save", {"filename": backup})
             saved = True

@@ -55,6 +55,35 @@ class PolicyTests(unittest.TestCase):
 
 
 class TransferTests(unittest.TestCase):
+    # Fixed-length and chunked snapshots stream within budget; truncation and excess leave no partial file.
+    def test_snapshot_download_bounds_and_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'snapshot'
+            node = Node('http://unused')
+            for length, payload, budget, error in ((4, b'1234', 4, None), (None, b'1234', 4, None),
+                    (5, b'1234', 5, OSError), (None, b'12345', 4, ValueError), (5, b'12345', 4, ValueError)):
+                with self.subTest(length=length, budget=budget, error=error):
+                    response = io.BytesIO(payload)
+                    response.headers = {} if length is None else {'Content-Length': str(length)}
+                    with mock.patch.object(node, 'open', return_value=response):
+                        if error:
+                            with self.assertRaisesRegex(error, 'connection interrupted|disk budget'):
+                                node.download('/snapshot', target, budget)
+                            self.assertFalse(target.exists())
+                        else:
+                            self.assertEqual(node.download('/snapshot', target, budget), 4)
+                            self.assertEqual(target.read_bytes(), payload)
+                            target.unlink()
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.headers = {}
+            response.read.side_effect = [b'123', http.client.IncompleteRead(b'4', 10)]
+            with mock.patch.object(node, 'open', return_value=response):
+                with self.assertRaisesRegex(OSError, 'connection interrupted'):
+                    node.download('/snapshot', target, 20)
+            self.assertFalse(target.exists())
+            self.assertEqual(node.last_bytes, 3)
+
     # Server response headers arrive before the body timer starts; empty responses do not update rate.
     def test_body_transfer_measurement(self):
         node = Node("http://127.0.0.1")
@@ -246,6 +275,35 @@ class HTTPTests(unittest.TestCase):
         continued, _ = self.chat(ahead + [66], sid=sid)
         self.assertEqual(continued, sid)
         self.assertEqual(self.app.store.get(sid)["tokens"], ahead + [66, 901, 902])
+
+    # Snapshot recovery bypasses only the delta cap; an interrupted download cannot reach decoder restore.
+    def test_resync_streams_and_download_failure_is_atomic(self):
+        sid, _ = self.chat([1, 2, 3])
+        session = self.app.store.get(sid)
+        before = self.decode.app.slots[session['slot']][:]
+        ahead = before + [55]
+        with self.prefill.app.db:
+            self.prefill.app.db.execute('UPDATE sessions SET tokens=? WHERE id=?',
+                                        (json.dumps(ahead), session['remote_id']))
+        real_open = Node.open
+        def interrupted(node, method, path, data=None, headers=None):
+            if path.endswith('/snapshot'):
+                response = io.BytesIO(b'partial')
+                response.headers = {'Content-Length': '100'}
+                return response
+            return real_open(node, method, path, data, headers)
+        with mock.patch.object(Node, 'open', new=interrupted), mock.patch.object(self.app.decode, 'request', wraps=self.app.decode.request) as decoder:
+            with self.assertRaisesRegex(OSError, 'connection interrupted'):
+                self.app.resync(session, self.config['clients']['fixture-a'], ahead + [66])
+            decoder.assert_not_called()
+        self.assertEqual(self.decode.app.slots[session['slot']], before)
+        self.assertEqual(self.app.store.get(sid), session)
+        self.assertFalse(list(Path(self.temp.name).glob('*-resync*')))
+        with mock.patch('proxy.MAX_DELTA', 1):
+            self.app.resync(session, self.config['clients']['fixture-a'], ahead + [66])
+        self.assertEqual(self.decode.app.slots[session['slot']], ahead)
+        self.assertEqual(session['tokens'], ahead)
+        self.assertEqual(session['remote_n'], len(ahead))
 
     # An incompatible remote prefix must be rejected before decoder save/restore or journal changes.
     def test_resync_incompatible_prefix_is_atomic(self):

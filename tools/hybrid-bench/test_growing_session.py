@@ -2,6 +2,7 @@
 import copy
 from array import array
 import json
+import io
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -39,18 +40,20 @@ class ScenarioTests(unittest.TestCase):
             with self.assertRaisesRegex(Refusal, reason):
                 growing.state_probe_plans(source, bad, 1)
 
-    # Captures come from GET snapshot after the live extend; a moved node boundary is rejected before file writes.
+    # Captures follow the live extend; a moved boundary refuses and removes its temporary files.
     def test_node_snapshot_capture_refuses_boundary_race(self):
         with tempfile.TemporaryDirectory() as directory:
             for count in (4, 5):
                 events = growing.Events(Path(directory))
                 node = growing.MeasuredNode('http://unused', events=events, session='h', source='critical')
                 snapshot = b'12345678' + count.to_bytes(4, 'little')
-                with mock.patch.object(growing.Node, 'request', side_effect=[b'delta', snapshot]) as request:
+                response = io.BytesIO(snapshot)
+                response.headers = {}
+                with mock.patch.object(growing.Node, 'request', return_value=b'delta'), mock.patch.object(growing.Node, 'open', return_value=response) as request:
                     if count == 4:
                         self.assertEqual(node.request('POST', '/v1/sessions/s/extend',
                             dict(n0=0, tokens=[1, 2, 3, 4], prefix_hash_n0='h', return_delta=True), binary=True), b'delta')
-                        self.assertEqual(Path(events.copy()[0]['node_snapshot']['path']).read_bytes(), snapshot)
+                        self.assertEqual(Path(events.copy()[-1]['node_snapshot']['path']).read_bytes(), snapshot)
                         self.assertEqual(request.call_args.args, ('GET', '/v1/sessions/s/snapshot'))
                     else:
                         before = set(Path(directory).iterdir())

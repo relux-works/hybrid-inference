@@ -601,3 +601,81 @@ The first build admission refused 1 because another lane was compiling; no confi
 Minimum observed disk throughout r41 was **29.791694848 GB**, above 28 GB. After owned build/mutant executable/expired fixture-credential cleanup, free disk was **31.319572480 GB**. All recorded task runtime PIDs were inactive at cleanup; the task disk observer was stopped first. Source, exact tokens, state/delta evidence, raw logits, SHA identities, command logs and both failed/corrected controls are retained under `.temp/r41/`; identical sealed logits share inodes. The task build tree is deleted.
 
 No requested row is out of contract. All pre-existing tests are retained except the explicitly requested replacement of the old free-divergence boundary test. Private self-review is `.temp/r41/self-review.md`; no board is configured, so the established `.temp/tasks.md` tracks scope/evidence. Missing ty/editorconfig-checker/ec means type/editorconfig tool checks were not run; hosted full-platform CI is unrun. GPU/Metal, 27B, 100k/deep and economics remain unqualified. The bounded CPU admission smoke is green; r41 awaits independent review.
+
+## r42: multi-chunk pre-stage and full snapshot streaming
+
+Run `hybrid-b-r42-261102` continues owner-designated `m3-growing-session` at signed `528303b54fd75094ebf7acf3cd115c5c6b310046`. This is a CPU-only repair of the GPU rehearsal's transport/capture failure. No GPU, model download, push, PR or upstream submission. The r41 acceptance rule is unchanged; target CUDA/Metal/27B/long-context qualification remains outstanding.
+
+### Cause and sequencing
+
+Incoming evidence is `/home/agent/lanes/hybrid/.temp/grow1-rehearsal/grow1-artifacts.tar.gz`, its extracted trace and `prefill-tail.log`. Both 10,876-token delta responses fit the 537,919,540-byte binary envelope allowance. The second extend's event contains `status=ok` **and** `error_type=ValueError`, but no captured snapshot/delta paths. `MeasuredNode.request` sets success after receiving a delta, then fetches a full node snapshot before returning that delta to the importer. At n=21,752 the full state is approximately 0.915 GB from the published geometry, above that allowance. This estimate is not an observed full response size.
+
+That capture raises `ValueError("upstream body too large")` before import two. The client therefore still holds n=10,876, whose hash is exactly the second request's `prefix_hash_n0`; the remote holds n=21,752. The warning prints those two positions, but the actual recovery checks compare the remote hash with `session.tokens[:n]` or `prompt[:n]` at the remote n. The import loop already applies a chunk, verifies its n/hash/token IDs and saves its acknowledgement before the next request. Its ordering and checks are preserved. Recovery then fetches the full snapshot through the same bounded reader and fails again. The old event's zero response bytes are a success-only telemetry update, not an empty HTTP response.
+
+The snapshot endpoint is registered without a `--bench` or `--bench-link` condition. Those switches control benchmark timing/link facilities. This was a client binary-read cap, not a disabled endpoint, JSON parsing failure, observed server-side 0.9 GB limit or hash weakening. Node snapshot materialization still requires adequate RAM and response capacity; CPU evidence does not qualify those resources on the rehearsal GPU.
+
+A CPU control executes the exact incoming `MeasuredNode` class and `Proxy.resync` method with a 20,800,000-byte cap and 64-token chunks. Delta one is 20,622,164 bytes; snapshot one is 20,621,688 bytes. Delta two is 20,622,147 bytes, still below the cap, but snapshot two is 21,041,272 bytes. The control reproduces local64/remote128, the second-extend ValueError and the recovery snapshot ValueError/zero-byte event. Its harness exits **1**, client HTTP400, for that intended failure (`old-native-01.log`, `old-native/multi-chunk/events.json`). The corrected implementation under the **same** cap exits **0**, importing four base chunks and two next-turn chunks and recovering a deliberately ahead native state (`fixed-small-cap-01.log`).
+
+### Change and finite coverage
+
+`Node.download` streams full snapshots with 64 KiB reads into an exclusively created 0600 file, under an explicit disk budget. It verifies Content-Length when supplied, propagates broken chunk framing/connection failures as transport errors, fsyncs successful downloads and removes partial files. Delta envelopes retain their original cap. Recovery downloads completely before saving/restoring the decoder, then retains the existing exact token/hash verification, journal commit and rollback. `snapshot_disk_reserve_bytes` defaults to zero for the general proxy; the driver sets its configured floor and reserves space for both incoming state and backup. A compatible native snapshot format/model, sufficient node RAM and client disk remain preconditions.
+
+The driver streams each capture through a separate measured Node, preserving the delta's transfer/import meter inputs. Snapshot GET events report consumed bytes and failure status; a failed post-response capture marks the enclosing event failed. Boundary n1 validation and file SHA-256 remain required. Resync logs now name local_n and remote_n explicitly.
+
+`SnapshotTests.test_snapshot_above_delta_limit` sends **537,985,076 bytes** over real chunked loopback HTTP, checks the captured file's length/SHA and GET byte count, checks that delta timing/byte metrics were preserved, and removes the state. It also confirms the binary reader still rejects an oversized body. This synthetic payload proves transport/capture behavior, not native state validity or inference at that size.
+
+`multi_chunk_prestage` uses the existing local Qwen3.5-0.8B Q4_0 GGUF and native q8_0 KV CPU binaries. A 256-token base needs four imports, ending at254 before the held token/generation. The regression saves, erases and restores that base, then offloads one appended turn through two more imports. Before every critical request, the actual decoder n/hash must match n0/prefix_hash_n0. Every imported n1 must match the complete native token journal/hash; fallback cannot satisfy the test. It then forces remote367/local351 and exercises the real streamed snapshot restore and exact post-restore journal. Successful regression states are hashed and removed before the larger smoke's reservation; logs, meters, event identities and cleanup records remain.
+
+Transfer negatives cover fixed-length truncation, malformed/interrupted chunk reads, Content-Length over budget and chunked bodies exceeding budget. Recovery negatives require no decoder save/restore, slot mutation, durable journal change or temporary file after incomplete download; existing incompatible-prefix/model and restore/journal rollback tests remain. The unchanged boundary-race test accepts a matching n1 and rejects a moved one, removing capture files.
+
+### Bounded mutation controls
+
+| Mutant | What it narrows the check to | Named failing test | Actual exit / survivor bound |
+|---|---|---|---|
+| old-snapshot-cap | Snapshot streaming must accept a state above the delta cap | test_snapshot_above_delta_limit | 1; killed |
+| unbounded-chunked | An absent Content-Length cannot bypass the disk budget | test_snapshot_download_bounds_and_interruption | 1; killed |
+| ignore-truncation | An early EOF with a declared length must refuse | test_snapshot_download_bounds_and_interruption | 1; killed |
+| retain-partial-file | Failure must remove the partial snapshot | test_snapshot_download_bounds_and_interruption | 1; killed |
+| buffered-resync | A truncated download must fail before decoder restore | test_resync_streams_and_download_failure_is_atomic | 1; killed; old method instead reaches decoder HTTP400 |
+
+There are no survivors in this five-plant set. `mutants-01` itself exits1 because its last log matcher anticipated the later cap failure; the restored old method is caught first by the preceding truncation case. The corrected targeted run retains that actual failure and `mutant-evidence-audit-02` exits0. This is bounded discrimination evidence, not exhaustive mutation coverage. The 22 r41 gate mutants are not rerun: the complete native checker and Python gate/replay/raw-validation function bodies are byte-identical to 528303b5 (`unchanged-gate.json`); fresh native smoke still validates every checkpoint.
+
+### Fresh CPU qualification under r41
+
+The full command is `nice -n 19 python3 tools/hybrid-bench/test_growing_session_native.py --build-dir .temp/r42/build --model /home/agent/Werkstatt/hybrid-models/Qwen3.5-0.8B-Q4_0.gguf --artifacts .temp/r42/native-02 --state-probes`. Harness **0**, cold **0**, pre-staged **0**; four checkpoint checker exits **0**. Both starts retain 39 calls, 12 measured turns per arm, exact paired journals, connected policy-local/offload, outage fallback, connected prompt catch-up and background replay. Seed281, D0=128, capped input48/output128, 4096 context and synthetic policy are the unchanged r41 smoke, not the GPU rehearsal workload.
+
+All ten controls pass at every checkpoint: NODE-B, RESTORE-B, BSTATE-B, NODE_RANGE-B, OWN_NATIVE-A, OWN_RANGE-A, CHAIN-H, CHAIN_ATTENTION-B, CHAIN_RECURRENT-H and A-L. Full raw distributions are revalidated by the unchanged driver. L-H teacher-forced top-1>=63/64 remains the sole L-H sanity gate; KL, free divergence and fidelity flags are report-only.
+
+| Start | Turn / depth | L-H mean KL | L-H top-1 /64 | Free divergence | True fidelity flags | Exit |
+|---|---|---|---|---|---|---|
+| cold | 10 / 1679 | 0.000637837220046 | 64 | -1 | mean_kl_nats, p95_kl_nats | 0 |
+| cold | 12 / 2043 | 0.00027947834459 | 63 | 0 | none | 0 |
+| pre-staged | 10 / 1679 | 0.000637837220046 | 64 | -1 | mean_kl_nats, p95_kl_nats | 0 |
+| pre-staged | 12 / 2043 | 0.00027947834459 | 63 | 0 | none | 0 |
+
+`measurements.json` retains every fresh L-H/noise/component metric and independently recomputed flag, route counts and verified raw-file SHA; `qualification-identity.json` binds source, native executables/shared libraries, model and environment. `unchanged-gate.json` proves the full native checker and Python gate/replay/raw-validator bodies unchanged. The four checkpoints pass without imposing an expectation that report-only metrics reproduce historical values.
+
+| Validation | Actual result | Evidence under .temp/r42 |
+|---|---|---|
+| CPU CMake configure/build, four required targets | 0 /0; nice19, -j4, shared lock after cc1plus/uptime admission | cpu-01-build-record.json; cpu-01-{configure,build}-01.log |
+| Benchmark Python suite | 0;94 tests,6 header-environment skips | bench-02.log |
+| Native identity fixtures covering those skips | 0;12 tests | identity-01.log |
+| Proxy Python suite | 0;76 tests | proxy-02.log |
+| Real chunked 537,985,076-byte synthetic capture | 0;SHA/size/telemetry/delta-cap controls | snapshot-large-01.log; also rerun in bench-02 |
+| Native same lowered cap regression | 0;four pre-stage/two next-turn imports plus native recovery | fixed-small-cap-01.log |
+| Full native harness/cold/pre-staged | 0/0/0;four checkpoints0 | native-02.log; native-02/commands.json |
+| Nine checkpoint instrument controls | Three0; six intended2 with exact refusal reasons | native-02/checkpoint-controls/commands.json |
+| Two degenerate route preflights | Intended2 each;zero arm calls | native-02/preflight-*-command.json |
+| Five new bounded mutation plants | Each1;named violations; evidence audit0 | mutants.json; mutant-evidence-audit-02.log |
+| Source/binary/raw/hash/journal/control/flag/route audit | 0 | audit-01.log;measurements.json |
+| AST/ASCII, model naming, whitespace | 0 each | syntax-ascii-01.log;code-style-02.log;whitespace-02.log |
+
+CMake4.4.4, GCC15.2.0 and Python3.14.4 are reused; no tool installs. CUDA/Metal/Vulkan are OFF in CMake. Build/native/test children have on-disk TMPDIR and PYTHONDONTWRITEBYTECODE=1. The one diagnostic import without that flag generated six task-owned bytecode files; they were removed (`bytecode-cleanup.json`). Full hosted/platform CI, GPU/Metal, 27B/100k/deep, performance and native validity of a 0.9GB state remain unrun. ty/editorconfig tools are unavailable; those checks are unrun.
+
+Failed/corrected controls are retained. The first new native regression exits1 because its expected prefix used full-message retokenization on the appended turn rather than the renderer's durable journal; the corrected assertion checks native acknowledgements against the committed journal and decoder. Bench01 exits1 because the prior boundary-race fixture mocked one Node instance while the new capture uses a separate measured Node; the class-level fixture fixes that setup and bench02 passes. Native01 completes all nine controls and the new regression, then its all-local driver refuses2 on the unchanged conservative disk reservation before trace creation; the harness's missing-trace failure1 is not route-gate evidence. Completed test states were hash-recorded/removed, sealed duplicate raw files were hardlinked only after matching SHA and a completed command ledger, and native02 runs fresh. The closed cold child's states were removed after its successful wait and full validation, before pre-staged admission; `cold-state-cleanup.json` retains hashes matching trace references. Code-style01 exits2 on a nonexistent script path; code-style02 runs the existing extracted CI naming check and passes. The mutation matcher failure and correction are described above.
+
+### Custody and limits
+
+At 2026-11-02T06:43:50.285400+00:00, cleanup verified every recorded task runtime PID inactive, removed the owned build tree and remaining native snapshots/deltas/slot states and expired fixture credentials. Minimum observed free disk was **28.653256704 GB**; cleanup readback **30.737817600 GB**. Logs, hashes, exact token journals, raw-logit evidence and command/PID/exit records remain private under `.temp/r42/`; sealed byte-identical files may share inodes. Incoming rehearsal files, models, other branches/worktrees and foreign processes are preserved.
+
+All four requested task rows are covered by the reproduction, independent streaming/cap controls, native multi-chunk/offload/recovery regression, and fresh r41 smoke/report. No surface table was supplied (brief gap); no requested row is excluded. Runtime/test scope outside tools/hybrid-bench is the owning proxy snapshot/recovery implementation and tests, with its operator documentation; root README links the new command and the existing unresolved-questions entry now states the r41 gate. Private scope/security/general/tests/approach self-review is `self-review.md`. Ready for review; the GPU rehearsal must be repeated on the reviewed signed head before hardware acceptance.
