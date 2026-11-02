@@ -202,3 +202,144 @@ Require exit 0 for each benchmark and retain eight SWA equivalence rows per arch
 Inspect Qwen's first deep forced-offload transfer and Gemma transfers crossing its chunk limit: multiple chunks, early statuses `staged`, exactly one final `imported`, no early applied/durable advance, final `remote_applied` equal to the complete range, fixed state only in the last body and no fallback. Every body must be at most 536,870,912 bytes; sum actual wire bytes and retain chunk endpoints. Repeat interruption/invalid-final controls with the combined server if changing deployment partitions. Health must advertise `delta_version: 2`, source/build records must name SOURCE and headers must use body format v3. Old body-format refusal must not be relabeled as numerical success.
 
 Keep JSONL, Markdown, sanitized archive/SHA sidecar, command exits, client/node source records and decoder logs. Keep credentials, session databases and native states private. Exit 2 is refusal, 3 numerical failure, 4 partial, 5 uncalibrated; none accepts GPU exactness. An unsupported real file must refuse without bypassing layout fingerprints, unknown-tensor checks or MTP admission.
+
+
+## r30 - current-main merge and landing evidence
+
+Run: hybrid-a-r30-261102. Signed source merge `23198b4f3fc4537c016ff75ae18c910b9db7d8e9` on `m3-swa-chunk`; first parent `03f1b4fff4c48e2cdb1f54066f070a62ae714215`, second parent exact fetched main `528724c96894aa5f65e98b329317de59aa694afc` (PR #7 fast hashing). `git verify-commit` exits 0, signature G. All 17 introduced commits above main verify G; the subsequent report-only delivery commit is checked separately. No rebase, push, GPU execution or model/tool download.
+
+### Every conflict and its resolution
+
+The merge command returned 1 for exactly two content conflicts; the resolved merge commit returned 0.
+
+| File | Resolution |
+| --- | --- |
+| `tools/hybrid/hybrid-state.h` | Keep main's `file_hash(path, read_bytes = 65536, backend = nullptr)` signature and the reviewed branch's `require_supported_architecture` declaration. Retain all fixed-state/chunk declarations. |
+| `tools/hybrid/README.md` | Union the build-target lists so both `llama-hybrid-check-hash` and `llama-hybrid-check-swa` remain. Retain both hash and chunk/SWA documentation. |
+
+Clean auto-merges were checked: CMake retains every target; `hybrid-state.cpp` contains main's exact complete hash implementation plus the reviewed branch's unchanged remaining logic. No manual implementation edits were needed.
+
+### Reviewed-diff comparison
+
+Common base is `1309bcb8b02e8e8de764f2456e5a6af94d7de476`. Replayed the exact binary patch `git diff --binary 1309bcb8 03f1b4ff` onto main with a separate Git index. The replay reports exactly the same two conflicts; resolving only the declared unions yields the complete expected tree. There are 58 branch-only paths byte-identical to r27, eight main-only paths byte-identical to main, and four overlapping paths: the header, README, CMake and helper implementation. The SHA-NI/portable/CommonCrypto block is byte-identical to main; removing only that hash delta from the merged helper reproduces the entire r27 helper byte-for-byte.
+
+```text
+reviewed patch + main + two resolutions -> 6e6c7849b20b826f60387872a2293a8fc551fbdf
+actual signed merge tree               -> 6e6c7849b20b826f60387872a2293a8fc551fbdf
+git diff --exit-code 6e6c7849b20b826f60387872a2293a8fc551fbdf 23198b4f3fc4537c016ff75ae18c910b9db7d8e9
+exit 0; empty diff
+```
+
+Thus `git diff 528724c9..23198b4f3fc4537c016ff75ae18c910b9db7d8e9` is exactly the reviewed branch diff carried onto PR #7 with the two listed resolutions. `reviewed-r27.patch`, `merged-vs-main.patch`, `merge-overlap.patch`, `replay-reviewed-patch.log`, `comparison-initial.json` and `comparison-replay.json` show the comparison. The later delta consists only of this requested r30 report appendix; final comparison evidence lists that one documentation path separately.
+
+### CPU validation and actual exits
+
+Evidence root: `.temp/hybrid-a-r30-261102/`. Exact commands/PIDs/exits, times and free-disk samples are in numbered JSON/log files and `command-ledger.json`; native control compile/link commands are also in `controls.json`. Tested source tree `6e6c7849b20b826f60387872a2293a8fc551fbdf` is bound to 329 source/test/configuration hashes and 21 native binary hashes in `validation-identity.json`. Linux x86_64, GCC 15.2.0, existing local CMake 4.4.4, Make, Python 3.14.4; same r27 Release AVX2/FMA CPU configuration with `GGML_NATIVE=OFF`, `GGML_CUDA=OFF`. Builds and controls were niced to 19, serial under the shared model-cache lock, with at most -j4. All tests were niced; TMPDIR stayed on task-local disk and `PYTHONDONTWRITEBYTECODE=1`. Only existing local Qwen 0.8B weights, original golden files and local header fixtures were used.
+
+| Gate / evidence stem | Real exit | Claim / limit |
+| --- | ---: | --- |
+| `configure-01` | 0 | CPU Release configure |
+| `build-01` | 0 | All requested native consumers and checkers |
+| `swa-final-02` | 0 | Allocated Gemma/Glimmer caches, original depth/chain cases, fresh/append chunks and legacy refusals |
+| `server-component-final-01` | 0 | 50 tests, 235 assertions, including prompt reuse threshold |
+| `chunks-q4-01` | 0 | Q4_0 fresh/append chunks, interruption, byte/logit equivalence and refusal/rollback controls |
+| `chunks-q8-01` | 0 | Q8_0 same chunk contract |
+| `http-01` | 0 | Real HTTP node/server/proxy transfer, interruption, atomic refusal and old-body rejection |
+| `proxy-01` | 0 | 123 proxy tests |
+| `bench-01` | 0 | 81 benchmark tests; six optional native cases skipped here |
+| `mirai-native-01` | 0 | 12 real-header tests, including the six optional native cases |
+| `codec-01` | 0 | Codec and malformed envelopes |
+| `guards-01` | 0 | Native guards and unchanged rejected state |
+| `recurrent-01` | 0 | Malformed recurrent state |
+| `append-01` | 0 | Golden append at 512/2048/8192, original 64-token controls |
+| `distributions-01` | 0 | Full distributions at 512/2048/8192 |
+| `capacity-01` | 0 | Capacity refusal |
+| `golden-01` | 0 | Golden checker |
+| `integrated-noise-01` | 0 | Focused same-partition and partition-noise checks |
+| `integrated-chunk-01` | 0 | Focused multi-chunk integration |
+| `integrated-all-01` | 1 | Full inherited integrated driver; existing timing diagnostic remains red |
+| `extra-checks-01` | 0 | LRU eviction/replay and actual RAM-budget 503 with zero retained sessions |
+| `reference-native-01` | 0 | Reference scoring and native refusal controls |
+| `hash-original-01` | 0 | Original four hash tests, automatic dispatch, real local GGUF |
+| `hash-original-portable-01` | 0 | Original four hash tests, forced portable |
+| `hash-ni-02` | 0 | Eight SHA-NI/portable tests; random boundaries, odd reads, NIST, sparse >4 GiB, invalid sizes and EIO |
+| `isa-isolation-01` | 0 | 32 SHA256RNDS2 and 12 each MSG1/MSG2 instructions confined to the attributed function, no global SHA ISA flags |
+| `build-hash-sanitized-01` | 0 | ASan+UBSan hash checker build |
+| `hash-sanitized-01` | 0 | Six sanitizer cases; linked vendor/engine libraries remain unsanitized |
+| `planner-01` | 0 | Fixed-window chunk-width boundary |
+| `invariants-01` | 0 | Retained generic bytes, flags, rollback, layout and v3 invariants |
+| `static-checks-01` | 0 | Changed Python syntax, ASCII additions, whitespace and model-naming workflow |
+| `gpu-recipe-syntax-01` | 0 | Shell syntax only; recipe not executed |
+| `compare-merge-tree-01` | 0 | Expected replay tree equals actual signed merge |
+| `repro-{512,520,600}-01` | 0 each | Original reviewer public-API F16 unified multi-slot checkpoint source, unchanged; 3,224-byte checkpoint and successful restore at all three depths |
+
+The full inherited integrated driver remains an actual exit 1, with its native timing checker exiting 3. Its same-partition result is exact (KL/max difference 0); fresh and append_chain both reproduce r27: whole-prompt top-1 7/8 and mean KL 0.00852205499931497 (`timing-diagnostic.json`). Whole-prompt numerical acceptance remains the prior CPU diagnostic. Focused chunk/noise, LRU/budget and reference tests were executed independently; their passing results do not change the failed driver outcome. No threshold, model, fixture expectation or engine implementation was changed to turn the full driver green. Original golden files were untouched; task-local copies change only the HYBD envelope to v2/body v3 while preserving native bodies and checksums (`golden-conversion.json`).
+
+PR #7 digests remain exactly `444406ddd926550c724ec18d5120a9d40ded44908a063b0e66e9a7e5464c652c` for the 507,154,688-byte local Q4 GGUF, and `01faa4689b7b9762b0c965822d43e087f61558f572609c0b384e6e981600231f` for the 4,294,967,361-byte sparse stream with markers a/b/c at 0, 2,147,483,655 and the final byte. Automatic SHA-NI, forced portable, hashlib and the original test's sha256sum reference agree. Hash throughput measurements were not repeated; this task validates digests and behavior.
+
+Readiness and corrected attempts remain explicit in `early-failures.md`: system CMake/Ninja are absent, so the already installed local CMake and Make were used; the first SWA launcher refused before executing a test because of an overly conservative GiB admission threshold; the already-running first hash sweep was then terminated by that earlier threshold (recorded -15/SIGTERM, wrapper shell exit 241), so it is incomplete, not passing. The complete `hash-ni-02` rerun is green. The first inherited r24 control driver exited 1 because its original scratch-source directory had been removed; the corrected driver uses the exact retained r27 witness copies and exits 0 as `r24-controls-02`. No failed log was overwritten.
+
+The requested disk floor is 28 GB (28,000,000,000 bytes). Minimum sampled free disk across the recorded commands was 29,537,103,872 bytes. Owned build/native scratch cleanup and its final free-disk readback are recorded in `cleanup.json`; command logs, test text evidence, source/control copies and hashes remain. `ty`, `clang-format` and `editorconfig-checker` are unavailable and unrun. No Mac, new GPU, heterogeneous backend/quantization, 5G or process-crash/outage qualification is claimed. No new surface table or separate landing-property suite was supplied; the inherited brief gap remains explicit. No requested row was treated as out of contract.
+
+### Narrowing controls
+
+All 22 r27 targeted controls were rerun and killed, plus all four PR #7 hash controls. Every credited control compile/link exits 0; every expected-red test below actually exits 1. Candidate engine files and libraries were never mutated. No targeted survivor is claimed as a kill.
+
+| Mutant | What it narrows the gate to | Named failing test / diagnostic | Actual exit |
+| --- | --- | --- | ---: |
+| `chunk-m1` | Early validation publishes nothing | `swa_chunk_transaction_equivalence_and_refusals / SWA early chunk changed cache` | 1 |
+| `chunk-m2` | Deferred KV is discarded after late failure | `swa_chunk_late_window_rollback: deferred keys written after rejection` | 1 |
+| `chunk-m3` | Window metadata/head roll back | `swa_chunk_late_window_rollback: metadata or neighbor changed` | 1 |
+| `chunk-m5` | Final endpoint matches the declared range | `chunk_late_endpoint_rollback` | 1 |
+| `merge-layout-gate` | Both chunk APIs require v2 physical windows | `swa_chunk_legacy_window_refused: validate accepted v0` | 1 |
+| `swa-f1` | Masked rows do not inflate K/V payload | `swa_masked_rows_metadata_only` | 1 |
+| `swa-f2` | Generic bytes stay legacy | `swa_generic_state_legacy_bytes` | 1 |
+| `swa-f3` | Saved physical indices are used | `swa_nonprefix_physical_indices` | 1 |
+| `swa-ma` | Indices are not compacted | `swa_nonprefix_physical_indices` | 1 |
+| `swa-mb` | Masked occupied cells retain metadata | `swa_chunk_single_equivalence: physical layout or bytes differ` | 1 |
+| `swa-mc` | Reader and writer use the same retention threshold | `swa_chunk_transaction_equivalence_and_refusals: SWA chunk transaction failed` | 1 |
+| `swa-md` | Previous physical version is refused | `swa_previous_layout_version_refused` | 1 |
+| `swa-me` | Compacted v0 layout is refused | `swa_legacy_compacted_record_refused` | 1 |
+| `swa-mh` | PARTIAL_ONLY checkpoints retain legacy bytes | `swa_checkpoint_legacy_bytes` | 1 |
+| `swa-mf` | Session save/load preserves physical layout/head | `swa_physical_cells_and_head` | 1 |
+| `chunk-m4` | Lost final ACK restores the original slot | `test_benchmark.ChunkAndLifecycleTests.test_lost_final_ack_restores_original_slot` | 1 |
+| `chunk-m6` | Staged chunks publish no durable applied state | `test_benchmark.ChunkAndLifecycleTests.test_staged_chunks_do_not_persist_applied_state_or_drop_checkpoints` | 1 |
+| `chunk-m6b` | Staging retains checkpoints | `test_benchmark.ChunkAndLifecycleTests.test_staged_chunks_do_not_persist_applied_state_or_drop_checkpoints` | 1 |
+| `main-r2` | Restart cannot import through a stale remote ID | `test_benchmark.BenchmarkProxyTests.test_burst_node_restart_then_offload` | 1 |
+| `r24-validation` | Early fixed state is refused per chunk | `FAIL chunk_early_native_state` | 1 |
+| `r24-rollback` | Late failure restores old metadata | `FAIL chunk_late_endpoint_rollback: chunk failure changed cells or state` | 1 |
+| `swa-n2` | One-token SWA window uses SWA semantics | `prompt_reuse_threshold / one-token SWA window` | 1 |
+| `hash-no-sha` | Capable host dispatches to SHA-NI | `FAIL: test_dispatch` | 1 |
+| `hash-ignore-switch` | Only explicit portable override selects fallback | `FAIL: test_dispatch` | 1 |
+| `hash-bad-round` | SHA rounds match fixed NIST answers | `FAIL: test_nist_vectors` | 1 |
+| `hash-ignore-read-error` | Read EIO yields no digest | `FAIL: test_read_error` | 1 |
+
+The template-control suite also exits 0 under its unchanged contract: 40 named kills, three bounded equivalent survivors and one positive identity control. The template mutant table above remains the per-mutant coverage map for this rerun; `template-controls/controls.json` contains the fresh commands and named failures. The three survivors retain exactly the declared bounds in that table (`frame-nonassistant-count`, `bos-len`, `plain-equal-branch`); they are not kills. No claimed property is inferred from agreement between two implementations alone. The four hash mutants add fixed-answer, dispatch/override and real EIO controls; the swallowed-EIO mutant additionally returns the empty-file digest on `/proc/self/mem` (`hash-eio-witness`, actual exit 0), demonstrating the planted violation.
+
+### Prior GPU qualification carried with provenance
+
+The owner supplied r27/r7n acceptance and swa7 GPU qualification on 2026-11-02, PRO 6000, CUDA. Read the existing results under `/home/agent/lanes/hybrid/.temp/swa7-results/` without executing GPU work. `gpu-prior-evidence.json` records exact local JSONL paths/hashes and passed summary/checker exits; `gpu-prior-summary.json` verifies all 20 equivalence cases are same-partition exact with KL/max-logit difference zero. These are prior r27 results, not new GPU execution on the merge.
+
+| Model | Same-partition exact cases | Supplied whole-prompt KL example | Example / partition noise | Largest whole-prompt KL in that result file |
+| --- | ---: | ---: | ---: | ---: |
+| Glimmer | 8 | 1.61550083e-05 | 0.379628x | 0.00753164053 |
+| Gemma 4 | 8 | 0.000459921188 | 0.15893x | 0.000459921188 |
+| Qwen 27B | 4 | 0.0133429409 | 1.24383x | 0.0133429409 |
+
+All three result summaries and every checker exit are 0. The supplied examples round to KL 1.6e-5, 4.6e-4 and 0.0133 at 0.38x, 0.16x and 1.24x partition noise. They are example rows, not universal maxima. Qwen's whole-prompt example is above the retained 0.01 absolute KL diagnostic (`numerical_within_bounds=false`), while its same-partition contract and checker pass. No numeric threshold was changed or cross-backend equivalence inferred.
+
+### Landing note
+
+PR title draft: `hybrid : add atomic chunk state with physical SWA layout`.
+
+PR body draft:
+
+> Transfer native hybrid state in bounded chunks, with recurrent and SWA window state only in the final chunk. Preserve physical SWA cell placement and allocator head, validate before publishing, and restore the original slot after rejected or interrupted transfers. Generic sequence/checkpoint bytes retain their reviewed legacy format; incompatible old chunk envelopes are refused.
+>
+> Preserve the r7n-reviewed r27 changes and merge main 528724c9 (PR #7). The two conflicts retain both the hash API and architecture guard, and both hash/SWA build targets; the complete hash implementation is unchanged from main. Replaying the reviewed patch with these resolutions reproduces the exact source tree.
+>
+> CPU validation, real exits and prior swa7 GPU evidence are in this report's r30 section. Same-partition comparisons pass, and the inherited whole-prompt CPU timing diagnostic remains explicitly red. Prior PRO 6000 CUDA examples for Glimmer/Gemma 4/Qwen 27B have KL 1.6e-5/4.6e-4/0.0133, or 0.38x/0.16x/1.24x measured partition noise; the report also lists maxima. No r30 GPU execution was performed.
+>
+> AI assistance: Codex resolved the merge conflicts, verified source scope and reran CPU checks under the contributor's specified design. Local draft for the hybrid-inference fork.
+
+Exact tested source head: `23198b4f3fc4537c016ff75ae18c910b9db7d8e9`. The report-only delivery commit is signed separately; `.temp/hybrid-a-r30-261102/landing-note.md` records that exact final delivery head, title/body draft and clean/signature evidence after the appendix commit. No PR was opened or updated, and nothing was pushed. Ready for review with the stated timing diagnostic and qualification bounds.
