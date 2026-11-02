@@ -17,6 +17,7 @@ from typing import cast
 from bridge import (MAX_BODY, Refusal, body_size, convert, digest, fingerprint,
                     require, token_hash, validate_layout)
 from node_backend import VllmBackend
+from fast_codec import qualify_node_codec
 
 
 @dataclass
@@ -37,7 +38,8 @@ class Adapter:
         require(type(backend.block_size) is int and 16 <= backend.block_size <= 4096 and backend.block_size % 16 == 0, "wrong block size")
         self.target, self.backend, self.scratch = target, backend, Path(scratch)
         self.owners = {"Bearer " + token: owner for owner, token in clients.items()}
-        self.context, self.codec, self.public = context, codec, public
+        self.codec, self.codec_check = qualify_node_codec(codec)
+        self.context, self.public = context, public
         self.sessions, self.lock, self.extends = {}, threading.Lock(), 0
         self.max_request = 1024**2
         self.block = backend.block_size
@@ -234,7 +236,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8091)
     parser.add_argument("--context", type=int, default=65536)
-    parser.add_argument("--codec", choices=("numpy", "torch", "auto"), default="auto")
+    parser.add_argument("--codec", choices=("reference", "numpy", "torch", "auto"), default="auto")
     args = parser.parse_args()
     require(args.clients.stat().st_mode & 0o077 == 0, "private client token file required")
     target, clients = [json.loads(p.read_text()) for p in (args.target, args.clients)]
@@ -243,6 +245,7 @@ def main():
     backend.probe()
     app = Adapter(target, clients, backend, args.scratch, args.context, args.codec,
                   public=args.host not in ("localhost", "127.0.0.1", "::1"))
+    (args.scratch / "codec-check.json").write_text(json.dumps(dict(codec=app.codec, cuda_check=app.codec_check)) + "\n")
     server = Server((args.host, args.port))
     server.app = app
     server.serve_forever()

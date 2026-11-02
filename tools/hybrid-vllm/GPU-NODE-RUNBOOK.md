@@ -32,7 +32,6 @@ nvidia-smi
 "$VLLM_VENV/bin/python" -c 'import vllm,torch,numpy; print(vllm.__version__,torch.__version__,numpy.__version__); assert vllm.__version__ == "0.32.0"; assert torch.cuda.is_available()'
 "$VLLM_VENV/bin/python" tools/hybrid-vllm/gather_test.py > "$RUN_DIR/gather-01.log" 2>&1
 "$VLLM_VENV/bin/python" -m unittest discover -s tools/hybrid-vllm -p test_fast_codec.py -v > "$RUN_DIR/codec-cpu-01.log" 2>&1
-"$VLLM_VENV/bin/python" tools/hybrid-vllm/cuda_codec_check.py > "$RUN_DIR/codec-cuda-01.log" 2>&1
 
 nice -n 10 cmake -S . -B "$RUN_DIR/build" \
   -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=103a-real \
@@ -82,4 +81,6 @@ Inspect the bundle's JSONL equivalence rows for `weight_comparison=heterogeneous
 
 The node hashes cached source weights once during startup. The BF16 GGUF is only its layout anchor; it is never loaded into a GPU receiver by this run. Both runtime memory reservations and the checker's five Q4 contexts must fit alongside the node; the utilization setting is a reservation request, not a measured peak. Record `nvidia-smi` before/after and actual peak memory. Report GPU tensor ownership, cache-hit/recompute counts and CUDA converter byte equivalence separately from CPU serialization results.
 
-The mandatory `cuda_codec_check.py` command above compares actual CUDA FP8/BF16 page conversion, half ties and complete envelopes against the scalar oracle before automatic CUDA conversion is used. It must exit 0. A live capture still needs the same byte comparison after ownership/extraction qualification; preserve one private capture, convert it with `bridge.py ... --backend reference` and `--backend torch` using the same target/session, then `cmp` the files. `test_fast_codec.py` alone checks torch CPU arithmetic.
+With `--codec auto` or `--codec torch` on a CUDA device, the adapter now runs `cuda_codec_check.check()` in its own process before opening its listener. Startup cannot become ready unless actual CUDA FP8/BF16 page conversion, half ties and a complete envelope match the scalar oracle. A failed or interrupted check refuses startup. Each launch runs a new check; a manual run or an old receipt never authorizes it. Preserve `$RUN_DIR/node/scratch/codec-check.json`, which records the selected backend, source hashes, torch/CUDA versions and current device properties. The synthetic gate covers block size 16 and a fresh envelope; live capture and other block sizes still require GPU qualification.
+
+Use `--codec reference` for scalar conversion without torch/CUDA imports, or `--codec numpy` for CPU vectorization. Neither mode claims CUDA byte qualification. CPU `auto` resolves once to NumPy. A live capture still needs the same byte comparison after ownership/extraction qualification; preserve one private capture, convert it with `bridge.py ... --backend reference` and `--backend torch` using the same target/session, then `cmp` the files. `test_fast_codec.py` alone checks torch CPU arithmetic.

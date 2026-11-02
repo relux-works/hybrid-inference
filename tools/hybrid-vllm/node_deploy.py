@@ -184,7 +184,7 @@ def main():
     parser.add_argument("--port", type=int, default=8091)
     parser.add_argument("--vllm-port", type=int, default=8093)
     parser.add_argument("--bind", default="127.0.0.1", choices=("127.0.0.1", "0.0.0.0"))
-    parser.add_argument("--codec", choices=("numpy", "torch", "auto"), default="auto")
+    parser.add_argument("--codec", choices=("reference", "numpy", "torch", "auto"), default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=.45)
     parser.add_argument("--startup-timeout", type=int, default=1200)
     args = parser.parse_args()

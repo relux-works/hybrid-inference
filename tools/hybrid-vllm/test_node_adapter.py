@@ -74,8 +74,11 @@ class AdapterTests(unittest.TestCase):
         case.test_prefill_namespace()
 
     def extend(self, path, before, suffix, delta=True):
-        return self.node.request("POST", path + "/extend", dict(n0=len(before), prefix_hash_n0=prefix_hash(before),
-                                 tokens=suffix, return_delta=delta), binary=delta)
+        try:
+            return self.node.request("POST", path + "/extend", dict(n0=len(before), prefix_hash_n0=prefix_hash(before),
+                                     tokens=suffix, return_delta=delta), binary=delta)
+        except HTTPError as error:
+            self.fail("valid extend refused: " + str(error.status))
 
     # Fresh rounding, shadow catch-up and an unaligned append start match scalar full-envelope bytes and native import.
     def test_fresh_append_reference_bytes(self):
@@ -129,7 +132,7 @@ class AdapterTests(unittest.TestCase):
         for key, value, status in (("n0", 0, 409), ("tokens", [-1], 400), ("tokens", [True], 400),
                                    ("return_delta", 1, 400), ("mtp", True, 400), ("speculative", {}, 400), ("endpoint", 18, 400)):
             with self.assertRaises(HTTPError) as error:
-                self.node.request("POST", path + "/extend", dict(good, **{key: value}))
+                self.node.request("POST", path + "/extend", dict(good, **{key: value}), binary=True)
             self.assertEqual(error.exception.status, status, key)
             self.assertEqual(self.node.request("GET", path), before)
         with mock.patch.object(self.backend, "prefill", side_effect=bridge.Refusal("speculative decoding is unsupported")):
@@ -189,8 +192,11 @@ class AdapterTests(unittest.TestCase):
         with mock.patch.object(stub_server, "decode_delta", side_effect=native_decode):
             sid = "adapter-integration"
             for tokens, expected_remote in ((list(range(70)), 64), (list(range(70)) + [901, 902] + list(range(72, 110)), 24)):
-                result = client.request("POST", "/v1/chat/completions", dict(messages=[], _tokens=tokens),
-                    {"X-Hybrid-Session": sid, "X-Hybrid-Bench-Mode": "offload"})
+                try:
+                    result = client.request("POST", "/v1/chat/completions", dict(messages=[], _tokens=tokens),
+                        {"X-Hybrid-Session": sid, "X-Hybrid-Bench-Mode": "offload"})
+                except HTTPError as error:
+                    self.fail("valid aligned proxy call refused: " + str(error.status))
                 with app.reserve(sid):
                     pass
                 trace = result["hybrid_bench"]

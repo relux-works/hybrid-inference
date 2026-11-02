@@ -16,12 +16,65 @@ from unittest import mock
 import exporter
 from node_backend import VllmBackend
 import node_deploy
+import node_adapter
 from node_deploy import stop_child, ticks
 from test_bridge import fixture
 import hybrid_bench
 
 
 class RuntimeTests(unittest.TestCase):
+    # A fake device exercises startup admission, not CUDA arithmetic: a failed byte check cannot bind a listener.
+    def test_node_cuda_codec_startup_gate(self):
+        _, target = fixture()
+        fake_torch = NS(cuda=NS(is_available=lambda: True))
+        result = dict(status="passed", device="fake-device", sources={"fast_codec.py": "fixture-build"})
+        gate = NS(check=mock.Mock(return_value=result))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"torch": fake_torch, "cuda_codec_check": gate}):
+            root = Path(tmp)
+            (root / "target.json").write_text(json.dumps(target))
+            clients = root / "clients.json"
+            clients.write_text(json.dumps({"a": "private-test-credential"}))
+            clients.chmod(0o600)
+            command = ["node_adapter.py", "--target", str(root / "target.json"), "--clients", str(clients),
+                       "--scratch", str(root / "scratch"), "--control", str(root / "control"), "--codec"]
+            backend = NS(block_size=16, probe=mock.Mock())
+            for codec in ("auto", "torch"):
+                with self.subTest(codec=codec), mock.patch.object(sys, "argv", command + [codec]), \
+                        mock.patch.object(node_adapter, "VllmBackend", return_value=backend), mock.patch.object(node_adapter, "Server") as server:
+                    gate.check.side_effect = ValueError("CUDA KV bytes differ: fake-device")
+                    with self.assertRaisesRegex(ValueError, "CUDA KV bytes differ: fake-device"):
+                        node_adapter.main()
+                    server.assert_not_called()
+                    self.assertFalse((root / "scratch/codec-check.json").exists())
+                    gate.check.side_effect = None
+                    gate.check.return_value = dict(result, status="failed")
+                    with self.assertRaisesRegex(ValueError, "CUDA codec byte check failed"):
+                        node_adapter.main()
+                    server.assert_not_called()
+                    self.assertFalse((root / "scratch/codec-check.json").exists())
+                    gate.check.return_value = result
+                    node_adapter.main()
+                    self.assertEqual(server.return_value.app.codec, "torch")
+                    self.assertEqual(json.loads((root / "scratch/codec-check.json").read_text()), dict(codec="torch", cuda_check=result))
+                    (root / "scratch/codec-check.json").unlink()
+            self.assertEqual(gate.check.call_count, 6)
+
+    # Scalar/NumPy startup never imports CUDA; CPU auto is frozen to NumPy and explicit torch refuses without CUDA.
+    def test_node_scalar_and_cpu_codec_startup(self):
+        from fast_codec import qualify_node_codec
+        gate = NS(check=mock.Mock(side_effect=AssertionError("CUDA gate must not run")))
+        with mock.patch.dict(sys.modules, {"torch": None, "cuda_codec_check": gate}):
+            for codec in ("reference", "numpy"):
+                self.assertEqual(qualify_node_codec(codec), (codec, None))
+            self.assertEqual(qualify_node_codec("auto"), ("numpy", None))
+            with self.assertRaisesRegex(ValueError, "torch CUDA unavailable"):
+                qualify_node_codec("torch")
+        with mock.patch.dict(sys.modules, {"torch": NS(cuda=NS(is_available=lambda: False)), "cuda_codec_check": gate}):
+            self.assertEqual(qualify_node_codec("auto"), ("numpy", None))
+            with self.assertRaisesRegex(ValueError, "torch CUDA unavailable"):
+                qualify_node_codec("torch")
+        gate.check.assert_not_called()
+
     # Node identity follows source weight bytes, while the BF16 GGUF remains a separate geometric anchor.
     def test_deploy_source_identity(self):
         _, target = fixture()

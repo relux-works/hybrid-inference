@@ -31,6 +31,8 @@ RUN_DIR=$(cd -- "$RUN_DIR" && pwd)
 export TMPDIR=${TMPDIR:-$RUN_DIR/tmp} PYTHONDONTWRITEBYTECODE=1
 mkdir -p -- "$TMPDIR"
 TMPDIR=$(cd -- "$TMPDIR" && pwd)
+PYTHONPYCACHEPREFIX=$(mktemp -d "$TMPDIR/pycache-XXXXXX")
+export PYTHONPYCACHEPREFIX
 export HF_HOME=${HF_HOME:-/root/kit161/gpu/work/hf}
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_VENV=${VLLM_VENV:-/root/kit161/gpu/work/vllm-venv}
@@ -131,12 +133,14 @@ exact_ref() {
         printf 'Refusing dirty source tree (tracked or untracked files):\n%s\n' "$changes" >&2
         return 1
     fi
-    changes=$(git status --porcelain --untracked-files=all --ignored -- CMakeLists.txt cmake common ggml include src tools vendor tests)
+    changes=$(git status --porcelain --untracked-files=all --ignored -- CMakeLists.txt cmake common ggml include src tools vendor tests \
+        ':(exclude,glob)**/__pycache__/*.pyc' ':(exclude,glob)**/__pycache__/*.pyo')
     if [[ -n $changes ]]; then
         printf 'Refusing ignored or dirty source paths:\n%s\n' "$changes" >&2
         return 1
     fi
-    changes=$(git ls-files --others --exclude-per-directory=.gitignore)
+    changes=$(git ls-files --others --exclude-per-directory=.gitignore -- . \
+        ':(exclude,glob)**/__pycache__/*.pyc' ':(exclude,glob)**/__pycache__/*.pyo')
     listing=$(git ls-files -v)
     while IFS= read -r entry; do
         case "$entry" in [a-zS]\ *) hidden+="$entry"$'\n' ;; esac
@@ -190,7 +194,31 @@ build() {
 }
 build_hashes() {
     [[ -x $BUILD_DIR/bin/llama-server && -x $BUILD_DIR/bin/llama-hybrid-bench-check ]]
-    (cd -- "$BUILD_DIR" && find -L bin -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+    (cd -- "$BUILD_DIR" && find -L bin -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) || return $?
+    # Bind the complete resolved loader closure, including future libraries outside bin.
+    local receiver dependencies line path
+    for receiver in llama-server llama-hybrid-bench-check; do
+        dependencies=$(LC_ALL=C ldd "$BUILD_DIR/bin/$receiver") || return $?
+        if [[ $dependencies == *'not found'* ]]; then
+            printf 'Unresolved receiver dependency: %s\n' "$receiver" >&2
+            return 1
+        fi
+        while IFS= read -r line; do
+            path=${line#"${line%%[![:space:]]*}"}
+            case "$path" in
+                *'=>'*) path=${path#*=>}; path=${path#"${path%%[![:space:]]*}"} ;;
+                /*) ;;
+                linux-vdso.so.*|linux-gate.so.*|'statically linked'|'') continue ;;
+                *) printf 'Unrecognized receiver dependency: %s\n' "$line" >&2; return 1 ;;
+            esac
+            path=${path% \(0x*}
+            if [[ $path != /* ]]; then
+                printf 'Receiver dependency must resolve to an absolute path: %s\n' "$line" >&2
+                return 1
+            fi
+            sha256sum -- "$path" || return $?
+        done <<< "$dependencies"
+    done
 }
 assert_build() {
     local hashes
@@ -205,8 +233,8 @@ assert_build() {
     for receiver in llama-server llama-hybrid-bench-check; do
         dependencies=$(LC_ALL=C ldd "$BUILD_DIR/bin/$receiver") || return $?
         printf '%s linkage:\n%s\n' "$receiver" "$dependencies"
-        if [[ $dependencies =~ lib(llama|ggml)[^[:space:]]*\.so || $dependencies == *'not found'* ]]; then
-            printf 'Receiver must use static llama/ggml with resolved runtime dependencies: %s\n' "$receiver" >&2
+        if [[ $dependencies =~ lib(llama|ggml|mtmd)[^[:space:]]*\.so || $dependencies == *'not found'* ]]; then
+            printf 'Receiver must use static llama/ggml/mtmd with resolved runtime dependencies: %s\n' "$receiver" >&2
             return 1
         fi
     done

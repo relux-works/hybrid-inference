@@ -141,3 +141,22 @@ def codec_for(backend):
         return TorchCodec() if torch.cuda.is_available() else NumpyCodec()
     require(backend in ("numpy", "torch"), "unknown converter backend")
     return TorchCodec() if backend == "torch" else NumpyCodec()
+
+
+def qualify_node_codec(backend):
+    require(backend in ("reference", "numpy", "torch", "auto"), "unknown converter backend")
+    if backend in ("reference", "numpy"):
+        return backend, None
+    try:
+        import torch
+    except ImportError:
+        require(backend == "auto", "torch CUDA unavailable")
+        return "numpy", None
+    if not torch.cuda.is_available():
+        require(backend == "auto", "torch CUDA unavailable")
+        return "numpy", None
+    # A fresh in-process check binds this launch to its loaded codec and current device; no receipt is reused.
+    from cuda_codec_check import check
+    result = check()
+    require(result["status"] == "passed", "CUDA codec byte check failed")
+    return "torch", result

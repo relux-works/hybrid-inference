@@ -5,6 +5,7 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import py_compile
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,7 @@ esac
         self.command("hostname", 'printf "%s\\n" "${FAKE_HOST:-relux-agents1}"\n')
         self.command("nproc", "printf '16\\n'\n")
         self.command("ldd", '''printf 'ldd %s preload=%s path=%s\\n' "$*" "${LD_PRELOAD-unset}" "${LD_LIBRARY_PATH-unset}" >> "$CALLS"
-printf '%s\\n' "${LDD_OUTPUT:-libc.so.6 => /lib/libc.so.6}"
+printf '%s\\n' "${LDD_OUTPUT:-libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6}"
 exit "${LDD_EXIT:-0}"
 ''')
         self.command("cmake", '''printf 'cmake %s\\n' "$*" >> "$CALLS"
@@ -87,7 +88,7 @@ exit "${CMAKE_EXIT:-0}"
         self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=120a-real", "\n".join(calls))
         self.assertIn("--target llama-server llama-hybrid-bench-check", "\n".join(calls))
         self.assertEqual((selected / "build.ref").read_text().strip(), "a" * 40)
-        self.assertEqual(len((selected / "binaries.sha256").read_text().splitlines()), 6)
+        self.assertEqual(len((selected / "binaries.sha256").read_text().splitlines()), 8)
         self.assertIn("  bin/libllama-server-impl.so\n", (selected / "binaries.sha256").read_text())
         self.assertFalse(self.run_dir.exists())
         self.assertTrue((self.root / "disk-tmp").is_dir())
@@ -95,6 +96,7 @@ exit "${CMAKE_EXIT:-0}"
     # A self-ignoring local .gitignore cannot hide a new source; removing both admits the tree.
     def test_self_ignoring_source_refusal(self):
         git = shutil.which("git")
+        assert git is not None
         source = self.root / "source"
         subprocess.run([git, "init", "-q", str(source)], check=True)
         cuda = source / "ggml/src/ggml-cuda"
@@ -122,6 +124,8 @@ esac
         self.assertEqual(self.run_step("build").returncode, 0)
         for output, code in (("libllama.so.0 => /elsewhere/libllama.so.0", "0"),
                              ("libggml-cpu.so.0 => /elsewhere/libggml-cpu.so.0", "0"),
+                             ("libmtmd.so.0 => /elsewhere/libmtmd.so.0", "0"),
+                             ("libfuture.so => relative/libfuture.so", "0"),
                              ("libcuda.so.1 => not found", "0"), ("", "9")):
             for step in ("build", "check"):
                 with self.subTest(output=output, code=code, step=step):
@@ -133,7 +137,7 @@ esac
         result = self.run_step("check", LD_LIBRARY_PATH="/untrusted/override", LD_PRELOAD="")
         self.assertEqual(result.returncode, 0, result.stderr)
         inspections = [line for line in self.calls.read_text().splitlines() if line.startswith("ldd ")]
-        self.assertEqual(len(inspections), 2)
+        self.assertEqual(len(inspections), 4)
         for receiver in ("llama-server", "llama-hybrid-bench-check"):
             self.assertTrue(any("/bin/" + receiver + " preload=unset path=unset" in line for line in inspections))
 
@@ -165,10 +169,7 @@ int main(void) {
         compile_elf("-shared", "-fPIC", '-DMARKER="external"', "-Wl,-soname,libllama.so.0", lib, "-o", other / shared.name)
         for receiver in ("llama-server", "llama-hybrid-bench-check"):
             compile_elf(main, "-L" + str(shared.parent), "-l:libllama.so.0", "-Wl,-rpath," + str(shared.parent), "-o", shared.parent / receiver)
-        def receipt(directory):
-            paths = sorted((directory / "bin").iterdir())
-            (directory / "binaries.sha256").write_text("".join(hashlib.sha256(p.read_bytes()).hexdigest() + "  bin/" + p.name + "\n" for p in paths))
-        receipt(build)
+        self.elf_receipt(build)
         copied = self.root / "copied-build"
         shutil.copytree(build, copied, symlinks=True)
         shutil.copyfile(other / shared.name, shared)
@@ -177,16 +178,128 @@ int main(void) {
                 self.calls.unlink(missing_ok=True)
                 result = self.run_step(step, BUILD_DIR=str(copied), **env)
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("Receiver must use static llama/ggml", result.stderr)
+                self.assertIn("Receiver bin file hashes FAILED", result.stderr)
                 self.assertNotIn("loaded ", self.calls.read_text())
         for receiver in ("llama-server", "llama-hybrid-bench-check"):
             compile_elf(main, lib, '-DMARKER="embedded"', "-o", copied / "bin" / receiver)
-        receipt(copied)
+        self.elf_receipt(copied)
         for env in ({}, {"LD_LIBRARY_PATH": str(other)}, {"LD_PRELOAD": str(other / shared.name)}):
             self.calls.unlink(missing_ok=True)
             result = self.run_step("check", BUILD_DIR=str(copied), **env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.calls.read_text().count("loaded embedded preload=unset path=unset"), 2)
+
+    def elf_receipt(self, directory):
+        paths = [(p, "bin/" + p.name) for p in sorted((directory / "bin").iterdir())]
+        for receiver in ("llama-server", "llama-hybrid-bench-check"):
+            output = subprocess.check_output(["ldd", str(directory / "bin" / receiver)], text=True)
+            for line in output.splitlines():
+                path = line.split("=>", 1)[-1].strip().rsplit(" (", 1)[0]
+                if path.startswith("/"):
+                    paths.append((Path(path), path))
+        (directory / "binaries.sha256").write_text("".join(hashlib.sha256(p.read_bytes()).hexdigest() + "  " + name + "\n" for p, name in paths))
+
+    # The reviewer's outside-bin mtmd RUNPATH refuses even with a complete receipt; fresh static code passes.
+    def test_real_elf_mtmd_runpath_refusal(self):
+        self.assertEqual(self.run_step("build").returncode, 0)
+        (self.bin / "ldd").unlink()
+        self.command("nvidia-smi", "exit 0\n")
+        build = self.run_dir / "build"
+        outside = self.root / "writable path"
+        outside.mkdir()
+        lib = self.root / "marker.c"
+        main = self.root / "main.c"
+        lib.write_text('const char *marker(void) { return MARKER; }\n')
+        main.write_text('#include <stdio.h>\nextern const char *marker(void);\nint main(void) { puts(marker()); return 0; }\n')
+        def compile_elf(*args):
+            subprocess.run(["nice", "-n", "10", "cc", *map(str, args)], check=True, capture_output=True)
+        for folder, marker in ((build / "bin", "hashed-bin"), (outside, "outside-bin")):
+            compile_elf("-shared", "-fPIC", '-DMARKER="' + marker + '"', "-Wl,-soname,libmtmd.so.0", lib, "-o", folder / "libmtmd.so.0")
+        for receiver in ("llama-server", "llama-hybrid-bench-check"):
+            compile_elf(main, "-L" + str(build / "bin"), "-l:libmtmd.so.0", "-Wl,-rpath," + str(outside), "-o", build / "bin" / receiver)
+        self.assertEqual(subprocess.check_output([str(build / "bin/llama-server")], text=True).strip(), "outside-bin")
+        self.elf_receipt(build)
+        for step in ("build", "check"):
+            result = self.run_step(step, self.root / ("mtmd-" + step), BUILD_DIR=str(build))
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Receiver must use static llama/ggml/mtmd", result.stderr)
+        for receiver in ("llama-server", "llama-hybrid-bench-check"):
+            compile_elf(main, lib, '-DMARKER="fresh-static"', "-o", build / "bin" / receiver)
+        self.elf_receipt(build)
+        result = self.run_step("build", self.root / "fresh-static", BUILD_DIR=str(build))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # A future library name is bound by resolved path and bytes; ldd supplies the transitive closure.
+    def test_future_library_receipt_binding(self):
+        self.assertEqual(self.run_step("build").returncode, 0)
+        dependency = self.root / "runtime with spaces/libfuture.so"
+        dependency.parent.mkdir()
+        dependency.write_bytes(b"original library")
+        output = "libfuture.so => " + str(dependency)
+        # The build writes a receipt from the real loader result, rather than a fixed set of project names.
+        fresh = self.root / "future-build"
+        self.assertEqual(self.run_step("build", fresh, LDD_OUTPUT=output).returncode, 0)
+        build = fresh / "build"
+        self.assertIn(str(dependency), (build / "binaries.sha256").read_text())
+        for plant in ("bytes", "path", "missing"):
+            dependency.write_bytes(b"changed library" if plant == "bytes" else b"original library")
+            other = self.root / "libfuture-moved.so"
+            other.write_bytes(b"original library")
+            changed_output = "libfuture.so => " + str(other) if plant == "path" else output
+            if plant == "missing":
+                dependency.unlink()
+            result = self.run_step("build", self.root / plant, BUILD_DIR=str(build), LDD_OUTPUT=changed_output)
+            self.assertEqual(result.returncode, 1, result.stderr)
+        dependency.write_bytes(b"original library")
+        self.assertEqual(self.run_step("build", self.root / "future-restored", BUILD_DIR=str(build), LDD_OUTPUT=output).returncode, 0)
+
+    # Only ignored Python cache bytes are exempt; ignored sources and tracked edits inside the cache still refuse.
+    def test_ignored_bytecode_source_gate(self):
+        git = shutil.which("git")
+        assert git is not None
+        source = self.root / "source"
+        subprocess.run([git, "init", "-q", str(source)], check=True)
+        (source / ".git/info/exclude").write_text("__pycache__/\n*.cu\n")
+        cache = source / "tools/hybrid-vllm/__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "bridge.cpython-314.pyc").write_bytes(b"ignored bytecode")
+        self.command("git", '''case "$1" in
+    rev-parse) printf '%s\\n' "$EXPECTED_REF" ;;
+    status|ls-files) "$REAL_GIT" -C "$PLANT_REPO" "$@" ;;
+esac
+''')
+        env = dict(REAL_GIT=git, PLANT_REPO=str(source))
+        self.assertEqual(self.run_step("build", **env).returncode, 0)
+        for name in ("payload.py", "payload.cu", ".gitignore"):
+            plant = cache / name
+            plant.write_text("new source\n")
+            self.calls.unlink()
+            result = self.run_step("build", **env)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(name, result.stderr)
+            self.assertNotIn("\ncmake ", "\n" + self.calls.read_text())
+            plant.unlink()
+        self.command("git", 'if [[ $1 == status ]]; then printf " M tools/hybrid-vllm/__pycache__/tracked.pyc\\n"; fi\nif [[ $1 == rev-parse ]]; then printf "%s\\n" "$EXPECTED_REF"; fi\n')
+        result = self.run_step("build")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Refusing dirty source tree", result.stderr)
+
+    # A valid timestamp cache containing different code is ignored by launched Python, even with a caller prefix.
+    def test_bytecode_read_isolation(self):
+        source = self.tools / "cache_probe.py"
+        source.write_text('VALUE = "evil"\n')
+        stamp = source.stat().st_mtime_ns
+        bytecode = self.tools / ("__pycache__/cache_probe.cpython-%d%d.pyc" % sys.version_info[:2])
+        py_compile.compile(str(source), cfile=str(bytecode), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+        source.write_text('VALUE = "safe"\n')
+        os.utime(source, ns=(stamp, stamp))
+        command = [sys.executable, "-c", "import cache_probe; print(cache_probe.VALUE)"]
+        env = dict(os.environ, PYTHONPATH=str(self.tools))
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        self.assertEqual(subprocess.check_output(command, env=env, text=True).strip(), "evil")
+        self.command("python", 'exec "$REAL_PYTHON" -c \'import cache_probe; assert cache_probe.VALUE == "safe", cache_probe.VALUE\'\n')
+        result = self.run_step("build", REAL_PYTHON=sys.executable, PYTHONPYCACHEPREFIX=str(self.tools / "__pycache__"))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     # A failed gather returns its real exit and blocks even the ref check and build.
     def test_gather_failure_stops_all(self):
@@ -217,6 +330,7 @@ int main(void) {
         source = self.root / "source"
         source.mkdir()
         git = shutil.which("git")
+        assert git is not None
         subprocess.run([git, "init", "-q", str(source)], check=True)
         self.command("git", '''case "$1" in
     rev-parse) printf '%s\\n' "$EXPECTED_REF" ;;
@@ -243,6 +357,7 @@ esac
         source = self.root / "source"
         source.mkdir()
         git = shutil.which("git")
+        assert git is not None
         def real_git(*args):
             return subprocess.run([git, "-C", str(source), *args], check=True, capture_output=True, text=True)
         real_git("init", "-q")
@@ -287,6 +402,7 @@ esac
     # Real ignore rules refuse in-repo run/build paths before cmake; ignored and outside paths pass.
     def test_artifact_path_preflight(self):
         git = shutil.which("git")
+        assert git is not None
         subprocess.run([git, "init", "-q", str(self.root)], check=True)
         (self.root / ".gitignore").write_text(".temp/\n")
         self.command("git", '''if [[ $1 == check-ignore ]]; then
@@ -448,6 +564,7 @@ worker.wait()
                 child = subprocess.Popen(["bash", str(self.script), "build"],
                                          env=dict(self.env, BUILD_READY=str(ready)),
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert child.stdout is not None and child.stderr is not None
                 pids = []
                 try:
                     self.assertTrue(select.select([fd], [], [], 10)[0], "build tree did not start")
@@ -583,6 +700,7 @@ exec /bin/sleep 60
                 child = subprocess.Popen(["bash", str(self.script), "capture"],
                                          env=dict(self.env, FAKE_RUNNER=str(runner), REQUEST_READY=str(ready)),
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert child.stdout is not None and child.stderr is not None
                 try:
                     self.assertTrue(select.select([fd], [], [], 10)[0], "request did not reach curl")
                     self.assertEqual(os.read(fd, 32), b"ready\n")

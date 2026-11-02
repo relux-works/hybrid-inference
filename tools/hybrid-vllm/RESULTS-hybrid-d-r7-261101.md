@@ -84,3 +84,79 @@ These observations are attributed to the orchestrator; this agent did not execut
 - Signed commits preserve the requested co-author trailer. The converter progress notice was sent to `agents1_hybrid_orch` in `#hybrid`, topic `prototype-go`. Final handoff records the exact signed head after review/cleanup; no publication or merge is requested.
 
 Task-local build trees, native helper/mutant binaries, probe deltas and the validation venv were removed before handoff (`cleanup-01.json`). Logs, source hashes, small control scripts/results and review notes remain under the task evidence directory. Sampled free space stayed above 28 GB; a late pre-cleanup sample was 34,603,261,952 bytes, and cleanup left 35,893,628,928 bytes free. Existing shared models/tools and GPU-host venv/cache are preserved.
+
+## r8: Muse r7p rework (hybrid-d-r8-261102)
+
+Ready for review on `m3-vllm-node`, based on reviewed head `7936196cf0a48a452a9a014abaaef4e86f6b9150`. CPU observations on agents1, 2026-11-02 UTC. No GPU, vLLM installation, model downloads, push or PR. All production and test changes remain under `tools/hybrid-vllm/`. The existing private-fork task authorizes the local signed commit and requested co-author trailer; this is not an upstream submission.
+
+**Receiver binding.** `build_hashes` now derives the complete file-backed dependency closure from `ldd` on both actual receivers, including transitive dependencies and future project libraries outside bin. The receipt includes their resolved absolute paths and bytes, plus the existing sorted bin file set. Missing, relative, changed-path and changed-byte dependencies refuse. Whitespace in paths is preserved. The explicit static-project check also includes mtmd. Thus the reviewer ELF reproduction refuses even with a complete new receipt: it cannot execute a different outside-bin libmtmd. A named test confirms that the real receiver would load the outside marker, requires admission refusal, then freshly links static project code and requires admission. Future library names are separately tested with byte, path and missing-file plants and a restored positive control.
+
+This intentionally also pins system/CUDA runtime files. Old bin-only receipts refuse; rebuild once rather than regenerate receipts for an unverified build. A runtime library upgrade requires rebuilding. Fresh receivers still use `BUILD_SHARED_LIBS=OFF` and `GGML_BACKEND_DL=OFF`. The existing exclusive-custody requirement between hash/inspection/execution remains.
+
+**Source precision.** Only ignored `.pyc`/`.pyo` files directly under `__pycache__` are exempt from the ignored/local-exclude scans. The initial full-tree status still refuses tracked edits, including tracked bytecode edits. Ignored `.py`, `.cu`, `.gitignore`, untracked sources, local excludes and index flags remain checked. Each script launch creates a private empty Python cache prefix under disk TMPDIR with bytecode writes disabled. A timestamp-valid cache plant first proves that an ordinary interpreter executes its different cached value, then proves that the launched child reads the reviewed source instead. Admitting ignored caches therefore does not make them executable inputs to the script's children.
+
+**Launch-bound CUDA gate.** Every CUDA `auto`/`torch` adapter startup calls `cuda_codec_check.check()` in the adapter process before opening its listener. An exception or non-passing result refuses startup; deploy cannot become ready without adapter health. Each launch repeats the check and never consumes an old receipt. The selected backend is frozen for this process. `scratch/codec-check.json` records source hashes, torch/CUDA versions, current device index/properties and the byte verdict. CPU auto selects NumPy once. `--codec reference` keeps scalar conversion available without importing torch; explicit NumPy remains available. The B300 runbook now relies on this mandatory launch check rather than a manual prerequisite. Fake-device tests exercise pass, mismatch exception and returned failure for both auto and torch, and assert that failures create neither a listener nor a verdict artifact. They do not execute or qualify CUDA arithmetic.
+
+### r8 regression evidence
+
+Logs and exact command/exit/PID/disk records are in `.temp/hybrid-d-r8-261102/`; commands ran as direct subprocesses, without tee. `validation-commands.txt`, `source-identity-final.json` and `implementation-notes.md` retain reproduction and source/configuration identities. The task-board is absent (`goal-read-02`: exit 1, missing `.task-board`); tracking stays in the existing `.temp/tasks.md`.
+
+| Gate | Result / real exit | Evidence |
+|---|---|---|
+| Full bridge/script/codec/adapter/runtime discovery | 65 tests, no skips, exit 0 (prior 59 plus six r8 tests) | `vllm-tests-04.log` |
+| Proxy regression discovery | 69 tests, exit 0 | `proxy-tests-01.log` |
+| Bench regression discovery | 42 tests, exit 0 | `bench-tests-01.log` |
+| Production gather, torch CPU | 2 tests, exit 0 | `gather-tests-01.log` |
+| Fresh static CPU server, bench checker and prefill build | nice 10, at most -j4, exit 0; no project shared dependency in either receiver | `configure-01.log`, `build-01.log`, `linkage-01.log` |
+| Native synthetic fresh/append imports and checksum-negative plant | Executed within the 65-test suite; helper build exit 0 | `native-build-01.log`, `test_native_roundtrip`, `test_fresh_append_reference_bytes` |
+| Existing local 0.8B model, shortened native chain + 18-token tail | Positive checker exit 0, same-partition exact; no download | `native-tail-probe-01.log`, `native-tail-positive.result.json` |
+| Wrong/absent native tail boundary | Both checker exits 2, exact `incomplete check chain`, no result files | `native-tail-wrong-boundary.log`, `native-tail-legacy.log` |
+| Changed production/tests type check, Python 3.11 target | exit 0 | `type-check-04.log` |
+| Bash/sh syntax, Python AST, ASCII/newlines/whitespace and retained original test names | exit 0 | `bash-syntax-01.log`, `sh-syntax-01.log`, `style-final-01.log` |
+
+The existing scalar serialization reference now explicitly selects `reference`: its previous default selected NumPy after r7 and let a scalar token-order plant survive that particular witness. The named scalar witness now kills it, while existing fast-codec tests still compare complete NumPy envelopes with the scalar oracle. Positive HTTP operations now fail named assertions on unexpected protocol errors; refusal probes request binary responses so an accidentally accepted delta cannot be mistaken for the intended HTTP rejection through a JSON-size error. No original test name was removed.
+
+### r8 narrowing controls
+
+Each applied mutation lives in an isolated copy. The unchanged copied candidate passes. Each row records its real failing outcome; unittest assertion kills exit 1 and the native refusal kill exits 2. Expected-red is not presented as passing execution.
+
+| Mutant | Narrows the gate to | Named failing test | Result |
+|---|---|---|---|
+| `fp4-mislabel` | labels NVFP4 weights as FP8 because their cache mentions FP8 | `test_node_runtime.RuntimeTests.test_deploy_source_identity` | Assertion kill, exit 1 |
+| `q8-half-ties` | rounds exact halves toward zero | `test_fast_codec.FastCodecTests.test_rounding_and_refusals` | Assertion kill, exit 1 |
+| `prefix-guard` | ignores caller n0/hash disagreement | `test_node_adapter.AdapterTests.test_refusals_auth_release` | Assertion kill, exit 1 |
+| `release-leak` | acknowledges DELETE while retaining authority | `test_node_adapter.AdapterTests.test_refusals_auth_release` | Assertion kill, exit 1 |
+| `leading-page-rows` | exports cached prefix rows before unaligned n0 | `test_node_adapter.AdapterTests.test_fresh_append_reference_bytes` | Assertion kill, exit 1 |
+| `proxy-chunk-alignment` | assumes a non-multiple chunk end was exported exactly | `test_node_adapter.AdapterTests.test_proxy_fresh_append_tail_and_release` | Assertion kill, exit 1 |
+| `hook-old-cursor` | reuses the offline bridge cursor instead of this request range | `test_node_runtime.RuntimeTests.test_node_hook_endpoints_and_probe` | Assertion kill, exit 1 |
+| `r8-cache-read-enabled` | timestamp-valid cached code can replace reviewed Python source | `test_gpu_run.ScriptTests.test_bytecode_read_isolation` | Assertion kill, exit 1 |
+| `r8-mtmd-static-gate` | shared mtmd can execute outside bin with a matching complete receipt | `test_gpu_run.ScriptTests.test_real_elf_mtmd_runpath_refusal` | Assertion kill, exit 1 |
+| `r8-loader-closure` | future external libraries are excluded from receipt hashes | `test_gpu_run.ScriptTests.test_future_library_receipt_binding` | Assertion kill, exit 1 |
+| `r8-cache-overrefusal` | ignored bytecode is treated as dirty source | `test_gpu_run.ScriptTests.test_ignored_bytecode_source_gate` | Assertion kill, exit 1 |
+| `r8-cuda-check-skipped` | CUDA launches without executing byte equality | `test_node_runtime.RuntimeTests.test_node_cuda_codec_startup_gate` | Assertion kill, exit 1 |
+| `r8-auto-not-frozen` | auto can select a different codec after admission | `test_node_runtime.RuntimeTests.test_node_cuda_codec_startup_gate` | Assertion kill, exit 1 |
+| `native held-token-only checker` | Only held-token tail boundaries admitted | `native_tail_probe.py` positive shortened-chain case | Native refusal kill, exit 2 |
+
+The unchanged r7 native held-token-only mutant was rebuilt from its retained source. `native_tail_probe.py`'s positive shortened-chain case passes on the candidate (exit 0) but exits 2 with `incomplete check chain` on the mutant, without writing a result (`native-held-token-01.log`, `native-mutant-verdict.json`). This is an intended native refusal kill, separate from unittest assertion kills.
+
+Previous bridge/export and shell/gather plants were also replayed, with historical anchors updated only where r7 changed the same contract's implementation. Existing green named-test evidence is reused only for unchanged source/test/environment identities; changed scalar serialization witnesses were replayed. The complete per-mutant table is retained in `mutant-evidence.md` with the applied narrowing, failing test and finite survivor bound.
+
+| Control family | Actual results | Evidence |
+|---|---|---|
+| Scalar codec/exporter | 24/24 named assertion kills; identity exit 0 | `codec-plants.json`, `codec-plants-03.log`, `codec-plants-04.log` |
+| Previous shell controls | 36/37 named assertion kills, no ERRORs; identity exit 0 | `shell-mutants.json`, `shell-mutants-01.log` |
+| Gather/rotated FP8 | 14/15 named assertion kills; identity exit 0; one ERROR-only detection uncredited | `gather-plants/plants.json`, `gather-plants-01.log` |
+
+| Surviving or uncredited mutant | Narrows the gate to | Named failing assertion | Bound stated by survival |
+|---|---|---|---|
+| `interrupt_no_child_term` | Removes redundant interrupt-time TERM, keeps cleanup group TERM/KILL | None; exit 0 | The tested cleanup path still stops the recorded owned group within its deadline; it does not prove that this redundant early signal is necessary. |
+| `upper_bound_off` | Removes the exporter's upper page bound | None; `GatherTests.test_refusals` errors, exit 1 | The mutant reaches a tensor indexing error rather than the intended early refusal. ERROR-only detection is not credited as a named assertion kill. |
+
+### Corrections and finite scope
+
+- `focused-tests-01` exited 1 because the existing copied-ELF test expected the old linkage refusal while the stronger new hash gate now rejects earlier. Its assertion now requires that exact hash refusal. Initial type checks (`type-check-01`/`03`, exits 1) exposed Optional setup handles in old tests; explicit setup assertions make the full changed-file type check green.
+- `mutant-controls-01`/`02` exited 1 on inherited ERROR-only HTTP detections; those attempts are not assertion kills. The corrected positive/refusal assertions produce the named failures in `mutant-controls-03`. `codec-plants-01` stopped on an unapplied historical anchor (exit 1), then the scalar token-order witness survived its old default path in `codec-plants-02`; both are retained. Corrected anchors and explicit scalar selection produced the credited current results. No skipped plant, setup error or surviving witness is counted as a kill.
+- No formal surface table was supplied (brief gap). The six new tests map the explicit loader, ignored-cache/read-isolation, CUDA launch and scalar/CPU requirements. No reviewer test was removed. Rework stays inside `tools/hybrid-vllm/`.
+- CUDA arithmetic, live vLLM tensor ownership/cache reuse and FP8-to-Q4 numerical/8k/32k qualification remain outside this CPU-only execution contract and unrun. The synthetic CUDA gate still covers block size 16 and a fresh envelope; live captures and other block sizes need GPU evidence. CPU fake-device admission tests do not close those gates. Existing TOCTOU/exclusive custody and unmodified process-ownership limits remain.
+
+Environment: Python 3.14.4, NumPy 2.4.2, torch 2.10.0+cpu and ty 0.0.88 in an isolated validation venv. CMake uses the verified read-only hybrid-a tool binary because it is absent from PATH. Binary-only, no-cache installs are recorded; no source dependency build was started. TMPDIR remained on disk, PYTHONDONTWRITEBYTECODE=1 throughout. Sampled free disk minimum was 32710434816 bytes (above 28 GB), including guarded concurrent validations. Builds were nice 10 and at most -j4; host build processes were sampled before and during work. Task-local build trees, venv, native binaries and large deltas are removed before signed handoff; shared models/tools are preserved.

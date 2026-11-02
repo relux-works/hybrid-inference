@@ -230,13 +230,13 @@ class BridgeTests(unittest.TestCase):
                             row.extend(sum(a * b for a, b in zip(weights, decoded)) for weights in matrix)
                     self.assertEqual(rows[token], reference_q8(row), (value, token))
 
-    # Every serialized BF16 KV row and f32 recurrent byte matches an independent source-layout reference.
+    # Every scalar-serialized BF16 KV row and f32 recurrent byte matches an independent source-layout reference.
     def test_serialized_layout_reference(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_fixture(root, self.snapshot)
             (root / "snapshot.json").write_text(json.dumps(self.snapshot))
-            bridge.convert(root / "snapshot.json", self.target, root / "output.delta")
+            bridge.convert(root / "snapshot.json", self.target, root / "output.delta", "reference")
             with (root / "output.delta").open("rb") as wire:
                 length = struct.unpack("<I", wire.read(4))[0]
                 wire.seek(length, 1)
@@ -403,6 +403,7 @@ class BridgeTests(unittest.TestCase):
     def test_native_roundtrip(self):
         binary = os.environ.get("HYBRID_VLLM_NATIVE_CHECK")
         self.assertTrue(binary, "set HYBRID_VLLM_NATIVE_CHECK to the built native_check; native round-trip must run")
+        assert binary is not None
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_fixture(root, self.snapshot)
