@@ -182,3 +182,5 @@ Delta import profiling uses `python3 tools/hybrid/profile_import.py` and `build/
 Combined SWA layout and final-state chunk CPU qualification, invariant checks and exact GPU operator commands are in [the r27 report](tools/hybrid/RESULTS-hybrid-a-r27-261101.md).
 
 The vLLM node adapter uses the same HYBD v2 final-state chunk protocol with exact aligned exports, local tails and borrowed native-body readers; see its [protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [r11 merge evidence](tools/hybrid-vllm/RESULTS-hybrid-d-r7-261101.md#r11-third-main-merge-after-pr-15). CPU adapter/converter checks use a temporary NumPy-only venv; commands and artifacts are in the [adapter tools guide](tools/hybrid-vllm/README.md#tools).
+
+The private hybrid prototype's [r46 timing packet](tools/hybrid-bench/packets/r46/ADDENDUM-MAC.md) documents capture-free Qwen/Glimmer runs, tools, exact entry points, private output locations and hardware qualification limits.

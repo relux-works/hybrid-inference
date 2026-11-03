@@ -324,12 +324,39 @@ def recheck_controls(build, model, root, run):
     private_json(root / 'recheck-cleanup.json', removed)
 
 
+def timing_local_control(state, root, config):
+    policy = root / 'timing-local-policy.json'
+    private_json(policy, dict(config['policy'], local_rates=[[0, 2000]]))
+    output = root / 'timing-all-local'
+    command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
+        '--output', str(output), '--depth', '128', '--turns', '3', '--disconnect-turn', '2', '--disconnect-turns', '1',
+        '--max-new', '48', '--max-output', '16', '--pause-cap', '0', '--seed', '281', '--checkpoint-turns', 'none',
+        '--policy', str(policy), '--link-label', 'CPU all-local timing control']
+    with (root / 'timing-all-local-01.log').open('wb') as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log)
+        (root / 'timing-all-local.pid').write_text(str(process.pid) + '\n')
+        try:
+            code = process.wait()
+        finally:
+            stop_process(process)
+    private_json(root / 'timing-all-local-command.json', dict(command=command, pid=process.pid, exit_code=code))
+    trace = json.loads((output / 'trace.json').read_text())
+    # A policy-local production run completes both paired arms without weakening the separate fidelity route gate.
+    require(code == 0 and trace['status'] == 'measured' and len([r for r in trace['calls'] if r['stage'] == 'turn']) == 6 and
+            trace['route_counts']['connected_policy_offload'] == 0 and trace['route_counts']['connected_policy_local'] == 2,
+            'all-local timing incorrectly refused or forced offload')
+    require(trace['capture'] == dict(enabled=False, node_snapshots=0, node_deltas=0, checker_runs=0) and
+            not (output / 'node-states').exists(), 'all-local timing captured measurement state')
+    print('PASS all-local timing: measured without forced turn offload', flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir', required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
     p.add_argument('--recheck-only', action='store_true', help='one preserved checkpoint and offline recheck controls')
+    p.add_argument('--timing-only', action='store_true', help='real two-arm run, no node captures or checker')
     p.add_argument('--controls-only', action='store_true')
     p.add_argument('--multi-chunk-only', action='store_true')
     p.add_argument('--state-probes', action='store_true')
@@ -337,7 +364,7 @@ def main():
     args = p.parse_args()
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
-    if not args.multi_chunk_only and not args.recheck_only:
+    if not args.multi_chunk_only and not args.recheck_only and not args.timing_only:
         checkpoint_controls(build, model, root)
     if args.controls_only:
         return
@@ -359,11 +386,11 @@ def main():
         private_json(state / 'client-info.json', client)
         private_json(state / 'proxy-config.json', config)
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
-        if not args.recheck_only:
+        if not args.recheck_only and not args.timing_only:
             multi_chunk_prestage(build, model, root, config)
         if args.multi_chunk_only:
             return
-        if not args.recheck_only:
+        if not args.recheck_only and not args.timing_only:
             preflight_controls(state, root, config)
         commands = []
         starts = ('pre-staged',) if args.recheck_only else (('cold', 'pre-staged') if args.start == 'both' else (args.start,))
@@ -375,6 +402,8 @@ def main():
                 '--start', start, '--link-label', 'CPU loopback; sampled output capped128/input48 seed281; synthetic policy']
             if args.recheck_only:
                 command += ['--checkpoint-turns', '10', '--keep-checkpoint-states']
+            if args.timing_only:
+                command += ['--checkpoint-turns', 'none']
             if args.state_probes:
                 command.append('--state-probes')
             with (root / (start + '.log')).open('wb') as log:
@@ -386,6 +415,22 @@ def main():
             require(code in (0, 3), start + ': experiment aborted; inspect the retained trace and log')
             trace = json.loads((output / 'trace.json').read_text())
             calls = [r for r in trace['calls'] if r['stage'] == 'turn']
+            if args.timing_only:
+                # Real imports, outage and both routes run; all measurement captures and the checker stay absent.
+                require(code == 0 and trace['status'] == 'measured' and len(calls) == 24 and
+                        trace['arms'] == ['hybrid', 'local'] and trace['checkpoints'] == [] and
+                        trace['capture'] == dict(enabled=False, node_snapshots=0, node_deltas=0, checker_runs=0),
+                        'timing mode captured state or ran the checker')
+                require(not (output / 'node-states').exists() and not list(output.glob('check-*')),
+                        'timing mode wrote capture artifacts')
+                require(not any('snapshot' in e.get('path', '') for e in trace['events']),
+                        'timing mode requested a node snapshot')
+                require(trace['route_counts']['connected_policy_local'] and trace['route_counts']['connected_policy_offload'],
+                        'timing mode did not exercise both routes')
+                require(any(r.get('resync') for r in calls), 'timing mode did not recover after outage')
+                require(node.request('GET', '/v1/sessions') == [], 'timing mode leaked remote sessions')
+                print('PASS timing-only: two arms, real imports/outage, zero captures/checker', flush=True)
+                continue
             # Three live sessions preserve their journals through both routes and the actual relay outage.
             require(len(calls) == 36 and trace['status'] in ('passed', 'failed'), 'incomplete three-arm session')
             hybrid = [r for r in calls if r['arm'] == 'hybrid']
@@ -407,6 +452,8 @@ def main():
             require(trace['depth_plan']['final_depth'] == trace['final_depth']['hybrid'] and
                     len(trace['workload']) == 12, 'depth plan or sequence changed')
             print('OBSERVED ' + start + ': ' + trace['status'] + '; driver exit ' + str(code), flush=True)
+        if args.timing_only:
+            timing_local_control(state, root, config)
         require(sha256(model) == digest, 'model file changed')
     require(all(r['exit_code'] == 0 for r in commands), 'append replay/component/token criterion is not qualified')
     print('PASS all native growing-session checks; CPU only, no downloads', flush=True)

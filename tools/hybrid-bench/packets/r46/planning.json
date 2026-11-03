@@ -1,0 +1,414 @@
+{
+  "qwen": [
+    {
+      "model": "qwen",
+      "assumptions": {
+        "link_bytes_s": 5190000.0,
+        "local_prefill": "PRI31 delta512 floor curve",
+        "decode": "PRI31 weighted depth curve",
+        "framing": 14,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 143439,
+      "policy_offloads": [],
+      "mixed_routes": false,
+      "seconds_model": {
+        "hybrid_turn_h": 1.0166519066239887,
+        "local_turn_h": 1.0166519066239887,
+        "base_h": 0.5277765002506438
+      },
+      "subtotal_h": 2.5610803134986213,
+      "down_body_estimate_bytes": 5054806112,
+      "up_token_json_upper_estimate_bytes": 1577829,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 5459037125,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "qwen",
+      "assumptions": {
+        "link_bytes_s": 9750000.0,
+        "local_prefill": "PRI31 delta512 floor curve",
+        "decode": "PRI31 weighted depth curve",
+        "framing": 14,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 143439,
+      "policy_offloads": [],
+      "mixed_routes": false,
+      "seconds_model": {
+        "hybrid_turn_h": 1.0166519066239887,
+        "local_turn_h": 1.0166519066239887,
+        "base_h": 0.37891720979397997
+      },
+      "subtotal_h": 2.4122210230419574,
+      "down_body_estimate_bytes": 5054806112,
+      "up_token_json_upper_estimate_bytes": 1577829,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 5459037125,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "qwen",
+      "assumptions": {
+        "link_bytes_s": 16000000.0,
+        "local_prefill": "PRI31 delta512 floor curve",
+        "decode": "PRI31 weighted depth curve",
+        "framing": 14,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 143439,
+      "policy_offloads": [
+        7,
+        13,
+        17,
+        31,
+        32
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 1.0055470269347417,
+        "local_turn_h": 1.0166519066239887,
+        "base_h": 0.33497806060678376
+      },
+      "subtotal_h": 2.3571769941655143,
+      "down_body_estimate_bytes": 6143805696,
+      "up_token_json_upper_estimate_bytes": 1577829,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 6548036709,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "qwen",
+      "assumptions": {
+        "link_bytes_s": 25000000.0,
+        "local_prefill": "PRI31 delta512 floor curve",
+        "decode": "PRI31 weighted depth curve",
+        "framing": 14,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 143439,
+      "policy_offloads": [
+        7,
+        13,
+        17,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.994567868551124,
+        "local_turn_h": 1.0166519066239887,
+        "base_h": 0.2949107767375027
+      },
+      "subtotal_h": 2.3061305519126156,
+      "down_body_estimate_bytes": 6534549184,
+      "up_token_json_upper_estimate_bytes": 1577829,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 6938780197,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    }
+  ],
+  "glimmer_hypothetical": [
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 5190000.0,
+        "local_prefill": 50,
+        "decode": 12,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        6,
+        7,
+        13,
+        16,
+        17,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.9175136835605225,
+        "local_turn_h": 0.9855136881883078,
+        "base_h": 0.5055630415684007
+      },
+      "subtotal_h": 2.408590413317231,
+      "down_body_estimate_bytes": 1204183488,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1608244793,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 5190000.0,
+        "local_prefill": 100,
+        "decode": 18,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        7,
+        13,
+        31
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.6923656851337282,
+        "local_turn_h": 0.7071152313981843,
+        "base_h": 0.2712273472341481
+      },
+      "subtotal_h": 1.6707082637660606,
+      "down_body_estimate_bytes": 835344592,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1239405897,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 5190000.0,
+        "local_prefill": 150,
+        "decode": 24,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        7,
+        13
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.574668743995305,
+        "local_turn_h": 0.5794109104105301,
+        "base_h": 0.1970610626496656
+      },
+      "subtotal_h": 1.3511407170555008,
+      "down_body_estimate_bytes": 775060160,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1179121465,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 9750000.0,
+        "local_prefill": 50,
+        "decode": 12,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        6,
+        7,
+        13,
+        16,
+        17,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.9005343052480119,
+        "local_turn_h": 0.9855136881883078,
+        "base_h": 0.4701009693085438
+      },
+      "subtotal_h": 2.3561489627448635,
+      "down_body_estimate_bytes": 1204183488,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1608244793,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 9750000.0,
+        "local_prefill": 100,
+        "decode": 18,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        6,
+        7,
+        13,
+        16,
+        17,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.6776830706801107,
+        "local_turn_h": 0.7071152313981843,
+        "base_h": 0.2589898581974327
+      },
+      "subtotal_h": 1.6437881602757276,
+      "down_body_estimate_bytes": 1204183488,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1608244793,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 9750000.0,
+        "local_prefill": 150,
+        "decode": 24,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        7,
+        13,
+        31
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.5679714464065513,
+        "local_turn_h": 0.5794109104105301,
+        "base_h": 0.1781312585661272
+      },
+      "subtotal_h": 1.3255136153832086,
+      "down_body_estimate_bytes": 891267168,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1295328473,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 25000000.0,
+        "local_prefill": 50,
+        "decode": 12,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        6,
+        7,
+        8,
+        13,
+        16,
+        17,
+        18,
+        22,
+        26,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.8864632675523674,
+        "local_turn_h": 0.9855136881883078,
+        "base_h": 0.44786668767154025
+      },
+      "subtotal_h": 2.3198436434122156,
+      "down_body_estimate_bytes": 1386727424,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1790788729,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 25000000.0,
+        "local_prefill": 100,
+        "decode": 18,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        6,
+        7,
+        13,
+        16,
+        17,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.665894690460905,
+        "local_turn_h": 0.7071152313981843,
+        "base_h": 0.2343693813185991
+      },
+      "subtotal_h": 1.6073793031776884,
+      "down_body_estimate_bytes": 1204183488,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1608244793,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    },
+    {
+      "model": "glimmer",
+      "assumptions": {
+        "link_bytes_s": 25000000.0,
+        "local_prefill": 150,
+        "decode": 24,
+        "framing": 32,
+        "import_fit": "Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac"
+      },
+      "final_depth": 128011,
+      "policy_offloads": [
+        5,
+        6,
+        7,
+        13,
+        16,
+        17,
+        31,
+        32,
+        33,
+        40
+      ],
+      "mixed_routes": true,
+      "seconds_model": {
+        "hybrid_turn_h": 0.5567061102139914,
+        "local_turn_h": 0.5794109104105301,
+        "base_h": 0.16399901094822872
+      },
+      "subtotal_h": 1.3001160315727502,
+      "down_body_estimate_bytes": 1204183488,
+      "up_token_json_upper_estimate_bytes": 1408121,
+      "link_probe_both_directions_bytes": 402653184,
+      "planning_traffic_bytes": 1608244793,
+      "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
+    }
+  ]
+}

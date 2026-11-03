@@ -2,6 +2,7 @@
 #include "llama-ext.h"
 #include "llama-io.h"
 #include "llama-memory-hybrid.h"
+#include "llama-kv-cache-iswa.h"
 #ifdef LLAMA_HYBRID_SERVER_SNAPSHOTS
 #include "server-common.h"
 #endif
@@ -37,10 +38,14 @@ public:
 };
 
 static size_t attention_state_size(llama_context * ctx) {
-    auto * memory = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
-    require(memory != nullptr, "state probes require hybrid memory");
     state_counter counter;
-    memory->get_mem_attn()->state_write(counter, 0, 0);
+    if (auto * memory = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx))) {
+        memory->get_mem_attn()->state_write(counter, 0, 0);
+    } else {
+        auto * window = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx));
+        require(window != nullptr, "state probes require hybrid or sliding memory");
+        window->get_base()->state_write(counter, 0, 0);
+    }
     return counter.n_bytes();
 }
 
@@ -114,10 +119,13 @@ static hybrid::json append_replay_controls(const hybrid::json & result) {
             row.at("top1_agreed") == 64 && row.at("free_running_first_divergence") == -1;
     };
     const auto & probes = result.at("probes");
+    const std::string component = result.value("state_component", "recurrent");
+    require(component == "recurrent" || component == "window", "invalid state component");
+    const std::string chain_component = component == "window" ? "CHAIN_WINDOW" : "CHAIN_RECURRENT";
     for (const auto & pair : std::vector<std::pair<std::string, std::string>>{
             {"NODE", "B"}, {"RESTORE", "B"}, {"BSTATE", "B"}, {"NODE_RANGE", "B"},
             {"OWN_NATIVE", "A"}, {"OWN_RANGE", "A"}, {"CHAIN", "H"},
-            {"CHAIN_ATTENTION", "B"}, {"CHAIN_RECURRENT", "H"}}) {
+            {"CHAIN_ATTENTION", "B"}, {chain_component, "H"}}) {
         const auto & probe = probes.at(pair.first);
         bool equal = exact(probe.at(pair.second));
         const auto & states = probe.at("roundtrips");
@@ -126,8 +134,8 @@ static hybrid::json append_replay_controls(const hybrid::json & result) {
             for (const auto & state : states) {
                 if (pair.first == "RESTORE" || pair.first == "BSTATE") {
                     equal &= state.contains("bytes_equal") ? state.at("bytes_equal").get<bool>() : state.at("snapshot_bytes_equal").get<bool>();
-                } else if (pair.first == "CHAIN_ATTENTION" || pair.first == "CHAIN_RECURRENT") {
-                    equal &= state.at("recurrent_equal").get<bool>();
+                } else if (pair.first == "CHAIN_ATTENTION" || pair.first == chain_component) {
+                    equal &= state.at(component + "_equal").get<bool>();
                 } else {
                     equal &= state.at("bytes_equal").get<bool>();
                 }
@@ -401,10 +409,11 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
                     require(split == 8 + attention_state_size(other.get()) && state.size() == reference.size() && split <= state.size(),
                             "state probe component layout mismatch");
                     const std::string component = step.at("replace");
-                    require(component == "attention" || component == "recurrent", "invalid state probe component");
+                    const bool window = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get())) != nullptr;
+                    require(component == "attention" || component == (window ? "window" : "recurrent"), "invalid state probe component");
                     states.push_back({{"n", n}, {"replace", component},
                         {"attention_equal", state.substr(8, split - 8) == reference.substr(8, split - 8)},
-                        {"recurrent_equal", state.substr(split) == reference.substr(split)}});
+                        {window ? "window_equal" : "recurrent_equal", state.substr(split) == reference.substr(split)}});
                     if (component == "attention") { state.replace(8, split - 8, reference, 8, split - 8); }
                     else { state.replace(split, state.size() - split, reference, split, reference.size() - split); }
                     hybrid::load_state(ctx.get(), state);
@@ -462,6 +471,10 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
         if (fixture.contains("acceptance_rule")) {
             require(fixture.at("acceptance_rule") == "session_append_replay_exact" && k == 64,
                     "invalid append replay acceptance rule or width");
+            const auto layout = hybrid::model_layout(model);
+            const std::string component = layout.contains("sliding_window") ? "window" : "recurrent";
+            require(fixture.value("state_component", "recurrent") == component, "state component/model mismatch");
+            if (component == "window") { result["state_component"] = component; }
             result["gate_controls"] = append_replay_controls(result);
             accepted = append_tokens_agree(result.at("top1_agreed"));
             for (const auto & control : result.at("gate_controls")) { accepted &= control.get<bool>(); }
@@ -481,6 +494,39 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--test-append-controls") {
+            // Each gate rejects changed distributions and component bytes; this does not exercise a model.
+            const hybrid::json exact = {{"exact", true}, {"max_abs_logit_diff", 0}, {"mean_kl_nats", 0},
+                {"top1_agreed", 64}, {"free_running_first_divergence", -1}};
+            for (const std::string component : {"recurrent", "window"}) {
+                const std::string chain = component == "window" ? "CHAIN_WINDOW" : "CHAIN_RECURRENT";
+                hybrid::json row = {{"state_component", component}, {"factorial", {{"A-L", exact}}}, {"probes", hybrid::json::object()}};
+                const std::vector<std::pair<std::string, std::string>> pairs = {
+                    {"NODE", "B"}, {"RESTORE", "B"}, {"BSTATE", "B"}, {"NODE_RANGE", "B"},
+                    {"OWN_NATIVE", "A"}, {"OWN_RANGE", "A"}, {"CHAIN", "H"}, {"CHAIN_ATTENTION", "B"}, {chain, "H"}};
+                for (const auto & pair : pairs) {
+                    row["probes"][pair.first] = {{pair.second, exact}, {"roundtrips", hybrid::json::array({
+                        {{"bytes_equal", true}, {component + "_equal", true}}})}};
+                }
+                const auto controls = append_replay_controls(row);
+                require(controls.size() == 10, "append control count");
+                for (const auto & value : controls) { require(value.get<bool>(), "append positive control"); }
+                for (const auto & pair : pairs) {
+                    auto bad = row;
+                    bad["probes"][pair.first][pair.second]["exact"] = false;
+                    require(!append_replay_controls(bad).at(pair.first + "-" + pair.second).get<bool>(), "append metric negative");
+                    if (pair.first != "NODE" && pair.first != "CHAIN") {
+                        bad = row;
+                        const std::string field = pair.first == chain || pair.first == "CHAIN_ATTENTION" ? component + "_equal" : "bytes_equal";
+                        bad["probes"][pair.first]["roundtrips"][0][field] = false;
+                        require(!append_replay_controls(bad).at(pair.first + "-" + pair.second).get<bool>(), "append byte negative");
+                    }
+                }
+                std::cout << "PASS append_controls_" << component << '\n';
+            }
+            require(append_tokens_agree(63) && !append_tokens_agree(62), "append 63/64 boundary");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--test-backend-labels") {
             // Registry aliases normalize; real cross-backend fixtures still refuse.
             for (const auto & name : {"MTL", "Metal", "CUDA", "CPU"}) {

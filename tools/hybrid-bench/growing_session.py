@@ -29,6 +29,7 @@ from hybrid_bench import PROVENANCE, link_probe, sanitized_info, stream_chat, ve
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
 from proxy import Handler, Node, Proxy
 from policy import Policy
+from growing_fixture import validate_fixture
 from store import prefix_hash
 
 QUANTILES = [.10, .25, .50, .75, .90, .99]
@@ -351,7 +352,7 @@ def base_messages(app, depth):
     return body['messages']
 
 
-def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1):
+def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1, require_mix=True):
     previous = True  # the base is explicitly offloaded
     rows = []
     for step in plan['sequence']:
@@ -362,8 +363,8 @@ def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1):
         previous = choice['offload'] and not outage
     counts = dict(policy_local=sum(not r['offload'] and not r['outage'] for r in rows),
                   policy_offload=sum(r['offload'] and not r['outage'] for r in rows))
-    require(all(counts.values()), 'route preflight refuses degenerate connected policy mix before any arm: ' + str(counts))
-    return dict(rows=rows, counts=counts, link_model='constant configured link; live EMA can change routes')
+    require(not require_mix or all(counts.values()), 'route preflight refuses degenerate connected policy mix before any arm: ' + str(counts))
+    return dict(rows=rows, counts=counts, require_mix=require_mix, link_model='constant configured link; live EMA can change routes')
 
 
 def session_catchup(events, sid):
@@ -463,6 +464,8 @@ def checkpoint_source(client, saved, trace, turn, probes=True):
         model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=trace['heterogeneous'],
         snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
         replay=replay_schedules(trace, turn, len(local['tokens'])))
+    if client.get('model_layout', {}).get('sliding_window'):
+        source['state_component'] = 'window'
     if probes:
         source['probes'] = state_probe_plans(source, trace, turn)
     return source
@@ -536,7 +539,7 @@ def state_probe_plans(source, trace, turn):
     plans = [('NODE', [snapshot, tail]), ('RESTORE', restore + [compare, tail]),
              ('BSTATE', [decode('B', 0, last), compare, tail]),
              ('NODE_RANGE', [snapshot, dict(roundtrip='range'), tail]), ('CHAIN', chain + [tail])]
-    for component in ('attention', 'recurrent'):
+    for component in ('attention', source.get('state_component', 'recurrent')):
         plans.append(('CHAIN_' + component.upper(), chain + [dict(snapshot, replace=component), tail]))
     for mode in ('native', 'range'):
         plans.append(('OWN_' + mode.upper(), [decode('A', 0, depth - 1), dict(roundtrip=mode), decode('A', depth - 1, depth)]))
@@ -615,9 +618,11 @@ def validate_raw_positions(row, depth):
 
 def append_replay_controls(row):
     controls = {}
+    component = row.get('state_component', 'recurrent')
+    require(component in ('recurrent', 'window'), 'invalid state component')
     pairs = [('NODE', 'B'), ('RESTORE', 'B'), ('BSTATE', 'B'), ('NODE_RANGE', 'B'),
              ('OWN_NATIVE', 'A'), ('OWN_RANGE', 'A'), ('CHAIN', 'H'),
-             ('CHAIN_ATTENTION', 'B'), ('CHAIN_RECURRENT', 'H')]
+             ('CHAIN_ATTENTION', 'B'), ('CHAIN_' + component.upper(), 'H')]
     require(set(name for name, _ in pairs) <= row.get('probes', {}).keys() and
             'A-L' in row.get('factorial', {}), 'missing append replay controls')
 
@@ -634,8 +639,8 @@ def append_replay_controls(row):
             for state in states:
                 if name in ('RESTORE', 'BSTATE'):
                     equal = equal and state.get('bytes_equal', state.get('snapshot_bytes_equal')) is True
-                elif name in ('CHAIN_ATTENTION', 'CHAIN_RECURRENT'):
-                    equal = equal and state['recurrent_equal'] is True
+                elif name in ('CHAIN_ATTENTION', 'CHAIN_' + component.upper()):
+                    equal = equal and state[component + '_equal'] is True
                 else:
                     equal = equal and state['bytes_equal'] is True
         controls[name + '-' + reference] = equal
@@ -710,6 +715,8 @@ def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id)
 def checkpoint_turns(value, turns):
     if value is None:
         return set(range(10, turns + 1, 10)) | {turns}
+    if value == 'none':
+        return set()
     parts = value.split(',')
     require(all(part.isascii() and part.isdecimal() for part in parts), 'invalid checkpoint turns: use comma-separated integers')
     selected = [int(part) for part in parts]
@@ -730,7 +737,7 @@ def parser():
     p.add_argument('--state-probes', action='store_true', help='capture private live node states and isolate serialization/import factors')
     p.add_argument('--turns', type=int, default=40)
     p.add_argument('--keep-checkpoint-states', action='store_true', help='retain saved states for checkpoint-only rechecks')
-    p.add_argument('--checkpoint-turns', help='increasing comma-separated checkpoint turns; default every 10 turns and final')
+    p.add_argument('--checkpoint-turns', help='none for capture-free hybrid/local timing; otherwise increasing turns, default every 10 and final')
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
     p.add_argument('--disconnect-turn', type=int, default=20, help='one-based, zero disables')
@@ -739,6 +746,7 @@ def parser():
     p.add_argument('--max-output', type=int, default=4506)
     p.add_argument('--pause-cap', type=float, default=340, help='zero for CPU smoke; changes the workload')
     p.add_argument('--policy', help='JSON Policy fields from calibration, never per-turn routing overrides')
+    p.add_argument('--rate-fixture', help='measured PRI-31 step-40 fixture; overrides only local policy rates')
     p.add_argument('--link-label', required=True, help='physical link description, no credentials or addresses')
     p.add_argument('--request-timeout', type=int, default=3600)
     p.add_argument('--disk-floor-gb', type=float, default=28)
@@ -748,6 +756,8 @@ def parser():
 def run(args):
     require((args.depth == 'deep' or 64 <= args.depth <= NATIVE_CONTEXT) and 1 <= args.turns <= 1000, 'invalid depth or turn count')
     checkpoints = checkpoint_turns(args.checkpoint_turns, args.turns)
+    require(bool(checkpoints) or not (args.state_probes or args.keep_checkpoint_states),
+            'timing-only mode forbids state probes and checkpoint retention')
     require(1 <= args.partition_ubatch <= args.partition_batch <= 4096, 'invalid partition batch/ubatch')
     require(0 <= args.disconnect_turn <= args.turns and args.disconnect_turns >= 1 and
             (not args.disconnect_turn or args.disconnect_turn + args.disconnect_turns <= args.turns),
@@ -762,28 +772,50 @@ def run(args):
     require(not config.get('hetero_quant'), 'growing-session requires identical model files')
     validate_identity(client['model_sha256'], client, node['model_sha256'], node)
     require(sha256(client['model_path']) == client['model_sha256'], 'client model file changed')
-    for binary in ('llama-server', 'llama-hybrid-bench-check'):
+    for binary in (('llama-server', 'llama-hybrid-bench-check') if checkpoints else ('llama-server',)):
         require(sha256(Path(client['build_dir']) / 'bin' / binary) == client['binaries'][binary], 'client binary changed: ' + binary)
     require(not root.exists() and root.parent.is_dir(), 'output must be a new directory in an existing parent')
-    capacity = min(client['context'], node['context'], NATIVE_CONTEXT)
-    require(max(client['context'], node['context']) <= NATIVE_CONTEXT, 'native 262144 context only; no YaRN')
-    require(args.depth != 'deep' or capacity == NATIVE_CONTEXT, 'deep arm needs native 262144 context on both roles')
+    layout = client['model_layout']
+    rate_fixture = json.loads(Path(args.rate_fixture).read_text()) if args.rate_fixture else None
+    if rate_fixture is not None:
+        validate_fixture(rate_fixture, client['model_sha256'], layout['architecture'])
+    require(layout['architecture'] != 'muse-glimmer' or client['backend'] != 'metal' or rate_fixture is not None,
+            'Glimmer Mac requires a measured PRI-31 fixture')
+    native_context = 131072 if layout['architecture'] == 'muse-glimmer' else NATIVE_CONTEXT
+    if layout['architecture'] == 'muse-glimmer':
+        require(layout.get('sliding_window') == 2048 and not any(r['recurrent'] for r in layout['layers']),
+                'Glimmer requires window 2048 without recurrent state')
+    capacity = min(client['context'], node['context'], native_context)
+    require(max(client['context'], node['context']) <= native_context, 'native context only; no YaRN')
+    require(args.depth != 'deep' or capacity == native_context, 'deep arm needs full native context on both roles')
     require(args.partition_batch != client.get('batch', 256) and args.partition_ubatch != client.get('ubatch', 256),
             'partition baseline needs different batch and ubatch')
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
-    size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
+    size = geometry['state_bytes'] + geometry.get('window_bytes', 0) + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
     raw_bytes = len(checkpoints) * 16 * 64 * client['model_layout']['vocab_size'] * 4
     require(shutil.disk_usage(root.parent).free > floor + ((3 if args.keep_checkpoint_states else 2) * len(checkpoints) + 6) * size + raw_bytes,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
-    state_dir = root / 'node-states'
+    state_dir = root / 'node-states' if checkpoints else None
     if state_dir is not None:
         state_dir.mkdir(mode=0o700)
     events = Events(state_dir)
     trace = dict(schema='hybrid-growing-session-v3', status='running', seed=args.seed, start=args.start,
         depth=args.depth, turns=args.turns, workload=[], calls=[], checkpoints=[],
+        measurement_mode='fidelity' if checkpoints else 'timing-only',
+        capture=dict(enabled=bool(checkpoints), node_snapshots=0, node_deltas=0, checker_runs=0),
+        arms=['hybrid', 'local', 'local_partition'] if checkpoints else ['hybrid', 'local'],
+        arm_definitions=dict(hybrid=dict(route='policy', recurrent_transport='f32' if geometry['state_bytes'] else None,
+                                        window_transport='q8_0' if geometry.get('window_bytes') else None,
+                                        attention_transport='q8_0'),
+                             local=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None),
+                             local_partition=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None)),
+        reserved_arms={'hybrid-bf16': dict(available=False, route='policy', recurrent_transport='bf16',
+                                         attention_transport='q8_0', window_transport=None,
+                                         prerequisite='dev-a r38 protocol capability and independent qualification')},
+        instrumentation=dict(version=1, pending='dev-d r13 timestamp list via owner', timestamps={}),
         provenance=dict(**PROVENANCE, depth_bins=DEPTH_BINS, pause_seconds=PAUSE,
                         sampling='linear below p50, log-linear above; bounded at last published quantile',
                         table_sha256=sha256(Path(__file__).with_name('fixtures') / 'growing-provenance.json'),
@@ -796,6 +828,9 @@ def run(args):
 
     def flush():
         trace['events'] = events.copy()
+        trace['capture'].update(node_snapshots=sum('node_snapshot' in r for r in trace['events']),
+                                node_deltas=sum('node_delta' in r for r in trace['events']),
+                                checker_runs=len(trace.get('checkpoint_inputs', [])))
         temp = root / 'trace.json.tmp'
         with temp.open('w') as target:
             json.dump(trace, target, indent=2, allow_nan=False)
@@ -814,6 +849,10 @@ def run(args):
                       prefill_timeout=args.request_timeout, decode_timeout=args.request_timeout)
         if args.policy:
             config['policy'] = json.loads(Path(args.policy).read_text())
+        if rate_fixture is not None:
+            config['policy'] = dict(config.get('policy', {}), local_rates=validate_fixture(
+                rate_fixture, client['model_sha256'], layout['architecture']))
+            trace['rate_fixture'] = dict(sha256=sha256(args.rate_fixture), **rate_fixture)
         token_file = root / 'decode-token'
         token_file.write_text(config['decode_token'])
         token_file.chmod(0o600)
@@ -851,7 +890,8 @@ def run(args):
         trace.update(depth=args.depth, depth_plan={k: v for k, v in plan.items() if k != 'sequence'},
                      workload=plan['sequence'], local_partition=dict(batch=args.partition_batch, ubatch=args.partition_ubatch))
         trace['policy'] = app.policy_config
-        trace['route_preflight'] = route_preflight(Policy(**app.policy_config), plan, args.disconnect_turn, args.disconnect_turns)
+        trace['route_preflight'] = route_preflight(Policy(**app.policy_config), plan, args.disconnect_turn, args.disconnect_turns,
+                                                 require_mix=bool(checkpoints))
         trace['engine'] = dict(extend_chunk_tokens=app.extend_chunk_tokens, delta_geometry=geometry,
             node=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
             checker=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
@@ -882,6 +922,7 @@ def run(args):
                 row = turn_record(arm, step, meter, first, total, prefix_hash(current['tokens']), captured[before:], sid)
                 cursors[arm] = len(captured)
                 row['stage'] = 'start' if initial else 'turn'
+                row['transport_profile'] = trace['arm_definitions'][arm]
                 row['at_seconds'] = time.monotonic() - events.started
                 row['ttft_other_seconds'] = None if first is None else first - sum(row[k] for k in
                     ('server_prefill_seconds', 'transfer_seconds', 'import_seconds', 'local_prefill_seconds', 'local_tail_seconds'))
@@ -908,7 +949,7 @@ def run(args):
             if args.start == 'pre-staged':
                 for arm in ('hybrid', 'local'):
                     stage_base(arm)
-            for arm in ('hybrid', 'local', 'local_partition'):
+            for arm in trace['arms']:
                 if arm == 'local_partition':
                     stop_process(decoder)
                     alternate = dict(client, batch=args.partition_batch, ubatch=args.partition_ubatch)
@@ -976,11 +1017,13 @@ def run(args):
             counts = route_counts(trace['calls'], events.copy(), trace['disconnect'])
             trace['route_counts'] = counts
             trace['final_depth'] = previous
-            require(counts['connected_policy_local'] and counts['connected_policy_offload'], 'scenario did not exercise both connected policy routes')
-            require(counts['connected_local_catchup_turns'], 'no connected policy-local prompt catch-up')
-            require(not args.disconnect_turn or any(r.get('resync') for r in trace['calls']),
-                    'no verified offload after reconnection')
-            trace['status'] = ('failed' if any(r['status'] == 'failed' for r in trace['checkpoints']) else
+            if checkpoints:
+                require(counts['connected_policy_local'] and counts['connected_policy_offload'], 'scenario did not exercise both connected policy routes')
+                require(counts['connected_local_catchup_turns'], 'no connected policy-local prompt catch-up')
+                require(not args.disconnect_turn or any(r.get('resync') for r in trace['calls']),
+                        'no verified offload after reconnection')
+            trace['status'] = ('measured' if not checkpoints else
+                               'failed' if any(r['status'] == 'failed' for r in trace['checkpoints']) else
                                'heterogeneous' if trace['heterogeneous'] else 'passed')
     except BaseException as error:
         trace.update(status='aborted', error_type=type(error).__name__,
@@ -1163,7 +1206,7 @@ def main():
     try:
         trace = run(args)
         print(json.dumps(dict(status=trace['status'], trace=str(Path(args.output) / 'trace.json'))))
-        return {'heterogeneous': 5, 'failed': 3, 'passed': 0}[trace['status']]
+        return {'heterogeneous': 5, 'failed': 3, 'passed': 0, 'measured': 0}[trace['status']]
     except (Refusal, OSError, ValueError, KeyError) as error:
         print('refused: ' + (str(error) if isinstance(error, Refusal) else type(error).__name__), file=sys.stderr)
         return 2

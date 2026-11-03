@@ -3,6 +3,7 @@ import copy
 from array import array
 import json
 import io
+import importlib.util
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -12,12 +13,123 @@ from unittest import mock
 import growing_session as growing
 from bench_common import Refusal
 from policy import Policy
+from growing_fixture import validate_fixture, from_archive
 from proxy import HTTPError
 from store import prefix_hash
 import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # A measured positive control is accepted; placeholders, wrong models, background and incomplete rates refuse.
+    def test_pri31_fixture_admission(self):
+        fixture = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-qwen-pri31.json').read_text())
+        rates = validate_fixture(fixture, fixture['model_sha256'], 'qwen35')
+        self.assertIn([100000, 65.3], rates)
+        self.assertEqual(len(rates), 7)
+        for fields in (dict(status='placeholder'), dict(priority=4), dict(override_used=True),
+                       dict(normal_priority=False), dict(depths=[])):
+            with self.subTest(fields=fields), self.assertRaises(Refusal):
+                validate_fixture(dict(fixture, **fields), fixture['model_sha256'], 'qwen35')
+        with self.assertRaisesRegex(Refusal, 'model mismatch'):
+            validate_fixture(fixture, '0' * 64, 'qwen35')
+        bad = copy.deepcopy(fixture)
+        del bad['depths'][0]['delta_prefill_tok_s']['2000']
+        with self.assertRaisesRegex(Refusal, 'incomplete'):
+            validate_fixture(bad, fixture['model_sha256'], 'qwen35')
+
+    # Archive pinning happens before tar parsing; a wrong file cannot be relabeled as a new rate source.
+    def test_fixture_archive_checksum_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wrong.tar.gz'
+            path.write_bytes(b'not a tar archive')
+            with self.assertRaisesRegex(Refusal, 'archive checksum mismatch'):
+                from_archive(path, '0' * 64)
+
+    # The Mac payload fixes two arms through none, preserves seed/outage, and requires a physical link label.
+    def test_mac_packet_command_and_placeholder_refusal(self):
+        path = Path(growing.__file__).parent / 'packets/r46/mac_timing.py'
+        spec = importlib.util.spec_from_file_location('mac_timing', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        command = module.command(Path('state'), Path('run'), Path('policy'), Path('fixture'), 76000, '5G')
+        for flag, value in (('--checkpoint-turns', 'none'), ('--depth', '76000'), ('--seed', '1'), ('--turns', '40'),
+                            ('--disconnect-turn', '2'), ('--disconnect-turns', '3'), ('--rate-fixture', 'fixture')):
+            self.assertEqual(command[command.index(flag) + 1], value)
+        placeholder = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-glimmer-pri31.pending.json').read_text())
+        client = dict(model_sha256='0' * 64, model_layout=dict(architecture='muse-glimmer'))
+        with self.assertRaisesRegex(Refusal, 'measured PRI-31 fixture required'):
+            module.admission(client, {}, {}, placeholder, {}, 'unused')
+        fixture = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-qwen-pri31.json').read_text())
+        client = dict(model_sha256=fixture['model_sha256'], model_layout=dict(architecture='qwen35'), backend='metal', context=196608)
+        node = dict(backend='cuda', context=196608)
+        fit = dict(model_sha256=fixture['model_sha256'], source_head='head')
+        self.assertEqual(module.admission(client, node, {}, fixture, fit, 'head')[1], 100000)
+        for bad_client, bad_node, bad_fit in ((dict(client, context=262144), node, fit),
+                                             (client, dict(node, backend='cpu'), fit),
+                                             (client, node, dict(fit, source_head='stale'))):
+            with self.assertRaises(Refusal):
+                module.admission(bad_client, bad_node, {}, fixture, bad_fit, 'head')
+
+    # Timing mode refuses capture options before reading metadata or creating artifacts.
+    def test_timing_mode_refuses_capture_options(self):
+        self.assertEqual(growing.checkpoint_turns('none', 40), set())
+        for option in ('--state-probes', '--keep-checkpoint-states'):
+            args = growing.parser().parse_args(['--client-state', 'absent', '--output', 'absent',
+                '--link-label', 'CPU', '--checkpoint-turns', 'none', option])
+            with mock.patch.object(growing, 'read_private') as read:
+                with self.assertRaisesRegex(Refusal, 'timing-only mode forbids'):
+                    growing.run(args)
+                read.assert_not_called()
+
+    # Timing observes an all-local production policy; the identical plan remains invalid for fidelity qualification.
+    def test_timing_all_local_preserves_fidelity_route_gate(self):
+        plan = growing.depth_plan(100000, 40, 1, 10875, 4506, 340, 14)
+        policy = Policy(local_rates=((0, 2000),), fixed=100)
+        result = growing.route_preflight(policy, plan, 2, 3, require_mix=False)
+        self.assertEqual(result['counts'], dict(policy_local=37, policy_offload=0))
+        with self.assertRaisesRegex(Refusal, 'degenerate connected policy mix'):
+            growing.route_preflight(policy, plan, 2, 3)
+
+    # The real request wrapper returns the import envelope without invoking snapshot download when capture is disabled.
+    def test_timing_node_request_has_no_snapshot(self):
+        events = growing.Events(None)
+        node = growing.MeasuredNode('http://unused', 'private-fixture', 1, events=events, session='h', source='critical')
+        node.last_bytes = 7
+        with mock.patch.object(growing.Node, 'request', return_value=b'envelope'), mock.patch.object(node, 'download') as download:
+            result = node.request('POST', '/v1/sessions/h/extend', dict(n0=0, tokens=[1], return_delta=True, prefix_hash_n0='0' * 64))
+        self.assertEqual(result, b'envelope')
+        download.assert_not_called()
+        self.assertFalse(any('node_snapshot' in r or 'node_delta' in r for r in events.copy()))
+
+    # Seed 1 fits Glimmer at 76k with framing up to 32 and a 2048-token margin; 80k must refuse.
+    def test_glimmer_native_depth_margin(self):
+        plan = growing.depth_plan(76000, 40, 1, 10875, 4506, 340, 32, 131072)
+        self.assertEqual(len(plan['sequence']), 40)
+        self.assertLessEqual(plan['final_depth'] + 2048, 131072)
+        with self.assertRaisesRegex(Refusal, 'no turns truncated'):
+            growing.depth_plan(80000, 40, 1, 10875, 4506, 340, 16, 131072)
+
+    # SWA keeps ten controls; changed window bytes and 62/64 cannot pass a forged summary.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_window_gate_replaces_recurrent_without_weakening(self, raw):
+        row = self.append_gate_row()
+        row['state_component'] = 'window'
+        row['probes']['CHAIN_WINDOW'] = row['probes'].pop('CHAIN_RECURRENT')
+        row['gate_controls']['CHAIN_WINDOW-H'] = row['gate_controls'].pop('CHAIN_RECURRENT-H')
+        for name in ('CHAIN_ATTENTION', 'CHAIN_WINDOW'):
+            state = row['probes'][name]['roundtrips'][0]
+            state['window_equal'] = state.pop('recurrent_equal')
+        growing.validate_checkpoint(row, False, 1000)
+        self.assertEqual(len(growing.append_replay_controls(row)), 10)
+        for name in ('CHAIN_ATTENTION', 'CHAIN_WINDOW'):
+            bad = copy.deepcopy(row)
+            bad['probes'][name]['roundtrips'][0]['window_equal'] = False
+            with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+                growing.validate_checkpoint(bad, False, 1000)
+        bad = dict(row, exact=False, top1_agreed=62)
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(bad, False, 1000)
+
     # Invalid selections fail before private metadata reads, process launch or output writes.
     def test_checkpoint_turns_invalid_is_atomic(self):
         for value in ('', '0', '-1', '41', '20,20', '40,20', '20,', 'x', '1.5', ' 20', '２０'):
@@ -56,6 +168,10 @@ class ScenarioTests(unittest.TestCase):
         trace = dict(calls=[dict(arm='hybrid', turn=1, session_id='h', meter=dict(chunks=[dict(status='imported', n1=9)]))],
                      events=[event(0, 4), event(4, 7, True), event(7, 9)])
         plans = {r['name']: r['steps'] for r in growing.state_probe_plans(source, trace, 1)}
+        window = {r['name']: r['steps'] for r in growing.state_probe_plans(dict(source, state_component='window'), trace, 1)}
+        self.assertIn('CHAIN_WINDOW', window)
+        self.assertNotIn('CHAIN_RECURRENT', window)
+        self.assertEqual(window['CHAIN_WINDOW'][-2]['replace'], 'window')
         self.assertEqual(plans['NODE'][0], dict(snapshot='snapshot', sha256='s'))
         self.assertEqual([next(iter(s)) for s in plans['CHAIN']], ['delta', 'decode', 'delta', 'decode'])
         self.assertEqual(plans['CHAIN'][1]['decode'], [dict(n0=4, n1=7, logits=True)])

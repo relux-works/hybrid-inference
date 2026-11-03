@@ -1,0 +1,8 @@
+{
+  "schema": "hybrid-growing-rate-fixture-v1",
+  "status": "placeholder",
+  "architecture": "muse-glimmer",
+  "priority": null,
+  "depths": [],
+  "reason": "PRI-31 Glimmer kit step 40 pending; background rates are not admissible. Regenerate with growing_fixture.py from the delivered archive."
+}
