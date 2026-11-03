@@ -1,3 +1,21 @@
+# r15h settlement deadline and guarded restart
+
+[RESTART-r15h.md](RESTART-r15h.md) registers the sequence153 diagnosis and continuation from accepted31c017ed. The phase's600s recovery window expired before earlier-call debits reached the key counter; the supervisor then settled the charge at zero debit. Recovery now allows a bounded1200s window and reserves that time plus120s metadata allowance before a paid call. Three stable bounded samples, immediate overshoot refusal, retained reservations, USD22/USD45 caps and both fixed phase cutoffs stay unchanged. Failure diagnostics retain the actual poll history.
+
+A settled HTTP429 with no generation, usage, stream or observed identity is a rate-limit availability failure and permits the next scheduled index. Completed responses still use the r15g identity gate, and every report keeps its independent provider filter. The historical watchdog's timeout flag on such a429 is not counted as a transport timeout. No original receipt or row needs replay or rewriting.
+
+From the signed m3-api-cache-r15g worktree, after verifying stopped custody and settled receipts:
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15h-261103/tmp
+python3 -m unittest discover -s tools/api-cache -p 'test_openrouter*.py' -v
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/tmp
+nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$TMPDIR" python3 -u tools/api-cache/openrouter_restart.py --root /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103 --resume >> /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/supervisor.log 2>&1 < /dev/null &
+```
+
+The fixed head carries all r15g fixes into both new paid phases, the live report, and the separate GET-only end audit under .temp/hybrid-d-r15h-261103/audit-end/. Keep this source frozen while running. Verify supervisor/child PIDs from a separate shell against workflow.json; heartbeat remains600s. The prior r15g audit is retained as a completed audit of the stopped cohort. No pause is shortened; cells that cannot fit the extended settlement allowance are skipped explicitly. The exact47-poll fixture, CPU evidence, cause citations, launch PIDs and ledger are recorded in the r15h task SUMMARY.md and RESTART-r15h.md.
+
 # r15g identity closure and authoritative filtered analysis
 
 Muse r7au2 found a prospective missing-provider bypass on03ad1a09c; no collected row was invalidated. The fixed source is isolated on m3-api-cache-r15g. Never edit the running r15e checkout or signal its supervisor, runner or observer. Amendment continues from that same original source: its supervisor has no alternate-head handoff or phase-boundary hash check. See REVIEW-r15g.md and .temp/hybrid-d-r15g-261103/AMENDMENT-BOUNDARY.md for the exact load chain and custody decision.

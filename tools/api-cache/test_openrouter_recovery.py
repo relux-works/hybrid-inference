@@ -92,6 +92,9 @@ class RecoveryTests(unittest.TestCase):
         terminal=json.loads((phase.out/'terminal.json').read_text())
         self.assertIn('unresolvable charge',terminal['reason'])
         self.assertTrue((phase.out/'unresolved-0000.json').exists())
+        unresolved=json.loads((phase.out/'unresolved-0000.json').read_text())
+        self.assertEqual(unresolved['sample_count'],1)
+        self.assertEqual(unresolved['samples'][0]['usage_usd'],'1')
         self.assertEqual(recovery.Budget.load(self.root/'ledger.json').receipts,{})
 
     # The same missing-cost path may continue only after stable, bounded cumulative usage.
@@ -300,15 +303,31 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn('serving provider differs or is absent',row['error']);self.assertFalse(row['accepted'])
         self.assertEqual(recovery.availability([row])['errors'],1)
 
-    # The stricter prospective source still settles a failed charge before halting for absent identity.
-    def test_http_failure_without_identity_settles_then_halts(self):
+    # A settled429 with no generation or usage is an availability failure, not a completed-response identity violation.
+    def test_rate_limited_no_generation_zero_debit_continues(self):
         RecoveryHandler.output_mode='http-error';Handler.cost=0;phase=self.phase()
-        with mock.patch.object(recovery,'settled_samples',side_effect=lambda client,*args:self.samples(0)):
-            self.assertEqual(phase.run(),1)
-        self.assertEqual(len(Handler.bodies),1)
-        self.assertIn('serving provider differs or is absent',phase.rows[0]['error'])
-        self.assertTrue(phase.rows[0]['charge_resolution']['resolved'])
-        self.assertEqual(recovery.availability(phase.rows)['errors'],1)
+        with mock.patch.object(recovery.time,'sleep'):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(not row['accepted'] and row['http_status']==429 and row['generation_id'] is None and row['usage'] is None for row in phase.rows))
+        self.assertTrue(all(row['charge_resolution']['resolved_observed_charge_usd']=='0' for row in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+        self.assertEqual(recovery.availability(phase.rows)['timeouts'],0)
+        self.assertGreater(phase.budget.committed,phase.budget.known)
+
+    # The429 transport exception cannot hide observed identity, usage, generation evidence or a guard-completed response.
+    def test_named_negative_rate_limit_exception_cannot_mask_completed_identity(self):
+        row=dict(http_status=429,generation_id=None,usage=None,observed_providers=[],observed_models=[],stream=[])
+        self.assertTrue(recovery.rate_limited_without_generation(row))
+        for changes in (dict(http_status=200),dict(generation_id='gen-wrong'),dict(usage={'cost':0}),
+                        dict(observed_providers=['wrong']),dict(observed_models=['wrong/model']),dict(stream=[{}]),dict(output_guard_triggered=True)):
+            with self.subTest(changes=changes):self.assertFalse(recovery.rate_limited_without_generation(dict(row,**changes)))
+
+    # The historical supervisor's timeout flag must not turn a completed HTTP429 into a transport timeout.
+    def test_historical_rate_limit_watchdog_flag_counts_only_as_availability_error(self):
+        row=dict(http_status=429,generation_id=None,usage=None,accepted=False,timed_out=True,error='HTTP error',observed_providers=[],observed_models=[])
+        self.assertEqual(recovery.availability([row]),dict(attempts=1,successes=0,errors=1,timeouts=0,rate=0))
+        self.assertTrue(row['timed_out'])
 
     # The stream identity check accepts exactly the frozen endpoint alias, never an arbitrary dated suffix.
     def test_frozen_stream_model_identity_positive_and_wrong_suffix_negative(self):
@@ -369,6 +388,12 @@ class RecoveryTests(unittest.TestCase):
     # A pause that cannot fit is omitted explicitly, never shortened and never POSTed.
     def test_deadline_cutoff_skips_without_compressing_pause(self):
         phase=self.phase();phase.end=time.time()+179+600
+        self.assertIsNone(phase.call(self.session,0))
+        self.assertEqual(Handler.bodies,[]);self.assertIn('unchanged pause',phase.skips[0]['reason'])
+
+    # A slot that fit the old600s recovery reserve must skip if the longer bounded settlement cannot fit.
+    def test_cutoff_reserves_extended_settlement_window(self):
+        phase=self.phase();phase.end=time.time()+180+1190
         self.assertIsNone(phase.call(self.session,0))
         self.assertEqual(Handler.bodies,[]);self.assertIn('unchanged pause',phase.skips[0]['reason'])
 
@@ -441,6 +466,47 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(client.get.call_count,6)
         self.assertEqual(recovery.Budget.load(self.root/'ledger.json').known,0)
         self.assertEqual(Handler.bodies,[])
+
+    def settlement_fixture(self,values,expected,maximum,timeout=None):
+        now=[0];client=mock.Mock(secret=self.secret)
+        client.get.side_effect=[{'data':{'usage':value}} for value in values]
+        args={} if timeout is None else dict(timeout_seconds=timeout)
+        with mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            samples=recovery.settled_samples(client,expected,maximum,self.root/'poll-evidence.json',**args)
+        return samples,client,now[0]
+
+    # Exact0153 phase+watchdog values need690s at15s cadence: the counter catches up, then three readings resolve zero debit.
+    def test_exact_0153_lag_then_three_stable_samples_resolves_zero(self):
+        fixture=json.loads((Path(__file__).parent/'fixtures/settlement-0153.json').read_text())
+        values=[s['usage_usd'] for s in fixture['samples']]
+        samples,client,elapsed=self.settlement_fixture(values,fixture['expected_usd'],fixture['maximum_usd'])
+        proof=recovery.resolve_delta(samples,fixture['expected_usd'],fixture['maximum_usd'])
+        self.assertEqual(client.get.call_count,47);self.assertEqual(elapsed,690)
+        self.assertEqual(proof['observed_delta_usd'],'-4.2E-9')
+        self.assertEqual(proof['resolved_observed_charge_usd'],'0')
+        self.assertEqual(proof['retained_reservation_usd'],'0.0204141')
+        self.assertEqual(len(json.loads((self.root/'poll-evidence.json').read_text())['samples']),47)
+
+    # The neighbouring late counter may include a non-zero charge, which must be retained as the measured debit.
+    def test_lag_then_stable_positive_debit_within_maximum(self):
+        samples,client,elapsed=self.settlement_fixture(['7.212300721']*44+['7.6483417282']*3,'7.6383417282','.0204141')
+        proof=recovery.resolve_delta(samples,'7.6383417282','.0204141')
+        self.assertEqual(proof['resolved_observed_charge_usd'],'0.0100000000')
+        self.assertEqual(client.get.call_count,47);self.assertEqual(elapsed,690)
+
+    # An overshoot after initial lag stops on that first excessive value, without waiting for stability.
+    def test_named_negative_lag_then_overshoot_stops_immediately(self):
+        with self.assertRaisesRegex(api.Refusal,'cumulative delta exceeds reservation'):
+            self.settlement_fixture(['7.212300721']*3+['7.6587558283'],'7.6383417282','.0204141')
+        persisted=json.loads((self.root/'poll-evidence.json').read_text())
+        self.assertEqual(len(persisted['samples']),4)
+        self.assertEqual(persisted['samples'][-1]['usage_usd'],'7.6587558283')
+
+    # A counter inside the charge range that never holds three readings fails at the finite deadline.
+    def test_named_negative_counter_never_stabilizes_stops(self):
+        with self.assertRaisesRegex(api.Refusal,'did not settle within recovery deadline'):
+            self.settlement_fixture(['7.6383417282','7.6383417283']*2,'7.6383417282','.0204141',timeout=60)
+        self.assertEqual(len(json.loads((self.root/'poll-evidence.json').read_text())['samples']),4)
 
     # A permanently stale/reset counter stops at the bounded deadline rather than fabricating a zero charge.
     def test_stale_counter_unresolved_by_deadline_stops(self):

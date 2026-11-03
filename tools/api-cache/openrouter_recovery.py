@@ -12,6 +12,7 @@ DISK_STOP_BYTES = int(28.5 * 1024**3)
 REQUEST_OUTPUT_TOKENS = 16
 RESERVED_OUTPUT_TOKENS = 1024
 ROUNDING = Decimal('.00000001')
+SETTLEMENT_DEADLINE_SECONDS = 1200
 DEPTH_DEADLINES = [(32768,180),(131072,300),(250000,600),(524288,1200),(1000000,2400)]
 
 
@@ -52,7 +53,7 @@ def usage_samples(client, count=3, pause=1):
     return result
 
 
-def settled_samples(client,expected,maximum,evidence_path,timeout_seconds=600,poll_seconds=15):
+def settled_samples(client,expected,maximum,evidence_path,timeout_seconds=SETTLEMENT_DEADLINE_SECONDS,poll_seconds=15):
     expected,maximum=api.money(expected),api.money(maximum)
     end=time.monotonic()+timeout_seconds
     history=[]
@@ -301,11 +302,17 @@ def provider_observations(row):
     return {value for value in values if isinstance(value,str) and value.strip()}
 
 
+def rate_limited_without_generation(row):
+    return (row.get('http_status')==429 and row.get('generation_id') is None and row.get('usage') is None
+            and not row.get('stream') and not provider_observations(row) and not row.get('observed_models')
+            and not row.get('output_guard_triggered'))
+
+
 def availability(rows):
     count=len(rows)
     success=sum(bool(r.get('accepted')) for r in rows)
     return dict(attempts=count,successes=success,errors=count-success,
-                timeouts=sum(bool(r.get('timed_out') or 'deadline' in (r.get('error') or '')) for r in rows),
+                timeouts=sum(bool(r.get('timed_out') or 'deadline' in (r.get('error') or '')) and not rate_limited_without_generation(r) for r in rows),
                 rate=success/count if count else None)
 
 

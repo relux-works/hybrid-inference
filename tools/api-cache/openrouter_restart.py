@@ -301,7 +301,7 @@ class Phase:
     def call(self,s,index,previous_end=None):
         seconds=recovery.deadline_for_depth(s['depth'])
         due=time.monotonic() if previous_end is None else previous_end+s['pauses'][index]
-        if time.time()+max(0,due-time.monotonic())+seconds+600>self.end:
+        if time.time()+max(0,due-time.monotonic())+seconds+recovery.SETTLEMENT_DEADLINE_SECONDS+120>self.end:
             self.skip(s,index,'insufficient phase time for unchanged pause and complete deadline/recovery'); return None
         m=dict(new_tokens=1000 if self.name=='v1' else 1065,framing_reserve=128,max_tokens=16)
         payload=amendment.payload(m,s,index)
@@ -356,11 +356,16 @@ class Phase:
             try:
                 samples=recovery.settled_samples(self.client,self.budget.known,estimated,self.out/('settlement-%04d.json'%sequence))
                 row['charge_resolution']=self.budget.recovered_call(samples,estimated,call_id)
-            except api.Refusal:
-                recovery.atomic_json(self.out/('unresolved-%04d.json'%sequence),dict(samples=samples,expected_usd=str(self.budget.known),maximum_usd=str(estimated)),self.client.secret)
+            except api.Refusal as error:
+                evidence=self.out/('settlement-%04d.json'%sequence)
+                try:samples=json.loads(evidence.read_text())['samples']
+                except (OSError,ValueError,KeyError):pass
+                recovery.atomic_json(self.out/('unresolved-%04d.json'%sequence),dict(samples=samples,sample_count=len(samples),settlement_evidence=evidence.name,error=str(error),expected_usd=str(self.budget.known),maximum_usd=str(estimated)),self.client.secret)
                 raise
         target=s['depth']-(len(s['pauses'])-1-index)*m['new_tokens']
-        recovery.classify_call(row,target,payload['model'],endpoint)
+        if recovery.rate_limited_without_generation(row):
+            row.update(accepted=False,error='HTTP 429 rate limited; charge settled',availability_failure='rate_limited')
+        else:recovery.classify_call(row,target,payload['model'],endpoint)
         recovery.atomic_json(self.out/('call-%04d.json'%sequence),row,self.client.secret)
         self.csv()
         print(api.redact(json.dumps({k:row.get(k) for k in ('sequence','provider','cohort','depth','call_index','cached_tokens','timed_out','accepted','error')}),self.client.secret),flush=True)
