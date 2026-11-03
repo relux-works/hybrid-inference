@@ -1,3 +1,4 @@
+#include "llama-io.h"
 #include "hybrid-state.h"
 #include "hybrid-scheduler.h"
 #include "httplib.h"
@@ -48,14 +49,20 @@ public:
     }
 };
 
-static void send_binary(httplib::Response & res, std::string wire) {
-    res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire)](size_t offset, httplib::DataSink & sink) {
+static void send_binary(httplib::Response & res, std::string wire, llama_trace_context trace = {}) {
+    res.set_chunked_content_provider("application/octet-stream", [wire = std::move(wire), trace](size_t offset, httplib::DataSink & sink) {
+        llama_trace_binding binding(trace);
+        llama_trace_span write_span("node.response_body_write");
         size_t n = std::min<size_t>(65536, wire.size() - offset);
+        write_span.bytes = n;
+        if (offset == 0) { llama_trace_span first("node.headers_sent_first_body_write_begin"); }
         if (n && !sink.write(wire.data() + offset, n)) { return false; }
-        if (offset + n == wire.size()) { sink.done(); }
+        if (offset + n == wire.size()) { llama_trace_span last("node.last_body_write_complete"); sink.done(); }
         return true;
     });
 }
+
+static thread_local uint64_t trace_receipt_ns = 0;
 
 static int64_t now() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -99,6 +106,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     try {
+        llama_trace_start();
         int port = 8091;
         int n_ctx = 8448;
         int max_ctx = 16384;
@@ -187,12 +195,30 @@ int main(int argc, char ** argv) {
         http.set_read_timeout(30, 0);
         http.set_write_timeout(3600, 0);
         http.set_keep_alive_max_count(1);
+        http.set_pre_routing_handler([](const httplib::Request &, httplib::Response &) {
+            trace_receipt_ns = llama_trace_enabled() ? llama_trace_now() : 0;
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
         http.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
         auto handler = [&](const httplib::Request & req, httplib::Response & res) {
+            if (bench && req.path == "/v1/bench/trace-flush") {
+                // Do not checkpoint an unfinished diagnostic parent span.
+                if (owners.find(req.get_header_value("Authorization")) == owners.end()) {
+                    respond(res, 401, {{"error", "unauthorized"}});
+                } else {
+                    respond(res, 200, {{"enabled", llama_trace_enabled()}, {"complete", llama_trace_checkpoint()}});
+                }
+                return;
+            }
+            llama_trace_context trace_parent;
+            for (const auto & header : req.headers) { llama_trace_header(trace_parent, header.first, header.second); }
+            llama_trace_binding trace_binding(trace_parent);
+            llama_trace_span request_trace("node.http_request_prepare", req.body.size(), 0, trace_receipt_ns);
+            { llama_trace_span upload("node.http_header_receipt_to_body_complete", req.body.size(), 0, trace_receipt_ns); }
             auto owner = owners.find(req.get_header_value("Authorization"));
             if (req.path == "/v1/health") {
-                json health = {{"status", "ok"}, {"delta_version", 2}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
+                json health = {{"native_trace_enabled", llama_trace_enabled()}, {"status", "ok"}, {"delta_version", 2}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
                                    {"model_layout", layout}, {"max_ctx", max_ctx}, {"n_ctx", n_ctx},
                                    {"ram_budget_bytes", ram_budget}, {"max_request_bytes", max_request}};
                 if (!public_node || owner != owners.end()) {
@@ -238,7 +264,10 @@ int main(int argc, char ** argv) {
                 try { critical = hybrid::parse_json(req.body, max_request).value("return_delta", true); }
                 catch (const std::exception &) { /* Invalid requests are rejected below. */ }
             }
-            auto admission = scheduler.enter(client, session_id, critical, req.is_connection_closed);
+            auto admission = [&] {
+                llama_trace_span queue_trace("node.scheduler_queue");
+                return scheduler.enter(client, session_id, critical, req.is_connection_closed);
+            }();
             if (!admission) { return; }
             try {
                 auto & space = sessions[owner->second];
@@ -290,7 +319,7 @@ int main(int argc, char ** argv) {
                     respond(res, 200, info(s, model_hash));
                 } else if (req.method == "GET" && action == "snapshot") {
                     s.recency = ++recency;
-                    send_binary(res, snapshot(s, empty_state));
+                    send_binary(res, snapshot(s, empty_state), trace_parent);
                 } else if (req.method == "POST" && action == "extend") {
                     json body = hybrid::parse_json(req.body, max_request);
                     if (!body.at("n0").is_number_integer() || !body.at("prefix_hash_n0").is_string()) {
@@ -337,16 +366,18 @@ int main(int argc, char ** argv) {
                         // Use the largest body length so the header budget is checked before inference.
                         hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
                     }
-                    hybrid::load_state(ctx.get(), s.state);
+                    request_trace.tokens = tokens.size();
+                    { llama_trace_span span("node.load_state", s.state.size(), n0); hybrid::load_state(ctx.get(), s.state); }
                     const auto prefill_started = std::chrono::steady_clock::now();
-                    hybrid::prefill(ctx.get(), tokens, n0);
+                    { llama_trace_span span("node.prefill", 0, tokens.size()); hybrid::prefill(ctx.get(), tokens, n0); }
                     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefill_started).count();
                     res.set_header("X-Hybrid-Prefill-Ms", std::to_string(ms));
                     std::string wire;
                     if (return_delta) {
                         wire = hybrid::encode_delta(std::move(header), hybrid::export_range(ctx.get(), n0, all.size(), fixed_state));
                     }
-                    std::string state = hybrid::save_state(ctx.get());
+                    std::string state;
+                    { llama_trace_span span("node.save_state", 0, all.size()); state = hybrid::save_state(ctx.get()); span.bytes = state.size(); }
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);
                     size_t new_bytes = state.size() + all.size() * sizeof(llama_token);
                     // Plan before deleting: an impossible admission must preserve every session.
@@ -387,7 +418,7 @@ int main(int argc, char ** argv) {
                     s.recency = ++recency;
                     ++extends;
                     if (!wire.empty()) {
-                        send_binary(res, std::move(wire));
+                        send_binary(res, std::move(wire), trace_parent);
                     } else {
                         respond(res, 202, {{"n", s.tokens.size()}, {"prefix_hash", hybrid::prefix_hash(s.tokens)}});
                     }
@@ -402,7 +433,7 @@ int main(int argc, char ** argv) {
         };
         http.Get("/v1/health", handler);
         http.Get("/metrics", handler);
-        if (bench) { http.Get("/v1/bench/link", handler); }
+        if (bench) { http.Get("/v1/bench/link", handler); http.Post("/v1/bench/trace-flush", handler); }
         http.Get("/v1/sessions", handler);
         http.Post("/v1/sessions", handler);
         http.Get(R"(/v1/sessions/[a-f0-9]{32}(/snapshot)?)", handler);

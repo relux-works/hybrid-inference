@@ -1,3 +1,4 @@
+#include "llama-io.h"
 #include "llama-mmap.h"
 
 #include "llama-impl.h"
@@ -414,7 +415,10 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
-llama_file::~llama_file() = default;
+llama_file::~llama_file() {
+    llama_trace_span span("file.close_flush");
+    pimpl.reset();
+}
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
@@ -447,7 +451,10 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsaf
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
-void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
+void llama_file::write_raw(const void * ptr, size_t len) const {
+    llama_trace_span span("file.write", len);
+    pimpl->write_raw(ptr, len);
+}
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap

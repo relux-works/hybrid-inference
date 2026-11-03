@@ -12,6 +12,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'tools/hybrid-bench'))
+sys.path.insert(0, str(Path(__file__).parent))
 import growing_session as g
 from growing_fixture import validate_fixture
 from bench_common import Refusal, read_private, private_json, require, sha256
@@ -27,9 +28,32 @@ def helper(packet, name):
     return module
 
 
+IDENTITY_FILES = ['tools/hybrid-proxy/proxy.py', 'tools/hybrid-proxy/traffic.py', 'tools/hybrid-proxy/timing.py',
+                  'src/llama-context.cpp', 'src/llama-kv-cache.cpp', 'src/llama-kv-cache-iswa.cpp',
+                  'src/llama-io.cpp', 'src/llama-io.h', 'src/llama-mmap.cpp', 'tools/hybrid/hybrid-state.cpp',
+                  'tools/server/server-context.cpp', 'tools/server/server-http.cpp', 'tools/server/server-task.h']
+
+
+def import_identity(client):
+    binaries = {}
+    for name in client['binaries']:
+        path = Path(client['build_dir']) / 'bin' / name
+        require(path.is_file(), 'missing import binary: ' + name)
+        binaries[name] = sha256(path)
+    return dict(import_path_sha256={name: sha256(ROOT / name) for name in IDENTITY_FILES}, binaries=binaries,
+                build_record=client.get('build_record'), model_sha256=client['model_sha256'])
+
+
+def require_fit_identity(fit, client):
+    current = import_identity(client)
+    require(all(fit.get(key) == current[key] for key in current),
+            'import fit source/binary identity mismatch; bounded calibration required')
+
+
 def admission(client, node, geometry, fixture, fit, head):
     rates = validate_fixture(fixture, client['model_sha256'], client['model_layout']['architecture'])
     require(fit['source_head'] == head and fit['model_sha256'] == client['model_sha256'], 'import fit identity mismatch')
+    require_fit_identity(fit, client)
     require(client['backend'] == 'metal' and node['backend'] == 'cuda', 'Mac packet requires Metal client and CUDA node')
     architecture = client['model_layout']['architecture']
     require(architecture in ('qwen35', 'muse-glimmer'), 'unsupported packet model')
@@ -56,7 +80,7 @@ def budgets(client, geometry, plan):
 def command(state, output, policy, fixture, depth, link):
     return [sys.executable, str(ROOT / 'tools/hybrid-bench/growing_session.py'), '--client-state', str(state),
         '--output', str(output), '--depth', str(depth), '--turns', '40', '--seed', '1', '--start', 'pre-staged',
-        '--checkpoint-turns', 'none', '--disconnect-turn', '2', '--disconnect-turns', '3',
+        '--checkpoint-turns', 'none', '--timing-spans', '--disconnect-turn', '2', '--disconnect-turns', '3',
         '--policy', str(policy), '--rate-fixture', str(fixture), '--link-label', link + '; M3 Max PRI31; CUDA to Metal; SSH',
         '--request-timeout', '3600']
 

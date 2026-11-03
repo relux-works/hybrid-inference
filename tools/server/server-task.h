@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-io.h"
+
 #include "common.h"
 #include "llama.h"
 
@@ -164,6 +166,13 @@ struct task_result_state {
 };
 
 struct server_task {
+    llama_trace_context trace_context = [] {
+        auto context = llama_trace_get();
+        // Queue/stream work can outlive dispatch; call IDs link these separate native roots.
+        context.parent_id[0] = context.parent_domain[0] = 0;
+        return context;
+    }();
+    uint64_t trace_queued_ns = llama_trace_enabled() ? llama_trace_now() : 0;
     int id = -1; // to be filled by server_queue
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader

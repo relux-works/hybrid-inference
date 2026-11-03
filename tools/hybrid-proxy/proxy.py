@@ -23,6 +23,8 @@ from concurrency import SessionQueue
 from journal import Capture, JournalConflict, Renderer, matching_messages, segment_range, settings_identity
 from store import Store, prefix_hash
 from release import release_diagnostic, release_retry
+import timing
+from traffic import TrafficBudget, TrafficBudgetExceeded
 
 LOG = logging.getLogger("hybrid")
 MAX_JSON = 8 * 1024 * 1024
@@ -55,20 +57,28 @@ class SlotUnavailable(HTTPError):
 
 
 class Node:
-    def __init__(self, url, token="", timeout=1.0):
+    def __init__(self, url, token="", timeout=1.0, budget=None):
+        self.budget = budget
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
         self.last_transfer_rate = None
         self.last_transfer_seconds = 0
         self.last_bytes = 0
         self.last_prefill_ms = None
+        self.last_upload_bytes = 0
 
+    @timing.traced('http.open_upload_headers')
     def open(self, method, path, data=None, headers=None):
         headers = dict(headers or {})
+        headers.update(timing.headers())
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         if isinstance(data, (dict, list)):
-            data = json.dumps(data).encode()
+            with timing.span('request.json_encode') as span:
+                data = json.dumps(data).encode()
+                span['bytes'] = len(data)
             headers["Content-Type"] = "application/json"
+        self.last_upload_bytes = len(data or b" ") if data is not None else 0
+        timing.annotate(bytes=self.last_upload_bytes)
         request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         try:
             return urllib.request.urlopen(request, timeout=self.timeout)
@@ -76,13 +86,40 @@ class Node:
             with error:
                 raise HTTPError(error.code, error.read(MAX_JSON)) from None
 
+    @timing.traced('http.request')
     def request(self, method, path, data=None, headers=None, binary=False):
+        timing.annotate(operation=method + ' ' + path)
+        if isinstance(data, dict) and 'n0' in data and isinstance(data.get('tokens'), list):
+            timing.annotate(tokens=len(data['tokens']), n0=data['n0'], n1=data['n0']+len(data['tokens']), transfer_id=data.get('transfer_id', ''),
+                            chunk_id=data.get('chunk_index', -1))
+        original = data
+        if self.budget is not None and isinstance(data, (dict, list)):
+            with timing.span('request.json_encode') as span:
+                data = json.dumps(data).encode()
+                span['bytes'] = len(data)
+            headers = dict(headers or {}, **{'Content-Type': 'application/json'})
+        if self.budget is None:
+            return self._request(method, path, data, headers, binary)
+        with self.budget.reserve(path, original, len(data or b''), method) as receipt:
+            result = self._request(method, path, data, headers, binary, receipt['response_limit'])
+            receipt['actual'] = self.last_bytes
+            return result
+
+    def _request(self, method, path, data=None, headers=None, binary=False, response_limit=None):
         self.last_bytes = 0
+        timing.annotate(operation=method + ' ' + path)
+        if isinstance(data, dict) and 'n0' in data and isinstance(data.get('tokens'), list):
+            timing.annotate(tokens=len(data['tokens']), n0=data['n0'], n1=data['n0']+len(data['tokens']),
+                            transfer_id=data.get('transfer_id', ''), chunk_id=data.get('chunk_index', -1))
         try:
             with self.open(method, path, data, headers) as response:
                 limit = MAX_DELTA if binary else MAX_JSON
+                if response_limit is not None:
+                    limit = min(limit, response_limit)
                 started = time.monotonic()
-                body = response.read(limit + 1)
+                with timing.span('http.response_body_read') as span:
+                    body = response.read(limit + 1)
+                    span['bytes'] = len(body)
                 elapsed = max(time.monotonic() - started, 1e-6)
                 self.last_transfer_rate = len(body) / elapsed if body else None
                 self.last_transfer_seconds = elapsed
@@ -90,12 +127,15 @@ class Node:
                 self.last_prefill_ms = getattr(response, "headers", {}).get("X-Hybrid-Prefill-Ms")
                 if len(body) > limit:
                     raise ValueError("upstream body too large")
-                return body if binary else (json.loads(body) if body else None)
+                with timing.span('response.json_decode', bytes=len(body)):
+                    return body if binary else (json.loads(body) if body else None)
         except http.client.HTTPException as error:
             raise OSError("upstream HTTP connection interrupted") from error
 
     def download(self, path, destination, max_bytes):
         """Full snapshots have a disk budget independent of the bounded delta envelope."""
+        if self.budget is not None:
+            raise TrafficBudgetExceeded('calibration snapshot download forbidden before dispatch')
         self.last_bytes = 0
         destination = Path(destination)
         started = None
@@ -114,11 +154,14 @@ class Node:
                             self.last_bytes += len(data)
                             if self.last_bytes > max_bytes:
                                 raise ValueError("snapshot exceeds disk budget")
-                            output.write(data)
+                            with timing.span('evidence.snapshot_write', bytes=len(data)):
+                                output.write(data)
                         if length is not None and self.last_bytes != length:
                             raise OSError("upstream HTTP connection interrupted")
-                        output.flush()
-                        os.fsync(output.fileno())
+                        with timing.span('evidence.snapshot_flush', bytes=self.last_bytes):
+                            output.flush()
+                        with timing.span('evidence.snapshot_fsync', bytes=self.last_bytes):
+                            os.fsync(output.fileno())
                 except BaseException:
                     if created:
                         destination.unlink(missing_ok=True)
@@ -159,6 +202,8 @@ class Proxy:
         self.decode = Node(config["decode_url"], config.get("decode_token", ""), config.get("decode_timeout", 120))
         self.store = Store(database, self.model)
         self.policy = Policy(**config.get("policy", {}))
+        self.traffic_budget = (TrafficBudget(config['traffic_budget_bytes'], config['delta_geometry'])
+                               if 'traffic_budget_bytes' in config else None)
         safe_chunk = extend_chunk_limit(**config.get("delta_geometry", {}))
         self.extend_chunk_tokens = config.get("extend_chunk_tokens", safe_chunk)
         if type(self.extend_chunk_tokens) is not int or not 1 <= self.extend_chunk_tokens <= safe_chunk:
@@ -181,6 +226,7 @@ class Proxy:
         self.renderer = Renderer(self.decode)
         self.inflight = {}
 
+    @timing.traced('client_delta.header_parse_rewrite')
     def client_delta(self, delta):
         if len(delta) < 4:
             raise ValueError("truncated heterogeneous envelope")
@@ -213,7 +259,7 @@ class Proxy:
         return value
 
     def remote(self, client):
-        return Node(self.prefill, client["prefill_token"], self.timeout)
+        return Node(self.prefill, client["prefill_token"], self.timeout, budget=self.traffic_budget)
 
     def reserve(self, sid, skip_busy=False):
         with self.lock:
@@ -229,6 +275,7 @@ class Proxy:
                     self.store.verified.discard(sid)
             return sid in self.store.verified
 
+    @timing.traced('catchup.sync')
     def sync(self, session, client, recreate=True):
         """202 is an acknowledgement of queuing, never proof that tokens were applied."""
         node = self.remote(client)
@@ -369,12 +416,13 @@ class Proxy:
                         current = self.store.get(pending["id"])
                         if (current.get("benchmark_mode") or (current.get("journal") or {}).get("last_meter", {}).get("benchmark_mode")) not in ("local", "closed"):
                             self.sync(current, client)
-                except (OSError, HTTPError, ValueError):
+                except (OSError, HTTPError, ValueError, TrafficBudgetExceeded):
                     pass
 
     def replay_loop(self):
         while not self.stop.wait(1):
-            self.replay()
+            with timing.span('catchup.background', origin='background'):
+                self.replay()
 
     def wait_idle(self, slot):
         deadline = time.monotonic() + SLOT_WAIT_SECONDS
@@ -404,6 +452,7 @@ class Proxy:
             self.slot_available.notify_all()
 
     @contextmanager
+    @timing.traced('proxy.slot_acquisition')
     def slot_lease(self, session):
         deadline = time.monotonic() + SLOT_WAIT_SECONDS
         while True:
@@ -505,6 +554,7 @@ class Proxy:
         return self.store.select_messages(client, messages, identity, tokens)
 
     @contextmanager
+    @timing.traced('proxy.prepare')
     def prepare(self, client, body, explicit):
         if body.get("n", 1) != 1:
             raise ValueError("only one completion per request is supported")
@@ -541,6 +591,7 @@ class Proxy:
                 fork_parent = session.get("_fork", False)
         forked = False
         while True:
+            timing.annotate(session_id=session['id'])
             with ticket:
                 if message_mode:
                     session = self.store.get(session["id"], client["id"])
@@ -597,6 +648,7 @@ class Proxy:
                 fork_parent = session.get("_fork", False)
 
     @contextmanager
+    @timing.traced('proxy.render_prepare')
     def prepare_messages(self, client, body, session, full_tokens, identity, template):
         session["_prepared"] = False
         journal = session.get("journal")
@@ -731,6 +783,7 @@ class Proxy:
                 (self.slot_path / backup).unlink(missing_ok=True)
 
     @contextmanager
+    @timing.traced('import.transaction')
     def delta_transfer(self, session, slot):
         state = dict(backup=None)
         try:
@@ -748,16 +801,20 @@ class Proxy:
             raise
         finally:
             try:
-                self.decode.request("POST", f"/slots/{slot}?action=abort_delta", {})
+                with timing.span('import.abort_delta'):
+                    self.decode.request("POST", f"/slots/{slot}?action=abort_delta", {})
             except (OSError, HTTPError, ValueError):
                 LOG.warning("delta staging cleanup unavailable session=%s", session["id"])
             if state["backup"]:
                 try:
-                    (self.slot_path / state["backup"]).unlink(missing_ok=True)
+                    with timing.span('import.backup_unlink'):
+                        (self.slot_path / state["backup"]).unlink(missing_ok=True)
                 except OSError:
                     LOG.warning("delta recovery file retained session=%s", session["id"])
 
+    @timing.traced('proxy.prepare_session')
     def prepare_session(self, client, body, session, tokens):
+        timing.annotate(session_id=session['id'], tokens=len(tokens))
         slot = session["slot"]
         self.store.benchmark_mode(session["id"], client.get("benchmark_mode"))
         info = self.decode.request("GET", f"/slots/{slot}/info")
@@ -829,11 +886,15 @@ class Proxy:
                         import_started = time.monotonic()
                         if index + 1 == len(starts):
                             filename = session["id"] + "-delta-backup.bin"
-                            self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": filename})
+                            with timing.span('import.old_slot_save', tokens=local_n) as span:
+                                saved = self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": filename})
+                                span['bytes'] = saved.get('n_written', 0)
                             transaction["backup"] = filename
-                        self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
-                                            {"Content-Type": "application/octet-stream",
-                                             "X-Hybrid-Session": session["remote_id"]})
+                        with timing.span('import.final_request' if index + 1 == len(starts) else 'import.stage_request',
+                                         bytes=len(delta), tokens=n1-n0, n0=n0, n1=n1, transfer_id=transfer_id, chunk_id=index):
+                            self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
+                                                {"Content-Type": "application/octet-stream",
+                                                 "X-Hybrid-Session": session["remote_id"]})
                         chunk["import_ms"] = (time.monotonic() - import_started) * 1000
                         meter["import_ms"] += chunk["import_ms"]
                         actual = self.decode.request("GET", f"/slots/{slot}/info")
@@ -887,7 +948,9 @@ class Proxy:
             request.update(prompt_tokens=tokens, return_tokens=True, verbose=True)
         return session, tokens, request
 
+    @timing.traced('proxy.finish_reconciliation')
     def finish(self, session, prompt):
+        timing.annotate(session_id=session['id'], tokens=len(prompt))
         info = self.decode.request("GET", f"/slots/{session['slot']}/info")
         evaluated = info["tokens"]
         if (len(evaluated) != info["n"] or evaluated[:len(prompt)] != prompt
@@ -1028,6 +1091,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        with timing.incoming(self.headers), timing.span('proxy.chat_request'):
+            return self.chat_post()
+
+    def chat_post(self):
         app = self.server.app
         started = False
         try:
@@ -1058,7 +1125,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.end_headers()
                         started = True
                         disconnected = False
+                        first_upstream = True
                         for line in upstream:
+                            if first_upstream:
+                                timing.point('decoder.first_response_body_read', bytes=len(line))
+                                first_upstream = False
                             if mode and line.strip() == b"data: [DONE]":
                                 continue
                             if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
@@ -1069,8 +1140,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 line = b"data: " + json.dumps(chunk).encode() + b"\n"
                             if not disconnected:
                                 try:
-                                    self.wfile.write(line)
-                                    self.wfile.flush()
+                                    with timing.span('proxy.sse_write_flush', bytes=len(line)):
+                                        self.wfile.write(line)
+                                        self.wfile.flush()
                                 except OSError:
                                     # Drain the upstream before releasing its slot; finish records all evaluated tokens.
                                     disconnected = True
@@ -1095,9 +1167,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if mode:
                     self.wfile.write(b"data: " + json.dumps({"hybrid_bench": session["_bench"]}).encode() + b"\n\ndata: [DONE]\n\n")
                     self.wfile.flush()
-        except (HTTPError, KeyError, ValueError, OSError) as error:
+        except (HTTPError, KeyError, ValueError, OSError, TrafficBudgetExceeded) as error:
             if not started:
-                status = (error.status if isinstance(error, HTTPError) else 404 if isinstance(error, KeyError) else
+                status = (413 if isinstance(error, TrafficBudgetExceeded) else error.status if isinstance(error, HTTPError) else 404 if isinstance(error, KeyError) else
                           409 if isinstance(error, JournalConflict) else 400)
                 self.json_response(status, {"error": {"message": str(error), "type": "hybrid_error"}})
             else:

@@ -9,6 +9,7 @@ set -eu
 umask 077
 mkdir -p "$NODE_ROOT/tmp"
 export TMPDIR="$NODE_ROOT/tmp" PYTHONDONTWRITEBYTECODE=1
+export LLAMA_HYBRID_TRACE="$NODE_ROOT/native-%p.jsonl"
 nvidia-smi > "$NODE_ROOT/gpu-01.log"
 bash tools/hybrid-bench/packets/r46/stage-qwen-node.sh --state "$NODE_ROOT/qwen-node" --build-dir "$NODE_ROOT/build" --build-lock "$NODE_ROOT/build.lock" > "$NODE_ROOT/qwen-deploy-01.log" 2>&1
 ```
@@ -28,3 +29,5 @@ printf '%s\n' "$R46_LINK_PID" > "$NODE_ROOT/link.pid"
 ```
 
 Transfer the chosen state's node-info.json and client-tokens.json to the Mac by the established private SSH channel; chmod600, no token values in output. Forward8091/8093 over SSH Compression=no. Preserve logs/metadata for the same model/run. After client cleanup, authenticate from the credential file to `/v1/sessions` and `/v1/health` and require sessions0/ram_bytes0. Then `tools/hybrid-bench/deploy-prefill-node.sh --state "$NODE_ROOT/glimmer-node" --stop` (or qwen-node) and `kill "$R46_LINK_PID"`. A nonzero remaining-session count is an ownership finding; do not delete foreign sessions.
+
+For r46b calibration/timing, native tracing must be enabled before starting the node. Health reports `native_trace_enabled`; missing tracing refuses the instrumented driver. Keep native JSONL private and transfer it after the run. Authenticated bench-only `/v1/bench/trace-flush` drains outside measured calls; no snapshots are taken. See TIMING-SPANS.md. Use a new trace directory for every node launch, never overwrite a previous trace.

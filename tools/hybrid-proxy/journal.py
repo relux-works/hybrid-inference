@@ -1,4 +1,5 @@
 """Message identity and checked incremental rendering for verified template families."""
+import timing
 import copy
 import bisect
 import hashlib
@@ -61,9 +62,11 @@ class Renderer:
     def __init__(self, node):
         self.node = node
 
+    @timing.traced('chat.render')
     def render(self, body):
         return self.node.request("POST", "/apply-template", body)["prompt"]
 
+    @timing.traced('chat.tokenize')
     def encode(self, text, initial=False):
         return self.node.request("POST", "/tokenize", dict(content=text, add_special=initial))["tokens"]
 
@@ -190,6 +193,7 @@ class Renderer:
                 result.append(dict(message_index=index, n=len(ids)))
         return result
 
+    @timing.traced('chat.layout')
     def layout(self, body, text, tokens, start=0, token_base=0, anchor_base=0):
         family = self.family(body)
         raw = self.token_bytes(text, tokens)
@@ -219,6 +223,7 @@ class Renderer:
             result.append(dict(message_index=index, role=role, start=position(byte), end=position(stop)))
         return result, position(end)
 
+    @timing.traced('chat.append')
     def append(self, body, full_text, full_tokens, past_count, anchor):
         if not past_count or body["messages"][past_count - 1].get("role") != "assistant":
             raise JournalConflict("no assistant boundary for incremental rendering")

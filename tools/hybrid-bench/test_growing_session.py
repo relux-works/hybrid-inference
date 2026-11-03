@@ -20,6 +20,155 @@ import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    @staticmethod
+    def packet_module(name):
+        path = Path(growing.__file__).parent / 'packets/r46' / (name + '.py')
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # The same source/binary binding accepts an unchanged fit and rejects changed bytes or missing binaries.
+    def test_fit_reuse_requires_source_and_binary_identity(self):
+        module = self.packet_module('mac_timing')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root/'bin').mkdir(); binary=root/'bin/llama-server'; binary.write_bytes(b'old')
+            client = dict(build_dir=str(root), binaries={'llama-server': 'unused'}, model_sha256='a'*64, build_record={'fixture': True})
+            fit = module.import_identity(client)
+            module.require_fit_identity(fit, client)
+            bad = copy.deepcopy(fit); bad['import_path_sha256']['src/llama-io.cpp']='0'*64
+            with self.assertRaisesRegex(Refusal, 'source/binary identity mismatch'):
+                module.require_fit_identity(bad, client)
+            binary.write_bytes(b'changed')
+            with self.assertRaisesRegex(Refusal, 'source/binary identity mismatch'):
+                module.require_fit_identity(fit, client)
+            binary.unlink()
+            with self.assertRaisesRegex(Refusal, 'missing import binary'):
+                module.require_fit_identity(fit, client)
+
+    # Metered traffic is reserved before open; rejected or interrupted exchanges cannot dispatch/reclaim credit.
+    def test_calibration_budget_refuses_before_dispatch(self):
+        from traffic import TrafficBudget, TrafficBudgetExceeded
+        data = dict(n0=0, tokens=[1,2], return_delta=True)
+        out = len(json.dumps(data).encode())
+        limit = TrafficBudget.cleanup_headroom + 8*1024**2 + TrafficBudget.allowance + out
+        budget = TrafficBudget(limit, dict(kv_bytes=16, state_bytes=100))
+        node = growing.Node('http://unused', budget=budget)
+        response = mock.MagicMock(); response.__enter__.return_value=response; response.read.return_value=b'{}'; response.headers={}
+        with mock.patch.object(node, 'open', return_value=response) as opened:
+            self.assertEqual(node.request('POST','/extend',data,binary=True), b'{}')
+            with self.assertRaisesRegex(TrafficBudgetExceeded, 'before dispatch'):
+                node.request('POST','/extend',data,binary=True)
+            opened.assert_called_once()
+        with mock.patch.object(node,'open') as opened:
+            with self.assertRaisesRegex(TrafficBudgetExceeded,'snapshot download forbidden before dispatch'):
+                node.download('/snapshot',Path('unused.bin'),10**9)
+            opened.assert_not_called()
+        state=budget.status()
+        self.assertLessEqual(state['charged_bytes'],limit)
+        self.assertEqual(state['outstanding_bytes'],0)
+        interrupted=TrafficBudget(limit,dict(kv_bytes=16,state_bytes=100))
+        with self.assertRaises(OSError), interrupted.reserve('/extend',data,out,'POST'):
+            raise OSError('transport interrupted')
+        with self.assertRaisesRegex(TrafficBudgetExceeded, 'before dispatch'):
+            with interrupted.reserve('/extend',data,out,'POST'): pass
+        self.assertEqual(interrupted.status()['charged_bytes'],limit-TrafficBudget.cleanup_headroom)
+
+    # The caps apply independently of requested repetition/size flags; local warmup does not waive either cap.
+    def test_calibration_plan_caps(self):
+        module = self.packet_module('calibrate_import')
+        self.assertEqual(module.validate_plan('qwen35',2_000_000_000,module.SIZES),2_000_000_000)
+        self.assertEqual(module.validate_plan('muse-glimmer',3_000_000_000,module.SIZES),3_000_000_000)
+        for architecture,budget,sizes in [('qwen35',2_000_000_001,module.SIZES),('muse-glimmer',3_000_000_001,module.SIZES),
+                                         ('qwen35',0,module.SIZES),('qwen35',2_000_000_000,module.SIZES*2)]:
+            with self.assertRaises(Refusal): module.validate_plan(architecture,budget,sizes)
+
+    # An injected 100ns hash delay moves that leaf and TTFT once, while transfer and the explicit residual stay fixed.
+    def test_nested_leaf_delay_reconciles_once(self):
+        import timing
+        def run(delay):
+            timing.start(); clock=[0]
+            with mock.patch.object(timing.time,'monotonic_ns',side_effect=lambda:clock[0]):
+                with timing.span('bench.call',call_id='control'):
+                    with timing.span('request'):
+                        with timing.span('checksum.sha256'): clock[0]+=delay
+                        with timing.span('transfer'): clock[0]+=20
+                    clock[0]+=5
+            rows=timing.rows(); result=timing.account(rows,0,clock[0],'control'); timing.stop()
+            return rows,result
+        original,base=run(1); rows,delayed=run(101)
+        self.assertEqual(delayed['ttft_ns']-base['ttft_ns'],100)
+        self.assertEqual(delayed['leaf_union_ns']-base['leaf_union_ns'],100)
+        self.assertEqual(delayed['residual_ns'],5)
+        self.assertEqual(next(r['duration_ns'] for r in rows if r['name']=='transfer'),20)
+        self.assertEqual(len(delayed['leaf_ids']),2)
+        bad=copy.deepcopy(rows); child=next(r for r in bad if r['name']=='transfer'); child['end_ns']+=1000; child['duration_ns']+=1000
+        with self.assertRaisesRegex(ValueError,'outside parent'): timing.account(bad,0,126,'control')
+        with self.assertRaisesRegex(ValueError,'duplicate'): timing.account(rows+[rows[0]],0,126,'control')
+        remote=copy.deepcopy(rows[0]); remote['clock_domain']='remote'; remote['id']='remote'
+        self.assertEqual(timing.account(rows+[remote],0,126,'control')['leaf_union_ns'],delayed['leaf_union_ns'])
+
+    # A bounded span collector reports loss instead of claiming a complete trace.
+    def test_span_overflow_is_not_success(self):
+        import timing
+        timing.start(1)
+        with timing.span('first'): pass
+        with timing.span('second'): pass
+        with self.assertRaisesRegex(ValueError,'overflow'): timing.rows()
+        timing.stop()
+
+    # Offline extracts retain held-token/reconciliation fields and reject loss, bad nesting or changed accounting.
+    def test_timing_extract_preserves_fields_and_refuses_incomplete(self):
+        import timing
+        module=self.packet_module('extract_timing')
+        bounds=dict(stream_start_ns=10,first_nonempty_delta_ns=30)
+        account=timing.account([],10,30,'call','domain')
+        call=dict(arm='hybrid',turn=1,stage='turn',ttft_seconds=20e-9,local_tail_seconds=.4,
+                  reconciliation_seconds=.7,import_seconds=3,import_stage_seconds=1,
+                  import_final_save_apply_seconds=2,timing_accounting=account,
+                  meter=dict(local_prompt_ms=17,timing_boundaries=bounds,timing_call_id='call',timing_clock_domain='domain'))
+        trace=dict(instrumentation=dict(spans=[]),calls=[call])
+        result=module.extract(trace,[])['calls'][0]
+        self.assertEqual(result['local_tail_seconds'],.4)
+        self.assertEqual(result['reconciliation_seconds'],.7)
+        self.assertEqual(result['meter']['local_prompt_ms'],17)
+        self.assertEqual(result['import_stage_seconds']+result['import_final_save_apply_seconds'],result['import_seconds'])
+        changed=copy.deepcopy(trace);changed['calls'][0]['timing_accounting']['residual_ns']+=1
+        with self.assertRaisesRegex(ValueError,'accounting mismatch'):module.extract(changed,[])
+        row=dict(kind='span',clock_domain='native',id='1',parent_domain='native',parent_id='',
+                 start_ns=1,end_ns=3,duration_ns=2,bytes=10,tokens=1)
+        module.validate_native([row])
+        bad=dict(row,parent_id='missing')
+        with self.assertRaisesRegex(ValueError,'missing parent'):module.validate_native([bad])
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'native.jsonl'
+            marker=dict(kind='trace_checkpoint',dropped=0,writer_ok=True,records=1)
+            path.write_text(json.dumps(row)+'\n'+json.dumps(marker)+'\n')
+            self.assertEqual(module.native_rows(path),[row])
+            for records in ([row],[row,dict(marker,dropped=1)],[row,dict(marker,records=2)]):
+                path.write_text('\n'.join(map(json.dumps,records)))
+                with self.assertRaises(ValueError):module.native_rows(path)
+            path.write_text(json.dumps(row)+'\n{')
+            with self.assertRaises(ValueError):module.native_rows(path)
+
+    # Seven requested links, fixed base staging and bf16's tensor-byte reduction are independent table invariants.
+    def test_link_table_and_wire_only_projection(self):
+        module=self.packet_module('estimate')
+        profiles=module.table()
+        self.assertEqual(len(profiles),5)
+        for profile in profiles:
+            self.assertEqual([r['link_MB_s'] for r in profile['rows']],[2,3,5,10,20,30,50])
+            for row in profile['rows']:
+                self.assertTrue(row['base_offloads'])
+                self.assertAlmostEqual(row['hybrid_total_ttft_s'],row['hybrid_base_ttft_s']+row['hybrid_turn_ttft_s'])
+                self.assertLessEqual(len(row['policy_offloads']),37)
+        f32=module.estimate('qwen',2e6); bf16=module.estimate('qwen',2e6,recurrent_dtype='bf16')
+        self.assertEqual(f32['down_body_estimate_bytes']-bf16['down_body_estimate_bytes'],78_446_592)
+        self.assertTrue(bf16['wire_projection_only'])
+        minimum=module.threshold('qwen')*1e6
+        self.assertFalse(module.estimate('qwen',minimum*.999999)['policy_offloads'])
+        self.assertTrue(module.estimate('qwen',minimum*1.000001)['policy_offloads'])
+
     # Ten attention chunks at 100k carry one fixed recurrent state, not ten copies; headers remain an allowance.
     def test_packet_traffic_counts_final_state_once(self):
         path = Path(growing.__file__).parent / 'packets/r46/estimate.py'
@@ -74,11 +223,13 @@ class ScenarioTests(unittest.TestCase):
         client = dict(model_sha256=fixture['model_sha256'], model_layout=dict(architecture='qwen35'), backend='metal', context=196608)
         node = dict(backend='cuda', context=196608)
         fit = dict(model_sha256=fixture['model_sha256'], source_head='head')
-        self.assertEqual(module.admission(client, node, {}, fixture, fit, 'head')[1], 100000)
+        with mock.patch.object(module, 'require_fit_identity') as proof:
+            self.assertEqual(module.admission(client, node, {}, fixture, fit, 'head')[1], 100000)
+            proof.assert_called_once_with(fit, client)
         for bad_client, bad_node, bad_fit in ((dict(client, context=262144), node, fit),
                                              (client, dict(node, backend='cpu'), fit),
                                              (client, node, dict(fit, source_head='stale'))):
-            with self.assertRaises(Refusal):
+            with mock.patch.object(module, 'require_fit_identity'), self.assertRaises(Refusal):
                 module.admission(bad_client, bad_node, {}, fixture, bad_fit, 'head')
 
     # Timing mode refuses capture options before reading metadata or creating artifacts.

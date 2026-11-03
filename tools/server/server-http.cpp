@@ -111,7 +111,10 @@ struct gcp_params {
     }
 };
 
+static thread_local uint64_t trace_receipt_ns = 0;
+
 bool server_http_context::init(const common_params & params) {
+    llama_trace_start();
     const gcp_params gcp;
 
     path_prefix = params.api_prefix;
@@ -335,6 +338,7 @@ bool server_http_context::init_listener(const common_params & params) {
 
     // register server middlewares
     srv->set_pre_routing_handler([&params, middleware_validate_api_key, middleware_server_state](const httplib::Request & req, httplib::Response & res) {
+        trace_receipt_ns = llama_trace_enabled() ? llama_trace_now() : 0;
         if (params.cors_credentials && params.cors_origins == "*") {
             // special case: echo back the Origin header to allow any origin to access the server with credentials
             res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
@@ -639,6 +643,8 @@ static std::string build_query_string(const httplib::Request & req) {
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
 static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
+    llama_trace_context stream_context;
+    for (const auto & header : request->headers) { llama_trace_header(stream_context, header.first, header.second); }
     if (response->is_stream()) {
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response
@@ -649,10 +655,13 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         std::shared_ptr<server_http_req> q_ptr = std::move(request);
         std::shared_ptr<server_http_res> r_ptr = std::move(response);
 
-        const auto chunked_content_provider = [response = r_ptr](size_t, httplib::DataSink & sink) -> bool {
+        const auto chunked_content_provider = [response = r_ptr, stream_context](size_t, httplib::DataSink & sink) -> bool {
+            llama_trace_binding binding(stream_context);
+            llama_trace_span next_span("decoder.completion_wait_sse");
             std::string chunk;
             const bool has_next = response->next(chunk);
             if (!chunk.empty()) {
+                llama_trace_span flush_span("decoder.sse_write", chunk.size());
                 if (!sink.write(chunk.data(), chunk.size())) {
                     return false;
                 }
@@ -681,6 +690,11 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+        llama_trace_context context;
+        for (const auto & header : req.headers) { llama_trace_header(context, header.first, header.second); }
+        llama_trace_binding binding(context);
+        llama_trace_span request_span("decoder.http_dispatch", req.body.size(), 0, trace_receipt_ns);
+        { llama_trace_span upload("decoder.http_header_receipt_to_body_complete", req.body.size(), 0, trace_receipt_ns); }
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -702,6 +716,11 @@ void server_http_context::get(const std::string & path, const server_http_contex
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+        llama_trace_context context;
+        for (const auto & header : req.headers) { llama_trace_header(context, header.first, header.second); }
+        llama_trace_binding binding(context);
+        llama_trace_span request_span("decoder.http_dispatch", req.body.size(), 0, trace_receipt_ns);
+        { llama_trace_span upload("decoder.http_header_receipt_to_body_complete", req.body.size(), 0, trace_receipt_ns); }
         std::string body = [&req]() {
             llama_io_timer timer("http_body_copy", req.body.size());
             return req.body;
@@ -809,6 +828,11 @@ void server_http_context::ws(const std::string & path, const server_http_context
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+        llama_trace_context context;
+        for (const auto & header : req.headers) { llama_trace_header(context, header.first, header.second); }
+        llama_trace_binding binding(context);
+        llama_trace_span request_span("decoder.http_dispatch", req.body.size(), 0, trace_receipt_ns);
+        { llama_trace_span upload("decoder.http_header_receipt_to_body_complete", req.body.size(), 0, trace_receipt_ns); }
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),

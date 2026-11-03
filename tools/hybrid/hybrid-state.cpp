@@ -180,12 +180,14 @@ static void sha256_update_ni(sha256_t * hash, const unsigned char * data, size_t
 class sha256_stream {
 public:
     sha256_stream() {
+        llama_trace_span init("checksum.sha256.init");
         const char * value = std::getenv("HYBRID_HASH_PORTABLE");
         const bool portable = value && std::strcmp(value, "1") == 0;
 #ifdef __APPLE__
         accelerated = !portable;
         if (accelerated) {
             backend = "commoncrypto";
+            init.backend = backend;
             require(CC_SHA256_Init(&apple) == 1, "cannot initialize SHA-256");
             return;
         }
@@ -199,6 +201,7 @@ public:
         (void) portable;
 #endif
         sha256_init(&hash);
+        init.backend = backend;
     }
 
     void update(const void * data, size_t size) {
@@ -250,6 +253,7 @@ std::string file_hash(const std::string & path, size_t read_bytes, const char **
 }
 
 std::string prefix_hash(const std::vector<llama_token> & tokens) {
+    llama_trace_span span("prefix.sha256", tokens.size()*sizeof(llama_token), tokens.size());
     sha256_t hash;
     sha256_init(&hash);
     for (auto token : tokens) {
@@ -263,8 +267,11 @@ std::string prefix_hash(const std::vector<llama_token> & tokens) {
 }
 
 std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1, bool fixed_state) {
+    llama_trace_span span("native.range_export", 0, n1-n0);
     const auto flags = fixed_state ? 0 : LLAMA_STATE_SEQ_FLAGS_KV_ONLY;
-    size_t size = llama_state_seq_get_data_range(ctx, nullptr, 0, 0, n0, n1, flags);
+    size_t size;
+    { llama_trace_span sizing("native.range_sizing", 0, n1-n0); size = llama_state_seq_get_data_range(ctx, nullptr, 0, 0, n0, n1, flags); }
+    span.bytes = size;
     require(size > 0, "cannot size range");
     std::string out(size, '\0');
     require(llama_state_seq_get_data_range(ctx, reinterpret_cast<uint8_t *>(&out[0]), out.size(), 0, n0, n1, flags) == size, "cannot export range");
@@ -277,19 +284,23 @@ static std::string checksums(std::string_view body) {
     if (timer.enabled) { std::fprintf(stderr, "hybrid_import sha256_backend=%s\n", sha.backend); }
     const auto delete_xxh = [](XXH3_state_t * p) { XXH3_freeState(p); };
     std::unique_ptr<XXH3_state_t, decltype(delete_xxh)> xxh(XXH3_createState(), delete_xxh);
-    require(bool(xxh) && XXH3_128bits_reset(xxh.get()) == XXH_OK, "cannot initialize XXH3");
+    { llama_trace_span pass("checksum.xxh3.init"); pass.backend = "XXH3";
+      require(bool(xxh) && XXH3_128bits_reset(xxh.get()) == XXH_OK, "cannot initialize XXH3"); }
     // Both digests consume the same cache-resident chunk before moving to the next one.
     for (size_t offset = 0; offset < body.size();) {
         const size_t bytes = std::min<size_t>(65536, body.size() - offset);
-        require(XXH3_128bits_update(xxh.get(), body.data() + offset, bytes) == XXH_OK, "cannot update XXH3");
-        sha.update(body.data() + offset, bytes);
+        { llama_trace_span pass("checksum.xxh3", bytes); pass.backend = "XXH3";
+          require(XXH3_128bits_update(xxh.get(), body.data() + offset, bytes) == XXH_OK, "cannot update XXH3"); }
+        { llama_trace_span pass("checksum.sha256", bytes); pass.backend = sha.backend;
+          sha.update(body.data() + offset, bytes); }
         offset += bytes;
     }
     XXH128_canonical_t canonical;
-    XXH128_canonicalFromHash(&canonical, XXH3_128bits_digest(xxh.get()));
+    { llama_trace_span pass("checksum.xxh3.final"); pass.backend = "XXH3";
+      XXH128_canonicalFromHash(&canonical, XXH3_128bits_digest(xxh.get())); }
     std::string out(reinterpret_cast<const char *>(&canonical), sizeof(canonical));
     unsigned char digest[32];
-    sha.finish(digest);
+    { llama_trace_span pass("checksum.sha256.final"); pass.backend = sha.backend; sha.finish(digest); }
     out.append(reinterpret_cast<const char *>(digest), sizeof(digest));
     return out;
 }
@@ -317,6 +328,7 @@ static void validate_chunk_header(const json & h, int64_t n0) {
 }
 
 std::string encode_delta_header(json header, size_t state_bytes) {
+    llama_trace_span span("envelope.header_encode", state_bytes);
     header["magic"] = "HYBD";
     header["version"] = 2;
     if (!header.contains("transfer_id")) {
@@ -339,13 +351,14 @@ std::string encode_delta_header(json header, size_t state_bytes) {
 }
 
 std::string encode_delta(json header, const std::string & state) {
+    llama_trace_span span("envelope.encode_copies", state.size());
     const std::string text = encode_delta_header(std::move(header), state.size());
     uint32_t n = text.size();
     std::string out;
     for (int i = 0; i < 4; ++i) { out += (char) (n >> (i * 8)); }
     out.reserve(4 + text.size() + state.size() + 48);
     out += text;
-    out += state;
+    { llama_trace_span copy("envelope.body_copy", state.size()); out += state; }
     out += checksums(state);
     return out;
 }
@@ -406,6 +419,7 @@ void delta_import::clear() {
 
 bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, std::string wire, const std::string & model_hash, const std::string & session_id,
                          const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab) {
+    llama_trace_span span("import.stage_parse_validate", wire.size());
     try {
         if (!chunks.empty()) {
             uint32_t size;
@@ -418,6 +432,7 @@ bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, std::string w
         auto source = std::make_unique<std::string>(std::move(wire));
         auto next = read_delta_view(*source, model_hash, chunks.empty() ? current.size() : tokens.size());
         const auto & h = next.header;
+        span.tokens = h.at("n1").get<size_t>() - h.at("n0").get<size_t>();
         require(h.at("session_id") == session_id, "Delta session mismatch");
         require(h.at("transfer_n1").get<uint64_t>() <= n_ctx, "Delta exceeds slot context");
         require(h.at("chunk_index").get<size_t>() == chunks.size(), "out-of-order or duplicate chunk");
@@ -449,6 +464,7 @@ bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, std::string w
 }
 
 void delta_import::apply(llama_context * ctx, llama_seq_id seq_id) {
+    llama_trace_span span("import.final_commit_apply");
     try {
         require(!chunks.empty() && chunks.back().header.at("fixed_state") == true, "missing final chunk");
         std::vector<llama_state_seq_chunk> native;
@@ -458,6 +474,8 @@ void delta_import::apply(llama_context * ctx, llama_seq_id seq_id) {
             bytes += chunk.state.size();
             native.push_back({reinterpret_cast<const uint8_t *>(chunk.state.data()), chunk.state.size(), chunk.header.at("n1").get<llama_pos>()});
         }
+        span.bytes = bytes;
+        span.tokens = tokens.size()-prefix.size();
         require(llama_state_seq_set_data_chunks(ctx, native, seq_id, prefix.size()) == bytes, "Native delta chunks rejected; slot preserved");
     } catch (...) {
         clear();
@@ -502,13 +520,16 @@ void prefill(llama_context * ctx, const std::vector<llama_token> & tokens, size_
 }
 
 std::string save_state(llama_context * ctx) {
+    llama_trace_span span("native.save_state");
     const auto flags = llama_get_model(ctx)->hparams.swa_type == LLAMA_SWA_TYPE_STANDARD ? LLAMA_STATE_SEQ_FLAGS_KV_LAYOUT : 0;
     std::string state(llama_state_seq_get_size_ext(ctx, 0, flags), '\0');
     require(!state.empty() && llama_state_seq_get_data_ext(ctx, reinterpret_cast<uint8_t *>(&state[0]), state.size(), 0, flags) == state.size(), "cannot save state");
+    span.bytes = state.size();
     return state;
 }
 
 void load_state(llama_context * ctx, const std::string & state) {
+    llama_trace_span span("native.load_state", state.size());
     if (state.empty()) {
         llama_memory_clear(llama_get_memory(ctx), true);
     } else {

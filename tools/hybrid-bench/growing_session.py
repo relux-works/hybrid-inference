@@ -29,6 +29,7 @@ from hybrid_bench import PROVENANCE, link_probe, sanitized_info, stream_chat, ve
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
 from proxy import Handler, Node, Proxy
 from policy import Policy
+import timing
 from growing_fixture import validate_fixture
 from store import prefix_hash
 
@@ -169,17 +170,20 @@ class MeasuredNode(Node):
         self.session = session
         self.source = source
 
+    @timing.traced('node.protocol_with_optional_evidence')
     def request(self, method, path, data=None, headers=None, binary=False):
         started = time.monotonic()
-        encoded = json.dumps(data).encode() if isinstance(data, (dict, list)) else data or b''
-        row = dict(kind='protocol', session=self.session, source=self.source, method=method, path=path, upload_body_bytes=len(encoded),
+        timing.annotate(session_id=self.session or '', origin=self.source)
+        row = dict(kind='protocol', session=self.session, source=self.source, method=method, path=path, upload_body_bytes=0,
                    response_body_bytes=0, status='failed')
+        if timing.enabled():
+            row['timing_context'] = {k: timing.context().get(k) for k in ('id', 'parent_id', 'clock_domain', 'call_id', 'origin')}
         if isinstance(data, dict) and path.endswith('/extend'):
             row.update(n0=data['n0'], n1=data['n0'] + len(data['tokens']),
                        catchup=not data.get('return_delta', False), prefix_hash_n0=data['prefix_hash_n0'])
         try:
             result = super().request(method, path, data, headers, binary)
-            row.update(status='ok', response_body_bytes=self.last_bytes)
+            row.update(status='ok', response_body_bytes=self.last_bytes, upload_body_bytes=self.last_upload_bytes)
             if row.get('catchup'):
                 require(self.last_prefill_ms is not None, 'node catch-up evaluation timing missing')
                 row['node_prefill_seconds'] = float(self.last_prefill_ms) / 1000
@@ -197,10 +201,13 @@ class MeasuredNode(Node):
                         header = source.read(12)
                     require(len(header) == 12 and int.from_bytes(header[8:12], 'little') == row['n1'],
                             'node snapshot moved past the captured import boundary')
-                    delta.write_bytes(result)
+                    with timing.span('evidence.delta_write', bytes=len(result)):
+                        delta.write_bytes(result)
                     for key, target in (('node_snapshot', snapshot), ('node_delta', delta)):
-                        target.chmod(0o600)
-                        row[key] = dict(path=str(target), sha256=sha256(target))
+                        with timing.span('evidence.chmod_header_check'):
+                            target.chmod(0o600)
+                        with timing.span('evidence.' + key + '_sha256', bytes=target.stat().st_size):
+                            row[key] = dict(path=str(target), sha256=sha256(target))
                 except BaseException:
                     snapshot.unlink(missing_ok=True)
                     delta.unlink(missing_ok=True)
@@ -214,7 +221,9 @@ class MeasuredNode(Node):
             row['seconds'] = time.monotonic() - started
             self.events.add(**row)
 
+    @timing.traced('evidence.snapshot_download')
     def download(self, path, destination, max_bytes):
+        timing.annotate(session_id=self.session or '', origin=self.source)
         started = time.monotonic()
         row = dict(kind='protocol', session=self.session, source=self.source, method='GET', path=path,
                    upload_body_bytes=0, status='failed')
@@ -253,7 +262,8 @@ class MeasuredProxy(Proxy):
 
     def remote(self, client):
         return MeasuredNode(self.prefill, client['prefill_token'], self.timeout, events=self.events,
-                            session=getattr(self.current, 'session', None), source=getattr(self.current, 'origin', 'background'))
+                            session=getattr(self.current, 'session', None), source=getattr(self.current, 'origin', 'background'),
+                            budget=self.traffic_budget)
 
     def sync(self, session, client, recreate=True):
         self.current.session = session['id']
@@ -322,7 +332,7 @@ def proxy_server(app):
             client = next(c for c in app.clients.values() if c['id'] == session['client'])
             for sid in set(value for value in ids if value):
                 try:
-                    Node(app.cleanup_prefill, client['prefill_token'], app.timeout).request('DELETE', '/v1/sessions/' + sid)
+                    Node(app.cleanup_prefill, client['prefill_token'], app.timeout, budget=app.traffic_budget).request('DELETE', '/v1/sessions/' + sid)
                 except Exception as error:
                     if getattr(error, 'status', None) != 404:
                         remaining.append(sid)
@@ -704,6 +714,8 @@ def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id)
         local_prefill_seconds=(meter['local_prompt_ms'] or 0) / 1000 if meter['path'] == 'local' else 0,
         local_tail_seconds=(meter['local_prompt_ms'] or 0) / 1000 if meter['path'] == 'offload' else 0,
         reconciliation_seconds=meter['reconciliation_ms'] / 1000,
+        import_stage_seconds=sum(c['import_ms'] for c in meter.get('chunks', []) if c['status'] == 'staged')/1000 if 'chunks' in meter else None,
+        import_final_save_apply_seconds=sum(c['import_ms'] for c in meter.get('chunks', []) if c['status'] == 'imported')/1000 if 'chunks' in meter else None,
         catchup_tokens=sum(r['n1'] - r['n0'] for r in catchup), catchup_seconds=sum(r['seconds'] for r in catchup),
         catchup_node_seconds=sum(r.get('node_prefill_seconds', 0) for r in catchup),
         catchup_upload_bytes=sum(r['upload_body_bytes'] for r in catchup),
@@ -746,6 +758,7 @@ def parser():
     p.add_argument('--max-output', type=int, default=4506)
     p.add_argument('--pause-cap', type=float, default=340, help='zero for CPU smoke; changes the workload')
     p.add_argument('--policy', help='JSON Policy fields from calibration, never per-turn routing overrides')
+    p.add_argument('--timing-spans', action='store_true', help='buffer nested monotonic spans; serialize after the stream')
     p.add_argument('--rate-fixture', help='measured PRI-31 step-40 fixture; overrides only local policy rates')
     p.add_argument('--link-label', required=True, help='physical link description, no credentials or addresses')
     p.add_argument('--request-timeout', type=int, default=3600)
@@ -755,6 +768,8 @@ def parser():
 
 def run(args):
     require((args.depth == 'deep' or 64 <= args.depth <= NATIVE_CONTEXT) and 1 <= args.turns <= 1000, 'invalid depth or turn count')
+    if args.timing_spans:
+        timing.start()
     checkpoints = checkpoint_turns(args.checkpoint_turns, args.turns)
     require(bool(checkpoints) or not (args.state_probes or args.keep_checkpoint_states),
             'timing-only mode forbids state probes and checkpoint retention')
@@ -815,7 +830,8 @@ def run(args):
         reserved_arms={'hybrid-bf16': dict(available=False, route='policy', recurrent_transport='bf16',
                                          attention_transport='q8_0', window_transport=None,
                                          prerequisite='dev-a r38 protocol capability and independent qualification')},
-        instrumentation=dict(version=1, pending='dev-d r13 timestamp list via owner', timestamps={}),
+        instrumentation=dict(version=2, enabled=args.timing_spans, clock='monotonic_ns',
+                             native_trace='LLAMA_HYBRID_TRACE async JSONL, separate clock domain', spans=[]),
         provenance=dict(**PROVENANCE, depth_bins=DEPTH_BINS, pause_seconds=PAUSE,
                         sampling='linear below p50, log-linear above; bounded at last published quantile',
                         table_sha256=sha256(Path(__file__).with_name('fixtures') / 'growing-provenance.json'),
@@ -828,6 +844,8 @@ def run(args):
 
     def flush():
         trace['events'] = events.copy()
+        if args.timing_spans:
+            trace['instrumentation']['spans'] = timing.rows()
         trace['capture'].update(node_snapshots=sum('node_snapshot' in r for r in trace['events']),
                                 node_deltas=sum('node_delta' in r for r in trace['events']),
                                 checker_runs=len(trace.get('checkpoint_inputs', [])))
@@ -856,6 +874,8 @@ def run(args):
         token_file = root / 'decode-token'
         token_file.write_text(config['decode_token'])
         token_file.chmod(0o600)
+        if args.timing_spans:
+            os.environ['LLAMA_HYBRID_TRACE'] = str(root / 'native-%p.jsonl')
         decoder = start_process(decoder_command(client, config, urllib.parse.urlsplit(config['decode_url']).port,
                                                 root / 'slots', token_file), root, 'decode')
         wait_health(config['decode_url'], '/health', decoder, timeout=args.request_timeout, token=config['decode_token'])
@@ -872,6 +892,7 @@ def run(args):
             try:
                 health = wait_health(bridge_url, '/v1/health', process, timeout=30)
                 require(health['model_sha256'] == client['model_sha256'], 'live node model changed')
+                require(not args.timing_spans or health.get('native_trace_enabled') is True, 'node native trace not enabled')
                 return process
             except BaseException:
                 stop_process(process)
@@ -904,6 +925,19 @@ def run(args):
             previous = {}
             cursors = {}
             def call(arm, sid, messages, step, initial=False):
+                with timing.span('bench.call', call_id=arm + '-' + str(step['turn']), session_id=sid,
+                                 tokens=step.get('input_tokens', 0), origin='critical'):
+                    result = call_inner(arm, sid, messages, step, initial)
+                    timing.point('bench.post_call_verification_end')
+                if args.timing_spans:
+                    row = trace['calls'][-1]
+                    bounds = row['meter']['timing_boundaries']
+                    row['timing_accounting'] = timing.account(timing.rows(), bounds['stream_start_ns'],
+                        bounds.get('first_nonempty_delta_ns'), row['meter']['timing_call_id'])
+                flush()
+                return result
+
+            def call_inner(arm, sid, messages, step, initial=False):
                 require(shutil.disk_usage(root).free > floor + size, 'disk guard reached before call')
                 before = cursors.get(arm, len(events.copy()))
                 app.phase = dict(arm=arm, turn=step['turn'])
@@ -932,7 +966,6 @@ def run(args):
                 if arm != 'hybrid':
                     reference = next(r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] == step['turn'])
                     require(row['journal_hash'] == reference['journal_hash'], 'paired journal hashes differ')
-                flush()
                 return sid, messages + [message]
 
             initial = dict(turn=0, output_tokens=1, seed=args.seed)
@@ -1032,10 +1065,24 @@ def run(args):
     finally:
         if bridge is not None:
             stop_process(bridge)
+        if decoder is not None and app is not None and args.timing_spans:
+            try:
+                trace['native_client_checkpoint'] = http(config['decode_url'], '/slots/0/info?trace_flush=1', config['decode_token'])
+            except Exception as error:
+                trace['native_client_checkpoint'] = dict(complete=False, error_type=type(error).__name__)
         if decoder is not None:
             stop_process(decoder)
+        if args.timing_spans and app is not None:
+            try:
+                remote = Node(upstream, next(iter(config['clients'].values()))['prefill_token'], args.request_timeout)
+                trace['native_node_checkpoint'] = remote.request('POST', '/v1/bench/trace-flush')
+            except Exception as error:
+                trace['native_node_checkpoint'] = dict(complete=False, error_type=type(error).__name__)
+            if not trace['native_node_checkpoint'].get('complete') or not trace.get('native_client_checkpoint', {}).get('complete'):
+                trace.update(status='aborted', reason='node trace checkpoint incomplete')
         trace['ended_utc'] = datetime.now(timezone.utc).isoformat()
         flush()
+    require(not args.timing_spans or (trace.get('native_node_checkpoint', {}).get('complete') and trace.get('native_client_checkpoint', {}).get('complete')), 'native trace checkpoint incomplete')
     return trace
 
 

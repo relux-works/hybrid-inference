@@ -1,4 +1,5 @@
 """Persistent token journal and client-scoped session mapping."""
+import timing
 import hashlib
 from functools import wraps
 import json
@@ -11,6 +12,7 @@ import uuid
 from journal import JournalConflict, matching_messages
 
 
+@timing.traced('prefix.sha256')
 def prefix_hash(tokens):
     digest = hashlib.sha256()
     for token in tokens:
@@ -83,6 +85,7 @@ class Store:
         return row
 
     @locked
+    @timing.traced('journal.sqlite_save_commit')
     def save(self, session):
         if "_turn" in session and not session.get("_commit"):
             return  # Keep the last completed token/message pair durable until generation is reconciled.

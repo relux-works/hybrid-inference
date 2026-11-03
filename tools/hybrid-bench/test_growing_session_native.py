@@ -350,12 +350,48 @@ def timing_local_control(state, root, config):
     print('PASS all-local timing: measured without forced turn offload', flush=True)
 
 
+def bounded_calibration_controls(build, model, root, state, config, packet):
+    controls=root/'bounded-calibration';controls.mkdir(mode=0o700)
+    calibration_state=controls/'metadata';calibration_state.mkdir(mode=0o700)
+    for name in ('client-info.json','node-info.json'):
+        private_json(calibration_state/name,json.loads((state/name).read_text()))
+    with native_server(build/'bin/llama-server',model,controls/'decoder',checkpoints=0) as (decoder,slots):
+        configured=dict(config,decode_url=decoder.url,slot_path=str(slots),slots=3)
+        private_json(calibration_state/'proxy-config.json',configured)
+        commands=[]
+        for name,budget,expected in [('refused',1,2),('one-pass',2_000_000_000,0)]:
+            output=controls/name
+            command=[sys.executable,str(Path(__file__).parent/'packets/r46/calibrate_import.py'),
+                     '--client-state',str(calibration_state),'--output',str(output),'--r44-packet',str(packet),
+                     '--budget-bytes',str(budget),'--depth','128','--sizes','32','64','96','128','160','1200']
+            with (controls/(name+'.log')).open('wb') as log:
+                process=subprocess.Popen(command,stdout=log,stderr=log)
+                (controls/(name+'.pid')).write_text(str(process.pid)+'\n');code=process.wait()
+            commands.append(dict(command=command,pid=process.pid,exit_code=code))
+            (controls/'commands.json').write_text(json.dumps(commands,indent=2)+'\n')
+            require(code==expected,name+': unexpected calibration exit')
+            result=json.loads((output/'calibration.json').read_text());traffic=result['traffic']
+            require(traffic['charged_bytes']<=budget and traffic['outstanding_bytes']==0,'calibration exceeded cap')
+            if expected:
+                # A one-byte cap prevents every WAN dispatch and publishes no fit; local warmup may still run.
+                require(result['status']=='refused' and traffic['requests']==0 and traffic['refused_before_dispatch']>0
+                        and not (output/'import-fit.json').exists(),'budget refusal was bypassed')
+            else:
+                # Six real imports span >1000 tokens and bind the resulting fit to current source/binaries.
+                require(result['status']=='passed' and result['repetitions']==1 and len(result['points'])==6
+                        and (output/'import-fit.json').exists(),'bounded calibration incomplete')
+    print('PASS bounded calibration: zero-dispatch refusal and one six-point real import pass',flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir', required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
     p.add_argument('--recheck-only', action='store_true', help='one preserved checkpoint and offline recheck controls')
+    p.add_argument('--timing-spans', action='store_true')
+    p.add_argument('--calibration-only', action='store_true')
+    p.add_argument('--r44-packet', type=Path)
     p.add_argument('--timing-only', action='store_true', help='real two-arm run, no node captures or checker')
     p.add_argument('--controls-only', action='store_true')
     p.add_argument('--multi-chunk-only', action='store_true')
@@ -364,7 +400,7 @@ def main():
     args = p.parse_args()
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
-    if not args.multi_chunk_only and not args.recheck_only and not args.timing_only:
+    if not args.multi_chunk_only and not args.recheck_only and not args.timing_only and not args.calibration_only:
         checkpoint_controls(build, model, root)
     if args.controls_only:
         return
@@ -386,11 +422,16 @@ def main():
         private_json(state / 'client-info.json', client)
         private_json(state / 'proxy-config.json', config)
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
-        if not args.recheck_only and not args.timing_only:
+        if args.calibration_only:
+            require(args.r44_packet is not None, '--r44-packet required for calibration control')
+            bounded_calibration_controls(build,model,root,state,config,args.r44_packet)
+            require(node.request('GET','/v1/sessions')==[],'calibration leaked remote sessions')
+            return
+        if not args.recheck_only and not args.timing_only and not args.calibration_only:
             multi_chunk_prestage(build, model, root, config)
         if args.multi_chunk_only:
             return
-        if not args.recheck_only and not args.timing_only:
+        if not args.recheck_only and not args.timing_only and not args.calibration_only:
             preflight_controls(state, root, config)
         commands = []
         starts = ('pre-staged',) if args.recheck_only else (('cold', 'pre-staged') if args.start == 'both' else (args.start,))
@@ -404,6 +445,8 @@ def main():
                 command += ['--checkpoint-turns', '10', '--keep-checkpoint-states']
             if args.timing_only:
                 command += ['--checkpoint-turns', 'none']
+            if args.timing_spans:
+                command += ['--timing-spans']
             if args.state_probes:
                 command.append('--state-probes')
             with (root / (start + '.log')).open('wb') as log:
@@ -429,6 +472,16 @@ def main():
                         'timing mode did not exercise both routes')
                 require(any(r.get('resync') for r in calls), 'timing mode did not recover after outage')
                 require(node.request('GET', '/v1/sessions') == [], 'timing mode leaked remote sessions')
+                if args.timing_spans:
+                    sys.path.insert(0,str(Path(__file__).parent/'packets/r46'))
+                    from extract_timing import native_rows, extract
+                    files=list(root.glob('native-*.jsonl'))+list(output.glob('native-*.jsonl'))
+                    require(len(files)==2,'expected complete node/client native traces')
+                    # The checkpoint is outside all measured parents; an unfinished flush parent must fail here.
+                    extracted=extract(trace,[row for path in files for row in native_rows(path)])
+                    private_json(output/'timing-extract.json',extracted)
+                    require(all(c['accounting'].get('residual_ns',0)>=0 for c in extracted['calls']),
+                            'negative timing residual')
                 print('PASS timing-only: two arms, real imports/outage, zero captures/checker', flush=True)
                 continue
             # Three live sessions preserve their journals through both routes and the actual relay outage.
