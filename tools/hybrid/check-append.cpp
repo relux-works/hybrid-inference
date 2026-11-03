@@ -35,12 +35,12 @@ static void run(llama_model * model, const std::string & model_hash, const std::
     const auto n1 = metadata.at("n1").get<llama_pos>();
     require(n0 > 0 && n1 == (llama_pos) tokens.size() - 1 && n0 < n1, "invalid golden boundaries");
     const auto wire = read_file(stem + ".delta");
-    const auto delta = hybrid::read_delta(wire, model_hash, n0);
+    const auto delta = hybrid::read_delta(wire, model_hash, n0, "f32");
     {
         // A fresh slot also preserves its empty state on a late failure, then accepts a valid initial import.
         auto fresh = hybrid::make_context(model, tokens.size() + 256);
         const auto empty = hybrid::save_state(fresh.get());
-        const auto full = hybrid::read_delta(read_file(stem + ".full.delta"), model_hash, 0);
+        const auto full = hybrid::read_delta(read_file(stem + ".full.delta"), model_hash, 0, "f32");
         require(llama_state_seq_set_data_append(fresh.get(), reinterpret_cast<const uint8_t *>(full.state.data()),
                 full.state.size() - 1, 0, 0, n1) == 0, "fresh truncated state accepted");
         require(hybrid::save_state(fresh.get()) == empty, "fresh failed import changed slot");

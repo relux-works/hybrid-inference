@@ -51,7 +51,7 @@ static void prepare(llama_model * model, const std::string & golden, const std::
         const auto stem = golden + "/prompt-" + std::to_string(depth);
         const auto metadata = hybrid::parse_json(read(stem + ".tokens.json"));
         const auto tokens = metadata.at("tokens").get<std::vector<llama_token>>();
-        const auto full = hybrid::read_delta(read(stem + ".full.delta"), metadata.at("model_sha256"), 0);
+        const auto full = hybrid::read_delta(read(stem + ".full.delta"), metadata.at("model_sha256"), 0, "f32");
         auto ctx = hybrid::make_context(model, 9216);
         hybrid::load_state(ctx.get(), full.state);
         hybrid::prefill(ctx.get(), {tokens.back()}, depth - 1);
@@ -92,7 +92,7 @@ static void measure(llama_model * model, const std::string & stem, int n0) {
 static void capacity(llama_model * model, const std::string & stem) {
     const auto meta = hybrid::parse_json(read(stem + ".tokens.json"));
     const int n0 = meta.at("n0"), n1 = meta.at("n1");
-    const auto delta = hybrid::read_delta(read(stem + ".delta"), meta.at("model_sha256"), n0);
+    const auto delta = hybrid::read_delta(read(stem + ".delta"), meta.at("model_sha256"), n0, "f32");
     auto cp = llama_context_default_params();
     cp.n_ctx = 512; cp.n_seq_max = 2; cp.kv_unified = true;
     cp.n_batch = 256; cp.n_ubatch = 256; cp.n_threads = 2; cp.n_threads_batch = 2;
@@ -130,7 +130,7 @@ static void identity(llama_model * model, const std::string & stem) {
     for (bool fresh : {true, false}) {
         auto ctx = hybrid::make_context(model, 9216);
         if (!fresh) { hybrid::load_state(ctx.get(), read(stem + ".prefix.state")); }
-        const auto delta = hybrid::read_delta(read(stem + (fresh ? ".full.delta" : ".delta")), meta.at("model_sha256"), fresh ? 0 : n0);
+        const auto delta = hybrid::read_delta(read(stem + (fresh ? ".full.delta" : ".delta")), meta.at("model_sha256"), fresh ? 0 : n0, "f32");
         require(append(ctx.get(), delta.state, fresh ? 0 : n0, n1) == delta.state.size(), "identity import failed");
         const auto imported = hybrid::save_state(ctx.get());
         std::string logits;

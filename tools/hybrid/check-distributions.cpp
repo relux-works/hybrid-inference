@@ -96,7 +96,7 @@ static void run(llama_model * model, const hybrid::json & fixture, const char * 
     const auto stem = filename.substr(0, filename.size() - suffix.size());
     const auto n0 = fixture.value("n0", 0);
     require(n0 >= 0 && (size_t) n0 < tokens.size() - 1, "invalid teacher delta start");
-    const auto delta = hybrid::read_delta(read_file((stem + ".delta").c_str()), fixture.at("model_sha256"), n0);
+    const auto delta = hybrid::read_delta(read_file((stem + ".delta").c_str()), fixture.at("model_sha256"), n0, "f32");
     require(delta.header.at("n1") == tokens.size() - 1, "teacher delta endpoint mismatch");
     require(delta.header.at("tokens").get<std::vector<llama_token>>() ==
             std::vector<llama_token>(tokens.begin() + n0, tokens.end() - 1), "teacher delta token mismatch");

@@ -410,6 +410,8 @@ std::string encode_delta_header(json header, size_t state_bytes) {
 }
 
 std::string encode_delta(json header, const std::string & state) {
+    header_budget(header); // Reject empty ranges before dtype-specific parsing.
+    require(!state.empty() && state.size() <= max_delta_body_bytes, "invalid delta size");
     const auto dtype = header.value("state_dtype", std::string("f32"));
     const auto compressed = dtype == "bf16" ? transcode_recurrent(state, true, header.value("fixed_state", true)) : std::string();
     const auto & body = dtype == "bf16" ? compressed : state;
@@ -465,8 +467,9 @@ delta_view read_delta_view(const std::string & wire, const std::string & model_s
     return {std::move(h), state};
 }
 
-delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0) {
+delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0, const std::string & expected_dtype) {
     auto view = read_delta_view(wire, model_sha256, n0);
+    require(expected_dtype.empty() || view.header.at("state_dtype") == expected_dtype, "state dtype mismatch");
     llama_io_timer timer("state_copy", view.state.size());
     auto state = view.header.at("state_dtype") == "bf16" ? transcode_recurrent(view.state, false, view.header.at("fixed_state")) : std::string(view.state);
     return {std::move(view.header), std::move(state)};

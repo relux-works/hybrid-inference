@@ -26,7 +26,7 @@ struct delta {
     json header;
     std::string state;
 };
-delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0);
+delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0, const std::string & expected_dtype = "");
 struct delta_view {
     json header;
     std::string_view state;

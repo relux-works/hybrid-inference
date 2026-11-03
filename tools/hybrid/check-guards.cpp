@@ -60,7 +60,7 @@ int main(int argc, char ** argv) {
         const auto metadata = hybrid::parse_json(read_file(std::string(argv[2]) + ".tokens.json"));
         const auto prefix = read_file(std::string(argv[2]) + ".prefix.state");
         const auto delta = hybrid::read_delta(read_file(std::string(argv[2]) + ".delta"),
-                                              hybrid::file_hash(argv[1]), metadata.at("n0").get<int>());
+                                              hybrid::file_hash(argv[1]), metadata.at("n0").get<int>(), "f32");
         // Real allocated KV caches use the supplied model's layout. This checks rejection, not SWA inference.
         for (auto type : {LLAMA_SWA_TYPE_NONE, LLAMA_SWA_TYPE_STANDARD, LLAMA_SWA_TYPE_CHUNKED, LLAMA_SWA_TYPE_SYMMETRIC}) {
             llama_kv_cache cache(*model, false, model->hparams, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,

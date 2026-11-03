@@ -61,3 +61,5 @@ For a reproducible complete-envelope example, use 32-character session/transfer 
 Real header length depends on token digit counts and identifiers. Tensor savings are exactly 78446592B per offload; the final envelope difference can be one byte smaller because `bf16` is one character longer. Chunking repeats KV headers but ships recurrent state only once, in the final chunk.
 
 GPU procedures: [KL study](../hybrid-bench/STATE-BF16-RUNBOOK.md) and [paired RULER arm](../hybrid-eval/RULER-BF16-RUNBOOK.md). CPU commands and finite limits: [r38 results](RESULTS-hybrid-a-r38-261103.md).
+
+Zero-token transfers (`n0 == n1`) and empty bodies are outside the HYBD contract for both dtypes. The encoder rejects them before dtype-specific parsing with `invalid positions` and `invalid delta size`, respectively. No bf16-only empty-delta refusal remains. The legacy check-client, check-distributions and check-guards harnesses (and check-append's legacy golden-fixture mode) explicitly require f32 and refuse bf16 before expansion; use the labelled benchmark/scorer for lossy imports.

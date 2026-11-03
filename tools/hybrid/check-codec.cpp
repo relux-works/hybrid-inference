@@ -147,6 +147,34 @@ static void codec_tests(size_t max_ctx) {
     require(hybrid::encode_delta_header(h, 3) == legacy_header, "f32 legacy header bytes changed");
     auto wire = hybrid::encode_delta(h, "abc");
     require(hybrid::read_delta(wire, hash, 0).state == "abc", "codec positive control");
+    // Legacy exact harness admission accepts f32 and refuses labelled bf16 before native expansion.
+    require(hybrid::read_delta(wire, hash, 0, "f32").state == "abc", "f32 harness control");
+    auto dtype_header = hybrid::parse_json(legacy_header);
+    dtype_header["state_dtype"] = "bf16";
+    const auto dtype_text = dtype_header.dump();
+    std::string dtype_wire;
+    for (int i = 0; i < 4; ++i) { dtype_wire += char(dtype_text.size() >> (8 * i)); }
+    dtype_wire += dtype_text + wire.substr(4 + legacy_header.size());
+    bool mismatch = false;
+    try { hybrid::read_delta(dtype_wire, hash, 0, "f32"); }
+    catch (const std::exception & e) { mismatch = std::string(e.what()) == "state dtype mismatch"; }
+    require(mismatch, "legacy exact harness expanded bf16");
+    std::cout << "PASS test_legacy_harness_dtype_admission_with_f32_control\n";
+    // Zero-token transfers are outside HYBD for both dtypes; valid f32 remains byte-identical.
+    for (const auto * dtype : {"f32", "bf16"}) {
+        auto empty = header(hash, 0, 0, {}); empty["state_dtype"] = dtype;
+        bool refused = false;
+        try { hybrid::encode_delta(empty, "abc"); }
+        catch (const std::exception & e) { refused = std::string(e.what()) == "invalid positions"; }
+        require(refused, "empty delta dtype-specific refusal");
+        auto nonempty = h; nonempty["state_dtype"] = dtype;
+        refused = false;
+        try { hybrid::encode_delta(nonempty, ""); }
+        catch (const std::exception & e) { refused = std::string(e.what()) == "invalid delta size"; }
+        require(refused, "empty body dtype-specific refusal");
+    }
+    require(hybrid::encode_delta(h, "abc") == wire, "valid f32 control changed");
+    std::cout << "PASS test_empty_delta_shared_refusal_with_nonempty_control\n";
     // A borrowed decode references the owning envelope; the copying API retains its independent state.
     const auto view = hybrid::read_delta_view(wire, hash, 0);
     const auto owned = hybrid::read_delta(wire, hash, 0);
