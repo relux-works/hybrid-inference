@@ -16,9 +16,16 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 static void require(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
+}
+
+static std::string checker_backend_label(const std::string & name, const std::string * expected = nullptr) {
+    const std::string label = name == "CUDA" ? "cuda" : (name == "MTL" || name == "Metal") ? "metal" : name == "CPU" ? "cpu" : name;
+    require(expected == nullptr || *expected == label, "checker backend label/device mismatch");
+    return label;
 }
 
 class state_counter : public llama_io_write_i {
@@ -474,6 +481,23 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--test-backend-labels") {
+            // Registry aliases normalize; real cross-backend fixtures still refuse.
+            for (const auto & name : {"MTL", "Metal", "CUDA", "CPU"}) {
+                const std::string expected = std::string(name) == "CUDA" ? "cuda" : std::string(name) == "CPU" ? "cpu" : "metal";
+                require(checker_backend_label(name) == expected, ("backend_label_" + std::string(name)).c_str());
+                std::cout << "PASS backend_label_" << name << '\n';
+            }
+            for (const auto & pair : {std::make_pair("MTL", "cuda"), std::make_pair("CUDA", "metal")}) {
+                bool refused = false;
+                const std::string expected = pair.second;
+                try { checker_backend_label(pair.first, &expected); }
+                catch (const std::runtime_error & error) { refused = std::string(error.what()) == "checker backend label/device mismatch"; }
+                require(refused, ("fixture_" + expected + "_actual_" + pair.first + "_refuses").c_str());
+                std::cout << "PASS fixture_" << pair.second << "_actual_" << pair.first << "_refuses\n";
+            }
+            return 0;
+        }
         require(argc == 6, "usage: llama-hybrid-bench-check MODEL TOKENS.json DELTA OUTPUT.json GPU_LAYERS");
         // Full-vocabulary KL must detect a changed distribution, including one with unchanged top-1.
         const float p[] = {2, -2}, q[] = {-2, 2}, near[] = {1, 0};
@@ -520,12 +544,13 @@ int main(int argc, char ** argv) {
         if (gpu_layers > 0) {
             require(llama_model_n_devices(model.get()) > 0, "GPU requested but model has no offload device");
             const std::string name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(llama_model_get_device(model.get(), 0)));
-            backend = name == "CUDA" ? "cuda" : name == "Metal" ? "metal" : name;
+            backend = name;
             for (int i = 0; i < llama_model_n_devices(model.get()); ++i) {
                 require(name == ggml_backend_reg_name(ggml_backend_dev_backend_reg(llama_model_get_device(model.get(), i))), "mixed checker devices unsupported");
             }
         }
-        require(fixture.value("backend", backend) == backend, "checker backend label/device mismatch");
+        const std::string expected_backend = fixture.value("backend", checker_backend_label(backend));
+        backend = checker_backend_label(backend, &expected_backend);
         const bool gpu = backend != "cpu";
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         for (auto token : tokens) { require(token >= 0 && token < vocab, "invalid check token"); }
