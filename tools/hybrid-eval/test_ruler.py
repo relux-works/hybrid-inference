@@ -3,6 +3,8 @@
 import hashlib
 import io
 import json
+import os
+import subprocess
 from pathlib import Path
 import random
 import re
@@ -19,6 +21,7 @@ from ruler_data import DATA_FILES, PUNKT_FILES, SOURCE, VENDOR, bootstrap, verif
 from ruler_eval import (SLOT_CLEANUP_PREDECESSOR, archive_depth, atomic_json, check_slot_space,
                         example_sessions, main as evaluate_main, recover_sessions, resume_manifest, run_example)
 from ruler_generate import Generator, body_for, configurations, score
+from ruler_glimmer import CONTEXT, DEPTHS, MODEL, NATIVE_REF, saved_session_bytes, validate_services
 
 
 def fixtures(root):
@@ -134,6 +137,97 @@ class RulerTests(unittest.TestCase):
                         self.assertEqual(spec['prompt_tokens'], depth)
                         self.assertEqual(score(task, spec['answers'], ' '.join(spec['answers'])), 1)
                         self.assertEqual(score(task, spec['answers'], 'WRONG ANSWER'), 0)
+
+    # The production profile pins all three services; valid neighbors prevent reject-all admission.
+    def test_glimmer_pins_services_and_negative_controls(self):
+        self.assertEqual(MODEL['repo'], 'meta-models/Muse-Glimmer-30B-GGUF')
+        self.assertEqual(MODEL['revision'], 'b44f1072cf75e918a1b82a3a17b45c4389b076e7')
+        self.assertEqual(MODEL['file'], 'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf')
+        self.assertEqual(MODEL['bytes'], 16756683904)
+        self.assertEqual(MODEL['sha256'], '4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e')
+        self.assertEqual(NATIVE_REF, '18d3f114e46c4f801c4a09e2c6cf8ba2303ae42d')
+        client = dict(model_sha256=MODEL['sha256'], commit=NATIVE_REF, context=131072,
+                      batch=64, ubatch=64, backend='cuda')
+        services = [client, dict(client, batch=256, ubatch=256), dict(client, batch=256, ubatch=256)]
+        for depth in DEPTHS:
+            validate_services(*services, depth, saved_session_bytes(depth))
+        for index in range(3):
+            for key, value, reason in [('model_sha256', 'wrong', 'model pin'), ('commit', 'wrong', 'native pin'),
+                                       ('context', 135168, 'context'), ('context', 8192, 'context'),
+                                       ('batch', 128, 'batch/ubatch'), ('ubatch', 32, 'batch/ubatch'),
+                                       ('backend', 'cpu', 'requires CUDA')]:
+                changed = [dict(info) for info in services]
+                changed[index][key] = value
+                with self.subTest(index=index, key=key, value=value), self.assertRaisesRegex(Refusal, reason):
+                    validate_services(*changed, 8192, saved_session_bytes(8192))
+        with self.assertRaisesRegex(Refusal, 'bound too small'):
+            validate_services(*services, 8192, saved_session_bytes(8192)-1)
+        with self.assertRaisesRegex(Refusal, 'invalid Glimmer depth'):
+            validate_services(*services, 131072, 10**10)
+
+    # All depths fit native context plus answer reserve; the bound exceeds four measured kit slot sizes.
+    def test_glimmer_depth_and_slot_arithmetic(self):
+        self.assertEqual(CONTEXT, 131072)
+        self.assertEqual(DEPTHS, (8192, 32768, 65536, 122880))
+        self.assertEqual(DEPTHS[-1] + 128 + 2, 123010)
+        self.assertEqual(CONTEXT - (DEPTHS[-1] + 128 + 2), 8062)
+        self.assertGreater(131072 + 128 + 2, CONTEXT)
+        for depth, bound in zip(DEPTHS, (152326144, 403984384, 739528704, 1326731264)):
+            self.assertEqual(saved_session_bytes(depth), bound)
+            self.assertLessEqual(depth + 128 + 2, CONTEXT)
+        for depth, measured in ((16000, 156884268), (50000, 397876268),
+                                (100000, 752276268), (118000, 879860268)):
+            self.assertEqual(7088*depth + 43476268, measured)
+            self.assertGreater(10240*(depth+130)+64*1024**2, measured)
+        for depth in (2048, 131072, 130943, -1):
+            with self.assertRaisesRegex(Refusal, 'invalid Glimmer depth'):
+                saved_session_bytes(depth)
+        rows = [dict(table_row(0), depth=depth) for depth in DEPTHS]
+        self.assertTrue(all('mcnemar_holm_four_depths' in t for t in analyze(rows)[1] if t['task'] == 'ALL'))
+
+    # CLI profile rejection precedes output/session creation; accepted admission records the profile in restart identity.
+    def test_glimmer_cli_admission_and_manifest_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/'inputs.lock.json').write_text('{}')
+            (root/'downloads.json').write_text('[]')
+            client = dict(model_sha256='wrong', commit=NATIVE_REF, context=CONTEXT, batch=64, ubatch=64, backend='cuda')
+            partition = dict(client, model_sha256=MODEL['sha256'], batch=256, ubatch=256)
+            argv = ['ruler_eval', '--model-profile', 'glimmer30', '--client-state', str(root),
+                    '--partition-client-state', str(root), '--data', str(root),
+                    '--input-lock-sha256', hashlib.sha256(b'{}').hexdigest(), '--output', str(root/'out'),
+                    '--depth', '8192', '--saved-session-bytes', str(saved_session_bytes(8192))]
+            with patch('sys.argv', argv), patch('ruler_eval.verify_data', return_value={}), \
+                 patch('ruler_eval.load_clients', return_value=({}, client, {}, partition, partition)), \
+                 patch('ruler_eval.recover_sessions', side_effect=RuntimeError('admitted')) as recover, \
+                 patch('ruler_eval.run_example') as execute:
+                with self.assertRaisesRegex(Refusal, 'Glimmer model pin differs'):
+                    evaluate_main()
+                self.assertFalse((root/'out').exists())
+                recover.assert_not_called()
+                client['model_sha256'] = MODEL['sha256']
+                with self.assertRaisesRegex(RuntimeError, '^admitted$'):
+                    evaluate_main()
+                manifest = json.loads((root/'out'/'depth-8192'/'manifest.json').read_text())
+                self.assertEqual(manifest['model_profile'], 'glimmer30')
+                self.assertEqual(manifest['seed'], 261102)
+                self.assertEqual(manifest['samples_per_task'], 30)
+                self.assertEqual(len(manifest['tasks']), 13)
+                recover.assert_called_once()
+                execute.assert_not_called()
+
+    # Missing settings and a wrong reviewed head fail before GPU probes, downloads, build or state creation.
+    def test_glimmer_stage_wrong_head_has_terminal_failure_and_no_writes(self):
+        script = Path(__file__).with_name('stage-ruler-glimmer.sh').resolve()
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)/'run'
+            for expected in ('', 'wrong'):
+                result = subprocess.run(['bash', str(script)], env=dict(os.environ, RUN=str(run), EXPECTED_HEAD=expected),
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('stage ruler-glimmer failed', result.stderr)
+                self.assertNotIn('stage ruler-glimmer done', result.stdout)
+                self.assertFalse(run.exists())
 
     # Partial reports expose Bonferroni, while exactly four depths get joint Holm; excess depths are refused.
     def test_adjustment_labels_partial_and_joint_depths(self):

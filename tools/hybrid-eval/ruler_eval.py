@@ -22,6 +22,7 @@ from hybrid_bench import mode_session, release_session, stream_chat, verify_mete
 from ruler_analysis import ARMS, write_analysis
 from ruler_data import SOURCE, verify_data, verify_source
 from ruler_generate import Generator, body_for, configurations, runtime_identity, score
+from ruler_glimmer import validate_services as validate_glimmer_services
 
 
 # Only this accepted predecessor can opt into the slot-lifetime repair.
@@ -204,6 +205,7 @@ def archive_depth(root, manifest, expected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--model-profile', choices=['glimmer30'], help='enforce pinned production services and slot budget')
     parser.add_argument('--client-state', type=Path, required=True)
     parser.add_argument('--partition-client-state', type=Path, required=True)
     parser.add_argument('--data', type=Path, required=True)
@@ -229,8 +231,10 @@ def main():
     import nltk
     nltk.data.path.insert(0, str(args.data/'nltk_data'))
     config, client, pcfg, pclient, node = load_clients(args.client_state, args.partition_client_state)
+    if args.model_profile == 'glimmer30':
+        validate_glimmer_services(client, pclient, node, args.depth, args.saved_session_bytes)
     require(args.depth > max(client['batch'], pclient['batch']), 'prompt does not exercise both partitions')
-    require(args.depth+128+2 <= min(client['context'], node['context']), 'insufficient service context')
+    require(args.depth+128+2 <= min(client['context'], pclient['context'], node['context']), 'insufficient service context')
     keys = ('backend', 'commit', 'model_sha256', 'quantization_type', 'layout_fingerprint', 'context',
             'batch', 'ubatch', 'threads', 'threads_batch', 'binaries', 'template_sha256')
     tools_root = Path(__file__).resolve().parents[1]
@@ -245,6 +249,8 @@ def main():
                     clients={name: {k: info[k] for k in keys if k in info} for name, info in
                              (('client', client), ('partition', pclient), ('node', node))},
                     data_provenance={'inputs.lock.json': lock, 'downloads.json': json.loads((args.data/'downloads.json').read_text())})
+    if args.model_profile:
+        manifest['model_profile'] = args.model_profile
     root = args.output/f'depth-{args.depth}'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     run_lock = (root/'.lock').open('a')

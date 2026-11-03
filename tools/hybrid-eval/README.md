@@ -158,6 +158,8 @@ These are planning calculations, not observed GPU runtimes. Historically, with t
 
 Use the fixed-token scorer in [tools/hybrid-bench/README.md](../hybrid-bench/README.md#reference-model-teacher-forced-scoring) for this prototype's KL(D || arm) study. Task accuracy, local partition controls and free-running answer disagreement remain the existing evaluator measures. This is a declared integration gap, not a substitute for the GPU reference-model study.
 
+For the pinned Glimmer 30B profile, native-context depths, slot bounds, fresh-GPU stage and measured-rate budget, use [GLIMMER-RULER-RUNBOOK.md](GLIMMER-RULER-RUNBOOK.md). CPU qualification and its SWA gap are recorded in [RESULTS-hybrid-d-r14-261103.md](RESULTS-hybrid-d-r14-261103.md).
+
 ## RULER tools
 
 | Command | Purpose | Output |
@@ -170,3 +172,8 @@ Use the fixed-token scorer in [tools/hybrid-bench/README.md](../hybrid-bench/REA
 | `python3 tools/hybrid-eval/test_native.py ... --ruler-checks` | Existing native checks plus real-GGUF RULER fixture integration | Private native artifact directory; see runbook |
 
 Generator dependencies are pinned in `ruler-requirements.txt`; the original evaluator/tests still use the Python standard library. No generator downloads run implicitly.
+
+| Glimmer entry point | Purpose | Artifacts |
+|---|---|---|
+| `python3 tools/hybrid-eval/ruler_glimmer.py [--depth 122880]` | Offline model/native pins, depth list and slot bounds | JSON on stdout or saved-session bytes |
+| `EXPECTED_HEAD=<reviewed-SHA> RUN=<new-absolute-path> bash tools/hybrid-eval/stage-ruler-glimmer.sh` | Fetch/verify Glimmer, build native pin, bootstrap data, run pilots and 390 pairs per depth | Private GPU RUN with logs, four depth archives, joint analysis and terminal done/failed |
