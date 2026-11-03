@@ -28,6 +28,52 @@ class ScenarioTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    # Labels cannot alias a transport, and the bf16 policy changes only tensor wire bytes while preserving metadata.
+    def test_bf16_arm_labels_and_policy_bytes(self):
+        layout=dict(architecture='qwen35',layers=[dict(recurrent=True)]*18,
+                    recurrent_layout=dict(state=128,inner=2048,conv=4,groups=16))
+        policy=dict(state_bytes=20201472+1600,kv_bytes=6528,local_rates=((0,100),),import_fixed=1.5)
+        before=copy.deepcopy(policy);bf16=growing.bf16_policy(layout,policy)
+        self.assertEqual(policy,before)
+        self.assertEqual(bf16,dict(before,state_bytes=10100736+1600))
+        self.assertEqual(growing.arm_names(set(),True),['hybrid','local','hybrid-bf16'])
+        self.assertEqual(growing.arm_names(set()),['hybrid','local'])
+        self.assertEqual(growing.arm_names({10}),['hybrid','local','local_partition'])
+        with self.assertRaisesRegex(Refusal,'common-journal rehearsal'):growing.arm_names({10},True)
+        with self.assertRaisesRegex(Refusal,'requires Qwen35'):growing.bf16_policy(dict(layout,architecture='muse-glimmer'),policy)
+        module=self.packet_module('mac_timing')
+        command=module.command(Path('state'),Path('out'),Path('policy'),Path('fixture'),100000,'5G',Path('bf16'))
+        self.assertIn('--include-bf16',command)
+        self.assertEqual(command[command.index('--bf16-policy')+1],'bf16')
+
+    # The paired calibration fits both dtypes under one shared cap; fixed metadata stays full width.
+    def test_bf16_calibration_shared_budget(self):
+        from traffic import TrafficBudget
+        module=self.packet_module('calibrate_import')
+        self.assertEqual(module.PAIRED_SIZES,[512,1024,2048,512,1024,2048])
+        module.validate_plan('qwen35',2_000_000_000,module.PAIRED_SIZES)
+        budget=TrafficBudget(2_000_000_000,dict(kv_bytes=34816,state_bytes=156894784,recurrent_tensor_bytes=156893184))
+        for dtype in ('f32','bf16'):
+            for n in module.PAIRED_SIZES:
+                data=dict(tokens=[100]*n,return_delta=True,state_dtype=dtype)
+                with budget.reserve('/extend',data,11*n,'POST') as receipt:
+                    receipt['actual']=34848*n+156894784-(78446592 if dtype=='bf16' else 0)+4096
+        self.assertLess(budget.status()['charged_bytes'],2_000_000_000)
+        self.assertEqual(budget.status()['requests'],12)
+        self.assertEqual(budget.status()['outstanding_bytes'],0)
+
+    # The rehearsal transforms actual captured delta steps only, leaves f32 inputs untouched and requires imports.
+    def test_bf16_common_journal_treatment(self):
+        module=self.packet_module('replay_bf16')
+        source=dict(acceptance_rule='session_append_replay_exact',probes=[dict(name='CHAIN',steps=[dict(delta='x',sha256='0'*64),dict(decode=[dict(n0=1,n1=2)])])])
+        before=copy.deepcopy(source);converted=module.treatment(source)
+        self.assertEqual(source,before)
+        self.assertTrue(converted['bf16_replay'])
+        self.assertEqual(converted['probes'][-1]['name'],'BF16_CHAIN')
+        self.assertEqual(converted['probes'][-1]['steps'][0]['reencode_state_dtype'],'bf16')
+        with self.assertRaisesRegex(Refusal,'source must be f32'):module.treatment(dict(source,state_dtype='bf16'))
+        with self.assertRaisesRegex(Refusal,'recorded imports'):module.treatment(dict(source,probes=[dict(name='CHAIN',steps=[])]))
+
     # The same source/binary binding accepts an unchanged fit and rejects changed bytes or missing binaries.
     def test_fit_reuse_requires_source_and_binary_identity(self):
         module = self.packet_module('mac_timing')

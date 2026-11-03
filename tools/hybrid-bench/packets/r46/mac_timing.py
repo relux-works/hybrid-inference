@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PRI-31 supervisor payload: admit a rate fixture, measure the link, then run two timing arms."""
+"""PRI-31 supervisor payload: admit a rate fixture, measure the link, then run Qwen three-arm or Glimmer two-arm timing."""
 import argparse
 from datetime import datetime, timezone
 import importlib.util
@@ -31,7 +31,8 @@ def helper(packet, name):
 IDENTITY_FILES = ['tools/hybrid-proxy/proxy.py', 'tools/hybrid-proxy/traffic.py', 'tools/hybrid-proxy/timing.py',
                   'src/llama-context.cpp', 'src/llama-kv-cache.cpp', 'src/llama-kv-cache-iswa.cpp',
                   'src/llama-io.cpp', 'src/llama-io.h', 'src/llama-mmap.cpp', 'tools/hybrid/hybrid-state.cpp',
-                  'tools/server/server-context.cpp', 'tools/server/server-http.cpp', 'tools/server/server-task.h']
+                  'tools/server/server-context.cpp', 'tools/server/server-http.cpp', 'tools/server/server-task.h',
+                  'tools/hybrid-proxy/store.py','tools/hybrid-proxy/journal.py','tools/hybrid/prefill.cpp']
 
 
 def import_identity(client):
@@ -77,12 +78,15 @@ def budgets(client, geometry, plan):
                 limitation='Models/build already staged; 4GB covers logs plus selective archive, no state archive')
 
 
-def command(state, output, policy, fixture, depth, link):
-    return [sys.executable, str(ROOT / 'tools/hybrid-bench/growing_session.py'), '--client-state', str(state),
+def command(state, output, policy, fixture, depth, link, bf16=None):
+    result = [sys.executable, str(ROOT / 'tools/hybrid-bench/growing_session.py'), '--client-state', str(state),
         '--output', str(output), '--depth', str(depth), '--turns', '40', '--seed', '1', '--start', 'pre-staged',
         '--checkpoint-turns', 'none', '--timing-spans', '--disconnect-turn', '2', '--disconnect-turns', '3',
         '--policy', str(policy), '--rate-fixture', str(fixture), '--link-label', link + '; M3 Max PRI31; CUDA to Metal; SSH',
         '--request-timeout', '3600']
+    if bf16 is not None:
+        result += ['--include-bf16','--bf16-policy',str(bf16)]
+    return result
 
 
 def main(argv=None):
@@ -91,6 +95,7 @@ def main(argv=None):
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--fixture', required=True, type=Path)
     p.add_argument('--import-fit', required=True, type=Path)
+    p.add_argument('--bf16-import-fit',type=Path,help='required Qwen bf16 calibration bound to this build')
     p.add_argument('--r44-packet', required=True, type=Path)
     p.add_argument('--link', required=True, choices=['5G', 'Wi-Fi'])
     p.add_argument('--link-port', type=int, default=8093)
@@ -104,6 +109,18 @@ def main(argv=None):
     fit = json.loads(a.import_fit.read_text())
     head = subprocess.check_output(['git', '-C', ROOT, 'rev-parse', 'HEAD'], text=True).strip()
     rates, depth = admission(client, node, config['delta_geometry'], fixture, fit, head)
+    require(config.get('state_dtype','f32')=='f32' and fit.get('state_dtype','f32')=='f32','baseline configuration/fit must be f32')
+    qwen=fixture['architecture']=='qwen35'
+    require(qwen==bool(a.bf16_import_fit),'Qwen requires bf16 import fit; Glimmer forbids it')
+    bf16_fit=None
+    if qwen:
+        bf16_fit=json.loads(a.bf16_import_fit.read_text())
+        require_fit_identity(bf16_fit,client)
+        require(bf16_fit['source_head']==head and bf16_fit.get('state_dtype')=='bf16' and bf16_fit.get('lossy_import') is True,
+                'bf16 import fit identity/profile mismatch')
+        token=next(iter(config['clients'].values()))['prefill_token']
+        require('bf16' in Node(config['prefill_url'],token,120).request('GET','/v1/health').get('state_dtypes',[]),
+                'node lacks bf16 capability')
     # Refuse missing/placeholder rates before link traffic, decoder shutdown, or measurement artifacts.
     priority = subprocess.check_output(['ps', '-p', str(os.getpid()), '-o', 'pri=,nice='], text=True).split()
     require([int(v) for v in priority] == [31, 0], 'existing PRI-31 supervisor required')
@@ -114,6 +131,9 @@ def main(argv=None):
     if fixture['architecture'] == 'muse-glimmer':
         policy['server_rate'] = 2823
     policy.update(local_rates=rates, import_fixed=fit['fixed_s'], import_per_token=fit['seconds_token'])
+    compressed=g.bf16_policy(client['model_layout'],policy) if qwen else None
+    if compressed is not None:
+        compressed.update(import_fixed=bf16_fit['fixed_s'],import_per_token=bf16_fit['seconds_token'])
     policy_object = g.Policy(**policy)
     renderer = Renderer(Node(config['decode_url'], config['decode_token'], 120))
     framing = g.template_framing(SimpleNamespace(renderer=renderer))
@@ -126,19 +146,24 @@ def main(argv=None):
     admission_path = a.output.with_name(a.output.name + '-admission.json')
     private_json(admission_path, dict(utc=datetime.now(timezone.utc).isoformat(), source_head=head,
         fixture_sha256=sha256(a.fixture), import_fit_sha256=sha256(a.import_fit), physical_link=a.link,
-        raw_link_points=points, policy=policy, budgets=budget, framing=framing,
+        raw_link_points=points, policy=policy,bf16_policy=compressed,
+        bf16_import_fit_sha256=sha256(a.bf16_import_fit) if qwen else None,budgets=budget,framing=framing,
         server_rate_source='FACTS 1a Glimmer118k Delta2000' if fixture['architecture'] == 'muse-glimmer' else 'FACTS 1a Qwen100k Delta2000',
         policy_limit='scalar node rate; depth-dependent import cost not represented'))
     # Production policy may choose all-local turns on a slow link; fidelity qualification still requires both routes.
     g.route_preflight(policy_object, plan, 2, 3, require_mix=False)
     policy_path = a.output.with_name(a.output.name + '-policy.json')
     private_json(policy_path, policy)
+    bf16_path=None
+    if compressed is not None:
+        bf16_path=a.output.with_name(a.output.name+'-bf16-policy.json')
+        private_json(bf16_path,compressed)
     # Stop only the launcher named by this metadata; the driver starts its own decoder.
     stop = subprocess.run([str(ROOT / 'tools/hybrid-bench/setup-client.sh'), '--state', str(a.client_state), '--stop'],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     require(stop.returncode == 0, 'owned launcher stop failed')
     execute = helper(a.r44_packet, 'run-session').execute
-    return execute(command(a.client_state, a.output, policy_path, a.fixture, depth, a.link), a.output)
+    return execute(command(a.client_state, a.output, policy_path, a.fixture, depth, a.link,bf16_path), a.output)
 
 
 if __name__ == '__main__':

@@ -363,7 +363,7 @@ def bounded_calibration_controls(build, model, root, state, config, packet):
             output=controls/name
             command=[sys.executable,str(Path(__file__).parent/'packets/r46/calibrate_import.py'),
                      '--client-state',str(calibration_state),'--output',str(output),'--r44-packet',str(packet),
-                     '--budget-bytes',str(budget),'--depth','128','--sizes','32','64','96','128','160','1200']
+                     '--with-bf16','--budget-bytes',str(budget),'--depth','128','--sizes','32','64','96','128','160','1200']
             with (controls/(name+'.log')).open('wb') as log:
                 process=subprocess.Popen(command,stdout=log,stderr=log)
                 (controls/(name+'.pid')).write_text(str(process.pid)+'\n');code=process.wait()
@@ -379,7 +379,8 @@ def bounded_calibration_controls(build, model, root, state, config, packet):
             else:
                 # Six real imports span >1000 tokens and bind the resulting fit to current source/binaries.
                 require(result['status']=='passed' and result['repetitions']==1 and len(result['points'])==6
-                        and (output/'import-fit.json').exists(),'bounded calibration incomplete')
+                        and (output/'import-fit.json').exists() and (output/'bf16-import-fit.json').exists()
+                        and set(result['profiles'])=={'f32','bf16'},'bounded calibration incomplete')
     print('PASS bounded calibration: zero-dispatch refusal and one six-point real import pass',flush=True)
 
 
@@ -388,8 +389,10 @@ def main():
     p.add_argument('--build-dir', required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
+    p.add_argument('--bf16-replay-only',action='store_true',help='one retained checkpoint and real common-journal bf16 replay')
     p.add_argument('--recheck-only', action='store_true', help='one preserved checkpoint and offline recheck controls')
     p.add_argument('--timing-spans', action='store_true')
+    p.add_argument('--include-bf16',action='store_true')
     p.add_argument('--calibration-only', action='store_true')
     p.add_argument('--r44-packet', type=Path)
     p.add_argument('--timing-only', action='store_true', help='real two-arm run, no node captures or checker')
@@ -398,6 +401,9 @@ def main():
     p.add_argument('--state-probes', action='store_true')
     p.add_argument('--start', choices=('both', 'cold', 'pre-staged'), default='both')
     args = p.parse_args()
+    if args.bf16_replay_only:
+        args.recheck_only=True
+        args.state_probes=True
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
     if not args.multi_chunk_only and not args.recheck_only and not args.timing_only and not args.calibration_only:
@@ -447,6 +453,8 @@ def main():
                 command += ['--checkpoint-turns', 'none']
             if args.timing_spans:
                 command += ['--timing-spans']
+            if args.include_bf16:
+                command += ['--include-bf16']
             if args.state_probes:
                 command.append('--state-probes')
             with (root / (start + '.log')).open('wb') as log:
@@ -460,8 +468,8 @@ def main():
             calls = [r for r in trace['calls'] if r['stage'] == 'turn']
             if args.timing_only:
                 # Real imports, outage and both routes run; all measurement captures and the checker stay absent.
-                require(code == 0 and trace['status'] == 'measured' and len(calls) == 24 and
-                        trace['arms'] == ['hybrid', 'local'] and trace['checkpoints'] == [] and
+                require(code == 0 and trace['status'] == 'measured' and len(calls) == (36 if args.include_bf16 else 24) and
+                        trace['arms'] == (['hybrid','local','hybrid-bf16'] if args.include_bf16 else ['hybrid','local']) and trace['checkpoints'] == [] and
                         trace['capture'] == dict(enabled=False, node_snapshots=0, node_deltas=0, checker_runs=0),
                         'timing mode captured state or ran the checker')
                 require(not (output / 'node-states').exists() and not list(output.glob('check-*')),
@@ -472,6 +480,12 @@ def main():
                         'timing mode did not exercise both routes')
                 require(any(r.get('resync') for r in calls), 'timing mode did not recover after outage')
                 require(node.request('GET', '/v1/sessions') == [], 'timing mode leaked remote sessions')
+                if args.include_bf16:
+                    bf16=[r for r in calls if r['arm']=='hybrid-bf16']
+                    require(len(bf16)==12 and any(r['lossy_import'] for r in bf16),'bf16 timing arm missing imports')
+                    require(all(r['state_dtype']=='bf16' and r['transport_profile']['recurrent_transport']=='bf16' for r in bf16),
+                            'bf16 timing arm mislabeled')
+                    require(all(not r['lossy_import'] for r in calls if r['arm'] in ('hybrid','local')),'baseline became lossy')
                 if args.timing_spans:
                     sys.path.insert(0,str(Path(__file__).parent/'packets/r46'))
                     from extract_timing import native_rows, extract
@@ -482,7 +496,7 @@ def main():
                     private_json(output/'timing-extract.json',extracted)
                     require(all(c['accounting'].get('residual_ns',0)>=0 for c in extracted['calls']),
                             'negative timing residual')
-                print('PASS timing-only: two arms, real imports/outage, zero captures/checker', flush=True)
+                print('PASS timing-only: '+('three' if args.include_bf16 else 'two')+' arms, real imports/outage, zero captures/checker',flush=True)
                 continue
             # Three live sessions preserve their journals through both routes and the actual relay outage.
             require(len(calls) == 36 and trace['status'] in ('passed', 'failed'), 'incomplete three-arm session')
@@ -495,7 +509,7 @@ def main():
             require([r['turn'] for r in trace['checkpoints']] == ([10] if args.recheck_only else [10, 12]), 'checkpoint missing')
             require(all(r['k'] == 64 for r in trace['checkpoints']), 'wrong checkpoint width')
             require(node.request('GET', '/v1/sessions') == [], 'remote sessions leaked')
-            if args.recheck_only:
+            if args.recheck_only and not args.bf16_replay_only:
                 recheck_controls(build, model, root, output)
             for arm in ('local', 'local_partition'):
                 local = [r for r in calls if r['arm'] == arm]
@@ -505,6 +519,20 @@ def main():
             require(trace['depth_plan']['final_depth'] == trace['final_depth']['hybrid'] and
                     len(trace['workload']) == 12, 'depth plan or sequence changed')
             print('OBSERVED ' + start + ': ' + trace['status'] + '; driver exit ' + str(code), flush=True)
+        if args.bf16_replay_only:
+            command=[sys.executable,str(Path(__file__).parent/'packets/r46/replay_bf16.py'),
+                     '--trace',str(root/'pre-staged/trace.json'),'--checker',str(build/'bin/llama-hybrid-bench-check'),
+                     '--model',str(model),'--output',str(root/'bf16-replay'),'--turns','10']
+            with (root/'bf16-replay.log').open('wb') as log:
+                process=subprocess.Popen(command,stdout=log,stderr=log)
+                (root/'bf16-replay.pid').write_text(str(process.pid)+'\n');code=process.wait()
+            private_json(root/'bf16-replay-exit.json',dict(pid=process.pid,exit_code=code))
+            require(code==5,'bf16 replay must exit lossy/5')
+            summary=json.loads((root/'bf16-replay/summary.json').read_text())
+            require(summary['exact'] is False and summary['quality_gate']==all(
+                c['local_to_bf16']['top1_agreed']>=63 for c in summary['checkpoints']),
+                'bf16 replay gate contradicts measurements')
+            print('PASS bf16 common-journal replay: real repeated imports, f32/local reference logits retained, lossy/5',flush=True)
         if args.timing_only:
             timing_local_control(state, root, config)
         require(sha256(model) == digest, 'model file changed')

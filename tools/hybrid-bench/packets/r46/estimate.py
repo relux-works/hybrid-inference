@@ -76,7 +76,7 @@ def estimate(kind, link, local=100, decode=18, recurrent_dtype="f32"):
                    policy.import_fixed + policy.import_per_token*(depth-1) + 1/prefill(depth))
     timing = dict(hybrid_turn_h=(generated + pauses + hybrid_prefill) / 3600,
                   local_turn_h=(generated + pauses + local_prefill) / 3600,
-                  base_h=(local_base + hybrid_base) / 3600)
+                  base_h=(local_base + hybrid_base) / 3600,local_base_h=local_base/3600,hybrid_base_h=hybrid_base/3600)
     return dict(model=kind, assumptions=dict(link_bytes_s=link, local_prefill=local if not qwen else 'PRI31 delta512 floor curve',
         decode=decode if not qwen else 'PRI31 weighted depth curve', framing=framing,
         import_fit='Qwen prior Metal fit, illustrative for Glimmer; must recalibrate on Mac'),
@@ -88,11 +88,17 @@ def estimate(kind, link, local=100, decode=18, recurrent_dtype="f32"):
         hybrid_total_ttft_s=hybrid_turn_ttft+hybrid_base+1/decoded(depth),
         local_total_ttft_s=local_turn_ttft+local_base+1/decoded(depth),
         ttft_model='prompt/policy cost plus one local held prompt token and 1/decode_rate first-sample proxy; excludes queue/serialization/unmodeled HTTP jitter; no pauses or post-first-token decode',
-        seconds_model=timing, subtotal_h=sum(timing.values()),
+        seconds_model=timing, subtotal_h=timing['hybrid_turn_h']+timing['local_turn_h']+timing['base_h'],
         down_body_estimate_bytes=down, up_token_json_upper_estimate_bytes=uploads,
         link_probe_both_directions_bytes=6 * 64 * 1024**2,
         planning_traffic_bytes=down + uploads + 6 * 64 * 1024**2,
         limits='Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin.')
+
+
+def qwen_three_arm(link):
+    f=estimate('qwen',link);b=estimate('qwen',link,recurrent_dtype='bf16')
+    return dict(body_bytes=sum(x['down_body_estimate_bytes']+x['up_token_json_upper_estimate_bytes'] for x in (f,b)),
+                hours=f['subtotal_h']+b['seconds_model']['hybrid_turn_h']+b['seconds_model']['hybrid_base_h'])
 
 
 LINKS = [2, 3, 5, 10, 20, 30, 50]
@@ -112,7 +118,7 @@ def threshold(kind, dtype='f32', local=100, decode=18):
 
 def table():
     profiles = [('Qwen f32 PRI31', 'qwen', 'f32', 100, 18),
-                ('Qwen bf16 wire projection', 'qwen', 'bf16', 100, 18)]
+                ('Qwen hybrid-bf16 wire estimate', 'qwen', 'bf16', 100, 18)]
     profiles += [('Glimmer interim '+str(p)+'/'+str(d), 'glimmer', 'f32', p, d)
                  for p, d in ((50, 12), (100, 18), (150, 24))]
     result = []
@@ -125,7 +131,7 @@ def table():
 def markdown(profiles):
     lines = ['# r46b link-rate planning', '',
         'Decimal MB/s. Seed1,40 turns, outage2-4. Base is forced offload by the current pre-staged driver at every positive link rate:100k Qwen,76k Glimmer. It is outside the measured turn window. A non-empty *turn* offload arm has the profile-specific threshold below; including the forced base, every arm is non-empty for any positive link.', '',
-        'Wire is estimated request/delta application bodies, excluding calibration, link probes, HTTP/SSH/TCP overhead/retransmissions and captures. Fixed state occurs only in the last chunk. BF16 changes only projected recurrent tensor bytes; import costs and quality are unmeasured and unchanged in this calculation. Glimmer curves are interim hypothetical sensitivity cases (prefill/decode tok/s), not PRI31 fixtures.', '',
+        'Wire is estimated request/delta application bodies, excluding calibration, link probes, HTTP/SSH/TCP overhead/retransmissions and captures. Fixed state occurs only in the last chunk. The hybrid-bf16 arm is enabled with accepted transport; this planning model changes recurrent tensor bytes only. BF16 import costs and quality remain unmeasured and unchanged in this calculation; the Mac run requires its own bounded fit. Glimmer curves are interim hypothetical sensitivity cases (prefill/decode tok/s), not PRI31 fixtures.', '',
         'TTFT totals include base plus40 turns; turn-only totals are also shown. They model prompt/policy costs, one held local prompt token and1/decode_rate first-sample proxy; queue, node load/save/serialization, readback and other residual costs remain unmodeled. No pauses or remaining output decode are added. RTT0.1406s, eta0.85, prior Qwen import1.498s+0.0000487s/token; Glimmer uses that fit as an explicitly interim portability assumption.', '']
     for profile in profiles:
         lines += ['## '+profile['profile'], '',
@@ -137,6 +143,10 @@ def markdown(profiles):
                 format((row['down_body_estimate_bytes']+row['up_token_json_upper_estimate_bytes'])/1e9, '.3f')+' | '+
                 ' | '.join(format(row[key], '.2f') for key in ('hybrid_total_ttft_s','local_total_ttft_s','hybrid_turn_ttft_s','local_turn_ttft_s'))+' |')
         lines.append('')
+    lines += ['## Qwen three-arm total', '', 'Run order: hybrid, local, hybrid-bf16. Body bytes include both forced bases; one403MB link probe and the shared <=2GB calibration are additional. Hours include generated output, sampled pauses and bases, with25-50% operational allowance still to add. The bf16 row assumes the f32 import fit only for planning.', '', '| MB/s | Total body GB | Three-arm hours before allowance |', '|---:|---:|---:|']
+    for link in LINKS:
+        row=qwen_three_arm(link*1e6)
+        lines.append('| '+str(link)+' | '+format(row['body_bytes']/1e9,'.3f')+' | '+format(row['hours'],'.2f')+' |')
     return '\n'.join(lines).rstrip()+'\n'
 
 

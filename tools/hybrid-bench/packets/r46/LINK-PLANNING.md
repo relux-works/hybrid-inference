@@ -2,7 +2,7 @@
 
 Decimal MB/s. Seed1,40 turns, outage2-4. Base is forced offload by the current pre-staged driver at every positive link rate:100k Qwen,76k Glimmer. It is outside the measured turn window. A non-empty *turn* offload arm has the profile-specific threshold below; including the forced base, every arm is non-empty for any positive link.
 
-Wire is estimated request/delta application bodies, excluding calibration, link probes, HTTP/SSH/TCP overhead/retransmissions and captures. Fixed state occurs only in the last chunk. BF16 changes only projected recurrent tensor bytes; import costs and quality are unmeasured and unchanged in this calculation. Glimmer curves are interim hypothetical sensitivity cases (prefill/decode tok/s), not PRI31 fixtures.
+Wire is estimated request/delta application bodies, excluding calibration, link probes, HTTP/SSH/TCP overhead/retransmissions and captures. Fixed state occurs only in the last chunk. The hybrid-bf16 arm is enabled with accepted transport; this planning model changes recurrent tensor bytes only. BF16 import costs and quality remain unmeasured and unchanged in this calculation; the Mac run requires its own bounded fit. Glimmer curves are interim hypothetical sensitivity cases (prefill/decode tok/s), not PRI31 fixtures.
 
 TTFT totals include base plus40 turns; turn-only totals are also shown. They model prompt/policy costs, one held local prompt token and1/decode_rate first-sample proxy; queue, node load/save/serialization, readback and other residual costs remain unmodeled. No pauses or remaining output decode are added. RTT0.1406s, eta0.85, prior Qwen import1.498s+0.0000487s/token; Glimmer uses that fit as an explicitly interim portability assumption.
 
@@ -20,7 +20,7 @@ First connected turn offload above approximately 10.234848 MB/s (strict policy i
 | 30 | 8 | yes, forced | 5.307 | 365.52 | 950.97 | 159.49 | 253.43 |
 | 50 | 10 | yes, forced | 5.660 | 277.49 | 950.97 | 128.59 | 253.43 |
 
-## Qwen bf16 wire projection
+## Qwen hybrid-bf16 wire estimate
 
 First connected turn offload above approximately 6.867503 MB/s (strict policy inequality; not a measured link).
 
@@ -75,3 +75,17 @@ First connected turn offload above approximately 3.598488 MB/s (strict policy in
 | 20 | 10 | yes, forced | 1.162 | 159.13 | 674.17 | 92.51 | 167.46 |
 | 30 | 10 | yes, forced | 1.162 | 136.39 | 674.17 | 81.20 | 167.46 |
 | 50 | 10 | yes, forced | 1.162 | 118.19 | 674.17 | 72.16 | 167.46 |
+
+## Qwen three-arm total
+
+Run order: hybrid, local, hybrid-bf16. Body bytes include both forced bases; one403MB link probe and the shared <=2GB calibration are additional. Hours include generated output, sampled pauses and bases, with25-50% operational allowance still to add. The bf16 row assumes the f32 import fit only for planning.
+
+| MB/s | Total body GB | Three-arm hours before allowance |
+|---:|---:|---:|
+| 2 | 7.208 | 4.46 |
+| 3 | 7.208 | 4.06 |
+| 5 | 7.208 | 3.75 |
+| 10 | 8.023 | 3.50 |
+| 20 | 9.822 | 3.35 |
+| 30 | 10.104 | 3.30 |
+| 50 | 10.549 | 3.25 |

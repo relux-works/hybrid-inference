@@ -205,7 +205,7 @@ class Proxy:
         self.decode = Node(config["decode_url"], config.get("decode_token", ""), config.get("decode_timeout", 120))
         self.store = Store(database, self.model)
         self.policy = Policy(**config.get("policy", {}))
-        self.traffic_budget = (TrafficBudget(config['traffic_budget_bytes'], config['delta_geometry'])
+        self.traffic_budget = (TrafficBudget(config['traffic_budget_bytes'], config.get('traffic_budget_geometry',config['delta_geometry']))
                                if 'traffic_budget_bytes' in config else None)
         safe_chunk = extend_chunk_limit(**config.get("delta_geometry", {}))
         self.extend_chunk_tokens = config.get("extend_chunk_tokens", safe_chunk)
@@ -935,7 +935,8 @@ class Proxy:
                                          bytes=len(delta), tokens=n1-n0, n0=n0, n1=n1, transfer_id=transfer_id, chunk_id=index):
                             self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
                                                 {"Content-Type": "application/octet-stream",
-                                                 "X-Hybrid-Session": session["remote_id"], "X-Hybrid-State-Dtype": self.state_dtype})
+                                                 "X-Hybrid-Session": session["remote_id"],
+                                                 **({"X-Hybrid-State-Dtype": self.state_dtype} if self.state_dtype != "f32" else {})})
                         chunk["import_ms"] = (time.monotonic() - import_started) * 1000
                         meter["import_ms"] += chunk["import_ms"]
                         actual = self.decode.request("GET", f"/slots/{slot}/info")

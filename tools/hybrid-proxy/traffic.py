@@ -23,6 +23,10 @@ class TrafficBudget:
         if path.endswith('/extend') and isinstance(data, dict) and data.get('return_delta'):
             fixed = data.get('chunk_index', 0) + 1 == data.get('chunk_count', 1)
             state = self.geometry['state_bytes'] + self.geometry.get('window_bytes', 0) if fixed else 0
+            if fixed and data.get('state_dtype')=='bf16':
+                tensors=self.geometry.get('recurrent_tensor_bytes',0)
+                if type(tensors) is int and 0<tensors<=self.geometry['state_bytes']:
+                    state-=tensors//2
             bound = max(bound, (self.geometry['kv_bytes'] + 32) * len(data['tokens']) + state + 1024**2 + 52)
         return bound
 

@@ -280,7 +280,9 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     const int threads = fixture.value("threads", 2);
     require(threads >= 1 && threads <= 8, "invalid checkpoint threads");
     std::map<std::string, checkpoint_observation> observations;
-    hybrid::json result = {{"state_dtype", fixture.value("state_dtype", std::string("f32"))}, {"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
+    const bool bf16_replay = fixture.value("bf16_replay", false);
+    require(!bf16_replay || hybrid::model_layout(model).at("architecture") == "qwen35", "bf16 replay requires Qwen35");
+    hybrid::json result = {{"state_dtype", bf16_replay ? std::string("bf16") : fixture.value("state_dtype", std::string("f32"))}, {"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
         {"raw_logits", {{"dtype", "float32-le"}, {"vocab", vocab}, {"files", hybrid::json::object()}}}};
     auto record = [&](const std::string & name, checkpoint_observation observation) {
         const uint32_t endian = 1;
@@ -351,6 +353,8 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             hybrid::delta_import pending;
             std::vector<llama_token> committed;
             hybrid::json states = hybrid::json::array();
+            bool probe_lossy = false;
+            size_t imports = 0;
             for (const auto & step : probe.at("steps")) {
                 require(!pending_delta || step.contains("delta"), "missing final state probe chunk");
                 if (step.contains("decode")) {
@@ -376,13 +380,23 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
                     require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe delta checksum mismatch");
                     auto wire = read_file(path.c_str());
                     const auto delta = hybrid::read_delta(wire, fixture.at("model_sha256"), n);
+                    const std::string dtype = step.value("reencode_state_dtype", fixture.value("state_dtype", std::string("f32")));
+                    if (step.contains("reencode_state_dtype")) {
+                        require(bf16_replay && name == "BF16_CHAIN" && dtype == "bf16" && delta.header.at("state_dtype") == "f32",
+                                "invalid bf16 common-journal conversion");
+                        auto header = delta.header;
+                        header["state_dtype"] = "bf16";
+                        wire = hybrid::encode_delta(header, delta.state);
+                    }
+                    probe_lossy |= dtype != "f32";
                     const size_t end = delta.header.at("n1");
                     require(end <= tokens.size() && delta.header.at("tokens").get<std::vector<llama_token>>() ==
                             std::vector<llama_token>(tokens.begin() + n, tokens.begin() + end), "state probe delta journal mismatch");
                     if (!pending_delta) { committed.assign(tokens.begin(), tokens.begin() + n); }
                     const bool final = pending.stage(ctx.get(), 0, std::move(wire), fixture.at("model_sha256"),
-                        delta.header.at("session_id"), committed, max_ctx, llama_vocab_n_tokens(llama_model_get_vocab(model)), fixture.value("state_dtype", std::string("f32")));
+                        delta.header.at("session_id"), committed, max_ctx, llama_vocab_n_tokens(llama_model_get_vocab(model)), dtype);
                     if (final) {
+                        ++imports;
                         pending.apply(ctx.get(), 0);
                         pending.clear();
                     }
@@ -441,7 +455,14 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             require(n == tokens.size() && ready, "incomplete state probe journal or final logits");
             record(name, observe(ctx.get(), model, n, k, observations.at("A").teacher));
             result["probes"][name]["roundtrips"] = states;
-            for (const std::string reference : {"A", "B", "H"}) {
+            if (name == "BF16_CHAIN") {
+                require(bf16_replay && probe_lossy && imports > 0, "bf16 replay needs lossy imports");
+                result["probes"][name].update({{"state_dtype", "bf16"}, {"lossy_import", true}, {"state_transport_exact", false},
+                    {"status", "lossy"}, {"exit_code", 5}, {"import_count", imports}});
+            }
+            auto references = std::vector<std::string>{"A", "B", "H"};
+            if (name == "BF16_CHAIN") { references.push_back("L"); }
+            for (const std::string & reference : references) {
                 if (observations.count(reference)) {
                     result["probes"][name][reference] = score_observations(observations.at(reference), observations.at(name), n, k);
                 }
@@ -482,8 +503,9 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             result["status_rule"] = "session_append_replay_exact";
             result["kl_limit"] = nullptr;
         }
-        const bool lossy = fixture.value("state_dtype", std::string("f32")) != "f32";
-        result["state_dtype"] = fixture.value("state_dtype", std::string("f32"));
+        require(!bf16_replay || result.at("probes").contains("BF16_CHAIN"), "bf16 replay probe missing");
+        const bool lossy = bf16_replay || fixture.value("state_dtype", std::string("f32")) != "f32";
+        result["state_dtype"] = bf16_replay ? std::string("bf16") : fixture.value("state_dtype", std::string("f32"));
         result["lossy_import"] = lossy;
         result["logits_exact"] = result.at("exact");
         if (lossy) { result["exact"] = false; }

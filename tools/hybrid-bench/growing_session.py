@@ -491,7 +491,8 @@ def checkpoint(app, client, root, turn, heterogeneous, trace, keep_states=False)
     result = scratch / 'result.json'
     captured = dict(trace, events=app.events.copy())
     source = checkpoint_source(client, saved, captured, turn, app.events.state_dir is not None)
-    source['state_dtype'] = app.state_dtype
+    if app.state_dtype != 'f32':
+        source['state_dtype'] = app.state_dtype
     private_json(fixture, source)
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
@@ -571,7 +572,7 @@ def validate_raw_positions(row, depth):
             left, right = name.split('-')
             pairs[name] = (left, right)
     for name, probe in row.get('probes', {}).items():
-        for reference in ('A', 'B', 'H'):
+        for reference in ('A', 'B', 'H', 'L'):
             if reference in probe:
                 pairs[name + ':' + reference] = (reference, name)
     handles = {}
@@ -726,7 +727,9 @@ def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id)
         catchup_upload_bytes=sum(r['upload_body_bytes'] for r in catchup),
         decode_tokens_per_second=(meter['generated_tokens'] - 1) * 1000 / meter['decode_ms']
             if meter.get('decode_ms') and meter['generated_tokens'] > 1 else None,
-        meter=meter)
+        state_dtype=meter.get('state_dtype','f32'),lossy_import=meter.get('lossy_import',False),
+        requested_state_dtype=meter.get('state_dtype','f32'),
+        negotiated_state_dtype=meter.get('state_dtype','f32') if meter['path']=='offload' else None,meter=meter)
 
 
 def checkpoint_turns(value, turns):
@@ -740,6 +743,27 @@ def checkpoint_turns(value, turns):
     require(selected and selected == sorted(set(selected)) and all(1 <= turn <= turns for turn in selected),
             'invalid checkpoint turns: require increasing unique turns within 1..turns')
     return set(selected)
+
+
+def recurrent_tensor_bytes(layout):
+    require(layout.get('architecture') == 'qwen35', 'bf16 arm requires Qwen35')
+    r=layout['recurrent_layout']; count=sum(layer['recurrent'] for layer in layout['layers'])
+    size=count*4*(r['state']*r['inner']+(r['conv']-1)*(r['inner']+2*r['groups']*r['state']))
+    require(type(size) is int and size > 0 and size % 2 == 0, 'invalid recurrent tensor bytes')
+    return size
+
+
+def bf16_policy(layout, policy):
+    result=dict(policy); saving=recurrent_tensor_bytes(layout)//2
+    require(result['state_bytes'] >= 2*saving, 'policy omits recurrent state bytes')
+    result['state_bytes']-=saving
+    return result
+
+
+def arm_names(checkpoints, include_bf16=False):
+    require(not include_bf16 or not checkpoints, 'bf16 timing arm requires no checkpoints; use common-journal rehearsal')
+    return (['hybrid','local','local_partition'] if checkpoints else
+            ['hybrid','local','hybrid-bf16'] if include_bf16 else ['hybrid','local'])
 
 
 def parser():
@@ -763,6 +787,8 @@ def parser():
     p.add_argument('--max-output', type=int, default=4506)
     p.add_argument('--pause-cap', type=float, default=340, help='zero for CPU smoke; changes the workload')
     p.add_argument('--policy', help='JSON Policy fields from calibration, never per-turn routing overrides')
+    p.add_argument('--include-bf16', action='store_true', help='third Qwen timing arm; native state remains f32')
+    p.add_argument('--bf16-policy', help='bf16 import fit and wire-byte policy, otherwise f32 import costs are a planning assumption')
     p.add_argument('--timing-spans', action='store_true', help='buffer nested monotonic spans; serialize after the stream')
     p.add_argument('--rate-fixture', help='measured PRI-31 step-40 fixture; overrides only local policy rates')
     p.add_argument('--link-label', required=True, help='physical link description, no credentials or addresses')
@@ -776,6 +802,8 @@ def run(args):
     if args.timing_spans:
         timing.start()
     checkpoints = checkpoint_turns(args.checkpoint_turns, args.turns)
+    arms=arm_names(checkpoints,args.include_bf16)
+    require(not args.bf16_policy or args.include_bf16, '--bf16-policy requires --include-bf16')
     require(bool(checkpoints) or not (args.state_probes or args.keep_checkpoint_states),
             'timing-only mode forbids state probes and checkpoint retention')
     require(1 <= args.partition_ubatch <= args.partition_batch <= 4096, 'invalid partition batch/ubatch')
@@ -796,6 +824,9 @@ def run(args):
         require(sha256(Path(client['build_dir']) / 'bin' / binary) == client['binaries'][binary], 'client binary changed: ' + binary)
     require(not root.exists() and root.parent.is_dir(), 'output must be a new directory in an existing parent')
     layout = client['model_layout']
+    require(config.get('state_dtype','f32')=='f32', 'hybrid/local require f32 client configuration; use --include-bf16')
+    if args.include_bf16:
+        recurrent_tensor_bytes(layout)
     rate_fixture = json.loads(Path(args.rate_fixture).read_text()) if args.rate_fixture else None
     if rate_fixture is not None:
         validate_fixture(rate_fixture, client['model_sha256'], layout['architecture'])
@@ -826,13 +857,15 @@ def run(args):
         depth=args.depth, turns=args.turns, workload=[], calls=[], checkpoints=[],
         measurement_mode='fidelity' if checkpoints else 'timing-only',
         capture=dict(enabled=bool(checkpoints), node_snapshots=0, node_deltas=0, checker_runs=0),
-        arms=['hybrid', 'local', 'local_partition'] if checkpoints else ['hybrid', 'local'],
+        arms=arms,
         arm_definitions=dict(hybrid=dict(route='policy', recurrent_transport='f32' if geometry['state_bytes'] else None,
                                         window_transport='q8_0' if geometry.get('window_bytes') else None,
                                         attention_transport='q8_0'),
                              local=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None),
-                             local_partition=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None)),
-        reserved_arms={'hybrid-bf16': dict(available=False, route='policy', recurrent_transport='bf16',
+                             local_partition=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None),
+                             **({'hybrid-bf16':dict(route='policy',recurrent_transport='bf16',attention_transport='q8_0',
+                                                   window_transport=None,lossy=True,protocol_version=2)} if args.include_bf16 else {})),
+        reserved_arms={} if args.include_bf16 else {'hybrid-bf16': dict(available=False, route='policy', recurrent_transport='bf16',
                                          attention_transport='q8_0', window_transport=None,
                                          prerequisite='dev-a r38 protocol capability and independent qualification')},
         instrumentation=dict(version=2, enabled=args.timing_spans, clock='monotonic_ns',
@@ -897,6 +930,9 @@ def run(args):
             try:
                 health = wait_health(bridge_url, '/v1/health', process, timeout=30)
                 require(health['model_sha256'] == client['model_sha256'], 'live node model changed')
+                require(not args.include_bf16 or 'bf16' in health.get('state_dtypes',[]), 'node lacks bf16 capability')
+                trace['transport_capabilities']=dict(node_state_dtypes=health.get('state_dtypes',['f32']),
+                    delta_version=health.get('delta_version'))
                 require(not args.timing_spans or health.get('native_trace_enabled') is True, 'node native trace not enabled')
                 return process
             except BaseException:
@@ -916,6 +952,20 @@ def run(args):
         trace.update(depth=args.depth, depth_plan={k: v for k, v in plan.items() if k != 'sequence'},
                      workload=plan['sequence'], local_partition=dict(batch=args.partition_batch, ubatch=args.partition_ubatch))
         trace['policy'] = app.policy_config
+        original_policy=dict(app.policy_config)
+        compressed_policy=bf16_policy(layout,original_policy) if args.include_bf16 else None
+        if args.bf16_policy:
+            supplied=json.loads(Path(args.bf16_policy).read_text())
+            for key,value in compressed_policy.items():
+                if key not in ('import_fixed','import_per_token'):
+                    require(json.loads(json.dumps(supplied.get(key,value)))==json.loads(json.dumps(value)),
+                            'bf16 policy differs beyond wire bytes/import fit: '+key)
+            compressed_policy.update(supplied)
+        trace['arm_policies']={'hybrid':original_policy,'local':original_policy}
+        if args.include_bf16:
+            trace['arm_policies']['hybrid-bf16']=compressed_policy
+            trace['bf16_policy_source']=(dict(path=args.bf16_policy,sha256=sha256(args.bf16_policy)) if args.bf16_policy else
+                dict(placeholder=True,reason='f32 import costs assumed; Mac payload requires its own bf16 fit'))
         trace['route_preflight'] = route_preflight(Policy(**app.policy_config), plan, args.disconnect_turn, args.disconnect_turns,
                                                  require_mix=bool(checkpoints))
         trace['engine'] = dict(extend_chunk_tokens=app.extend_chunk_tokens, delta_geometry=geometry,
@@ -949,7 +999,8 @@ def run(args):
                 app.phase = dict(arm=arm, turn=step['turn'])
                 body = dict(messages=messages, max_tokens=step['output_tokens'], temperature=0,
                             seed=step['seed'], ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
-                mode = 'offload' if initial and arm == 'hybrid' else 'local' if arm == 'local_partition' else arm
+                mode = ('offload' if initial and arm in ('hybrid','hybrid-bf16') else
+                        'hybrid' if arm=='hybrid-bf16' else 'local' if arm == 'local_partition' else arm)
                 sid, message, meter, first, total = stream_chat(proxy_url, credential, body, mode, sid, args.request_timeout)
                 verify_meter(meter, previous.get(arm, 0), mode)
                 previous[arm] = meter['depth_after']
@@ -971,7 +1022,9 @@ def run(args):
                 trace['calls'].append(row)
                 if arm != 'hybrid':
                     reference = next(r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] == step['turn'])
-                    require(row['journal_hash'] == reference['journal_hash'], 'paired journal hashes differ')
+                    row['paired_journal_equal']=row['journal_hash']==reference['journal_hash']
+                    if arm != 'hybrid-bf16':
+                        require(row['paired_journal_equal'], 'paired journal hashes differ')
                 return sid, messages + [message]
 
             initial = dict(turn=0, output_tokens=1, seed=args.seed)
@@ -989,6 +1042,12 @@ def run(args):
                 for arm in ('hybrid', 'local'):
                     stage_base(arm)
             for arm in trace['arms']:
+                if arm=='hybrid-bf16':
+                    app.state_dtype='bf16'
+                    app.policy=MeasuredPolicy(Policy(**compressed_policy),app.current)
+                    app.link_rate=compressed_policy['link_rate']
+                    if args.start=='pre-staged':
+                        stage_base(arm)
                 if arm == 'local_partition':
                     stop_process(decoder)
                     alternate = dict(client, batch=args.partition_batch, ubatch=args.partition_ubatch)
@@ -1016,22 +1075,22 @@ def run(args):
                     require(previous[arm] + step['input_tokens'] + step['output_tokens'] + plan['framing_tokens'] + DEPTH_MARGIN <=
                             capacity, 'growing context exhausted; no clamping')
                     turn = step['turn']
-                    if arm == 'hybrid' and turn == args.disconnect_turn:
-                        events.add(kind='disconnect', turn=turn, pid=bridge.pid)
+                    if arm in ('hybrid','hybrid-bf16') and turn == args.disconnect_turn:
+                        events.add(kind='disconnect', arm=arm, turn=turn, pid=bridge.pid)
                         stop_process(bridge)
                         bridge = None
                         flush()
-                    if arm == 'hybrid' and args.disconnect_turn and turn == args.disconnect_turn + args.disconnect_turns:
+                    if arm in ('hybrid','hybrid-bf16') and args.disconnect_turn and turn == args.disconnect_turn + args.disconnect_turns:
                         reconnect_events = len(events.copy())
                         started = time.monotonic()
                         bridge = connect()
-                        events.add(kind='reconnect', turn=turn, pid=bridge.pid, seconds=time.monotonic() - started)
+                        events.add(kind='reconnect', arm=arm, turn=turn, pid=bridge.pid, seconds=time.monotonic() - started)
                     time.sleep(step['pause_seconds'])
                     sid, messages = call(arm, sid, messages + [dict(role='user', content=' x' * step['input_tokens'])], step)
                     row = trace['calls'][-1]
                     require(row['new_tokens'] == step['input_tokens'] + plan['framing_tokens'],
                             'actual template growth differs from sampled plan; no clamping')
-                    if arm == 'hybrid' and args.disconnect_turn <= turn < args.disconnect_turn + args.disconnect_turns and args.disconnect_turn:
+                    if arm in ('hybrid','hybrid-bf16') and args.disconnect_turn <= turn < args.disconnect_turn + args.disconnect_turns and args.disconnect_turn:
                         require(row['path'] == 'local', 'offload accepted during disconnection')
                     if reconnect_events is not None and row['path'] == 'offload':
                         recovered = events.copy()[reconnect_events:]
