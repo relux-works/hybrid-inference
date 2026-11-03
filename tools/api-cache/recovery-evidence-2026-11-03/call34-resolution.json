@@ -1,0 +1,32 @@
+{
+    "call_path": "/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15b-261103/full-v3/call-0034.json",
+    "recorded_baseline_usd": "2.1530475775",
+    "baseline_kind": "recorded conservative accounting floor; preceding live usage lagged",
+    "later_known_charges": [],
+    "expected_without_call_usd": "2.1530475775",
+    "samples": [
+        {
+            "at": "2026-11-03T19:20:42.611514+00:00",
+            "usage_usd": "2.153047576",
+            "limit_remaining_usd": "247.846952424"
+        },
+        {
+            "at": "2026-11-03T19:20:43.662614+00:00",
+            "usage_usd": "2.153047576",
+            "limit_remaining_usd": "247.846952424"
+        },
+        {
+            "at": "2026-11-03T19:20:44.703756+00:00",
+            "usage_usd": "2.153047576",
+            "limit_remaining_usd": "247.846952424"
+        }
+    ],
+    "stable_usage": true,
+    "observed_delta_usd": "-1.5E-9",
+    "maximum_usd": "0.420",
+    "reserved_maximum_usd": "0.420048",
+    "resolved": true,
+    "resolved_charge_upper_bound_usd": "0",
+    "rounding_tolerance_usd": "0.00000001",
+    "rule": "owner-approved cumulative-usage delta; no replay, no fabricated generation identity"
+}
