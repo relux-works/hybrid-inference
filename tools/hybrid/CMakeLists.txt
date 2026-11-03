@@ -45,3 +45,6 @@ target_link_libraries(llama-hybrid-check-identity PRIVATE hybrid-state)
 
 add_executable(llama-hybrid-score ../hybrid-bench/score.cpp)
 target_link_libraries(llama-hybrid-score PRIVATE hybrid-state)
+
+add_executable(llama-hybrid-depth ../hybrid-bench/depth.cpp)
+target_link_libraries(llama-hybrid-depth PRIVATE hybrid-state)
