@@ -31,7 +31,109 @@ def write_fixture(root, rows, manifest):
     return root/'rows.jsonl'
 
 
+def timing_fixture():
+    return {'Qwen': {'f32': {'8192': dict(start='2026-11-03T05:52:00Z', end='2026-11-03T07:32:00Z')}}}
+
+
 class EquivalenceTests(unittest.TestCase):
+    def assert_bootstrap_pass_requires_unseen_bound(self, left, right, degenerate):
+        result = score_pair(left, right)
+        self.assertEqual(result['degenerate'], degenerate)
+        self.assertTrue(result['registered_interval_inside_margin'])
+        self.assertFalse(result['equivalent_unadjusted'])
+        self.assertGreater(result['sidecars']['exact_unseen_departures']['interval95'][1], .02)
+        rows, manifest = fixture()
+        for row, a, b in zip(rows, left, right):
+            row['results']['local']['score'] = b
+            row['results']['offload']['score'] = a
+            row['results']['local_partition']['score'] = b
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_fixture(Path(tmp), rows, manifest)
+            family = analyze_family([path], 'fixture', [8192, 32768, 65536, 131072])
+            offload = next(r for r in family['primary'] if r['pair'] == 'offload-local')
+            partition = next(r for r in family['primary'] if r['pair'] == 'local_partition-local')
+            self.assertFalse(offload['equivalent_holm'])
+            self.assertTrue(partition['equivalent_holm'])
+            self.assertIn('not certified; see sidecars', markdown(family))
+        return result
+
+    # Repeat of r7ap F1: subtraction jitter cannot bypass the gate at score_pair or full-family output.
+    def test_jittered_constant_1p5pp_requires_sidecars_end_to_end(self):
+        bases = [.10, .20, .30, .40, .50, .60, .70, .80]
+        right = [bases[i % len(bases)] for i in range(390)]
+        left = [b+.015 for b in right]
+        self.assertGreater(len({a-b for a, b in zip(left, right)}), 1)
+        result = self.assert_bootstrap_pass_requires_unseen_bound(left, right, True)
+        self.assertAlmostEqual(result['difference'], .015)
+        self.assertEqual(result['sidecars']['exact_unseen_departures']['departures'], 0)
+
+    # A real one-pair departure above rounding tolerance cannot certify from a narrow percentile interval.
+    def test_two_value_near_constant_1p5pp_requires_range_sidecar_end_to_end(self):
+        result = self.assert_bootstrap_pass_requires_unseen_bound([.515]*389+[.5151], [.5]*390, False)
+        bound = result['sidecars']['exact_unseen_departures']
+        self.assertEqual((bound['training_pairs'], bound['binomial_trials'], bound['departures']), (2, 388, 1))
+        self.assertLess(bound['conditioning_range'][1], .0151)
+
+    # A genuinely varied +/-1pp bootstrap still passes unadjusted equivalence with its unseen-range bound.
+    def test_genuinely_varied_tight_bootstrap_positive_control(self):
+        result = score_pair([.5+(.01 if i % 2 else -.01) for i in range(390)], [.5]*390)
+        self.assertFalse(result['degenerate'])
+        self.assertTrue(result['equivalent_unadjusted'])
+        self.assertTrue(result['sidecars']['exact_unseen_departures']['equivalent_unadjusted'])
+        self.assertLess(result['claim_p'], .025)
+
+    def assert_timing_cli(self, payload, message=None):
+        rows, manifest = fixture()
+        manifest['clients']['client']['model_sha256'] = FAMILY_MODELS['Qwen']
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = write_fixture(root, rows, manifest)
+            times = root/'times.json'
+            times.write_text(json.dumps(payload))
+            output = root/'output'
+            proc = subprocess.run([sys.executable, str(Path(__file__).with_name('ruler_equivalence.py')),
+                                   str(path), '--family', 'Qwen', '--run-times', str(times), '--output', str(output)],
+                                  capture_output=True, text=True)
+            if message is not None:
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertTrue(proc.stderr.startswith('REFUSED:'), proc.stderr)
+                self.assertIn(message, proc.stderr)
+                self.assertNotIn('Traceback', proc.stderr)
+                self.assertFalse(output.exists())
+            else:
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                result = json.loads((output/'equivalence.json').read_text())
+                self.assertTrue(all(r['registration_timing']['timing'] == 'before' for r in result['primary']))
+
+    # A list root is rejected before any output directory is created.
+    def test_run_times_list_root_cli_refuses(self):
+        self.assert_timing_cli(['not', 'a', 'dict'], 'run-times root must be an object')
+
+    # A non-object family fails as invalid input, without AttributeError or partial output.
+    def test_run_times_non_dict_family_cli_refuses(self):
+        self.assert_timing_cli({'Qwen': 5}, 'run-times family Qwen must be an object')
+
+    # Nested mode/depth objects are required even when other map levels have valid shapes.
+    def test_run_times_non_dict_mode_or_depth_cli_refuses(self):
+        self.assert_timing_cli({'Qwen': {'f32': 5}}, 'run-times mode Qwen/f32 must be an object')
+        self.assert_timing_cli({'Qwen': {'f32': {'8192': []}}}, 'run-times depth Qwen/f32/8192 must be an object')
+
+    # A non-string start is rejected explicitly rather than passed to datetime parsing.
+    def test_run_times_non_string_start_cli_refuses(self):
+        payload = timing_fixture()
+        payload['Qwen']['f32']['8192']['start'] = 5
+        self.assert_timing_cli(payload, 'run-times start Qwen/f32/8192 must be a string')
+
+    # A non-string end gets the same clean refusal as a non-string start.
+    def test_run_times_non_string_end_cli_refuses(self):
+        payload = timing_fixture()
+        payload['Qwen']['f32']['8192']['end'] = None
+        self.assert_timing_cli(payload, 'run-times end Qwen/f32/8192 must be a string')
+
+    # A fully valid timing map reaches analysis and writes outputs under the same CLI path as the negatives.
+    def test_run_times_valid_map_cli_positive_control(self):
+        self.assert_timing_cli(timing_fixture())
+
     # Newcombe (1998), Table III, pp. 2641-2642: e=both+, f=left+, g=right+, h=both-.
     # https://www.site.uottawa.ca/~nat/Courses/csi5388/Newcombe.1998.pdf
     # Values are published to four decimals; these include positive, negative and undefined phi.

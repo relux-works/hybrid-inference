@@ -12,12 +12,13 @@ from statistics import NormalDist
 import sys
 
 from hybrid_eval import Refusal, digest, require
-from ruler_analysis import ARMS, analyze as analyze_text, paired_cells, wilson
+from ruler_analysis import ARMS, analyze as analyze_text, paired_cells, upper_exact, wilson
 
 SEED = 261102
 RESAMPLES = 10000
 MARGIN = .02
 ALPHA = .025
+DISPERSION_TOL = 32*math.ulp(1.0)
 TASKS = tuple(f'niah_{kind}_{i}' for kind in ('single', 'multikey') for i in range(1, 4)) + (
     'niah_multivalue', 'niah_multiquery', 'vt', 'cwe', 'fwe', 'qa_1', 'qa_2')
 PAIRS = (('offload', 'local'), ('local_partition', 'local'), ('bf16', 'local'), ('bf16', 'offload'))
@@ -37,10 +38,24 @@ RUN_TIMES = {
 }
 
 
+def validate_run_times(run_times):
+    require(isinstance(run_times, dict), 'run-times root must be an object')
+    for family, modes in run_times.items():
+        require(isinstance(modes, dict), f'run-times family {family} must be an object')
+        for mode, depths in modes.items():
+            require(isinstance(depths, dict), f'run-times mode {family}/{mode} must be an object')
+            for depth, times in depths.items():
+                path = f'{family}/{mode}/{depth}'
+                require(isinstance(times, dict), f'run-times depth {path} must be an object')
+                for field in ('start', 'end'):
+                    require(isinstance(times.get(field), str), f'run-times {field} {path} must be a string')
+
+
 def registration_info(family, depth, arm='offload', run_times=None):
     mode = 'bf16' if arm == 'bf16' else 'f32'
     times = RUN_TIMES.get(family, {}).get(mode, {}).get(str(depth))
     if run_times is not None:
+        validate_run_times(run_times)
         times = run_times.get(family, {}).get(mode, {}).get(str(depth), times)
     scope = 'named in registration' if family == 'Qwen' else 'not named in registration; rules applied by extension'
     if times is None:
@@ -110,6 +125,24 @@ def invert_tost(interval, margin=MARGIN):
     return high
 
 
+def unseen_range_sidecar(differences):
+    training = min(2, len(differences))
+    # Freeze support from training pairs; only held-out pairs count toward the mass bound.
+    lower = max(-1., min(differences[:training])-DISPERSION_TOL)
+    upper = min(1., max(differences[:training])+DISPERSION_TOL)
+    held_out = differences[training:]
+    outside = sum(not lower <= d <= upper for d in held_out)
+    n = len(held_out)
+    def interval(tail):
+        unseen = (upper_exact(outside, n, alpha=tail) if outside else
+                  -math.expm1(math.log(tail)/n)) if n else 1.
+        return [lower*(1-unseen)-unseen, upper*(1-unseen)+unseen]
+    return dict(label='exact unseen range departures sidecar', estimand='mean raw score difference',
+                training_pairs=training, conditioning_range=[lower, upper], departures=outside,
+                n=len(differences), binomial_trials=n, interval95=interval(ALPHA),
+                tost_p=invert_tost(interval), equivalent_unadjusted=inside(interval(ALPHA)))
+
+
 def degenerate_sidecars(left, right, difference):
     n = len(left)
     # Zero discordance is fixed in advance; a nonzero atom is fixed by the first pair.
@@ -121,7 +154,7 @@ def degenerate_sidecars(left, right, difference):
     cells = paired_cells([x == 1 for x in left], [x == 1 for x in right])
     counts = [cells[k] for k in ('both_true', 'left_only', 'right_only', 'both_false')]
     binary = lambda tail: newcombe10(*counts, tail=tail)
-    return dict(
+    sidecars = dict(
         exact_unseen_departures=dict(
             label='exact unseen discordance sidecar' if difference == 0 else 'exact unseen departures sidecar',
             estimand='mean raw score difference', observed_constant=difference, departures=0, n=n, binomial_trials=trials,
@@ -130,6 +163,10 @@ def degenerate_sidecars(left, right, difference):
             estimand='fully-correct rate difference', cells=cells,
             difference=(cells['left_only']-cells['right_only'])/n,
             interval95=binary(ALPHA), tost_p=invert_tost(binary), equivalent_unadjusted=inside(binary(ALPHA))))
+    differences = [a-b for a, b in zip(left, right)]
+    if max(differences)-min(differences) > 0:
+        sidecars['exact_unseen_departures'] = unseen_range_sidecar(differences)
+    return sidecars
 
 
 def score_pair(left, right):
@@ -155,14 +192,16 @@ def score_pair(left, right):
     result.update(interval95=ci, tost_p=max(inverted, 1/RESAMPLES) if limited else inverted,
                   tost_p_inverted=inverted, tost_p_resolution_limited=limited,
                   registered_interval_inside_margin=inside(ci))
-    degenerate = result['method'] == 'paired_percentile_bootstrap' and len(set(differences)) == 1
+    degenerate = result['method'] == 'paired_percentile_bootstrap' and max(differences)-min(differences) <= DISPERSION_TOL
     result.update(degenerate=degenerate, equivalent_unadjusted=inside(ci), claim_p=result['tost_p'],
                   claim_basis='registered primary interval')
-    if degenerate:
-        sidecars = degenerate_sidecars(left, right, differences[0])
+    if degenerate or (result['method'] == 'paired_percentile_bootstrap' and inside(ci)):
+        sidecars = degenerate_sidecars(left, right, result['difference'])
         result.update(sidecars=sidecars, claim_basis='both post-review sidecars; degenerate primary cannot certify',
                       equivalent_unadjusted=all(s['equivalent_unadjusted'] for s in sidecars.values()),
                       claim_p=max(s['tost_p'] for s in sidecars.values()))
+        if not degenerate:
+            result['claim_basis'] = 'both post-review sidecars; bootstrap pass requires unseen-range bound'
     if result['method'] == 'paired_percentile_bootstrap':
         near = not degenerate and min(abs(x-bound) for x in ci for bound in (-MARGIN, MARGIN)) <= .001
         result.update(monte_carlo_near_margin=near,
@@ -328,13 +367,19 @@ def markdown(result):
              '|---:|---|---:|---|---|---:|---:|---|---|']
     for r in result['primary']:
         ci = ', '.join(f'{100*x:+.4f}' for x in r['interval95'])
-        verdict = 'not certified; see sidecars' if r['degenerate'] else f"{r['equivalent_unadjusted']} / {r['equivalent_holm']}; {r['decision_stability']}"
+        verdict = 'not certified; see sidecars' if 'sidecars' in r else f"{r['equivalent_unadjusted']} / {r['equivalent_holm']}; {r['decision_stability']}"
         method = r['method'] + (' (DEGENERATE; not claim evidence)' if r['degenerate'] else '')
+        if not r['degenerate'] and 'sidecars' in r:
+            method += ' (unseen-range guard)'
         lines.append(f"| {r['depth']} | {r['pair']} | {100*r['difference']:+.4f} | [{ci}] | {method} | {r['tost_p']:.6g} | {r['holm_p']:.6g} | {verdict} | {r['registration']} |")
-    degenerate = [r for r in result['primary'] if r['degenerate']]
+    degenerate = [r for r in result['primary'] if 'sidecars' in r]
     if degenerate:
-        lines += ['', '## Sidecars for degenerate sets (post-review supplement)', '',
-                  'Claims require both sidecars. Supplementary claim Holm uses max(sidecar p) at a degenerate depth and the registered p otherwise; registered primary numbers above are unchanged.', '',
+        heading = '## Sidecars for degenerate sets (post-review supplement)'
+        rule = 'Claims require both sidecars. Supplementary claim Holm uses max(sidecar p) at a degenerate depth and the registered p otherwise; registered primary numbers above are unchanged.'
+        if any(not r['degenerate'] for r in degenerate):
+            heading = '## Sidecars for degenerate sets and bootstrap passes (post-review supplement)'
+            rule = 'Claims require both sidecars. Supplementary claim Holm uses max(sidecar p) where sidecars apply; registered primary numbers above are unchanged.'
+        lines += ['', heading, '', rule, '',
                   '| Depth | Pair | Sidecar / estimand | 95% interval (pp) | TOST p | Combined claim Holm p (upper bound) | Equivalent from both sidecars |',
                   '|---:|---|---|---|---:|---:|---|']
         for r in degenerate:
@@ -366,6 +411,8 @@ def main():
     args = parser.parse_args()
     try:
         run_times = json.loads(args.run_times.read_text()) if args.run_times else None
+        if args.run_times:
+            validate_run_times(run_times)
         result = analyze_family(args.rows, args.family, args.depths, run_times)
     except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
         print('REFUSED: '+str(error), file=sys.stderr)

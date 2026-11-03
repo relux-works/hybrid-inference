@@ -1,6 +1,6 @@
 {
   "alpha_per_side": 0.025,
-  "analysis_sha256": "34201c392892eb1a1d84b043e67baf152183e9e0536986be31ba012a4a272e0b",
+  "analysis_sha256": "73a7e0579c7407c313e5491b34eef63a7218708aef8345420d49084bde5f5ed6",
   "degenerate_policy": "retain primary numbers; claims require both post-review sidecars; max sidecar p enters supplementary claim Holm",
   "depths": [
     8192,

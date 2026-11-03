@@ -1,6 +1,6 @@
-# RULER equivalence: review rework hybrid-d-r16b-261103
+# RULER equivalence: review rework hybrid-d-r16c-261103
 
-Analysis on agents1, 2026-11-03; rework of signed head `422813a69` after Muse r7ap CHANGES REQUESTED. Base and contract: `m3-ruler-prereg` at `7556f46165b01216ff1028c381845c8e79c65955`, [preregistration](RULER-EQUIVALENCE-PREREGISTRATION.md). This is a local analysis on the private prototype fork, with no publication or GPU execution. RC4 data cut-off: 2026-11-05 12:00Z.
+Analysis on agents1, 2026-11-03; narrow rework of signed head `aafcceec1` after Muse r7ap2 CHANGES REQUESTED. The six committed primary rows and Qwen 8k sidecar sentence remain unchanged. Base and contract: `m3-ruler-prereg` at `7556f46165b01216ff1028c381845c8e79c65955`, [preregistration](RULER-EQUIVALENCE-PREREGISTRATION.md). This is a local analysis on the private prototype fork, with no publication or GPU execution. RC4 data cut-off: 2026-11-05 12:00Z.
 
 ## Analysis rule and review disposition
 
@@ -17,7 +17,19 @@ A point-mass bootstrap interval cannot certify equivalence. Qwen 8k has 377 full
 
 The Qwen 8k equivalence statement is supported by both sidecars with roughly 1 pp half-widths, not by [0,0]. The automatic rule requires both sidecar intervals inside the margin and uses their maximum p for a supplementary four-depth claim Holm calculation; other depths use their registered p. At Qwen 8k the supplementary Holm upper bound is 0.00955312 for both pairs. This conservative supplementary decision is distinct from the unchanged registered primary Holm arithmetic. JSON flags `equivalent_unadjusted` and `equivalent_holm` refer to this explicit `claim_basis`, with `claim_p` and `claim_holm_p`; `registered_interval_inside_margin` records only geometric containment, never a claim from a point mass.
 
-The same rule applies automatically to every future constant-difference partial-credit bootstrap set, including bf16, and refuses the n=3 zero-difference claim. For a constant nonzero difference c, the first pair fixes that observed value, and the remaining n-1 pairs bound unseen departures without selecting the value on those same trials; at n=1 the bound is [-1,1]. With unseen mass bounded by u the raw-mean sidecar is `[c-(1+c)*u, c+(1-c)*u]`. A shifted partial-credit fixture cannot pass merely because binarisation discards its shift. Binary-score sets retain their ordinary nondegenerate Newcombe primary.
+The same sidecar rule applies to future constant-difference partial-credit sets, including bf16, and rejects the n=3 zero-difference claim. For an exactly represented constant nonzero difference c, the first pair fixes c and the remaining n-1 pairs bound unseen departures; at n=1 the bound is [-1,1]. With unseen mass bounded by u the raw-mean sidecar remains `[c-(1+c)*u, c+(1-c)*u]`. Binary-score sets retain their ordinary Newcombe primary.
+
+### r16c / repeat of r7ap F1: dispersion and unseen-range guard
+
+Exact float identity is no longer the degeneracy predicate. On the fixed [0,1] score scale, bootstrap differences with spread `max(D)-min(D) <= 32*ulp(1.0)` are marked degenerate. This tolerance is approximately 7.1054e-15 score units (7.1054e-13 pp), comfortably above the roughly 1e-17 subtraction jitter in the review witness and negligible relative to the 0.02 margin. It changes classification only: scores and the mean paired estimate are never rounded or replaced. Widening the conditioning range by this tolerance is conservative. The original exactly constant Qwen 8k sidecars remain byte-identical.
+
+A tolerance alone would move the bypass to a slightly larger spread. Therefore every other raw-passing partial-credit bootstrap also requires the raw-score unseen-range sidecar and the existing score==1 sidecar before it can certify. For nonzero spread, the first two paired differences freeze an envelope `[lo,hi]`, expanded by 32 ulps and clipped to [-1,1]. Only the remaining n-2 pairs count toward a two-sided 95% Clopper-Pearson upper bound u on mass outside that fixed envelope. The score-mean bound is `[(1-u)*lo-u, (1-u)*hi+u]`; at zero held-out pairs, u=1 and the bound is [-1,1]. This uses held-out departures, not a zero count against a range selected on all observations. Its p is obtained by the same central-interval inversion; supplementary claim Holm remains unchanged in construction.
+
+Both review witnesses now reject through `score_pair`, `analyze_family` and generated Markdown: mathematically constant +1.5 pp differences with subtraction jitter, and 389 differences of +1.5000 pp plus one of +1.5100 pp. The raw bootstrap intervals are retained, but cannot certify without the sidecars. The Qwen-8k-shaped positive and binary controls still pass; genuinely varied +/-1 pp differences also pass unadjusted equivalence with a nonzero unseen-range interval. This extra conservative guard may withhold a future bootstrap claim; it does not claim that every small unit fixture or every true equivalent distribution has sufficient power after Holm.
+
+### r16c F2: timing-map refusals
+
+`--run-times` validates the entire map before analysis: root, family, mode and depth entries must be objects, and start/end must be strings. Invalid shapes produce a specific `REFUSED:` message, exit 2 and no output directory, rather than an AttributeError traceback. Named CLI negatives cover a list root, non-dict family/mode/depth, and non-string start/end, alongside a valid-map positive control. The same validation protects direct `registration_info` calls. Existing date and timezone validation remains in place.
 
 ### R2: actual collection timing and registration scope
 
@@ -42,7 +54,7 @@ The registration specifies the score estimand, 95% intervals, Newcombe method 10
 | P construction and finite resolution | Invert central intervals at coverage `1-2*alpha`; max one-sided p, no doubling; bracket 1e-15; conservative bootstrap floor 1/10000; p=1 if no alpha<=0.5 certifies containment | r16 implementation |
 | Holm families | Separate per model and arm pair, without cross-family error control | r16 before calculation |
 | Pending entry | p=1 upper bounds, with the stability interpretation above | r16 entry; r16b clarifies wording |
-| Degenerate-case sidecars | Keep registered results; add exact raw-score bound and score==1 Newcombe; both required, max sidecar p enters supplementary claim Holm | r16b, post-review and post-observation |
+| Degenerate-case sidecars | Keep registered results; add exact raw-score bound and score==1 Newcombe; both required, max sidecar p enters supplementary claim Holm | r16b; r16c replaces float equality and extends the raw-pass range guard after re-review |
 | Near-margin diagnostics | If a nondegenerate bootstrap endpoint is within 0.1 pp of either margin, report five seeds 261100-261104 without changing the registered seed or decision | r16b, post-review |
 
 For N2, an inverted percentile-bootstrap p is approximate, a construction for Holm rather than an exact registered test. P-values just above 1/10000 are still coarse even without a resolution flag. The registered criterion remains strict interval containment; the R1 sidecar claim is explicitly supplemental. Current Glimmer endpoints are over 0.6 pp from +2, so the new near-margin trigger is false for this cut; a named CPU test exercises its five-seed diagnostics on a near-margin fixture. No cross-Python-version stability is claimed; JSON records the actual Python version.
@@ -145,31 +157,29 @@ Text equivalence is not established for any of these depths. The nonsignificant 
 
 ## Validation and review coverage
 
-CPU only, `PYTHONDONTWRITEBYTECODE=1`, disk-backed `.temp/hybrid-d-r16b-261103/tmp`. No installs, model/data downloads, GPU activity or supervisor/output access. The r16b extract command stops below 28.2 GB free; extracts stay under 6 MB and are removed at the end.
+CPU only, `PYTHONDONTWRITEBYTECODE=1`, disk-backed `.temp/hybrid-d-r16c-261103/tmp`; no downloads, GPU activity or supervisor/output access. Small extracts are removed after regeneration. All 26 prior test names and their positive controls remain, with nine new tests for the two statistical witnesses, the varied positive control, and timing-map CLI shapes.
 
-| Check | Count / real exit | Evidence under `.temp/hybrid-d-r16b-261103/` |
+| Check | Count / real exit | Evidence under `.temp/hybrid-d-r16c-261103/` |
 |---|---|---|
-| Updated equivalence suite, all original test names retained | 26 tests / 0 | `regeneration-02.log` (final source; `unit-02.log` also green) |
+| Updated equivalence suite | 35 tests / 0 | `regeneration-01.log` |
 | Existing evaluator suite | 11 tests / 0 | `evaluator-regression-01.log` |
 | Existing paired analysis and archive tests | 2 tests / 0 | `secondary-regression-01.log` |
-| Byte-for-byte report/JSON regeneration, archive/member hashes and both CLI analyses | 0 | `regeneration-03.log`, `reproduction-01.log` |
-| Registered primary numerical fields vs reviewed head; every secondary/descriptive table unchanged; sidecar golden values and timing | 0 | `result-comparison-01.log` |
-| Real CSV and JSONL input endpoints agree | 0 | `csv-comparison-01.log` |
+| Report regeneration and verified archive/member hashes | 0 | `regeneration-01.log` |
+| All generated tables and every result field unchanged vs reviewed head | 0 | `table-comparison-01.log` |
 | Syntax, scoped style and diff checks | 0 | `syntax-style-01.log`, `diff-check-01.log` |
 
-Total: 39 CPU tests green. Regression names from r16 are preserved, including `test_identical_partial_pairs_and_bootstrap_resolution`, whose n=3 equivalence assertion now correctly rejects. This is rework within `tools/hybrid-eval/` only. No requested analysis rows were excluded as out of contract. The referenced review's surface rows map to these bounded controls; this is not a claim of exhaustive attack-surface coverage.
+Total: 48 CPU tests green. Five new witness tests first ran against the unchanged producer and exited 1 with five intended failures: both statistical shapes and the three required malformed CLI shapes (`regressions-before-01.log`). No crash was credited as a successful negative. The final CLI negatives assert the intended exit 2, clear message, absence of traceback and absence of partial outputs.
 
-| Review surface | Named test / evidence | Narrowing mutant and real test exit |
-|---|---|---|
-| 1a Mixed-set interval rule | `test_mixed_scores_use_whole_set_bootstrap` | Force binary branch / 1 |
-| 1b Family/run registration timing | `test_glimmer32_registration_uses_run_times_not_depth` | Restore depth-only before label / 1 |
-| 2 Degenerate claim evidence | `test_identical_partial_pairs_and_bootstrap_resolution` | Skip sidecar gate / 1 |
-| 3 Holm ordering / bounds | `test_holm_ordering_and_pending_depth`, `test_pending_holm_upper_bounds_do_not_reverse_observed_decisions` | Ignore Holm order / 1 |
-| 4 Mean and independent numerical reproduction | `test_shifted_fixture_not_equivalent_positive_control`, result comparison | Replace reported mean by zero / 1 |
-| 5 Newcombe / bootstrap / inversion | `test_newcombe10_published_reference_cells`, deterministic bootstrap and normal inversion tests | Omit positive phi correction / 1 |
-| 6 Named negatives | `test_interval_crossing_margin_is_not_equivalent`, `test_changed_seed_refuses`, `test_nonsignificant_mcnemar_never_implies_equivalence` | Accept every interval; skip row seed check; force raw equivalence / 1 each |
+The registered primary and Qwen 8k sidecar tables are byte-identical to `aafcceec1`, as is the complete generated-table block in this report. Both regenerated JSON snapshots are byte-identical after substituting only `analysis_sha256`, which must truthfully track the changed tool source. No score, interval, p-value, claim, timing label or other result field changes. Extracts are deleted. Independent review r7ap2 verified the prior numbers; this candidate awaits re-review.
 
-The initial control driver exited 1 before applying the new sidecar mutant because its replacement matched two sites; it was narrowed to the score gate and rerun. That setup failure is not credited as a killed mutant. All nine mutants were confined to `.temp/`, each named test exited 1 with the intended assertion failure, and the control driver exited 0 only after verifying those failures; no survivors. Evidence: `plant-controls-03.log` and per-mutant logs. The raw primary numbers and unchanged secondary implementation are also independently verified by Muse r7ap for the prior head; this candidate awaits re-review. Native C++ build, hosted CI, `ty` and `editorconfig-checker` were not run: native code is unchanged and the latter tools are unavailable under the no-download rule. Syntax/style checks cover the changed Python files. Scope/progress remain in `.temp/tasks.md` because no native task-board exists in this workbench. No push or landing is claimed.
+| Narrowing mutant | Property narrowed | Named failing test | Real test exit |
+|---|---|---|---:|
+| Restore exact-equality gate | Representation-jitter sets must be classified degenerate | `test_jittered_constant_1p5pp_requires_sidecars_end_to_end` | 1 |
+| Omit nondegenerate bootstrap range guard | A genuine one-pair departure cannot certify from percentile width alone | `test_two_value_near_constant_1p5pp_requires_range_sidecar_end_to_end` | 1 |
+
+The original nine bounded controls were also rerun: positive phi correction, margin containment, row seed check, Holm ordering, mixed-set branch, sidecar gate, family/depth timing, reported mean, and raw-equivalence flag. Each fails its original named test with exit 1. All eleven mutants are killed; no survivors. Driver exit 0 requires an intended assertion failure, not an import error or crash. Evidence: `plant-controls-02.log` and per-mutant logs. The first exact-equality mutant narrows the dispersion classification; the separate range guard independently protects raw-passing bootstrap claims. This is finite coverage of the two review findings, not exhaustive distributional or input coverage.
+
+Changes remain within `tools/hybrid-eval/`; no requested measurement is excluded. Native code and the secondary analyser are unchanged. No native build, remote CI, unavailable type/style tools, push or landing is claimed. Scope/progress remain in `.temp/tasks.md`; no native task-board exists in this workbench. Previous non-blocking library-family/import limitations remain as stated above.
 
 ## Regeneration
 
@@ -177,7 +187,7 @@ Run from the repository root. The original archives stay in place. This verifies
 
 ```sh
 export PYTHONDONTWRITEBYTECODE=1
-export TMPDIR="$PWD/.temp/hybrid-d-r16b-261103/tmp"
+export TMPDIR="$PWD/.temp/hybrid-d-r16c-261103/tmp"
 mkdir -p "$TMPDIR"
 python3 - <<'PY_EXTRACT'
 import hashlib
@@ -186,7 +196,7 @@ import shutil
 import tarfile
 
 source = Path('/home/agent/lanes/hybrid/.temp/ruler-results-261103')
-work = Path('.temp/hybrid-d-r16b-261103')
+work = Path('.temp/hybrid-d-r16c-261103')
 archives = [
     ('qwen-8192', 'depth-8192-complete.tar.gz', '2be3eae64b783867258a1f22e1c7bbdb4188f257c378f17c07554a8868248aa4'),
     ('qwen-32768', 'depth-32768-complete.tar.gz', 'a6fb1e7e6ac0fb7d25ed3ed24ef1f47cdf4f6495b54a4866d6486870bfeef176'),
@@ -210,13 +220,13 @@ for label, name, expected in archives:
             (folder/member).write_bytes(archive.extractfile(member).read())
 PY_EXTRACT
 python3 tools/hybrid-eval/ruler_equivalence.py \
-    .temp/hybrid-d-r16b-261103/extracted/qwen-8192/rows.jsonl \
-    .temp/hybrid-d-r16b-261103/extracted/qwen-32768/rows.jsonl \
-    --family Qwen --output .temp/hybrid-d-r16b-261103/qwen
+    .temp/hybrid-d-r16c-261103/extracted/qwen-8192/rows.jsonl \
+    .temp/hybrid-d-r16c-261103/extracted/qwen-32768/rows.jsonl \
+    --family Qwen --output .temp/hybrid-d-r16c-261103/qwen
 python3 tools/hybrid-eval/ruler_equivalence.py \
-    .temp/hybrid-d-r16b-261103/extracted/glimmer-8192/rows.jsonl \
+    .temp/hybrid-d-r16c-261103/extracted/glimmer-8192/rows.jsonl \
     --family Glimmer --depths 8192 32768 65536 122880 \
-    --output .temp/hybrid-d-r16b-261103/glimmer
+    --output .temp/hybrid-d-r16c-261103/glimmer
 python3 -m unittest discover -s tools/hybrid-eval -p test_ruler_equivalence.py -v
 PYTHONPATH=tools/hybrid-eval python3 -m unittest \
     test_ruler.RulerTests.test_known_paired_table_and_intervals \
@@ -226,7 +236,7 @@ python3 - <<'PY_REPORT'
 from pathlib import Path
 import shutil
 
-work = Path('.temp/hybrid-d-r16b-261103')
+work = Path('.temp/hybrid-d-r16c-261103')
 root = Path('tools/hybrid-eval')
 report = root/'RULER-EQUIVALENCE-RESULTS.md'
 begin = '<!-- BEGIN GENERATED TABLES -->'
