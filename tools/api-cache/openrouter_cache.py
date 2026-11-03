@@ -417,6 +417,7 @@ def run(args):
                        max_cost_usd=float(estimate),live_spend_before_usd=float(spent),accepted=False)
             write_json(out/('intent-%04d.json'%sequence),row,client.secret)
             result = stream_call(client,payload,endpoint)
+            response_end = time.monotonic()
             row.update(result)
             row['ended_at'] = utc()
             if row.get('cost_usd') is not None:
@@ -448,7 +449,7 @@ def run(args):
                     raise Refusal('call failed or unverifiable; no further spending')
             if index+1 < count:
                 pause = 0 if args.smoke else PAUSES[index+1]
-                heapq.heappush(queue,(time.monotonic()+pause,number,index+1,time.monotonic()))
+                heapq.heappush(queue,(response_end+pause,number,index+1,response_end))
         status,reason = 'done','all scheduled attempts recorded'
     except Exception as error:
         reason = redact(str(error),client.secret)

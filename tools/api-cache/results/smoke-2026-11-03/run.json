@@ -1,0 +1,47 @@
+{
+  "started": "2026-11-03T14:08:38.485152+00:00",
+  "pid": 2897967,
+  "smoke": true,
+  "snapshot_sha256": "7c154c4097bdfd9270f57dc8f858ea51ac14eccb3695603ec1cb925ba750ca0c",
+  "script_sha256": "2608539ff0ffae073f4639a4ff5ba8d42a9805769b3a7fad822465401709f882",
+  "initial_key_usage": 0.0,
+  "cap_usd": 0.5,
+  "sessions": 1,
+  "excluded": [
+    {
+      "model": "qwen/qwen3.8-27b",
+      "endpoint": "PrimeIntellect | qwen/qwen3.8-27b-20260814",
+      "reasons": [
+        "context below 262144"
+      ]
+    },
+    {
+      "model": "qwen/qwen3.8-27b",
+      "endpoint": "Mancer 2 | qwen/qwen3.8-27b-20260814",
+      "reasons": [
+        "cache read price not declared"
+      ]
+    },
+    {
+      "model": "qwen/qwen3.8-27b",
+      "endpoint": "Venice | qwen/qwen3.8-27b-20260814",
+      "reasons": [
+        "cache read price not declared"
+      ]
+    },
+    {
+      "model": "qwen/qwen3.8-27b",
+      "endpoint": "Cerebras | qwen/qwen3.8-27b-20260814",
+      "reasons": [
+        "context below 262144"
+      ]
+    },
+    {
+      "model": "z-ai/glm-5.3-flash",
+      "endpoint": "Darkbloom | z-ai/glm-5.3-flash-20260826",
+      "reasons": [
+        "context below 1000000"
+      ]
+    }
+  ]
+}

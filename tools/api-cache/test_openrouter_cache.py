@@ -233,5 +233,25 @@ class CacheTests(unittest.TestCase):
         self.assertIn('budget',terminal['reason'])
 
 
+    # Injected bookkeeping time must count toward the observed gap since the previous response.
+    def test_pause_includes_post_response_bookkeeping_regression(self):
+        args=argparse.Namespace(output=self.path/'pauses',snapshot=cache.SNAPSHOT,smoke=True,key_path=self.key)
+        Handler.dynamic=True
+        Handler.live_spend=0
+        clock=[0]
+        original_get=self.client.get
+        def get_with_bookkeeping(path):
+            result=original_get(path)
+            if Handler.calls:
+                clock[0]+=100
+            return result
+        with mock.patch.object(cache,'Client',return_value=self.client), \
+             mock.patch.object(self.client,'get',side_effect=get_with_bookkeeping), \
+             mock.patch.object(cache.time,'monotonic',side_effect=lambda:clock[0]):
+            self.assertEqual(cache.run(args),0)
+        row=json.loads((args.output/'call-0001.json').read_text())
+        self.assertEqual(row['pause_actual_seconds'],400)
+
+
 if __name__=='__main__':
     unittest.main()

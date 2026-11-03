@@ -1,0 +1,14 @@
+[
+    {
+        "call_index": 1,
+        "recorded_gap_seconds": 0.19668590789660811,
+        "corrected_gap_seconds": 0.956684,
+        "basis": "UTC request-start minus previous response-return; original records retained"
+    },
+    {
+        "call_index": 2,
+        "recorded_gap_seconds": 0.19039606396108866,
+        "corrected_gap_seconds": 0.238897,
+        "basis": "UTC request-start minus previous response-return; original records retained"
+    }
+]
