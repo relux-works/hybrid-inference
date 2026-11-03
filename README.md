@@ -133,7 +133,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 #### Tools
 
-- GPU operator stages: `python3 tools/hybrid-eval/stage_ruler_bf16.py --help` and `python3 tools/hybrid-bench/stage_kl_bf16.py --help`. See the [RULER stage/restore runbook](tools/hybrid-eval/RULER-BF16-RUNBOOK.md) and [fresh KL stage/provenance constraints](tools/hybrid-bench/STATE-BF16-RUNBOOK.md). Outputs stay under the explicit `--stage`/`--root`; CPU contract tests use `python3 -m unittest discover -s tools/hybrid-eval -p test_gpu_stages.py`, with logs under `.temp/`. Native legacy admission controls: `python3 tools/hybrid/test_legacy_dtype.py --build-dir BUILD --model MODEL.gguf --artifacts .temp/legacy-dtype`; use only the existing local small model on CPU.
+- GPU operator stages: `python3 tools/hybrid-eval/stage_ruler_bf16.py --help` and `python3 tools/hybrid-bench/stage_kl_bf16.py --help`. See the [RULER stage/restore runbook](tools/hybrid-eval/RULER-BF16-RUNBOOK.md) and [fresh KL stage/provenance constraints](tools/hybrid-bench/STATE-BF16-RUNBOOK.md). Outputs stay under the explicit `--stage`/`--root`; CPU contract tests use `python3 -m unittest discover -s tools/hybrid-eval -p test_gpu_stages.py`, with logs under `.temp/`. Real-manager RULER restoration controls: `python3 -m unittest discover -s tools/hybrid-eval -p test_ruler_restore.py` (owned CPU workers only). Native legacy admission controls: `python3 tools/hybrid/test_legacy_dtype.py --build-dir BUILD --model MODEL.gguf --artifacts .temp/legacy-dtype`; use only the existing local small model on CPU.
 
 - [cli](tools/cli/README.md)
 - [completion](tools/completion/README.md)

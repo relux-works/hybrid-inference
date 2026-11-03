@@ -4,8 +4,11 @@ import argparse
 import contextlib
 import os
 from pathlib import Path
+import re
+import socket
 import signal
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'hybrid-bench'))
@@ -63,6 +66,45 @@ def evaluator_command(args, manifest):
             '--request-timeout', '7200', '--saved-session-bytes', str((442685280*(depth+130)+8191)//8192)]
 
 
+def preserve_pidless_state(state, command, role, log):
+    require(state.is_dir() and not state.is_symlink(), f'cannot inspect pid-less state directory: {state}')
+    require(not list(state.glob('*.pid')), f'PID records present in {state}; use the recorded owner controls')
+    ports = []
+    for flag in (('--port',) if role == 'node' else ('--port', '--decode-port')):
+        require(command.count(flag) == 1, f'cannot determine {flag} for pid-less state {state}')
+        try:
+            port = int(command[command.index(flag)+1])
+        except (ValueError, TypeError, IndexError) as error:
+            raise RuntimeError(f'cannot determine {flag} for pid-less state {state}') from error
+        require(1 <= port <= 65535 and port not in ports, f'invalid recovery port for {state}')
+        ports.append(port)
+    # Hold the expected loopback ports while checking for a child spawned before its PID was recorded.
+    with contextlib.ExitStack() as stack:
+        for port in ports:
+            sock = stack.enter_context(socket.socket())
+            try:
+                sock.bind(('127.0.0.1', port))
+            except OSError as error:
+                raise RuntimeError(f'pid-less state {state}: port {port} is not free; refusing recovery without signalling its owner') from error
+        exact = re.compile(r"(?<![\w./-])" + re.escape(str(state.resolve())) + r"(?=$|[/\s\x00\"'])")
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                command_line = os.fsdecode((entry/'cmdline').read_bytes())
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError as error:
+                raise RuntimeError(f'cannot inspect process {entry.name}; refusing pid-less recovery of {state}') from error
+            require(not exact.search(command_line),
+                    f'process {entry.name} references exact state path {state}; stop it through its owner path before recovery')
+        require(not list(state.glob('*.pid')), f'PID record appeared in {state}; refusing pid-less recovery')
+        preserved = Path(tempfile.mkdtemp(prefix=state.name+'.pidless-'+time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())+'-', dir=state.parent))
+        state.rename(preserved/state.name)
+        with log.open('a') as output:
+            output.write('preserved pid-less state '+str(state)+' as '+str(preserved/state.name)+'; ports='+str(ports)+'\n')
+
+
 def restore(stage, plan):
     errors = []
     # Launcher stop checks recorded PID identity; it does not kill by process name.
@@ -73,8 +115,15 @@ def restore(stage, plan):
                 run([sys.executable, Path(plan['source'])/'tools/hybrid-bench/manage.py',
                      'node' if role == 'node' else 'client', '--state', state, '--stop'], stage/'restore.log')
             except Exception as error:
-                errors.append(f'candidate {role} stop: {error}')
+                try:
+                    preserve_pidless_state(state, plan['candidate'][role], role, stage/'restore.log')
+                except Exception as recovery_error:
+                    errors.append(f'candidate {role} stop: {error}; {recovery_error}')
     require(not errors, '; '.join(errors))
+    for role in ROLES:
+        state = Path(plan['original_run'])/role
+        if (stage/'original-services'/role).exists() and state.exists() and not list(state.glob('*.pid')):
+            preserve_pidless_state(state, plan['restore'][role], role, stage/'restore.log')
     for role in ROLES:
         backup = stage/'original-services'/role
         if not backup.exists():
