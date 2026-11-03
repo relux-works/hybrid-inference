@@ -49,6 +49,34 @@ def usage_samples(client, count=3, pause=1):
     return result
 
 
+def settled_samples(client,expected,maximum,evidence_path,timeout_seconds=600,poll_seconds=15):
+    expected,maximum=api.money(expected),api.money(maximum)
+    end=time.monotonic()+timeout_seconds
+    history=[]
+    while time.monotonic()<end:
+        client.get_timeout=min(30,max(.1,end-time.monotonic()))
+        try:
+            item=dict(at=api.utc(),usage_usd=str(client.get('/key')['data']['usage']))
+            history.append(item)
+        except Exception as error:
+            history.append(dict(at=api.utc(),error=api.redact(str(error),client.secret)))
+        atomic_json(evidence_path,dict(expected_usd=str(expected),maximum_usd=str(maximum),samples=history),client.secret)
+        if 'usage_usd' in history[-1] and api.money(history[-1]['usage_usd'])>expected+maximum:
+            client.get_timeout=30
+            raise api.Refusal('unresolvable charge: cumulative delta exceeds reservation')
+        last=history[-3:]
+        if len(last)==3 and all('usage_usd' in s for s in last):
+            try:
+                resolve_delta(last,expected,maximum)
+                client.get_timeout=30
+                return last
+            except api.Refusal:pass
+        remaining=end-time.monotonic()
+        if remaining>0:time.sleep(min(poll_seconds,remaining))
+    client.get_timeout=30
+    raise api.Refusal('unresolvable charge: cumulative counter did not settle within recovery deadline')
+
+
 class Budget:
     def __init__(self,path,known,committed,reported='0',receipts=None):
         self.path=path
@@ -148,6 +176,7 @@ class Client(api.Client):
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)
         self.post_timeout=300
+        self.get_timeout=30
         self.journal=None
         self.trace=None
 
@@ -158,7 +187,7 @@ class Client(api.Client):
         raw=None if body is None else json.dumps(body).encode()
         if body is not None and self.journal is not None:
             self.trace=StreamTrace(self.journal,self.secret)
-        response=self.opener.open(Request(self.base+path,data=raw,headers=headers),timeout=30 if body is None else self.post_timeout)
+        response=self.opener.open(Request(self.base+path,data=raw,headers=headers),timeout=self.get_timeout if body is None else self.post_timeout)
         return RecordedResponse(response,self.trace) if body is not None and self.trace is not None else response
 
 

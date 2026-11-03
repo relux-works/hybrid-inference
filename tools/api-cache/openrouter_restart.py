@@ -87,6 +87,13 @@ def price_metrics(rows,candidate,depths):
     known=bool(zero) and all(r.get('cached_tokens') is not None for r in zero)
     measured['pause_levels']['0']=dict(n=len(zero),token_hit_rate=sum(r['cached_tokens'] for r in zero)/sum(r['prompt_tokens'] for r in zero) if known else None,call_hit_rate=sum(r['cached_tokens']>0 for r in zero)/len(zero) if known else None,actual_pauses_seconds=[r['pause_actual_seconds'] for r in zero])
     measured['pricing_basis']='Per-call live list prices; conservative input plus cache-write surcharge; 1065 new input, 512 output. Equal and measured depth mixes disclosed.'
+    matched=[r for r in valid if r.get('pause_actual_seconds') is not None and r['pause_target_seconds']-.01<=r['pause_actual_seconds']<=r['pause_target_seconds']+max(2,.1*r['pause_target_seconds'])]
+    measured['target_pause_grouping_warning']='pause_levels groups target pauses; actual gaps are retained. Late calls do not establish target TTL.'
+    measured['matched_target_pause_levels']={}
+    for pause in (0,8,35,60,300,900,3600):
+        subset=[r for r in matched if r['pause_target_seconds']==pause]
+        reliable=bool(subset) and all(r.get('cached_tokens') is not None for r in subset)
+        measured['matched_target_pause_levels'][str(pause)]=dict(n=len(subset),token_hit_rate=sum(r['cached_tokens'] for r in subset)/sum(r['prompt_tokens'] for r in subset) if reliable else None)
     return measured
 
 
@@ -186,14 +193,24 @@ def phase_sessions(phase):
     return result
 
 class Phase:
-    def __init__(self,root,name,client,until=None):
+    def __init__(self,root,name,client,until=None,resume=False):
         self.root,self.name,self.client=root,name,client
-        self.out=root/name; self.out.mkdir(exist_ok=False)
+        self.out=root/name; self.out.mkdir(exist_ok=resume)
         self.end=epoch(PHASE_ENDS[name]) if until is None else until
         self.cap=22 if name=='v1' else 45
         self.budget=recovery.Budget.load(root/'ledger.json')
         self.rows,self.skips=[],[]
-        self.preflights=0
+        self.preflights=len(list(self.out.glob('uptime-*.json')))
+        if resume:
+            for path in sorted(self.out.glob('call-*.json')):
+                row=json.loads(path.read_text())
+                if name+'/%04d'%row['sequence'] not in self.budget.receipts:raise api.Refusal('resume has unresolved charge')
+                self.rows.append(row)
+            intents={p.name.replace('intent-','call-') for p in self.out.glob('intent-*.json')}
+            if intents-{p.name for p in self.out.glob('call-*.json')}:raise api.Refusal('resume has unresolved request intent')
+            for filename in ('terminal.json','run.json'):
+                path=self.out/filename
+                if path.exists():path.replace(self.out/(filename.removesuffix('.json')+'-history-'+str(time.time_ns())+'.json'))
         self.planned=phase_sessions(name)
         self.status,self.reason='running','collecting'
         recovery.atomic_json(self.out/'run.json',dict(phase=name,pid=os.getpid(),at=api.utc(),cutoff=timestamp(self.end),cap_usd=self.cap,planned_sessions=len(self.planned),deadlines=recovery.DEPTH_DEADLINES))
@@ -268,8 +285,10 @@ class Phase:
         if row.get('cost_usd') is not None:
             row['charge_resolution']=self.budget.reported_call(row['cost_usd'],estimated,call_id)
         else:
-            samples=recovery.usage_samples(self.client)
-            try:row['charge_resolution']=self.budget.recovered_call(samples,estimated,call_id)
+            samples=[]
+            try:
+                samples=recovery.settled_samples(self.client,self.budget.known,estimated,self.out/('settlement-%04d.json'%sequence))
+                row['charge_resolution']=self.budget.recovered_call(samples,estimated,call_id)
             except api.Refusal:
                 recovery.atomic_json(self.out/('unresolved-%04d.json'%sequence),dict(samples=samples,expected_usd=str(self.budget.known),maximum_usd=str(estimated)),self.client.secret)
                 raise
@@ -288,7 +307,14 @@ class Phase:
         return ended
 
     def interleave(self,source):
-        seeds=deque(source); warm=[]; serial=0
+        seeds=deque();warm=[];serial=0
+        for s in source:
+            previous=[r for r in self.rows if r['session_id']==s['session_id']]
+            if not previous:seeds.append(s);continue
+            last=max(previous,key=lambda r:r['call_index']);index=last['call_index']+1
+            if index<len(s['pauses']):
+                ended=time.monotonic()-(time.time()-epoch(last['ended_at']));serial+=1
+                heapq.heappush(warm,(ended+s['pauses'][index],serial,s,index,ended))
         while seeds or warm:
             if warm and (warm[0][0]<=time.monotonic() or not seeds):
                 _,_,s,index,ended=heapq.heappop(warm)
@@ -345,6 +371,7 @@ class Phase:
             except Exception as error:
                 self.status,self.reason='failed','output validation: '+api.redact(str(error),self.client.secret)
             recovery.atomic_json(self.out/'terminal.json',dict(status=self.status,reason=self.reason,at=api.utc(),attempts=len(self.rows),skipped_cells=len(self.skips)))
+            self.progress(status=self.status,current_call=None,next_call_time=None,next_call_reason=self.reason)
             print(self.status+' phase='+self.name+' '+self.reason,flush=True)
         return 0 if self.status=='done' else 1
 
@@ -379,6 +406,7 @@ def heartbeat(root,client,status='running'):
               current_request_deadline_at=progress.get('current_request_deadline_at'),interval_seconds=600)
     data['free_disk_bytes']=api.shutil.disk_usage(root).free
     if data['free_disk_bytes']<recovery.MIN_FREE_BYTES:(root/'STOP').touch()
+    if status!='running':data.update(current_call=None,next_call_time=None,next_call_reason='workflow '+status)
     # Persist custody before a GET, so metadata delays cannot hide an in-flight request.
     recovery.atomic_json(root/'heartbeat.json',data)
     try:
@@ -401,7 +429,8 @@ def recover_interrupted(root,phase,client):
             if receipt.get('within_maximum') is False:raise api.Refusal('previous reported cost exceeds reservation')
         else:
             # An intent may have reached the server; even a killed writer needs a bounded charge.
-            receipt=ledger.recovered_call(recovery.usage_samples(client),intent['maximum_cost_usd'],call_id)
+            samples=recovery.settled_samples(client,ledger.known,intent['maximum_cost_usd'],directory/('settlement-watchdog-%04d.json'%sequence))
+            receipt=ledger.recovered_call(samples,intent['maximum_cost_usd'],call_id)
         if not row.get('charge_resolution'):
             row.update(accepted=False,timed_out=True,error=row.get('error') or 'supervisor watchdog interrupted request',ended_at=row.get('ended_at') or api.utc(),charge_resolution=receipt)
             recovery.atomic_json(rowpath,row,client.secret)
@@ -424,31 +453,52 @@ def write_summary(root,status,reason):
     (root/'SUMMARY.md').write_text('\n'.join(lines)+'\n')
 
 
-def supervise(root):
-    if (root/'workflow.json').exists():raise api.Refusal('workflow already initialized; inspect existing custody before any replay')
+def supervise(root,resume=False):
+    previous=None
+    if (root/'workflow.json').exists():
+        if not resume:raise api.Refusal('workflow already initialized; inspect existing custody before any replay')
+        previous=json.loads((root/'workflow.json').read_text())
+        if previous['status']!='failed':raise api.Refusal('resume requires failed terminal workflow')
+        if list((root/'amendment').glob('call-*.json')):raise api.Refusal('amendment already has data; automatic replay refused')
+    elif resume:raise api.Refusal('resume requires existing workflow')
     if api.shutil.disk_usage(root).free<recovery.MIN_FREE_BYTES:raise api.Refusal('free disk below28 GiB')
     lock=LOCK_PATH.open('a+')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     client=recovery.Client()
-    proof=json.loads((root/'call34-resolution.json').read_text())
-    expected=proof['expected_without_call_usd']
-    maximum=proof['maximum_usd']
-    samples=recovery.usage_samples(client)
-    resolution=recovery.resolve_delta(samples,expected,maximum)
-    recovery.atomic_json(root/'call34-revalidated.json',resolution,client.secret)
-    known=max(api.money(expected),api.money(samples[-1]['usage_usd']))
-    ledger=recovery.Budget(root/'ledger.json',known,api.money(expected)+api.money(maximum));ledger.save()
+    if resume:
+        ledger=recovery.Budget.load(root/'ledger.json')
+        # Prove every attempted request settled before replacing failed custody.
+        for path in (root/'v1').glob('intent-*.json'):
+            row=json.loads(path.read_text());call_id='v1/%04d'%row['sequence']
+            if call_id not in ledger.receipts:raise api.Refusal('resume has unresolved charge')
+            if ledger.receipts[call_id].get('within_maximum') is False:raise api.Refusal('resume has excessive charge')
+        samples=recovery.settled_samples(client,ledger.known,ledger.committed-ledger.known,root/'resume-settlement.json')
+        ledger.known=max(ledger.known,api.money(samples[-1]['usage_usd']));ledger.save()
+        ledger.reserve(ledger.known,Decimal(0))
+    else:
+        proof=json.loads((root/'call34-resolution.json').read_text())
+        expected=proof['expected_without_call_usd'];maximum=proof['maximum_usd']
+        samples=recovery.usage_samples(client)
+        resolution=recovery.resolve_delta(samples,expected,maximum)
+        recovery.atomic_json(root/'call34-revalidated.json',resolution,client.secret)
+        known=max(api.money(expected),api.money(samples[-1]['usage_usd']))
+        ledger=recovery.Budget(root/'ledger.json',known,api.money(expected)+api.money(maximum));ledger.save()
     head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
     subprocess.run(['git','verify-commit',head],check=True,capture_output=True)
     dirty=subprocess.check_output(['git','status','--porcelain','--','tools/api-cache'],text=True)
     if dirty:raise api.Refusal('cache instrumentation must be committed before new data')
-    workflow=dict(pid=os.getpid(),started_at=api.utc(),status='running',phase_pids={},source_commit=head,source_sha256=source_identity(),
+    if previous is not None:
+        stamp=str(time.time_ns())
+        recovery.atomic_json(root/('workflow-history-'+stamp+'.json'),previous)
+        if (root/'terminal.json').exists():(root/'terminal.json').replace(root/('terminal-history-'+stamp+'.json'))
+    workflow=dict(pid=os.getpid(),started_at=api.utc(),status='running',resumed=resume,phase_pids={},source_commit=head,source_sha256=source_identity(),
                   phase_cutoffs=PHASE_ENDS,global_cap_usd=45,preregistration_commit='4ab91fcbb',network='HTTPS openrouter.ai only')
+    if resume:workflow['resume_registration_commit']=head
     recovery.atomic_json(root/'workflow.json',workflow)
     (root/'supervisor.pid').write_text(str(os.getpid())+'\n')
     stop=threading.Event()
     def monitor():
-        index=0
+        index=len(list((root/'uptime-window').glob('uptime-*.json')))
         while not stop.is_set():
             started=time.monotonic()
             try:
@@ -464,8 +514,10 @@ def supervise(root):
         for phase in ('v1','amendment'):
             if time.time()+600>=epoch(PHASE_ENDS[phase]):raise api.Refusal('phase start too late: '+phase)
             env=os.environ.copy();env['PYTHONDONTWRITEBYTECODE']='1';env['TMPDIR']=str(root/'tmp')
-            with (root/(phase+'.log')).open('w') as log:
-                child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'--root',str(root),'--phase',phase,'--lease-fd',str(lock.fileno())],
+            with (root/(phase+'.log')).open('a' if resume else 'w') as log:
+                argv=[sys.executable,str(Path(__file__).resolve()),'--root',str(root),'--phase',phase,'--lease-fd',str(lock.fileno())]
+                if resume:argv.append('--resume')
+                child=subprocess.Popen(argv,
                                        stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,env=env,pass_fds=(lock.fileno(),))
                 workflow['phase_pids'][phase]=child.pid
                 recovery.atomic_json(root/'workflow.json',workflow)
@@ -514,6 +566,7 @@ def main():
     parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--phase',choices=('v1','amendment'))
     parser.add_argument('--lease-fd',type=int)
+    parser.add_argument('--resume',action='store_true',help='continue a failed v1 only after every prior intent has a settled receipt')
     args=parser.parse_args()
     root=args.root.resolve()
     try:
@@ -524,8 +577,8 @@ def main():
             if args.lease_fd is None:raise api.Refusal('inherited exclusive lease required')
             lease=os.fdopen(args.lease_fd,'a+',closefd=False)
             fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            return Phase(root,args.phase,recovery.Client()).run()
-        return supervise(root)
+            return Phase(root,args.phase,recovery.Client(),resume=args.resume).run()
+        return supervise(root,resume=args.resume)
     except Exception as error:
         reason=api.redact(str(error))
         recovery.atomic_json(root/'startup-failed.json',dict(at=api.utc(),error=reason))

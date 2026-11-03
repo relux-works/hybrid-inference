@@ -87,7 +87,7 @@ class RecoveryTests(unittest.TestCase):
     # A real loopback stream timeout preserves its generation/TTFT journal and is an availability error.
     def test_timeout_counts_against_availability_and_keeps_evidence(self):
         RecoveryHandler.timeout_mode=True;phase=self.phase()
-        with mock.patch.object(recovery,'deadline_for_depth',return_value=.05),mock.patch.object(recovery,'usage_samples',side_effect=lambda client:self.samples(Handler.spend)):
+        with mock.patch.object(recovery,'deadline_for_depth',return_value=.05),mock.patch.object(recovery,'settled_samples',side_effect=lambda client,*args:self.samples(Handler.spend)):
             phase.call(self.session,0)
         row=phase.rows[0]
         self.assertTrue(row['timed_out']);self.assertFalse(row['accepted'])
@@ -218,6 +218,89 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(phala['whole_window_availability']['rate'],.5)
         self.assertEqual(phala['eligibility'],'excluded-availability')
         self.assertEqual(len(rows),3)
+
+    # A below-expected counter may settle later; no accounting or POST is allowed during the wait.
+    def test_stale_counter_waits_for_three_settled_samples(self):
+        clock=mock.Mock();clock.now=0
+        def sleep(seconds):clock.now+=seconds
+        client=mock.Mock(secret=self.secret)
+        client.get.side_effect=[{'data':{'usage':x}} for x in (0,0,0,.2,.2,.2)]
+        with mock.patch.object(recovery.time,'monotonic',side_effect=lambda:clock.now),mock.patch.object(recovery.time,'sleep',side_effect=sleep):
+            samples=recovery.settled_samples(client,'.2','.1',self.root/'settlement.json')
+        self.assertEqual([s['usage_usd'] for s in samples],['0.2']*3)
+        self.assertEqual(client.get.call_count,6)
+        self.assertEqual(recovery.Budget.load(self.root/'ledger.json').known,0)
+        self.assertEqual(Handler.bodies,[])
+
+    # A permanently stale/reset counter stops at the bounded deadline rather than fabricating a zero charge.
+    def test_stale_counter_unresolved_by_deadline_stops(self):
+        now=[0]
+        client=mock.Mock(secret=self.secret);client.get.return_value={'data':{'usage':0}}
+        with mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            with self.assertRaisesRegex(api.Refusal,'did not settle within recovery deadline'):
+                recovery.settled_samples(client,'.2','.1',self.root/'settlement.json',timeout_seconds=45)
+        self.assertEqual(now[0],45);self.assertEqual(Handler.bodies,[])
+        self.assertEqual(recovery.Budget.load(self.root/'ledger.json').receipts,{})
+
+    # An excessive observed debit never receives a grace period.
+    def test_excessive_delta_stops_on_first_sample(self):
+        client=mock.Mock(secret=self.secret);client.get.return_value={'data':{'usage':.31}}
+        with mock.patch.object(recovery.time,'sleep') as sleep:
+            with self.assertRaisesRegex(api.Refusal,'exceeds reservation'):
+                recovery.settled_samples(client,'.2','.1',self.root/'settlement.json')
+        self.assertEqual(client.get.call_count,1);sleep.assert_not_called()
+
+    # Resume preserves the original record, continues the next index, and never bills a duplicate index.
+    def test_resume_continues_next_index_and_preserves_financial_ledger(self):
+        self.session['pauses']=[0,0,0]
+        first=self.phase();first.call(self.session,0)
+        original=(first.out/'call-0000.json').read_bytes()
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]):
+            resumed=restart.Phase(self.root,'v1',self.client,until=time.time()+5000,resume=True)
+        self.assertEqual(resumed.run(),0)
+        self.assertEqual([r['call_index'] for r in resumed.rows],[0,1,2])
+        self.assertEqual(len(Handler.bodies),3)
+        self.assertEqual((first.out/'call-0000.json').read_bytes(),original)
+        self.assertEqual(recovery.Budget.load(self.root/'ledger.json').reported,Decimal('.000003'))
+
+    # Missing settled receipts make resume fail before any new POST or ledger write.
+    def test_resume_refuses_unsettled_receipt(self):
+        phase=self.phase()
+        recovery.atomic_json(phase.out/'call-0000.json',dict(sequence=0,session_id='missing',call_index=0))
+        with self.assertRaisesRegex(api.Refusal,'resume has unresolved charge'):
+            restart.Phase(self.root,'v1',self.client,resume=True)
+        self.assertEqual(Handler.bodies,[])
+
+    # Target-group rates retain late observations, while matched rates do not mislabel a long delay as8s.
+    def test_late_pause_is_separate_from_log_matched_rates(self):
+        row=dict(accepted=True,call_index=1,prompt_tokens=32000,cached_tokens=31000,new_tokens_estimate=1000,depth=32768,pause_target_seconds=8,pause_actual_seconds=600,cohort='core')
+        measured=restart.price_metrics([row],self.candidate,[32768])
+        self.assertEqual(measured['pause_levels']['8']['n'],1)
+        self.assertEqual(measured['matched_target_pause_levels']['8']['n'],0)
+        row['pause_actual_seconds']=8.01
+        self.assertEqual(restart.price_metrics([row],self.candidate,[32768])['matched_target_pause_levels']['8']['n'],1)
+
+    # Resumed custody retains old signed-era data and ledger, then passes --resume to both sequential children.
+    def test_supervisor_resume_keeps_history_and_shared_spend(self):
+        first=self.phase();first.call(self.session,0)
+        recovery.atomic_json(self.root/'workflow.json',dict(status='failed',pid=123,source_commit='old'))
+        recovery.atomic_json(self.root/'terminal.json',dict(status='failed',reason='old guard'))
+        children=[]
+        def spawn(argv,**kwargs):
+            self.assertIn('--resume',argv)
+            phase=argv[argv.index('--phase')+1]
+            directory=self.root/phase;directory.mkdir(exist_ok=True)
+            recovery.atomic_json(directory/'terminal.json',dict(status='done',attempts=0))
+            child=mock.Mock(pid=11000+len(children));child.wait.return_value=0;children.append(child)
+            return child
+        with mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'settled_samples',return_value=self.samples('.000001')),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['b'*40,'']):
+            self.assertEqual(restart.supervise(self.root,resume=True),0)
+        self.assertEqual(len(children),2)
+        self.assertEqual(len(Handler.bodies),1)
+        self.assertEqual(recovery.Budget.load(self.root/'ledger.json').reported,Decimal('.000001'))
+        self.assertEqual(len(list(self.root.glob('workflow-history-*.json'))),1)
+        self.assertEqual(len(list(self.root.glob('terminal-history-*.json'))),1)
+        self.assertTrue(json.loads((self.root/'workflow.json').read_text())['resumed'])
 
     # The supervisor sequences both child PIDs under one lease and persists terminal custody and heartbeat.
     def test_supervisor_sequences_children_and_records_terminal_custody(self):
