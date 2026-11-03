@@ -54,3 +54,14 @@ Tracked/untracked changes, ignored files under source directories and index flag
 Captures contain token IDs and model state. Keep them in a private workbench, outside version control. The converter reads only single-component tensor paths and rejects symlinks, truncated files, unsupported dtypes and geometry. It streams the body to disk, checksums it, then replaces the destination atomically. It does not relabel one target GGUF as another: generate a target identity and a separate envelope for each target.
 
 For isolated CPU validation, create a task-local NumPy-only environment with `python3 -m venv .temp/TASK/venv`, then `.temp/TASK/venv/bin/python -m pip install --only-binary=:all: --no-deps numpy==2.4.2`. Use that Python for converter/adapter tests and remove the venv after testing. Run gather only with an existing torch installation; otherwise report it unrun. The GPU host uses its existing vLLM environment. Set disk-backed `TMPDIR` and `PYTHONDONTWRITEBYTECODE=1` for every command.
+
+## Loopback phase timing
+
+The [r39b timing runbook](BRIDGE-TIMING.md) measures the real node-to-CUDA-client
+append at three depths and two delta sizes, including export, conversion,
+transfer, import and TTFT. Use `bash tools/hybrid-vllm/run-bridge-timing.sh` on
+node C after its KL run. Outputs live in the private RUN_DIR. CPU controls:
+`python3 -m unittest discover -s tools/hybrid-vllm -p test_bridge_timing.py -v`.
+The new evaluate header is backend HTTP wall minus measured export; it includes
+framework/one-token overhead. No GPU execution or numerical equivalence is
+claimed by these timing tools.

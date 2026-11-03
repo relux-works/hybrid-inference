@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from bridge import ATTENTION, RECURRENT, SOURCE, body_size, require, validate, MAX_BODY
@@ -89,6 +90,7 @@ def export_snapshot(runner, scheduler_output, config, n0):
 
         # Device work and state copies finish before the request can release its blocks.
         torch.cuda.synchronize()
+        export_started = time.perf_counter()
         for gid, group in enumerate(groups):
             spec = group.kv_cache_spec
             blocks = req.block_ids[gid]
@@ -124,6 +126,7 @@ def export_snapshot(runner, scheduler_output, config, n0):
                 snapshot["layers"].append(row)
         validate(snapshot, target)
         (folder / "snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n")
+        (folder / "timing.json").write_text(json.dumps(dict(export_seconds=time.perf_counter() - export_started)))
         folder.rename(destination)
     return n1
 
@@ -154,6 +157,8 @@ def after_prefill(runner, scheduler_output):
         require(n1 == len(config["tokens"]), "request is no longer in prefill")
         if config.get("capture", True):
             export_snapshot(runner, scheduler_output, config, config["n0"])
+        else:
+            (output / "timing.json").write_text(json.dumps(dict(export_seconds=0.0)))
         (output / "finished.json").write_text(json.dumps(dict(n=n1, block_size=block)))
         return
     n0 = getattr(runner, "_hybrid_bridge_n0", 0)

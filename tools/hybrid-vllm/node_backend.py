@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 import urllib.request
 
@@ -53,8 +54,17 @@ class VllmBackend:
         return self.block_size
 
     def prefill(self, tokens, n0, output, capture=True):
+        started = time.perf_counter()
+        self.last_timing = None
         self.request(dict(node_mode=True, target=self.target, tokens=tokens, n0=n0,
                           capture=capture, output=str(output), rotations=[256, 64]))
+        elapsed = time.perf_counter() - started
+        timing_path = (output / ("capture-%08d" % len(tokens)) / "timing.json") if capture else output / "timing.json"
+        if timing_path.exists():
+            export = json.loads(timing_path.read_text())["export_seconds"]
+            require(type(export) in (int, float) and 0 <= export <= elapsed, "invalid export timing")
+            self.last_timing = dict(backend_ms=elapsed * 1000, export_ms=export * 1000,
+                                    evaluate_ms=(elapsed - export) * 1000)
         try:
             finished = json.loads((output / "finished.json").read_text())
             require(finished == dict(n=len(tokens), block_size=self.block_size), "incomplete vLLM prefill")

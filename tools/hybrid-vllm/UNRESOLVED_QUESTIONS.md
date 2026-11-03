@@ -16,3 +16,10 @@ These are experiment gates, not claims of a blocked CPU implementation. The orig
 - r10 merged main 683caeed: rebuild node and receivers together for HYBD v2 / llama-native-chunks-v3. CPU tests cover final-only fixed state, physical SWA layout, aligned endpoints and exact local tails. GPU extraction, torch gather without an existing installation and numerical qualification of the merged head remain unrun. Earlier B300 evidence belongs to c2f47472 and does not qualify this merge.
 
 - r11 merges PR #15 main 3ac1503d into the r10 head accepted by r7u. Landing still requires the exact merged head's PRO 6000 re-smoke: gather, adapter-bound CUDA byte gate, 8k/32k fresh and append imports, 32k multi-chunk and KL/top-1. Use [the r11 commands](GPU-NODE-RUNBOOK.md#pro-6000-re-smoke-after-pr-15-r11); this CPU-only merge does not close that gate.
+
+
+## r39b timing qualification
+
+- Run the six loopback timing shapes on node C after KL release. CPU fixtures do not establish live CUDA extraction/import or throughput.
+- Keep evaluation-envelope wall time distinct from pure GPU prefill and from export/conversion; the driver documents and checks those boundaries.
+- The heterogeneous FP8/Q4 numerical gate remains separate from timing and native import success.

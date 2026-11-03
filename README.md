@@ -182,3 +182,8 @@ Delta import profiling uses `python3 tools/hybrid/profile_import.py` and `build/
 Combined SWA layout and final-state chunk CPU qualification, invariant checks and exact GPU operator commands are in [the r27 report](tools/hybrid/RESULTS-hybrid-a-r27-261101.md).
 
 The vLLM node adapter uses the same HYBD v2 final-state chunk protocol with exact aligned exports, local tails and borrowed native-body readers; see its [protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [r11 merge evidence](tools/hybrid-vllm/RESULTS-hybrid-d-r7-261101.md#r11-third-main-merge-after-pr-15). CPU adapter/converter checks use a temporary NumPy-only venv; commands and artifacts are in the [adapter tools guide](tools/hybrid-vllm/README.md#tools).
+
+Loopback bridge phase timing uses `bash tools/hybrid-vllm/run-bridge-timing.sh`
+on a rental; its [runbook](tools/hybrid-vllm/BRIDGE-TIMING.md) gives exact commands,
+phase boundaries and CPU controls. Private logs/JSON go under RUN_DIR; no model
+or GPU is required by `python3 -m unittest discover -s tools/hybrid-vllm -p test_bridge_timing.py -v`.

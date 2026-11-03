@@ -143,7 +143,9 @@ class Adapter:
             capture = self.backend.prefill(accepted, n0, root, capture=return_delta)
             if return_delta:
                 delta = root / "output.delta"
+                conversion_started = time.perf_counter()
                 header = convert(capture, self.target, delta, self.codec, sid, transfer or None)
+                conversion_ms = (time.perf_counter() - conversion_started) * 1000
                 require(header["n0"] == n0 and header["n1"] == n1 and header["prefix_hash_n1"] == token_hash(accepted), "backend capture boundary mismatch")
                 wire = delta.read_bytes()
             else:
@@ -153,6 +155,13 @@ class Adapter:
         self.extends += 1
         headers = {"X-Hybrid-Prefill-Ms": str((time.perf_counter() - started) * 1000),
                    "X-Hybrid-Export-N1": str(n1), "X-Hybrid-Requested-N1": str(requested)}
+        phases = getattr(self.backend, "last_timing", None)
+        if phases is not None:
+            headers.update({"X-Hybrid-Backend-Ms": str(phases["backend_ms"]),
+                            "X-Hybrid-Export-Ms": str(phases["export_ms"]),
+                            "X-Hybrid-Evaluate-Ms": str(phases["evaluate_ms"])})
+            if return_delta:
+                headers["X-Hybrid-Conversion-Ms"] = str(conversion_ms)
         return (200, wire, headers) if return_delta else (202, dict(n=n1, prefix_hash=token_hash(accepted)), headers)
 
     def snapshot(self, session):
