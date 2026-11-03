@@ -97,7 +97,7 @@ class CacheTests(unittest.TestCase):
         result=cache.stream_call(self.client,payload,self.session['endpoint'])
         self.assertNotIn('error',result)
         self.assertEqual(Handler.payload['provider'],dict(order=['chutes/fp8'],only=['chutes/fp8'],allow_fallbacks=False))
-        self.assertNotIn('reasoning',Handler.payload)
+        self.assertEqual(Handler.payload['reasoning'],{'enabled':False})
         self.assertEqual(result['cached_tokens'],30000)
         self.assertEqual(result['cache_write_tokens'],2000)
         self.assertEqual(result['http_status'],200)
@@ -279,7 +279,7 @@ class CacheTests(unittest.TestCase):
         Handler.provider='Morph'
         Handler.reject_disabled_reasoning=True
         payload=cache.build_payload(session,0)
-        self.assertNotIn('reasoning',payload)
+        self.assertEqual(payload['reasoning'],{'effort':'low'})
         self.assertEqual(payload['max_tokens'],16)
         self.assertLess(len(payload['messages'][0]['content'][0]['text'].encode())/4+16,262144)
         valid=cache.stream_call(self.client,payload,session['endpoint'])
@@ -302,6 +302,27 @@ class CacheTests(unittest.TestCase):
             routing=cache.build_payload(region,0)['provider']
             self.assertEqual(routing['only'],[child])
             self.assertNotIn('ignore',routing)
+
+
+    # The deadline handler rejects a stalled request, and the failure path disarms the installed timer.
+    def test_wall_clock_deadline_stops_and_clears_alarm(self):
+        payload=cache.build_payload(self.session,0)
+        def stalled_request(*args):
+            cache.request_deadline(None,None)
+        with mock.patch.object(self.client,'request',side_effect=stalled_request), \
+             mock.patch.object(cache.signal,'setitimer') as timer:
+            result=cache.stream_call(self.client,payload,self.session['endpoint'],timeout_seconds=300)
+        self.assertIn('wall-clock deadline',result['error'])
+        self.assertEqual(timer.call_args_list,[mock.call(cache.signal.ITIMER_REAL,300),mock.call(cache.signal.ITIMER_REAL,0)])
+
+    # Per-chunk recovery evidence is written as it arrives and is scrubbed before reaching disk.
+    def test_stream_journal_redacts_echo(self):
+        Handler.provider=self.secret
+        path=self.path/'stream.jsonl'
+        result=cache.stream_call(self.client,cache.build_payload(self.session,0),self.session['endpoint'],event_path=path)
+        self.assertIn('error',result)
+        self.assertTrue(path.read_text())
+        self.assertNotIn(self.secret,path.read_text())
 
 
 if __name__=='__main__':

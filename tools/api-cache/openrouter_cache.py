@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import signal
 import stat
 import sys
 import time
@@ -191,15 +192,23 @@ def build_payload(session, index, smoke=False):
                    stream=True, stream_options={'include_usage': True}, temperature=0,
                    session_id=session['session_id'], provider=dict(order=[endpoint['tag']], only=[endpoint['tag']],
                    allow_fallbacks=False))
+    payload['reasoning'] = ({'enabled': False} if session['model']=='qwen/qwen3.8-27b' else {'effort': 'low'})
     if session.get('routing_ignore'):
         payload['provider']['ignore'] = session['routing_ignore']
     return payload
 
 
-def stream_call(client, payload, endpoint):
+def request_deadline(signum, frame):
+    raise Refusal('request exceeded wall-clock deadline')
+
+
+def stream_call(client, payload, endpoint, event_path=None, timeout_seconds=300):
     start = time.monotonic()
     first, last, usage, providers, generation, chunks = None, None, None, set(), None, []
     status = None
+    previous_handler = signal.signal(signal.SIGALRM, request_deadline)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    journal = None if event_path is None else event_path.open('w')
     try:
         with client.request('/chat/completions', payload) as response:
             status = response.status
@@ -211,6 +220,9 @@ def stream_call(client, payload, endpoint):
                     break
                 obj = json.loads(item)
                 chunks.append(obj)
+                if journal is not None:
+                    journal.write(redact(json.dumps(obj),client.secret)+'\n')
+                    journal.flush()
                 if obj.get('error'):
                     raise Refusal('stream reported error')
                 if obj.get('provider'):
@@ -237,8 +249,13 @@ def stream_call(client, payload, endpoint):
     except HTTPError as error:
         return dict(http_status=error.code, error='HTTP error', error_body=redact(error.read().decode(errors='replace'), client.secret))
     except Exception as error:
-        return dict(http_status=status, error=redact(str(error), client.secret), stream=chunks,
+        return dict(http_status=status, generation_id=generation, usage=usage, error=redact(str(error), client.secret), stream=chunks,
                     elapsed_seconds=time.monotonic() - start)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if journal is not None:
+            journal.close()
 
 
 def sample_endpoints(client, out, sequence):
@@ -421,7 +438,7 @@ def run(args):
                        prompt_sha256=hashlib.sha256(text.encode()).hexdigest(),prompt_bytes=len(text.encode()),
                        max_cost_usd=float(estimate),live_spend_before_usd=float(spent),accepted=False)
             write_json(out/('intent-%04d.json'%sequence),row,client.secret)
-            result = stream_call(client,payload,endpoint)
+            result = stream_call(client,payload,endpoint,event_path=out/('stream-%04d.jsonl'%sequence))
             response_end = time.monotonic()
             row.update(result)
             row['ended_at'] = utc()
