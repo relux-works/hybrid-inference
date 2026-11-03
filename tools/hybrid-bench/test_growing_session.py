@@ -525,5 +525,147 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(meter['path'], 'offload')
 
 
+
+
+class RecheckTests(unittest.TestCase):
+    @staticmethod
+    def fixture(root):
+        run = root / 'run'
+        (run / 'slots').mkdir(parents=True)
+        (run / 'check-1').mkdir()
+        tokens = list(range(12))
+        saved = []
+        for arm in ('hybrid', 'local', 'local_partition'):
+            path = run / 'slots' / (arm + '-checkpoint-1.bin')
+            path.write_bytes(arm.encode())
+            saved.append(dict(path=str(path), sha256=growing.sha256(path), tokens=tokens))
+        node, delta = run / 'node.snapshot', run / 'node.delta'
+        node.write_bytes(b'node snapshot')
+        delta.write_bytes(b'node delta')
+        calls = [dict(arm='hybrid', turn=0, depth_before=0, depth_after=8, session_id='h',
+                      meter=dict(prompt_depth=4, chunks=[dict(n0=0, n1=3, status='imported')])),
+                 dict(arm='hybrid', turn=1, depth_before=8, depth_after=12, session_id='h',
+                      meter=dict(prompt_depth=10, chunks=[dict(n0=8, n1=9, status='imported')]), journal_hash=prefix_hash(tokens))]
+        calls += [dict(calls[-1], arm=arm) for arm in ('local', 'local_partition')]
+        events = [dict(session='h', status='ok', n0=a, n1=b, catchup=catchup,
+                       node_snapshot=dict(path=str(node), sha256=growing.sha256(node)),
+                       node_delta=dict(path=str(delta), sha256=growing.sha256(delta)))
+                  for a, b, catchup in ((0, 3, False), (3, 8, True), (8, 9, False))]
+        trace = dict(schema='hybrid-growing-session-v3', status='aborted', turns=1, calls=calls, events=events,
+                     client=dict(context=4096, model_sha256='model', backend='cpu'), node=dict(backend='cpu'),
+                     heterogeneous=False, engine=dict(checker=dict(batch=256, ubatch=256, threads=2, threads_batch=2)))
+        growing.private_json(run / 'trace.json', trace)
+        growing.private_json(run / 'check-1/input.json', growing.checkpoint_source(trace['client'], saved, trace, 1))
+        return run
+
+    # Reconstruction binds fixture bytes, journal, replay and every referenced state hash before any checker/output side effect.
+    def test_recheck_preserved_input_positive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            before = {p: p.read_bytes() for p in run.rglob('*') if p.is_file()}
+            trace, source, fixture, verified = growing.verify_recheck(run / 'trace.json', 1)
+            self.assertEqual(source['tokens'], list(range(12)))
+            self.assertEqual(len(verified), 5)
+            self.assertEqual(before, {p: p.read_bytes() for p in run.rglob('*') if p.is_file()})
+
+    # Only files referenced by this checkpoint are inputs; an unused intermediate capture is not required.
+    def test_recheck_unused_intermediate_snapshot_is_not_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            path = run / 'trace.json'
+            trace = json.loads(path.read_text())
+            trace['events'][0]['node_snapshot'] = dict(path=str(run / 'unused-missing.snapshot'), sha256='0' * 64)
+            path.write_text(json.dumps(trace))
+            _, _, _, verified = growing.verify_recheck(path, 1)
+            self.assertNotIn(str(run / 'unused-missing.snapshot'), verified)
+
+    # A running trace is not a stable preserved checkpoint source.
+    def test_recheck_running_trace_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            path = run / 'trace.json'
+            trace = json.loads(path.read_text())
+            trace['status'] = 'running'
+            path.write_text(json.dumps(trace))
+            with self.assertRaisesRegex(Refusal, 'finished or aborted'):
+                growing.verify_recheck(path, 1)
+
+    # Missing snapshots cannot trigger computation or create an output; the positive fixture above uses the same verifier.
+    def test_recheck_missing_snapshot_refuses(self):
+        self.refusal('node.snapshot', None, 'missing preserved input')
+
+    # A one-byte state change refuses at its original fixture hash, before checker launch and output creation.
+    def test_recheck_modified_state_refuses(self):
+        self.refusal('slots/hybrid-checkpoint-1.bin', b'changed', 'preserved input checksum mismatch')
+
+    # The trace also anchors deltas; changing a delta cannot be hidden by otherwise valid saved states.
+    def test_recheck_modified_delta_refuses(self):
+        self.refusal('node.delta', b'changed', 'preserved input checksum mismatch')
+
+    # Even valid JSON with changed serialization is not the preserved input emitted by the driver.
+    def test_recheck_modified_input_refuses(self):
+        self.refusal('check-1/input.json', b'{}', 'invalid preserved checkpoint input')
+
+    # GPU command construction uses the original driver's 999 layers; this does not execute a GPU backend.
+    def test_recheck_command_preserves_gpu_layers(self):
+        for backend, expected in (('cpu', 0), ('metal', 999), ('cuda', 999)):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = self.fixture(root)
+                trace_path, fixture = run / 'trace.json', run / 'check-1/input.json'
+                trace, source = json.loads(trace_path.read_text()), json.loads(fixture.read_text())
+                model, checker = root / 'model', root / 'checker'
+                model.write_bytes(b'model')
+                checker.write_bytes(b'checker')
+                checker.chmod(0o700)
+                trace['client']['backend'] = source['backend'] = backend
+                trace['heterogeneous'] = source['heterogeneous'] = backend != 'cpu'
+                trace['client']['model_sha256'] = source['model_sha256'] = growing.sha256(model)
+                trace_path.write_text(json.dumps(trace))
+                fixture.write_text(json.dumps(source, indent=2) + '\n')
+                args = SimpleNamespace(trace=str(trace_path), turn=1, checker=str(checker), model=str(model), output=str(root / 'recheck'))
+                process = SimpleNamespace(pid=123, returncode=2, poll=lambda: 2, wait=lambda: 2)
+                with mock.patch.object(growing, 'model_identity', return_value=dict(model_layout=dict(vocab_size=1))), \
+                     mock.patch.object(growing, 'start_process', return_value=process) as start:
+                    with self.assertRaisesRegex(Refusal, 'checker produced no metrics'):
+                        growing.recheck(args)
+                self.assertEqual(start.call_args.args[0][-1], expected)
+                record = json.loads((root / 'recheck/recheck.json').read_text())
+                self.assertEqual((record['gpu_layers'], record['checker_exit_code'], record['status']), (expected, 2, 'refused'))
+
+    # Output under the original run and existing output both refuse before reading inputs or launching the checker.
+    def test_recheck_output_preserves_original_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.fixture(root)
+            existing = root / 'existing'
+            existing.mkdir()
+            for output in (run / 'new', existing):
+                args = SimpleNamespace(trace=str(run / 'trace.json'), turn=1, output=str(output))
+                with mock.patch.object(growing, 'verify_recheck') as verify:
+                    with self.assertRaisesRegex(Refusal, 'new directory outside'):
+                        growing.recheck(args)
+                    verify.assert_not_called()
+
+    def refusal(self, path, content, reason):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.fixture(root)
+            if content is None:
+                (run / path).unlink()
+            else:
+                (run / path).write_bytes(content)
+            before = {p: p.read_bytes() for p in run.rglob('*') if p.is_file()}
+            args = growing.recheck_parser().parse_args(['--trace', str(run / 'trace.json'), '--turn', '1',
+                '--checker', 'unused', '--model', 'unused', '--output', str(root / 'recheck')])
+            with mock.patch.object(growing, 'start_process') as start:
+                with self.assertRaises((Refusal, KeyError)) as caught:
+                    growing.recheck(args)
+                self.assertIn(reason, str(caught.exception))
+                start.assert_not_called()
+            self.assertFalse((root / 'recheck').exists())
+            self.assertEqual(before, {p: p.read_bytes() for p in run.rglob('*') if p.is_file()})
+
+
 if __name__ == '__main__':
     unittest.main()

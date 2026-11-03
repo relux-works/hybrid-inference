@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 
 from bench_common import (Refusal, http, private_json, read_private, require, sha256,
-                          start_process, validate_identity, wait_health)
+                          start_process, validate_identity, wait_health, model_identity)
 from hybrid_bench import PROVENANCE, link_probe, sanitized_info, stream_chat, verify_meter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
@@ -457,7 +457,18 @@ def replay_schedules(trace, turn, depth):
     return schedules
 
 
-def checkpoint(app, client, root, turn, heterogeneous, trace):
+def checkpoint_source(client, saved, trace, turn, probes=True):
+    local = saved[1]
+    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'], acceptance_rule='session_append_replay_exact',
+        model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=trace['heterogeneous'],
+        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
+        replay=replay_schedules(trace, turn, len(local['tokens'])))
+    if probes:
+        source['probes'] = state_probe_plans(source, trace, turn)
+    return source
+
+
+def checkpoint(app, client, root, turn, heterogeneous, trace, keep_states=False):
     saved = [app.saved[(arm, turn)] for arm in ('hybrid', 'local', 'local_partition')]
     hybrid, local, partition = saved
     require(hybrid['tokens'] == local['tokens'] == partition['tokens'], 'checkpoint journal mismatch between arms')
@@ -465,15 +476,13 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     scratch.mkdir(mode=0o700)
     fixture = scratch / 'input.json'
     result = scratch / 'result.json'
-    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'], acceptance_rule='session_append_replay_exact',
-        model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=heterogeneous,
-        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
-        replay=replay_schedules(dict(trace, events=app.events.copy()), turn, len(local['tokens'])))
-    if app.events.state_dir is not None:
-        source['probes'] = state_probe_plans(source, dict(trace, events=app.events.copy()), turn)
+    captured = dict(trace, events=app.events.copy())
+    source = checkpoint_source(client, saved, captured, turn, app.events.state_dir is not None)
     private_json(fixture, source)
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
+    trace.setdefault('checkpoint_inputs', []).append(dict(turn=turn, input_sha256=sha256(fixture),
+        snapshot_sha256=source['snapshot_sha256'], gpu_layers=command[-1]))
     process = start_process(command, scratch, 'checker')
     try:
         process.wait()
@@ -486,8 +495,9 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
     row.update(turn=turn, checker_exit_code=process.returncode, fidelity_flag=fidelity_flags(row),
                snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
-    for item in saved:
-        Path(item['path']).unlink()
+    if not keep_states:
+        for item in saved:
+            Path(item['path']).unlink()
     return row
 
 
@@ -719,6 +729,7 @@ def parser():
     p.add_argument('--partition-ubatch', type=int, default=32)
     p.add_argument('--state-probes', action='store_true', help='capture private live node states and isolate serialization/import factors')
     p.add_argument('--turns', type=int, default=40)
+    p.add_argument('--keep-checkpoint-states', action='store_true', help='retain saved states for checkpoint-only rechecks')
     p.add_argument('--checkpoint-turns', help='increasing comma-separated checkpoint turns; default every 10 turns and final')
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
@@ -763,7 +774,7 @@ def run(args):
     size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
     raw_bytes = len(checkpoints) * 16 * 64 * client['model_layout']['vocab_size'] * 4
-    require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size + raw_bytes,
+    require(shutil.disk_usage(root.parent).free > floor + ((3 if args.keep_checkpoint_states else 2) * len(checkpoints) + 6) * size + raw_bytes,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
@@ -952,7 +963,7 @@ def run(args):
                             upload_body_bytes=sum(r['upload_body_bytes'] for r in catchup))
                         reconnect_events = None
                     if arm == 'local_partition' and turn in checkpoints:
-                        result = checkpoint(app, client, root, turn, trace['heterogeneous'], trace)
+                        result = checkpoint(app, client, root, turn, trace['heterogeneous'], trace, args.keep_checkpoint_states)
                         trace['checkpoints'].append(result)
                         flush()
                 events.add(kind='window', arm=arm, seconds=time.monotonic() - start)
@@ -983,6 +994,125 @@ def run(args):
         trace['ended_utc'] = datetime.now(timezone.utc).isoformat()
         flush()
     return trace
+
+
+def recheck_parser():
+    p = argparse.ArgumentParser(description='Recheck a preserved checkpoint without contacting the node or changing the run')
+    p.add_argument('--trace', required=True)
+    p.add_argument('--turn', required=True, type=int)
+    p.add_argument('--checker', required=True)
+    p.add_argument('--model', required=True)
+    p.add_argument('--output', required=True)
+    return p
+
+
+def verify_recheck(trace_path, turn):
+    trace = json.loads(trace_path.read_text())
+    require(trace['schema'] == 'hybrid-growing-session-v3' and
+            trace['status'] in ('passed', 'failed', 'heterogeneous', 'aborted'), 'recheck needs a finished or aborted trace')
+    require(1 <= turn <= trace['turns'], 'invalid recheck turn')
+    fixture = trace_path.parent / ('check-' + str(turn)) / 'input.json'
+    require(fixture.is_file(), 'missing preserved checkpoint input: ' + str(fixture))
+    require(fixture.stat().st_size <= 64 * 1024 * 1024, 'checkpoint input exceeds limit')
+    source = read_private(fixture)
+    require(isinstance(source, dict) and all(key in source for key in
+            ('tokens', 'snapshots', 'snapshot_sha256', 'probes')), 'invalid preserved checkpoint input')
+    require(len(source['snapshots']) == len(source['snapshot_sha256']) == 3, 'checkpoint needs three preserved states')
+    tokens = source['tokens']
+    journal_hash = prefix_hash(tokens)
+    saved = []
+    for arm, path, digest in zip(('hybrid', 'local', 'local_partition'), source['snapshots'], source['snapshot_sha256']):
+        rows = [r for r in trace['calls'] if r['arm'] == arm and r['turn'] == turn]
+        require(len(rows) == 1 and rows[0]['journal_hash'] == journal_hash and
+                rows[0]['depth_after'] == len(tokens), 'preserved checkpoint journal mismatch: ' + arm)
+        require(Path(path) == trace_path.parent / 'slots' / (arm + '-checkpoint-' + str(turn) + '.bin'),
+                'preserved checkpoint state path mismatch: ' + arm)
+        saved.append(dict(path=path, sha256=digest, tokens=tokens))
+    heterogeneous = trace['client']['backend'] != trace['node']['backend']
+    require(trace['heterogeneous'] == heterogeneous, 'trace backend relationship mismatch')
+    require(trace['engine']['checker'] == dict(batch=256, ubatch=256, threads=2, threads_batch=2),
+            'unsupported preserved checker parameters')
+    expected = checkpoint_source(trace['client'], saved, trace, turn)
+    # R44 has no separate input-file digest: bind its exact serialization to the trace and original state manifest.
+    encoded = (json.dumps(expected, indent=2) + '\n').encode()
+    require(fixture.read_bytes() == encoded, 'preserved checkpoint input differs from trace reconstruction')
+    verified = {}
+
+    def verify(path, digest):
+        path = Path(path)
+        require(path.is_file(), 'missing preserved input: ' + str(path))
+        key = str(path)
+        if key not in verified:
+            actual = sha256(path)
+            require(actual == digest, 'preserved input checksum mismatch: ' + key)
+            verified[key] = actual
+        require(verified[key] == digest, 'conflicting preserved input hashes: ' + key)
+
+    for item in saved:
+        verify(item['path'], item['sha256'])
+    for probe in source['probes']:
+        for step in probe['steps']:
+            for key in ('snapshot', 'compare_snapshot', 'delta'):
+                if key in step:
+                    verify(step[key], step['sha256'])
+    manifest = [r for r in trace.get('checkpoint_inputs', []) if r['turn'] == turn]
+    if manifest:
+        require(len(manifest) == 1 and manifest[0]['input_sha256'] == sha256(fixture) and
+                manifest[0]['snapshot_sha256'] == source['snapshot_sha256'] and
+                manifest[0]['gpu_layers'] == (0 if source['backend'] == 'cpu' else 999), 'checkpoint input checksum mismatch')
+    return trace, source, fixture, verified
+
+
+def recheck(args):
+    trace_path, root = Path(args.trace).resolve(), Path(args.output).resolve()
+    require(not root.exists() and root.parent.is_dir() and not root.is_relative_to(trace_path.parent),
+            'recheck output must be a new directory outside the original run')
+    trace, source, fixture, verified = verify_recheck(trace_path, args.turn)
+    checker, model = Path(args.checker).resolve(), Path(args.model).resolve()
+    require(checker.is_file() and os.access(checker, os.X_OK), 'recheck checker is not executable')
+    require(model.is_file() and sha256(model) == source['model_sha256'], 'preserved checkpoint model checksum mismatch')
+    vocab = model_identity(model)['model_layout']['vocab_size']
+    require(shutil.disk_usage(root.parent).free > 28e9 + 16 * 64 * vocab * 4,
+            'insufficient disk for recheck logits above floor')
+    gpu_layers = 0 if source['backend'] == 'cpu' else 999
+    root.mkdir(mode=0o700)
+    (root / 'input.json').write_bytes(fixture.read_bytes())
+    (root / 'input.json').chmod(0o600)
+    (root / 'trace.json').write_bytes(trace_path.read_bytes())
+    (root / 'trace.json').chmod(0o600)
+    command = [checker, model, root / 'input.json', source['snapshots'][0], root / 'result.json', gpu_layers]
+    record = dict(schema='hybrid-checkpoint-recheck-v1', turn=args.turn, status='running',
+        trace_path=str(trace_path), trace_sha256=sha256(root / 'trace.json'), input_path=str(fixture), input_sha256=sha256(fixture),
+        input_binding=('recorded input SHA256 plus trace reconstruction' if trace.get('checkpoint_inputs') else
+                       'trace reconstruction plus original fixture state hashes; r44 has no independent input-file digest'),
+        preserved_inputs=verified, model_sha256=source['model_sha256'], checker_sha256=sha256(checker),
+        driver_sha256=sha256(__file__), gpu_layers=gpu_layers, command=[str(v) for v in command],
+        started_utc=datetime.now(timezone.utc).isoformat())
+    private_json(root / 'invocation.json', record)
+    process = None
+    try:
+        process = start_process(command, root, 'checker')
+        record['pid'] = process.pid
+        record['checker_exit_code'] = process.wait()
+        require((root / 'result.json').is_file(), 'checkpoint checker produced no metrics; inspect its log')
+        row = json.loads((root / 'result.json').read_text())
+        require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
+        require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
+        validate_checkpoint(row, trace['heterogeneous'], len(source['tokens']))
+        record.update(status=row['status'], fidelity_flag=fidelity_flags(row), result_sha256=sha256(root / 'result.json'))
+        return process.returncode
+    except (KeyboardInterrupt, SystemExit):
+        record.update(status='interrupted')
+        raise
+    except (Refusal, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        record.update(status='refused', reason=str(error))
+        raise
+    finally:
+        if process is not None:
+            stop_process(process)
+            record['checker_exit_code'] = process.returncode
+        record['ended_utc'] = datetime.now(timezone.utc).isoformat()
+        private_json(root / 'recheck.json', record)
 
 
 def replay_from_trace(argv):
@@ -1018,6 +1148,12 @@ def replay_from_trace(argv):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'recheck':
+        try:
+            return recheck(recheck_parser().parse_args(sys.argv[2:]))
+        except (Refusal, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+            print('refused: ' + (str(error) if isinstance(error, Refusal) else type(error).__name__), file=sys.stderr)
+            return 2
     if len(sys.argv) > 1 and sys.argv[1] == 'replay':
         return replay_from_trace(sys.argv[2:])
     if len(sys.argv) == 4 and sys.argv[1] == 'relay':

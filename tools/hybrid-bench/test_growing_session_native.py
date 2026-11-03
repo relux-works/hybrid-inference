@@ -252,11 +252,84 @@ def multi_chunk_prestage(build, model, root, config):
     private_json(output / 'cleanup.json', removed)
 
 
+def recheck_controls(build, model, root, run):
+    result_path = run / 'check-10/result.json'
+    original_bytes = result_path.read_bytes()
+    original = json.loads(original_bytes)
+    # Bound scratch use: preserve original raw-file hashes, then remove only this CPU fixture's old logits.
+    raw_hashes = {}
+    for name, entry in original['raw_logits']['files'].items():
+        raw_hashes[name] = sha256(entry['path'])
+        require(raw_hashes[name] == entry['sha256'], 'original raw logit hash mismatch')
+        Path(entry['path']).unlink()
+    before = {str(p): sha256(p) for p in run.rglob('*') if p.is_file()}
+    source = json.loads((run / 'check-10/input.json').read_text())
+    snapshot = Path(source['probes'][0]['steps'][0]['snapshot'])
+    state = Path(source['snapshots'][0])
+    commands = []
+    for name in ('test_recheck_missing_snapshot_refuses', 'test_recheck_modified_state_refuses', 'test_recheck_cpu_result_byte_identical'):
+        output = root / name
+        command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), 'recheck',
+                   '--trace', str(run / 'trace.json'), '--turn', '10', '--checker', str(build / 'bin/llama-hybrid-bench-check'),
+                   '--model', str(model), '--output', str(output)]
+        missing = name == 'test_recheck_missing_snapshot_refuses'
+        changed = name == 'test_recheck_modified_state_refuses'
+        moved = snapshot.with_suffix('.held')
+        byte = None
+        try:
+            if missing:
+                snapshot.rename(moved)
+            if changed:
+                with state.open('r+b') as target:
+                    byte = target.read(1)
+                    target.seek(0)
+                    target.write(bytes([byte[0] ^ 1]))
+            with (root / (name + '.log')).open('wb') as log:
+                process = subprocess.Popen(command, stdout=log, stderr=log)
+                (root / (name + '.pid')).write_text(str(process.pid) + '\n')
+                try:
+                    code = process.wait()
+                finally:
+                    stop_process(process)
+        finally:
+            if missing:
+                moved.rename(snapshot)
+            if byte is not None:
+                with state.open('r+b') as target:
+                    target.write(byte)
+        commands.append(dict(name=name, command=command, pid=process.pid, exit_code=code))
+        private_json(root / (name + '.command.json'), commands[-1])
+        if missing or changed:
+            reason = 'missing preserved input' if missing else 'preserved input checksum mismatch'
+            require(code == 2 and reason in (root / (name + '.log')).read_text() and not output.exists(), name + ': unrelated refusal')
+        else:
+            # Only output paths change; all result bytes after that substitution and every raw logit byte identity must match.
+            expected = original_bytes.replace(str(result_path).encode(), str(output / 'result.json').encode())
+            require(code == original['exit_code'] and (output / 'result.json').read_bytes() == expected,
+                    'CPU recheck result differs beyond output paths')
+            reproduced = json.loads((output / 'result.json').read_text())
+            require({k: sha256(v['path']) for k, v in reproduced['raw_logits']['files'].items()} == raw_hashes,
+                    'CPU recheck raw logits differ')
+            private_json(output / 'comparison.json', dict(result_bytes_equal_after_output_path_substitution=True,
+                original_result_sha256=sha256(result_path), raw_logits_byte_identical=True, raw_sha256=raw_hashes))
+        require(before == {str(p): sha256(p) for p in run.rglob('*') if p.is_file()}, 'recheck changed the original run')
+        print('PASS ' + name + ': exit ' + str(code), flush=True)
+    # The binary fixtures are task-owned; keep hashes/logs after the comparison to restore the host disk margin.
+    removed = []
+    for directory in (run, output):
+        for path in directory.rglob('*'):
+            if path.is_file() and path.suffix in ('.bin', '.node_snapshot', '.node_delta', '.f32'):
+                removed.append(dict(path=str(path), bytes=path.stat().st_size, sha256=sha256(path)))
+                path.unlink()
+    private_json(root / 'recheck-cleanup.json', removed)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir', required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
+    p.add_argument('--recheck-only', action='store_true', help='one preserved checkpoint and offline recheck controls')
     p.add_argument('--controls-only', action='store_true')
     p.add_argument('--multi-chunk-only', action='store_true')
     p.add_argument('--state-probes', action='store_true')
@@ -264,7 +337,7 @@ def main():
     args = p.parse_args()
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
-    if not args.multi_chunk_only:
+    if not args.multi_chunk_only and not args.recheck_only:
         checkpoint_controls(build, model, root)
     if args.controls_only:
         return
@@ -286,17 +359,22 @@ def main():
         private_json(state / 'client-info.json', client)
         private_json(state / 'proxy-config.json', config)
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
-        multi_chunk_prestage(build, model, root, config)
+        if not args.recheck_only:
+            multi_chunk_prestage(build, model, root, config)
         if args.multi_chunk_only:
             return
-        preflight_controls(state, root, config)
+        if not args.recheck_only:
+            preflight_controls(state, root, config)
         commands = []
-        for start in (('cold', 'pre-staged') if args.start == 'both' else (args.start,)):
+        starts = ('pre-staged',) if args.recheck_only else (('cold', 'pre-staged') if args.start == 'both' else (args.start,))
+        for start in starts:
             output = root / start
             command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
                 '--output', str(output), '--depth', '128', '--turns', '12', '--disconnect-turn', '4',
                 '--disconnect-turns', '2', '--max-new', '48', '--max-output', '128', '--pause-cap', '1.1', '--seed', '281',
                 '--start', start, '--link-label', 'CPU loopback; sampled output capped128/input48 seed281; synthetic policy']
+            if args.recheck_only:
+                command += ['--checkpoint-turns', '10', '--keep-checkpoint-states']
             if args.state_probes:
                 command.append('--state-probes')
             with (root / (start + '.log')).open('wb') as log:
@@ -316,9 +394,11 @@ def main():
             require(trace['route_counts']['background_catchup_events'], 'background replay path missing')
             require(all(r['path'] == 'local' for r in hybrid if 4 <= r['turn'] < 6), 'offload during outage')
             require(any(r.get('resync', {}).get('tokens', 0) > 0 for r in hybrid), 'no recovered journal catch-up')
-            require([r['turn'] for r in trace['checkpoints']] == [10, 12], 'checkpoint missing')
+            require([r['turn'] for r in trace['checkpoints']] == ([10] if args.recheck_only else [10, 12]), 'checkpoint missing')
             require(all(r['k'] == 64 for r in trace['checkpoints']), 'wrong checkpoint width')
             require(node.request('GET', '/v1/sessions') == [], 'remote sessions leaked')
+            if args.recheck_only:
+                recheck_controls(build, model, root, output)
             for arm in ('local', 'local_partition'):
                 local = [r for r in calls if r['arm'] == arm]
                 require(all(r['journal_hash'] == l['journal_hash'] for r, l in zip(hybrid, local)), 'paired journals differ')
