@@ -26,6 +26,14 @@ def delta_wire_estimate(tokens, geometry, chunk_tokens=None):
             4096 * ((tokens + chunk - 1) // chunk))
 
 
+def planning_policy(kind, geometry, link, local=100):
+    fixture = json.loads((ROOT / 'tools/hybrid-bench/fixtures/m3-max-qwen-pri31.json').read_text())
+    rates = g.validate_fixture(fixture, fixture['model_sha256'], fixture['architecture']) if kind == 'qwen' else [[0, local]]
+    return Policy(local_rates=rates, server_rate=1767 if kind == 'qwen' else 2823,
+        link_rate=link, fixed=.1406, import_fixed=1.498, import_per_token=.0000487,
+        kv_bytes=geometry['kv_bytes'], state_bytes=geometry['state_bytes'] + geometry.get('window_bytes', 0))
+
+
 def estimate(kind, link, local=100, decode=18, recurrent_dtype="f32"):
     qwen = kind == 'qwen'
     fixture = json.loads((ROOT / 'tools/hybrid-bench/fixtures/m3-max-qwen-pri31.json').read_text())
@@ -45,10 +53,7 @@ def estimate(kind, link, local=100, decode=18, recurrent_dtype="f32"):
     elif recurrent_dtype != 'f32':
         raise ValueError('unknown recurrent wire dtype')
     plan = g.depth_plan(depth, 40, 1, 10875, 4506, 340, framing, context)
-    state = geometry['state_bytes'] + geometry.get('window_bytes', 0)
-    policy = Policy(local_rates=tuple([(0, prefill(0))] + [(r['depth'], r['prefill']) for r in rows]) if qwen else ((0, local),),
-        server_rate=1767 if qwen else 2823, link_rate=link, fixed=.1406, import_fixed=1.498,
-        import_per_token=.0000487, kv_bytes=geometry['kv_bytes'], state_bytes=state)
+    policy = planning_policy(kind, geometry, link, local)
     base_down = delta_wire_estimate(depth - 1, geometry, original_chunk)
     down = base_down
     uploads = 11 * depth

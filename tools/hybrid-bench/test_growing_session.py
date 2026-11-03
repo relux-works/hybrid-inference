@@ -28,6 +28,43 @@ class ScenarioTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    # The failed GPU packet must refuse on its real geometry; the sourced replacement must exercise both routes.
+    def test_qwen_rehearsal_old_16mb_policy_refuses(self):
+        plan = growing.depth_plan(100000, 40, 1, 10875, 4506, 340, 14, 196608)
+        old = Policy(local_rates=[[0,100]], server_rate=1767, link_rate=16000000, fixed=.110,
+                     import_fixed=1.618657356721653, import_per_token=.0004953084013066794,
+                     kv_bytes=34816, state_bytes=156893184)
+        self.assertEqual(growing.route_preflight(old, plan, 2, 3, False)['counts'],
+                         dict(policy_local=37, policy_offload=0))
+        with self.assertRaisesRegex(Refusal, "degenerate connected policy mix.*'policy_offload': 0"):
+            growing.route_preflight(old, plan, 2, 3)
+        module = self.packet_module('rehearsal_policy')
+        policy, report = module.prepare('qwen', dict(kv_bytes=34816, state_bytes=156893184))
+        self.assertEqual(report['f32']['counts'], dict(policy_local=30, policy_offload=7))
+        self.assertEqual(report['bf16_independent_policy']['counts'], dict(policy_local=28, policy_offload=9))
+        self.assertEqual(report['bf16_chain_turn_imports'], [7,13,17,31,32,33,40])
+        self.assertEqual(report['bf16_chain_imports_at_checkpoints'], {'10':2,'20':4,'30':4,'40':8})
+        self.assertEqual(growing.route_preflight(Policy(**policy), plan, 2, 3)['counts'], report['f32']['counts'])
+        self.assertEqual((plan['final_depth'], min(r['input_tokens'] for r in plan['sequence']),
+                          max(r['input_tokens'] for r in plan['sequence'])), (143439,6,2329))
+
+    # Glimmer's old real-window policy is already mixed; a low-link negative prevents vacuous rehearsal admission.
+    def test_glimmer_rehearsal_low_link_refuses_and_old_policy_is_mixed(self):
+        plan = growing.depth_plan(76000, 40, 1, 10875, 4506, 340, 32, 131072)
+        old = Policy(local_rates=[[0,100]], server_rate=2823, link_rate=16000000, fixed=.110,
+                     import_fixed=1.618657356721653, import_per_token=.0004953084013066794,
+                     kv_bytes=7072, state_bytes=43514896)
+        self.assertEqual(growing.route_preflight(old, plan, 20, 3)['counts'], dict(policy_local=26, policy_offload=11))
+        policy, report = self.packet_module('rehearsal_policy').prepare(
+            'glimmer', dict(kv_bytes=7072, state_bytes=0, window_bytes=43514896))
+        self.assertEqual(report['f32']['counts'], dict(policy_local=26, policy_offload=11))
+        self.assertEqual(report['f32']['offload_turns'], [3,5,6,7,13,16,17,31,32,33,40])
+        low = dict(policy, link_rate=2000000)
+        self.assertEqual(growing.route_preflight(Policy(**low), plan, 20, 3, False)['counts'],
+                         dict(policy_local=37, policy_offload=0))
+        with self.assertRaisesRegex(Refusal, "degenerate connected policy mix.*'policy_offload': 0"):
+            growing.route_preflight(Policy(**low), plan, 20, 3)
+
     # Labels cannot alias a transport, and the bf16 policy changes only tensor wire bytes while preserving metadata.
     def test_bf16_arm_labels_and_policy_bytes(self):
         layout=dict(architecture='qwen35',layers=[dict(recurrent=True)]*18,
@@ -73,6 +110,19 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(converted['probes'][-1]['steps'][0]['reencode_state_dtype'],'bf16')
         with self.assertRaisesRegex(Refusal,'source must be f32'):module.treatment(dict(source,state_dtype='bf16'))
         with self.assertRaisesRegex(Refusal,'recorded imports'):module.treatment(dict(source,probes=[dict(name='CHAIN',steps=[])]))
+
+    # Base-only rounding cannot qualify repeated imports; other arms, local turns and later turns do not count.
+    def test_bf16_rehearsal_base_only_chain_refuses(self):
+        module = self.packet_module('replay_bf16')
+        calls = [dict(arm='hybrid',stage='start',path='offload',turn=0),
+                 dict(arm='hybrid',stage='turn',path='local',turn=1),
+                 dict(arm='local',stage='turn',path='offload',turn=7),
+                 dict(arm='hybrid',stage='turn',path='offload',turn=31)]
+        with self.assertRaisesRegex(Refusal, 'turn imports beyond the base'):
+            module.replay_coverage(dict(calls=calls), [10,20,30])
+        calls.append(dict(arm='hybrid',stage='turn',path='offload',turn=7))
+        self.assertEqual(module.replay_coverage(dict(calls=calls), [10,20,30,40]),
+                         dict(turn_imports=[7,31],final_imports_at_checkpoints={'10':2,'20':2,'30':2,'40':3}))
 
     # The same source/binary binding accepts an unchanged fit and rejects changed bytes or missing binaries.
     def test_fit_reuse_requires_source_and_binary_identity(self):

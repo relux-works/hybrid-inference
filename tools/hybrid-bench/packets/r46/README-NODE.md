@@ -20,7 +20,7 @@ For Glimmer, use its MODEL/MODEL_SHA256 and the alternative command, after relea
 bash tools/hybrid-bench/packets/r46/stage-glimmer-node.sh --state "$NODE_ROOT/glimmer-node" --build-dir "$NODE_ROOT/build" --build-lock "$NODE_ROOT/build.lock" > "$NODE_ROOT/glimmer-deploy-01.log" 2>&1
 ```
 
-Builds use deploy-prefill-node's existing stamped-ref/build-lock flow. For stamped exact-head reuse only, add `--skip-build`. Bind remains127.0.0.1:8091. q8_0 K/V, flash attention, node batch/ubatch256/256 and2 threads remain unchanged. Record source/tree, model, binaries/libraries, stamp and CUDA/device identity. Start the authenticated r44 helper for the separate SSH link probe and retain its PID:
+Builds use deploy-prefill-node's existing stamped-ref/build-lock flow. For stamped exact-head node reuse only, add `--skip-build`. The node stamp covers llama-hybrid-prefill, not the client targets. GPU rehearsals next use `bash tools/hybrid-bench/packets/r46/setup-rehearsal-client.sh qwen` (or `glimmer`) with BUILD pointing to that same build tree and NODE_ROOT to that same lock root. The wrapper builds and records all client targets at R46_HEAD under the shared lock; do not skip this build or manually edit the stamp. See each rehearsal's sequential operator commands. The launcher's25 GiB build floor stays active. Bind remains127.0.0.1:8091. q8_0 K/V, flash attention, node batch/ubatch256/256 and2 threads remain unchanged. Record source/tree, model, binaries/libraries, stamp and CUDA/device identity. Start the authenticated r44 helper for the separate SSH link probe and retain its PID:
 
 ```bash
 python3 "$R44_PACKET/node-link.py" serve --port 8093 > "$NODE_ROOT/link-01.log" 2>&1 &

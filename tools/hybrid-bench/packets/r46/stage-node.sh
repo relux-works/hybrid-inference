@@ -23,4 +23,5 @@ require(x['architecture']==sys.argv[1], 'wrong node model')
 if sys.argv[1]=='muse-glimmer':
     require(x['sliding_window']==2048 and not any(r['recurrent'] for r in x['layers']), 'wrong Glimmer state layout')
 PY
+# This records prefill only. Rehearsals next build client targets with setup-rehearsal-client.sh under the same lock.
 exec tools/hybrid-bench/deploy-prefill-node.sh --model "$MODEL" --sha256 "$MODEL_SHA256" --ctx "$context" --cuda --bench-link --ref "$R46_HEAD" --bind 127.0.0.1 --port 8091 --startup-timeout 3600 --offline "$@"

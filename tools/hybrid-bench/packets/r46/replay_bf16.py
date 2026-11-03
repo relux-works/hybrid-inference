@@ -13,6 +13,13 @@ import growing_session as g
 from bench_common import Refusal, private_json, require, sha256, start_process
 
 
+def replay_coverage(trace, turns):
+    imports = sorted(r['turn'] for r in trace['calls'] if r['arm'] == 'hybrid' and
+                     r['stage'] == 'turn' and r['path'] == 'offload' and r['turn'] <= max(turns))
+    require(imports, 'bf16 repeated-rounding rehearsal needs turn imports beyond the base')
+    return dict(turn_imports=imports, final_imports_at_checkpoints={str(t): 1 + sum(n <= t for n in imports) for t in turns})
+
+
 def treatment(source):
     require(source.get('state_dtype','f32')=='f32', 'replay source must be f32')
     require(source.get('acceptance_rule')=='session_append_replay_exact', 'exact baseline controls required')
@@ -57,6 +64,7 @@ def main():
     require(not a.output.exists() and a.output.parent.is_dir(),'new replay output required')
     original=json.loads(a.trace.read_text())
     require(original['status']=='passed' and not original['heterogeneous'], 'passed homogeneous f32 rehearsal required')
+    coverage=replay_coverage(original,a.turns)
     a.output.mkdir(mode=0o700);results=[]
     for turn in a.turns:
         trace,source,fixture,verified=g.verify_recheck(a.trace,turn)
@@ -82,7 +90,7 @@ def main():
         baseline=json.loads((fixture.parent/'result.json').read_text())
         result=summarize(row,turn,baseline);private_json(run/'summary.json',result);results.append(result)
     result=dict(schema='bf16-growing-replay-v1',status='lossy',exit_code=5,exact=False,
-        quality_gate=all(r['local_top1_gate'] for r in results),checkpoints=results,
+        quality_gate=all(r['local_top1_gate'] for r in results),checkpoints=results,coverage=coverage,
         interpretation='Same captured token journal and f32 routing boundaries; every critical recurrent envelope is rounded once. Node states remain f32. This isolates accumulated client-side effects, not changed free-running history or bf16 policy decisions.')
     private_json(a.output/'summary.json',result)
     print(json.dumps(dict(status=result['status'],quality_gate=result['quality_gate'],summary=str(a.output/'summary.json'))))

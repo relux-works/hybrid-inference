@@ -24,22 +24,17 @@ export TMPDIR="$NODE_ROOT/tmp" PYTHONDONTWRITEBYTECODE=1
 export BF16_NODE_STATE="$NODE_ROOT/qwen-bf16-node"
 bash tools/hybrid-bench/packets/r46/stage-qwen-bf16-node.sh --build-dir "$BUILD" --build-lock "$NODE_ROOT/build.lock" > "$NODE_ROOT/deploy-01.log" 2>&1
 export TMPDIR="$CLIENT_ROOT/tmp"
-tools/hybrid-bench/setup-client.sh --state "$CLIENT_ROOT/client" --model "$MODEL" --sha256 "$MODEL_SHA256" --ctx 196608 --cuda --node-info "$BF16_NODE_STATE/node-info.json" --token-file "$BF16_NODE_STATE/client-tokens.json" --prefill-url http://127.0.0.1:8091 --request-timeout 3600 --startup-timeout 3600 --ref "$R46_HEAD" --build-dir "$BUILD" --skip-build --offline > "$CLIENT_ROOT/setup-01.log" 2>&1
-python3 - "$CLIENT_ROOT" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0,'tools/hybrid-bench')
-from bench_common import private_json,read_private
-r=Path(sys.argv[1]);c=read_private(r/'client/proxy-config.json');x=c['delta_geometry']
-private_json(r/'rehearsal-policy.json',dict(local_rates=[[0,100]],server_rate=1767,link_rate=16000000,fixed=.110,
- import_fixed=1.618657356721653,import_per_token=.0004953084013066794,
- kv_bytes=x['kv_bytes'],state_bytes=x['state_bytes']))
-PY
+bash tools/hybrid-bench/packets/r46/setup-rehearsal-client.sh qwen > "$CLIENT_ROOT/setup-01.log" 2>&1
+python3 tools/hybrid-bench/packets/r46/rehearsal_policy.py --model qwen --client-state "$CLIENT_ROOT/client" --output "$CLIENT_ROOT/rehearsal-policy.json" > "$CLIENT_ROOT/policy-01.log" 2>&1
 tools/hybrid-bench/setup-client.sh --state "$CLIENT_ROOT/client" --stop > "$CLIENT_ROOT/stop-launcher-01.log" 2>&1
 python3 tools/hybrid-bench/growing_session.py --client-state "$CLIENT_ROOT/client" --output "$CLIENT_ROOT/f32-rehearsal" --depth 100000 --turns 40 --seed 1 --start pre-staged --disconnect-turn 2 --disconnect-turns 3 --checkpoint-turns 10,20,30,40 --keep-checkpoint-states --state-probes --policy "$CLIENT_ROOT/rehearsal-policy.json" --link-label 'PRO6000 CUDA loopback; illustrative routing, common-journal bf16 rehearsal' --request-timeout 3600
 ```
 
-The policy uses prior Qwen GPU import coefficients and simulated16MB/s solely to exercise local/offload/recovery. It is not a Mac calibration or loopback bandwidth measurement. It does not force per-turn decisions. Original preflight still requires both routes; do not alter samples or shrink context to force a result. After baseline exit0/statuspassed and zero remaining remote sessions, stop the owned node to release its GPU memory. The offline checker then uses the same card sequentially, with the node and decoder stopped:
+Client setup deliberately omits `--skip-build`: the node stamp records only llama-hybrid-prefill. The shared wrapper builds and records llama-server, llama-hybrid-bench-check and llama-hybrid-score at R46_HEAD under the node's same build.lock, with the launcher's existing 25 GiB admission/runtime floor. No manual target build or stamp edit is required. Both stages are sequential. Keep at least28GB free throughout the rehearsal as well.
+
+The [policy source and route audit](REHEARSAL-POLICY.md) uses the r46b planning scenario at20 decimal MB/s: measured Qwen PRI31 delta512 floor rates, server1767tok/s, RTT0.1406s, prior Metal import1.498s+0.0000487s/token. This is illustrative routing on loopback, not a calibration or a WAN timing measurement. Geometry comes from the launched client's delta_geometry, including34816 attention bytes/token and156893184 recurrent bytes. With the unchanged seed1 schedule/framing14, f32 preflight predicts30 connected local and7 offload turns (7,13,17,31,32,33,40), plus three outage turns2-4 and the forced base. The independent bf16-byte policy would predict28 local/9 offloads; BF16_CHAIN deliberately follows the actual captured f32 routes instead.
+
+Repeated-rounding coverage needs imports beyond the base. Under the configured-link prediction, BF16_CHAIN gets seven such turns, with cumulative final import counts2/4/4/8 at checkpoints10/20/30/40 including the base. Base chunk count is not a repeated-state import count: only the final chunk installs recurrent state. Live transfer-rate EMA can change route decisions on loopback; record actual turn imports and cumulative counts from the captured trace and replay summaries. A base-only chain cannot qualify repeated-rounding behavior; retain it as insufficient coverage. Preflight still requires both routes. Do not alter samples, seed, turns or context to force a result. After baseline exit0/statuspassed and zero remaining remote sessions, stop the owned node to release its GPU memory. The offline checker then uses the same card sequentially, with the node and decoder stopped:
 
 ```bash
 tools/hybrid-bench/deploy-prefill-node.sh --state "$BF16_NODE_STATE" --stop > "$NODE_ROOT/stop-01.log" 2>&1

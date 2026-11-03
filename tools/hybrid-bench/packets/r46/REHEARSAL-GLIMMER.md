@@ -27,24 +27,19 @@ All10 must be exact (zero KL and logit difference,64/64, no free-running diverge
 
 ## Run
 
-Prepare separate NODE_ROOT and CLIENT_ROOT under this GPU checkout's .temp and staged BUILD/model paths. Use the launcher-generated node metadata/token files. Client setup below builds all required targets on the same signed head. The rehearsal policy deliberately uses an illustrative local100tok/s target, 16MB/s simulated WAN rate and the prior PR9 CUDA import fit1.6186573567s +0.0004953084s/token. These are functional routing parameters, not PRI31 Glimmer Mac data or measured loopback rates. The Mac packet refuses this placeholder and requires its own fixture/calibration.
+Prepare separate NODE_ROOT and CLIENT_ROOT under this GPU checkout's .temp and staged BUILD/model paths. Set MODEL, MODEL_SHA256 and R46_HEAD as in README-NODE.md. The command list below stages the node, then builds and records all three client targets at the same exact ref under the same build.lock. No `--skip-build`, manual target build or stamp edit is required; the launcher's 25 GiB build admission/runtime floor remains active. The rehearsal additionally keeps28GB free.
+
+The [policy source and route audit](REHEARSAL-POLICY.md) uses the r46b interim Glimmer100tok/s planning scenario at20 decimal MB/s, server2823tok/s, RTT0.1406s and prior Qwen Metal import1.498s+0.0000487s/token. These are illustrative functional routing parameters, not PRI31 Glimmer Mac data or a loopback calibration. The Mac packet continues to require its own measured fixture/calibration. Real geometry is7072 attention bytes/token, no recurrent bytes, and43514896 window bytes including metadata. Framing32, seed1,76000 start and outage20-22 predict26 connected local and11 offload turns:3,5,6,7,13,16,17,31,32,33,40. The old16MB/s policy already gave the same mixed counts for Glimmer; it did not have Qwen's degeneracy defect. The replacement shares the documented planning source. Actual template framing and live transfer-rate EMA can change routes; preserve the runtime preflight and record actual counts.
 
 ```bash
 set -eu
 umask 077
-mkdir -p "$CLIENT_ROOT/tmp"
-export TMPDIR="$CLIENT_ROOT/tmp" PYTHONDONTWRITEBYTECODE=1
-tools/hybrid-bench/setup-client.sh --state "$CLIENT_ROOT/client" --model "$MODEL" --sha256 "$MODEL_SHA256" --ctx 131072 --cuda --node-info "$NODE_ROOT/glimmer-node/node-info.json" --token-file "$NODE_ROOT/glimmer-node/client-tokens.json" --prefill-url http://127.0.0.1:8091 --request-timeout 3600 --startup-timeout 3600 --ref "$R46_HEAD" --build-dir "$BUILD" --offline > "$CLIENT_ROOT/setup-01.log" 2>&1
-python3 - "$CLIENT_ROOT" <<'PY'
-import json,sys
-from pathlib import Path
-sys.path.insert(0,'tools/hybrid-bench')
-from bench_common import private_json,read_private
-r=Path(sys.argv[1]); c=read_private(r/'client/proxy-config.json'); x=c['delta_geometry']
-private_json(r/'rehearsal-policy.json',dict(local_rates=[[0,100]],server_rate=2823,link_rate=16000000,fixed=.110,
- import_fixed=1.618657356721653,import_per_token=.0004953084013066794,
- kv_bytes=x['kv_bytes'],state_bytes=x['state_bytes']+x.get('window_bytes',0)))
-PY
+mkdir -p "$NODE_ROOT/tmp" "$CLIENT_ROOT/tmp"
+export TMPDIR="$NODE_ROOT/tmp" PYTHONDONTWRITEBYTECODE=1
+bash tools/hybrid-bench/packets/r46/stage-glimmer-node.sh --state "$NODE_ROOT/glimmer-node" --build-dir "$BUILD" --build-lock "$NODE_ROOT/build.lock" > "$NODE_ROOT/deploy-01.log" 2>&1
+export TMPDIR="$CLIENT_ROOT/tmp"
+bash tools/hybrid-bench/packets/r46/setup-rehearsal-client.sh glimmer > "$CLIENT_ROOT/setup-01.log" 2>&1
+python3 tools/hybrid-bench/packets/r46/rehearsal_policy.py --model glimmer --client-state "$CLIENT_ROOT/client" --output "$CLIENT_ROOT/rehearsal-policy.json" > "$CLIENT_ROOT/policy-01.log" 2>&1
 tools/hybrid-bench/setup-client.sh --state "$CLIENT_ROOT/client" --stop > "$CLIENT_ROOT/stop-launcher-01.log" 2>&1
 ```
 
