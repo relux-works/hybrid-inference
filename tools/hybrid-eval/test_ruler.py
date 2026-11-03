@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import random
+import re
 import tempfile
 import unittest
 import tarfile
@@ -63,10 +65,12 @@ class RulerTests(unittest.TestCase):
 
     # A character tokenizer checks stable contents, exact full-prompt length and seed separation for every configuration.
     def test_all_generators_deterministic_and_too_short_negative(self):
-        with tempfile.TemporaryDirectory() as tmp, patch('nltk.tokenize.sent_tokenize', side_effect=fixture_sentences):
+        with tempfile.TemporaryDirectory() as tmp, patch('nltk.tokenize.sent_tokenize', side_effect=fixture_sentences), \
+             patch('wonderwords.random_word._get_words_from_text_file', return_value=[f'word{i}' for i in range(300)]):
             data = fixtures(Path(tmp))
             for task in configurations():
-                generator = Generator(task, data, list, 17, fixture=True)
+                # VT's upstream 500-token example needs a word tokenizer; rendering still counts every character.
+                generator = Generator(task, data, str.split if task == 'vt' else list, 17, fixture=True)
                 def render(body):
                     return list(''.join(m['content'] for m in body['messages']))
                 first = generator.generate(0, 8192, render)
@@ -77,6 +81,72 @@ class RulerTests(unittest.TestCase):
                 self.assertEqual(score(task, first['answers'], 'WRONG ANSWER'), 0)
             with self.assertRaisesRegex(Refusal, 'minimum exceeds'):
                 Generator('cwe', data, list, 17, fixture=True).generate(0, 512, render)
+
+    # Compare the worked example, answer and insertion to the pinned upstream path, independently of fitting/padding.
+    def test_vt_worked_example_matches_upstream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = Generator('vt', fixtures(Path(tmp)), str.split, 17, fixture=True)
+            module = generator.module
+            random.seed(17)
+            generator.np.random.seed(17)
+            example = module['sys_vartrack_w_noise_random'](
+                num_samples=1, max_seq_length=500, incremental=5,
+                num_chains=module['args'].num_chains, num_hops=module['args'].num_hops)[0]
+            self.assertEqual(generator.icl_example, example)
+            self.assertLessEqual(example['length'], 500)
+            self.assertTrue(all(re.fullmatch('[A-Z]{3}', name) for name in example['outputs']))
+            seed = int(digest([17, 'vt', 0])[:8], 16)
+            random.seed(seed)
+            generator.np.random.seed(seed)
+            text, answers = module['generate_input_output'](20, module['args'].num_chains, module['args'].num_hops)
+            worked = module['randomize_icl'](example['input']+' '+' '.join(example['outputs'])+'\n')
+            cutoff = text.index(generator.base['template'][:20])
+            expected = text[:cutoff]+worked+'\n'+text[cutoff:]
+            actual, references = generator.candidate(0, 20, 8192)
+            self.assertEqual((actual, references), (expected, answers))
+            self.assertEqual(actual.count(generator.base['template'][:20]), 2)
+            worked_answers = worked.strip().split()[-len(example['outputs']):]
+            self.assertTrue(all(re.fullmatch('[A-Z]{3}', name) for name in worked_answers))
+            self.assertTrue(all('VAR '+name in worked for name in worked_answers))
+            self.assertEqual((actual, references), generator.candidate(0, 20, 32768))
+
+    # Fixture word/whitespace tokens bound largest requests and total rendering at production depths; no GPU/corpora.
+    def test_all_generators_bounded_render_work(self):
+        def tokenize(text):
+            return re.findall(r'\S+|\s', text)
+        with tempfile.TemporaryDirectory() as tmp, patch('nltk.tokenize.sent_tokenize', side_effect=fixture_sentences), \
+             patch('wonderwords.random_word._get_words_from_text_file', return_value=[f'word{i}' for i in range(300)]):
+            data = fixtures(Path(tmp))
+            for depth in (8192, 32768):
+                for task in configurations():
+                    with self.subTest(task=task, depth=depth):
+                        generator = Generator(task, data, tokenize, 17, fixture=True)
+                        lengths = []
+                        def render(body):
+                            tokens = tokenize(''.join(m['content'] for m in body['messages']))
+                            lengths.append(len(tokens))
+                            self.assertLessEqual(len(tokens), 4*depth, 'oversized tokenizer request')
+                            self.assertLessEqual(sum(lengths), 30*depth, 'excessive total render work')
+                            return tokens
+                        spec = generator.generate(0, depth, render)
+                        self.assertEqual(spec['prompt_tokens'], depth)
+                        self.assertEqual(score(task, spec['answers'], ' '.join(spec['answers'])), 1)
+                        self.assertEqual(score(task, spec['answers'], 'WRONG ANSWER'), 0)
+
+    # Partial reports expose Bonferroni, while exactly four depths get joint Holm; excess depths are refused.
+    def test_adjustment_labels_partial_and_joint_depths(self):
+        rows = [table_row(i, True) for i in range(6)]
+        partial = analyze(rows)[1][0]
+        self.assertNotIn('mcnemar_holm_four_depths', partial)
+        self.assertEqual(partial['mcnemar_bonferroni_four_depths'], 4*partial['mcnemar_p'])
+        joint = [dict(row, depth=depth) for depth in (8192, 32768, 65536, 131072) for row in rows]
+        primary = [table for table in analyze(joint)[1] if table['task'] == 'ALL']
+        self.assertEqual(len(primary), 4)
+        for table in primary:
+            self.assertNotIn('mcnemar_bonferroni_four_depths', table)
+            self.assertEqual(table['mcnemar_holm_four_depths'], 4*table['mcnemar_p'])
+        with self.assertRaisesRegex(Refusal, 'more than four'):
+            analyze(joint+[dict(row, depth=262144) for row in rows])
 
     # The independent 11-pair table has b=6,c=0, hence exact p=2/64 and rates 8/11 versus 2/11.
     def test_known_paired_table_and_intervals(self):
@@ -236,6 +306,9 @@ class RulerTests(unittest.TestCase):
                 run.return_value = row
                 self.assertEqual(evaluate_main(), 0)
                 self.assertEqual(generator.return_value.generate.call_count, 1)
+                frozen = json.loads((depth/'specs'/'niah_single_1-0000.json').read_text())
+                self.assertGreaterEqual(frozen['generation_seconds'], 0)
+                self.assertEqual(frozen['generation_seconds'], spec['generation_seconds'])
                 self.assertEqual(len(list((depth/'rows').glob('*.json'))), 1)
                 calls = run.call_count
                 self.assertEqual(evaluate_main(), 0)

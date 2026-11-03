@@ -108,9 +108,15 @@ def analyze(rows, margin=.02):
                 table['accuracy_pairs'][arm] = dict(**acc, mcnemar_p=mcnemar(acc['left_only'], acc['right_only']))
             tables.append(table)
     running = 0.0
-    for rank, table in enumerate(sorted((t for t in tables if t['task'] == 'ALL'), key=lambda t: t['mcnemar_p'])):
+    primary = [t for t in tables if t['task'] == 'ALL']
+    require(len(primary) <= 4, 'more than four primary depths')
+    adjustment = 'mcnemar_holm_four_depths' if len(primary) == 4 else 'mcnemar_bonferroni_four_depths'
+    for rank, table in enumerate(sorted(primary, key=lambda t: t['mcnemar_p'])):
+        if len(primary) < 4:
+            table[adjustment] = min(1.0, 4*table['mcnemar_p'])
+            continue
         running = max(running, min(1.0, (4-rank)*table['mcnemar_p']))
-        table['mcnemar_holm_four_depths'] = running
+        table[adjustment] = running
     return examples, tables
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 import random
 import sys
 import tarfile
+import time
 import uuid
 
 from hybrid_eval import (Refusal, digest, http, model_identity, public_trace, read_private, require,
@@ -193,9 +194,11 @@ def main():
                     require(spec['input_sha256'] == digest([spec['input'], spec['answer_prefix']]) and
                             spec['prompt_sha256'] == digest(render_tokens(body_for(spec['input'], spec['answer_prefix']))), 'frozen input changed')
                 else:
+                    started = time.perf_counter()
                     if generator is None:
                         generator = Generator(task, args.data, tokenize, args.seed)
                     spec = generator.generate(index, args.depth, render_tokens)
+                    spec['generation_seconds'] = time.perf_counter()-started
                     atomic_json(path, dict(spec, spec_sha256=digest(spec)))
                 result_path = root/'rows'/name
                 if result_path.exists():

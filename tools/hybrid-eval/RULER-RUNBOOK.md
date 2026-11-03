@@ -1,12 +1,12 @@
 # Paired RULER on one RTX PRO 6000
 
-This is the hybrid-a-r34-261102 integration for the private hybrid-inference prototype, based on main fca0fe31d. It requires one homogeneous CUDA node, a CUDA client decoder at batch/ubatch 64, and a second CUDA client decoder at 256. All use the same GGUF, native binaries, chat template, context and threads. No GPU experiment or benchmark-data download was performed on agents1.
+This is the hybrid-a-r35-261103 review revision of the r34 integration for the private hybrid-inference prototype, based on main fca0fe31d. It requires one homogeneous CUDA node, a CUDA client decoder at batch/ubatch 64, and a second CUDA client decoder at 256. All use the same GGUF, native binaries, chat template, context and threads. No GPU experiment or benchmark-data download was performed on agents1.
 
 ## Protocol and scope
 
 The 13 configurations in NVIDIA's `synthetic.yaml` are retained: `niah_single_1/2/3`, `niah_multikey_1/2/3`, `niah_multivalue`, `niah_multiquery`, `vt`, `cwe`, `fwe`, `qa_1` (SQuAD v2 answerable questions), and `qa_2` (HotpotQA distractor validation). The unchanged generators, templates, configurations, metrics, licence and source hashes are vendored under `vendor/ruler/`. Source: https://github.com/NVIDIA/RULER/tree/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a, Apache-2.0.
 
-The adapter calls upstream `generate_input_output` with a bounded, deterministic haystack-size search instead of upstream's batch sizing and unlimited retry loops. Each candidate resets Python/NumPy RNG from seed, task and example index. QA selects distinct questions using a seeded permutation. Configured complexities, few-shot CWE examples, needle sentences, query text and answer prefixes come from upstream. Unlike the old synthetic tool-conversation experiment, each RULER trial is one user prompt and the official assistant answer-prefix continuation. There is no ingest acknowledgement or extra question. The decoder applies its actual Jinja template with thinking disabled. The same complete prompt is frozen and supplied to all three arms; the sampled continuation is scored.
+The adapter calls upstream `generate_input_output` with a bounded, deterministic haystack-size search instead of upstream's batch sizing. The initial upper bound is three times depth divided by estimated tokens per size unit, measured on a minimum-sized rendered candidate, following upstream's sizing rule. It never starts at depth documents for QA. Each candidate resets Python/NumPy RNG from seed, task and example index. QA selects distinct questions using a seeded permutation. Configured complexities, few-shot CWE examples, needle sentences, query text and answer prefixes come from upstream. VT builds the upstream 500-token worked example through `sys_vartrack_w_noise_random`, with three-letter variables and initial value 12345, then inserts `randomize_icl`'s worked input plus answer before the main template, exactly as upstream does. VT fitting includes that example. Unlike the old synthetic tool-conversation experiment, each RULER trial is one user prompt and the official assistant answer-prefix continuation. There is no ingest acknowledgement or extra question. The decoder applies its actual Jinja template with thinking disabled. The same complete prompt is frozen and supplied to all three arms; the sampled continuation is scored.
 
 Depth means exactly **8192, 32768, 65536 or 131072 rendered input tokens**, including BOS/chat framing and the answer prefix, measured by that GGUF decoder's `/apply-template` and `/tokenize`. These are input depths, rather than upstream's input-plus-output `max_seq_length`. Generation reserves upstream's task-specific output budgets (128/30/120/50/32) beyond depth. No task text is truncated. Small whitespace padding after the first newline reaches the exact input depth; padding count, input hash, full prompt-token hash and record/document character offsets are retained. This is an explicitly documented length-control adapter, not byte-identical reproduction of upstream's sampled example sequence. Native tests use small local fixtures; production evaluation refuses missing or modified input locks.
 
@@ -34,13 +34,17 @@ At n=390, the 95% Wilson interval has worst-case half-width 4.94 percentage poin
 
 For the requested framing, let O=offload answer differs from local and P=partition answer differs from local. Persist all four cells, O-only/P-only example rows, exact two-sided McNemar p, each changed-answer rate with a 95% Wilson interval, and O-P. The difference interval is a conservative 95% two-sided bound from four one-sided Clopper-Pearson tails at .0125 (Bonferroni); it remains valid at zero discordance. A literal "offload changes answers no more often" claim requires the upper bound <=0. Also predeclare a practical margin of **2 percentage points** and report noninferiority (upper <.02) and two-sided equivalence (interval inside [-.02,.02]) separately. That margin is a planning choice, not the literal zero-margin claim. With zero discordances at n=390 the conservative upper excess is 1.12 points: practical equivalence can pass while the literal claim remains unestablished. A nonsignificant McNemar p never establishes equivalence. Per-depth intervals are marginal; no pooled-depth or universal model-quality conclusion follows.
 
+Practical 2 pp equivalence needs near-zero total discordance under this conservative interval. At n=390, b=c=0, 1, 2, 5 give upper excess bounds 1.12, 1.62, 2.02, 2.89 pp respectively. Thus b=c=2 already fails despite exactly equal change rates. If disagreement persists, report "no significant difference; equivalence at 2 pp not established" when supported by the tests.
+
+Predeclare the 128k budget option before collecting that depth: set `SAMPLES_128K=20` for n=260, leaving the first three depths at 30/task. At partition-only probability .05, detectable excess at 80% power is 7.45 pp (alpha .05) or 9.21 pp (Holm-first .0125), versus 5.78/7.12 pp at n=390. Zero discordance gives an upper excess bound of 1.67 pp, so 2 pp equivalence remains reachable, but b=c=1 already fails. n=195 (15/task) gives 2.22 pp even at zero discordance and makes 2 pp equivalence impossible. Choose 30 or 20 before the depth starts; changing its denominator after partial collection requires a new output directory and a declared protocol change.
+
 ## GPU setup and ordered execution
 
 Use Python 3.11+ with binary wheels available for the pinned dependencies. Use the owner's already qualified CUDA build and the same local GGUF as the existing pilot. No model download is part of these commands. The native build record must match the binaries; do not change a stamp to bypass admission. The model file must be visible to the evaluator, because live decoder identity hashes it. This runbook does not start a remote deployment from agents1.
 
 ```bash
 export PYTHONDONTWRITEBYTECODE=1
-export RUN="$PWD/.temp/ruler-r34"
+export RUN="$PWD/.temp/ruler-r35"
 export DATA="$RUN/data"
 export MODEL=/absolute/path/to/qualified-model.gguf
 export BUILD=/absolute/path/to/qualified-cuda-build
@@ -57,6 +61,8 @@ export NATIVE_REF=$(python3 -c 'import json,os; print(json.load(open(os.environ[
 ```
 
 Keep the bootstrap output and input lock. On restart, **reuse** the existing venv, data and `input-lock.sha256`; do not run the new-directory bootstrap again. The evaluator verifies the vendored source, all locked corpus/NLTK files, dependencies and all client identities before measuring a depth.
+
+If bootstrap failed before creating a valid lock, preserve the partial directory with `mv "$DATA" "$RUN/data-failed-$(date -u +%Y%m%dT%H%M%SZ)"`, then rerun bootstrap into the now-absent `$DATA`. This retry is only for failed bootstrap, never for an input corpus already used by an evaluation.
 
 Launch all three services on the same node, sequentially. Use these state directories only for this experiment:
 
@@ -77,23 +83,28 @@ nice -n 10 tools/hybrid-bench/setup-client.sh \
 
 Require aggregate VRAM admission for three model/context allocations on the 96 GB card. Inspect service startup commands and model contexts; all requests are sequential. If the actual model cannot fit, stop and choose an explicitly documented smaller model or change the service-lifecycle design before collecting data. CPU fallback or silently changing contexts/partitions does not satisfy this CUDA-to-CUDA protocol. Disk state size also depends on that model's KV/recurrent geometry.
 
-First run a separate one-example routing pilot; it has its own output directory and cannot inflate the paper denominator:
+Before each full depth run a separate pilot with one QA and one noise example. At minimum run 8k and 32k before the reservation decision; each pilot has its own output directory and cannot inflate the paper denominator. Repeat at 64k/128k to estimate the remaining budget at the actual depth:
 
 ```bash
-nice -n 10 "$PY" tools/hybrid-eval/ruler_eval.py \
-  --client-state "$RUN/client" --partition-client-state "$RUN/partition" --data "$DATA" \
-  --input-lock-sha256 "$INPUT_SHA" --output "$RUN/pilot" --depth 8192 \
-  --tasks niah_single_1 --samples-per-task 1 --seed 261102
+for depth in 8192 32768; do
+  nice -n 10 "$PY" tools/hybrid-eval/ruler_eval.py \
+    --client-state "$RUN/client" --partition-client-state "$RUN/partition" --data "$DATA" \
+    --input-lock-sha256 "$INPUT_SHA" --output "$RUN/pilot" --depth "$depth" \
+    --tasks niah_single_1 qa_1 --samples-per-task 1 --seed 261102 || break
+done
 ```
 
 Then run complete depths in the requested order. A command failure must stop the loop. It is safe to repeat it with the same options:
 
 ```bash
+export SAMPLES_128K=30 # Set to 20 before starting 128k for the n=260 budget option.
 for depth in 8192 32768 65536 131072; do
+  samples=30
+  if [ "$depth" = 131072 ]; then samples="$SAMPLES_128K"; fi
   nice -n 10 "$PY" tools/hybrid-eval/ruler_eval.py \
     --client-state "$RUN/client" --partition-client-state "$RUN/partition" --data "$DATA" \
     --input-lock-sha256 "$INPUT_SHA" --output "$RUN/results" --depth "$depth" \
-    --samples-per-task 30 --seed 261102 --margin .02 --request-timeout 7200 || break
+    --samples-per-task "$samples" --seed 261102 --margin .02 --request-timeout 7200 || break
   (cd "$RUN/results/depth-$depth" && sha256sum -c complete.tar.gz.sha256) || break
   # Copy each completed depth directory's complete.tar.gz and sidecar to durable storage here.
 done
@@ -101,9 +112,23 @@ done
 
 A hard stop loses at most the current three-arm example; the next launch starts that example in fresh sessions. Fully committed rows are skipped. Complete depths have `complete.json`, `complete.tar.gz`, an external archive hash and per-member `SHA256SUMS`. A depth is marked complete only after all expected pairs and analysis are present; an interrupted depth has partial `specs/` and `rows/` without a completion marker. Never call an incomplete depth complete or combine subsets from changed manifests. Restarts refuse model, template, partition, seed, source, data or margin changes. A partial live session after a power loss belongs to the private service state: stop these owned services, preserve their logs, and restart them before resuming. Do not manually delete other sessions' state.
 
+`--state` must not exist at launch. After a crash or stop, use this sequence only for these three owned state directories. Moving them preserves logs and removes the old paths; all stop commands must succeed before moving anything. Then repeat the three launch commands above with identical build/model/settings (the node launch creates fresh credentials for the new clients). Keep `$RUN/results`, `$RUN/pilot`, `$DATA`, the lock and venv in place. Evaluator identity excludes state paths/credentials, so this service relaunch can resume the same depth.
+
+```bash
+tools/hybrid-bench/setup-client.sh --state "$RUN/client" --stop && \
+tools/hybrid-bench/setup-client.sh --state "$RUN/partition" --stop && \
+tools/hybrid-bench/deploy-prefill-node.sh --state "$RUN/node" --stop && \
+  backup="$RUN/services-stopped-$(date -u +%Y%m%dT%H%M%SZ)" && \
+  mkdir -m 700 "$backup" && \
+  mv "$RUN/client" "$RUN/partition" "$RUN/node" "$backup/"
+# Relaunch only after the entire sequence succeeds and the three old state paths are absent.
+```
+
+On an incomplete-depth resume, existing frozen specs are re-rendered/tokenized even for saved rows to verify integrity. At late 128k this can mean hundreds of full prompt renders before new inference; budget restart time separately.
+
 `specs/` contains long private prompts; `rows/` stores one atomic JSON per completed pair. Keep both for reproduction. Shareable archives include only example answers/scores and hashes, traces without credentials, analysis tables, allowlisted model metadata, source identity and input/download locks. They exclude long corpus text, tokens, native state, endpoints, model paths and credentials. Include budget-hit counts when interpreting equal truncated continuations.
 
-For a joint report, concatenate only completed `rows.jsonl` files into a new analysis input and run `ruler_analysis.py` with all four depths. Its JSON reports Holm-adjusted primary p-values against the predeclared family of four; task rows remain descriptive.
+For a joint report, concatenate only completed `rows.jsonl` files into a new analysis input and run `ruler_analysis.py` with all four depths. Its JSON reports `mcnemar_holm_four_depths` only when all four primary depths are present. Per-depth/subset reports instead expose `mcnemar_bonferroni_four_depths` (4 x p, capped at 1), not a joint Holm result; task rows remain descriptive.
 
 ```bash
 cat "$RUN/results"/depth-*/rows.jsonl > "$RUN/paired-all-depths.jsonl"
@@ -115,7 +140,9 @@ tools/hybrid-bench/deploy-prefill-node.sh --state "$RUN/node" --stop
 
 ## Time and disk budget
 
-These are scenario estimates, not measured PRO 6000 results. A depth executes 1170 completions, at least 1170 x depth input-token work, output generation and remote shadow/state I/O. Let R be **effective aggregate end-to-end** input tokens/s across this three-arm protocol, including serialization, imports, decode and generator/tokenizer overhead. A first reservation uses R=2500..10000 tokens/s with 50% contingency. Replace it after the 8k pilot, and remeasure at each deeper length; attention and state I/O can grow faster than linearly.
+These are scenario estimates, not measured PRO 6000 results. A depth executes 1170 completions, at least 1170 x depth input-token work, output generation and remote shadow/state I/O. Separate prompt generation/tokenization from inference: each frozen spec and paired row records `generation_seconds` (including generator initialization on the first example of each task), and each arm records `seconds`. For m pilot examples at depth D, compute mean G=sum(generation_seconds)/m, mean A=sum(all arm seconds)/m, and inference R=3*D/A. Budget H=1.5*n*(G+A)/3600 per depth, or equivalently 1.5*(3*n*D/R+n*G)/3600. Include output decode, prefill and imports in A; external setup, restart verification and archive/copy time remain additional. Measure QA and noise separately; two examples do not bound all 13 tasks. Remeasure at each deeper length; attention and state I/O can grow faster than linearly.
+
+The table is an inference scenario at R=2500..10000 tokens/s plus 50% contingency. Add `1.5*sum(n_depth*G_depth)/3600` hours for measured prompt preparation; the CPU fixture pilot in the revision report is a preparation-only observation, not a GPU throughput measurement. The upper end of the table is not a worst-case bound for 128k.
 
 | Input depth | Cases / completions | Input work | GPU hours with 50% contingency | Private prompt storage estimate |
 |---:|---:|---:|---:|---:|
@@ -124,6 +151,8 @@ These are scenario estimates, not measured PRO 6000 results. A depth executes 11
 | 65536 | 390 / 1170 | 76.68M tokens | 3.19..12.78 | 0.20 GB |
 | 131072 | 390 / 1170 | 153.35M tokens | 6.39..25.56 | 0.41 GB |
 | Total | 1560 / 4680 | 277.95M tokens | **11.6..46.3 hours** | 0.74 GB |
+
+With n=260 at 128k, that depth is 260 cases / 780 completions, 102.24M input tokens and 4.26..17.04 inference GPU-hours. The four-depth total is 1430 cases / 4290 completions, 226.84M input tokens and **9.45..37.81 inference GPU-hours**, plus measured preparation and setup. This saves one third of 128k inference work (18.4% overall).
 
 Prompt storage assumes roughly 4 UTF-8 bytes/token and allows JSON overhead; QA/UUIDs can differ. Reserve 2 GB for immutable data/raw downloads, Python wheels and analysis, and another 2 GB for private prompts/results. Model/build storage is additional. Allow **at least 4 x a native saved-session size at the active depth plus model/build space** for transient slot/backup/export files; obtain the size from the pilot, scale using model KV geometry, and monitor high-water usage. This state-dependent part can dominate the table. The request timeout is per request, not a total time budget. A budget stop after a completed depth preserves that depth's archive; no partial 128k run invalidates completed 8k/32k/64k runs.
 
@@ -142,3 +171,5 @@ nice -n 10 "$PY" tools/hybrid-eval/test_native.py \
 ```
 
 The native extension uses all 13 local-fixture generators with the real GGUF tokenizer at 2k (4k CWE), plus a three-arm RULER needle execution and the existing five-arm synthetic execution. Local abbreviation-free fixtures use untrained Punkt to avoid a corpus/tokenizer-data download on agents1. This verifies determinism, token fitting, scoring and routing; it does not measure long-context quality or verify GPU data availability. Unit tests include wrong-answer rejection, known McNemar cells/intervals, invalid/missing pair rejection, source/data integrity and incomplete-depth refusal. No surface table was supplied in the brief; no exhaustive platform or statistical coverage is claimed.
+
+R35's real-tokenizer CPU preparation pilot (four fixture tasks, 8k/32k) measured mean G=1.034/1.259 seconds including initialization. An illustrative linear deeper-depth extrapolation gives preparation additions of 1.60 hours full or 1.33 hours with n=260 at 128k, including contingency: total **13.2..47.9 hours** or **10.8..39.1 hours**, respectively. These are planning scenarios, not GPU measurements or upper bounds. See RESULTS-hybrid-a-r34-261102.md for per-task observations and limitations; replace both G and inference R with GPU-host measurements before each deeper depth.

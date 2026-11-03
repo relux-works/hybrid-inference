@@ -34,6 +34,7 @@ def configurations():
 
 
 def postprocess(answer):
+    # References contain no control characters, so this preserves upstream substring matches.
     return re.sub(r'[\x00-\x1f]', '\n', answer.strip()).strip()
 
 
@@ -88,6 +89,11 @@ class Generator:
                 else:
                     sys.modules[key] = value
         self.module = namespace
+        self.icl_example = None
+        if family == 'variable_tracking':
+            self.icl_example = namespace['sys_vartrack_w_noise_random'](
+                num_samples=1, max_seq_length=500, incremental=5,
+                num_chains=namespace['args'].num_chains, num_hops=namespace['args'].num_hops)[0]
 
     def candidate(self, index, size, depth):
         seed = int(digest([self.seed, self.task, index])[:8], 16)
@@ -99,7 +105,12 @@ class Generator:
         family = self.family
         function = module['generate_input_output']
         if family == 'variable_tracking':
-            return function(size, module['args'].num_chains, module['args'].num_hops)
+            text, answers = function(size, module['args'].num_chains, module['args'].num_hops)
+            example = self.icl_example
+            assert example is not None
+            worked = example['input'] + ' ' + ' '.join(example['outputs']) + '\n'
+            cutoff = text.index(self.base['template'][:20])
+            return text[:cutoff] + module['randomize_icl'](worked) + '\n' + text[cutoff:], answers
         if family == 'freq_words_extraction':
             return function(max_len=depth*100, num_words=size, vocab_size=max(4, (depth-self.base['tokens_to_generate'])//50),
                             alpha=module['args'].alpha)[:2]
@@ -127,13 +138,14 @@ class Generator:
             require(at >= 0, 'NVIDIA answer prefix missing')
             prompt, prefix = text[:at], text[at:]
             return prompt, prefix, answers, render_tokens(body_for(prompt, prefix))
-        lo, hi = minimum, max(minimum+1, depth)
+        first = candidate(minimum)
+        require(len(first[3]) <= depth, 'RULER task minimum exceeds context depth')
+        # Upstream estimates tokens per size unit and allows 3x slack, including for document units.
+        lo, hi = minimum, max(minimum+1, int(3*depth*minimum/max(1, len(first[3]))))
         capacity = None
         if self.family == 'common_words_extraction':
             capacity = max(len(self.module['words']), len(self.module['randle_words']))
             hi = min(hi, capacity)
-        first = candidate(lo)
-        require(len(first[3]) <= depth, 'RULER task minimum exceeds context depth')
         # A bounded deterministic search changes only the upstream haystack-size argument.
         for _ in range(24):
             if len(candidate(hi)[3]) > depth:
