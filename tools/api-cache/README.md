@@ -1,6 +1,23 @@
+# r15f output-length non-compliance and continuation
+
+[RESTART-r15f.md](RESTART-r15f.md) registers the owner-approved output classification and guard. Full HTTP200 usage above the requested16 tokens is accepted, flagged with its actual count, and priced at its real cost. Reservations use1024 output tokens. The client closes a stream above1024 reported completion tokens or1024 exposed UTF-8 output bytes, retaining the partial journal and reconciling unknown charges before another request. The byte limit is conservative and can cancel before1024 actual tokens; SSE chunks are never counted as tokens.
+
+The active source is the signed m3-api-cache-r15e worktree. Run the CPU suite with an on-disk TMPDIR, then migrate the stopped study's settled historical output refusals and resume without replay:
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15f-261103/tmp
+python3 -m unittest discover -s tools/api-cache -p 'test_openrouter*.py' -v
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/tmp
+python3 tools/api-cache/openrouter_restart.py --root /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103 --reclassify-output
+nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$TMPDIR" python3 -u tools/api-cache/openrouter_restart.py --root /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103 --resume >> /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/supervisor.log 2>&1 < /dev/null &
+```
+
+The migration reads no key, sends no requests, archives original rows under reclassification-r15f/, validates identity/depth/usage/settled receipts, and leaves ledger.json byte-identical. The live report and CSV are rebuilt with per-provider over-cap counts and corrected availability. Supervisor and child PIDs, signed head, cutoffs and source hashes are in workflow.json. The fixed caps remain cumulative USD22 for v1 and USD45 combined, including all prior costs and retained reservations. No pause is shortened. Free disk below28.5GiB stops before paid requests; the floor remains28GiB. Heartbeat cadence stays600s. A new GET-only end observer writes to the r15f task directory so the r15e checks repeat at the extended study end.
+
 # r15e read-only audit and legacy retirement
 
-On m3-api-cache-r15e, both legacy report functions and standalone run routes refuse before reading a key or making requests, and name the live r15d report path. Their older commands below are historical records. The paid live run stays on95671982b in its original worktree and is not changed by this branch. See RESTART-r15d.md for the explicit cost/price acceptance and pooled1M label.
+On m3-api-cache-r15e, both legacy report functions and standalone run routes refuse before reading a key or making requests, and name the live r15d report path. Their older commands below are historical records. During r15e the paid run stayed on95671982b in its original worktree; the owner explicitly authorizes the prospective r15f restart above from this branch. See RESTART-r15d.md for the explicit cost/price acceptance and pooled1M label.
 
 From this isolated worktree:
 

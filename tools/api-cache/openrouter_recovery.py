@@ -8,6 +8,9 @@ from urllib.request import Request
 import openrouter_cache as api
 
 MIN_FREE_BYTES = 28 * 1024**3
+DISK_STOP_BYTES = int(28.5 * 1024**3)
+REQUEST_OUTPUT_TOKENS = 16
+RESERVED_OUTPUT_TOKENS = 1024
 ROUNDING = Decimal('.00000001')
 DEPTH_DEADLINES = [(32768,180),(131072,300),(250000,600),(524288,1200),(1000000,2400)]
 
@@ -127,7 +130,13 @@ class StreamTrace:
         self.first=None
         self.generation=None
         self.usage=None
+        self.usage_complete=False
         self.providers=set()
+        self.models=set()
+        self.output_bytes=0
+        self.output_tokens=None
+        self.guard_triggered=False
+        self.guard_reason=None
         self.handle=path.open('w')
 
     def record(self,line):
@@ -140,15 +149,32 @@ class StreamTrace:
                 event['event']=obj
                 self.generation=obj.get('id') or self.generation
                 self.usage=obj.get('usage') or self.usage
+                if obj.get('usage'):
+                    self.usage_complete=not obj.get('choices') or any(c.get('finish_reason') is not None for c in obj['choices'])
                 if obj.get('provider'):self.providers.add(obj['provider'])
+                if obj.get('model'):self.models.add(obj['model'])
+                tokens=(obj.get('usage') or {}).get('completion_tokens')
+                if isinstance(tokens,int) and not isinstance(tokens,bool) and tokens>=0:self.output_tokens=tokens
                 for choice in obj.get('choices',[]):
                     delta=choice.get('delta',{})
+                    texts=[delta.get(k) for k in ('content','reasoning','reasoning_content')]
+                    if not any(delta.get(k) for k in ('reasoning','reasoning_content')):
+                        texts += [part.get('text') for part in delta.get('reasoning_details',[]) if isinstance(part,dict)]
+                    self.output_bytes+=sum(len(t.encode('utf-8')) for t in texts if isinstance(t,str))
                     if self.first is None and any(delta.get(k) for k in ('content','reasoning','reasoning_content')):
                         self.first=elapsed
             else:event['done']=True
         else:event['keepalive_or_other_line']=True
         self.handle.write(api.redact(json.dumps(event),self.secret)+'\n')
         self.handle.flush()
+        # SSE chunks are not tokens. Bytes are an earlier, conservative stop for exposed text.
+        if self.output_tokens is not None and self.output_tokens>RESERVED_OUTPUT_TOKENS:
+            self.guard_reason='reported completion tokens exceed reserved output bound'
+        elif self.output_bytes>RESERVED_OUTPUT_TOKENS:
+            self.guard_reason='exposed output UTF-8 bytes exceed conservative streaming bound'
+        if self.guard_reason:
+            self.guard_triggered=True
+            raise api.Refusal('output guard canceled stream')
 
     def close(self):
         self.handle.close()
@@ -204,6 +230,23 @@ def stream(client,payload,endpoint,depth,journal):
             if result.get('usage') is None:result['usage']=trace.usage
             if result.get('ttft_seconds') is None:result['ttft_seconds']=trace.first
             result['observed_providers']=sorted(trace.providers)
+            result['observed_models']=sorted(trace.models)
+            result.update(output_guard_triggered=trace.guard_triggered,output_guard_reason=trace.guard_reason,
+                          streamed_output_utf8_bytes=trace.output_bytes,reserved_output_tokens=RESERVED_OUTPUT_TOKENS,
+                          usage_complete=trace.usage_complete)
+            if trace.guard_triggered:
+                result['completion_over_cap']=trace.output_tokens if trace.usage_complete and trace.output_tokens is not None and trace.output_tokens>REQUEST_OUTPUT_TOKENS else None
+                result['completion_over_cap_censored']=not trace.usage_complete
+            allowed=allowed_models(payload['model'],endpoint)
+            result['allowed_model_identities']=sorted(allowed)
+            if trace.models-allowed:result['error']='serving model differs from pinned model'
+            if trace.providers and trace.providers!={endpoint['provider_name']}:result['error']='serving provider differs from pinned provider'
+            if result.get('usage') is not None:
+                try:result.update(api.parse_usage(result['usage']))
+                except api.Refusal:pass
+            if trace.guard_triggered and not trace.usage_complete:
+                result['partial_usage_cost_usd']=result.pop('cost_usd',None)
+                result['observed_completion_tokens_lower_bound']=trace.output_tokens
         error=result.get('error','').lower()
         result['timed_out']=('deadline' in error or 'timed out' in error or result.get('http_status') in (408,504))
         result['request_deadline_seconds']=seconds
@@ -212,6 +255,40 @@ def stream(client,payload,endpoint,depth,journal):
     finally:
         if client.trace is not None:client.trace.close()
         client.journal=None
+
+
+def allowed_models(model,endpoint):
+    allowed={model}
+    for item in json.loads(api.SNAPSHOT.read_text())['models']:
+        if item['data']['id']!=model:continue
+        for frozen in item['data']['endpoints']:
+            if frozen['tag']==endpoint['tag'] and frozen.get('model_id')==model:
+                _,separator,canonical=frozen['name'].partition(' | ')
+                if separator:allowed.add(canonical)
+    return allowed
+
+
+def classify_call(row,target,model,endpoint):
+    """Accept complete usage independently of requested output length; retain real failures."""
+    row['accepted']=False
+    tokens=row.get('completion_tokens')
+    if not row.get('completion_over_cap_censored') and isinstance(tokens,int) and tokens>REQUEST_OUTPUT_TOKENS:row['completion_over_cap']=tokens
+    observed_models=set(row.get('observed_models',[])) | {c['model'] for c in row.get('stream',[]) if c.get('model')}
+    observed_providers=set(row.get('observed_providers',row.get('serving_provider',[])))
+    if observed_models-allowed_models(model,endpoint):row['error']='serving model differs from pinned model'
+    if observed_providers and observed_providers!={endpoint['provider_name']}:row['error']='serving provider differs or is absent'
+    if not observed_providers and not row.get('error'):row['error']='serving provider differs or is absent'
+    try:parsed=api.parse_usage(row.get('usage'))
+    except api.Refusal:return
+    if row.get('output_guard_triggered') and not row.get('usage_complete'):return
+    row.update(parsed)
+    if parsed['completion_tokens']>REQUEST_OUTPUT_TOKENS:row['completion_over_cap']=parsed['completion_tokens']
+    if row.get('error') in ('completion cap exceeded','output guard canceled stream'):
+        row['previous_classification']=row.pop('error')
+    if row.get('error'):return
+    if row.get('http_status')!=200:row['error']='successful HTTP status missing';return
+    if abs(row['prompt_tokens']-target)>max(512,target*.03):row['error']='measured depth outside tolerance';return
+    row['accepted']=True
 
 
 def availability(rows):

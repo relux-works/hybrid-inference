@@ -61,6 +61,49 @@ def read_rows(root):
     return result
 
 
+def write_calls_csv(directory,rows,secret=''):
+    import csv
+    fields=list(dict.fromkeys(k for row in rows for k in row if k not in ('stream','usage','error_body')))
+    with (directory/'calls.csv').open('w',newline='') as handle:
+        writer=csv.DictWriter(handle,fieldnames=fields,extrasaction='ignore');writer.writeheader()
+        for row in rows:writer.writerow({k:api.redact(json.dumps(v) if isinstance(v,(dict,list)) else str(v),secret) for k,v in row.items() if k in fields})
+
+
+def reclassify_over_caps(root):
+    """Reclassify only settled legacy output refusals, preserving originals and every charge."""
+    if json.loads((root/'workflow.json').read_text())['status']!='failed':raise api.Refusal('reclassification requires stopped failed workflow')
+    budget=recovery.Budget.load(root/'ledger.json')
+    changes=[]
+    for phase in ('v1','amendment'):
+        planned={s['session_id']:s for s in phase_sessions(phase)}
+        for path in sorted((root/phase).glob('call-*.json')):
+            original=path.read_bytes();row=json.loads(original)
+            if row.get('error')!='completion cap exceeded':continue
+            receipt=budget.receipts.get(phase+'/%04d'%row['sequence'],{})
+            if receipt.get('within_maximum') is not True:raise api.Refusal('over-cap reclassification requires settled bounded receipt')
+            if api.money(receipt['maximum_usd'])!=api.money(row['maximum_cost_usd']):raise api.Refusal('over-cap reservation evidence differs')
+            if abs(api.money(receipt['cost_usd'])-api.money(row['usage']['cost']))>recovery.ROUNDING:raise api.Refusal('over-cap charge evidence differs')
+            s=planned[row['session_id']]
+            target=s['depth']-(len(s['pauses'])-1-row['call_index'])*(1000 if phase=='v1' else 1065)
+            recovery.classify_call(row,target,s['candidate']['model'],s['candidate']['endpoint'])
+            if not row.get('accepted') or row.get('completion_over_cap') is None:raise api.Refusal('over-cap reclassification failed identity, depth or usage validation')
+            row['reclassification_protocol']='r15f output-length non-compliance; financial receipt unchanged'
+            changes.append((path,original,row))
+    # Validate the entire migration before any original record is replaced.
+    history=root/'reclassification-r15f';history.mkdir(exist_ok=True)
+    for path,original,row in changes:
+        archived=history/(path.parent.name+'-'+path.name)
+        with archived.open('xb') as handle:handle.write(original)
+        recovery.atomic_json(path,row)
+    for phase in ('v1','amendment'):
+        directory=root/phase
+        if list(directory.glob('call-*.json')):write_calls_csv(directory,[json.loads(p.read_text()) for p in sorted(directory.glob('call-*.json'))])
+    analysis(root,final=True)
+    result=dict(at=api.utc(),reclassified=[str(p.relative_to(root)) for p,_,_ in changes],known_observed_usd=str(budget.known),committed_upper_usd=str(budget.committed),financial_ledger_changed=False)
+    recovery.atomic_json(history/'evidence.json',result)
+    return result
+
+
 def price_metrics(rows,candidate,depths):
     warm=recovery.cache_rows(rows)
     measured=amendment.metrics(warm,candidate,depths)
@@ -119,7 +162,11 @@ def analysis(root,final=False,output=None,rows=None):
         providers.append(dict(provider=name,provider_name=c['endpoint']['provider_name'],model=c['model'],
                               eligibility=recovery.eligible(c,own),eligibility_final=final,
                               whole_window_availability=recovery.availability(own),million=metrics,million_by_phase=by_phase,phases=phases,
-                              depths=depths))
+                              depths=depths,
+                              output_noncompliance=dict(over_cap_calls=sum(isinstance(r.get('completion_over_cap'),int) and r['completion_over_cap']>16 for r in own),
+                                  guard_cancellations=sum(bool(r.get('output_guard_triggered')) for r in own),
+                                  censored_calls=sum(bool(r.get('completion_over_cap_censored')) for r in own),
+                                  calls=[dict(phase=r['phase'],sequence=r.get('sequence'),call_index=r['call_index'],completion_tokens=r.get('completion_tokens'),completion_over_cap=r.get('completion_over_cap'),guard_triggered=r.get('output_guard_triggered',False),accepted=r.get('accepted',False)) for r in own if r.get('completion_over_cap') is not None or r.get('output_guard_triggered')])))
     comparisons={}
     for model in ('qwen/qwen3.8-27b','z-ai/glm-5.3-flash'):
         comparisons[model]={}
@@ -146,7 +193,7 @@ def analysis(root,final=False,output=None,rows=None):
         own=[r for r in rows if r['provider']==p['provider']]
         p['cold_probe_latencies']=[dict(depth=r['depth'],call_index=r['call_index'],**amendment.miss_latency(r)) for r in own if r.get('cohort')=='probe']
     _,excluded=api.matrix(json.loads(api.SNAPSHOT.read_text()))
-    data=dict(protocol='r15d+r15e-analysis',million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
+    data=dict(protocol='r15d+r15e+r15f-analysis',million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
               providers=providers,million_token_comparison=comparisons,
               remote_uptime_samples=len(samples),remote_sample_times=[s['at'] for s in samples],
               smoke_used_for_cache=False,seed_calls_used_for_cache=False,
@@ -161,6 +208,11 @@ def analysis(root,final=False,output=None,rows=None):
     for p in providers:
         av=p['whole_window_availability']; m=p['million']
         lines.append('| '+' | '.join([p['provider'],str(av['attempts']),str(av['errors']),str(av['timeouts']),fmt(av['rate']),str(m['cache_sample_attempts']),fmt(m['effective_usd_per_1000_by_depth']['1000000']),fmt(p['million_by_phase']['v1']['effective_usd_per_1000_by_depth']['1000000']),fmt(p['million_by_phase']['amendment']['effective_usd_per_1000_by_depth']['1000000']),p['eligibility']+(' (provisional)' if not final else '')])+' |')
+    lines+=['','## Output-length non-compliance (r15f)','','Full valid usage above the requested16 output tokens remains successful availability and cache-eligible. Every seed remains excluded from cache inference. The numeric completion_over_cap is the actual reported count. A guard cancellation without final usage is censored and remains an availability failure, with its charge reconciled before another call.','',
+            '| Endpoint | Confirmed over-cap calls | Guard cancellations | Unknown final token count |','|---|---:|---:|---:|']
+    for p in providers:
+        n=p['output_noncompliance']
+        lines.append('| '+p['provider']+' | '+str(n['over_cap_calls'])+' | '+str(n['guard_cancellations'])+' | '+str(n['censored_calls'])+' |')
     lines+=['','## Profile and logs comparison','','| Endpoint | Phase/cohort | Warm accepted | Cached fraction | Uncached/call | Delta vs3200 | USD/1000 measured depth mix |','|---|---|---:|---:|---:|---:|---:|']
     for p in providers:
         for phase,cohorts in p['phases'].items():
@@ -219,11 +271,7 @@ class Phase:
         recovery.atomic_json(self.out/'run.json',dict(phase=name,pid=os.getpid(),at=api.utc(),cutoff=timestamp(self.end),cap_usd=self.cap,planned_sessions=len(self.planned),deadlines=recovery.DEPTH_DEADLINES))
 
     def csv(self):
-        import csv
-        fields=list(dict.fromkeys(k for row in self.rows for k in row if k not in ('stream','usage','error_body')))
-        with (self.out/'calls.csv').open('w',newline='') as handle:
-            writer=csv.DictWriter(handle,fieldnames=fields,extrasaction='ignore');writer.writeheader()
-            for row in self.rows:writer.writerow({k:api.redact(json.dumps(v) if isinstance(v,(dict,list)) else str(v),self.client.secret) for k,v in row.items() if k in fields})
+        write_calls_csv(self.out,self.rows,self.client.secret)
 
     def progress(self,**changes):
         data=dict(phase=self.name,pid=os.getpid(),at=api.utc(),last_completed_call=self.rows[-1] if self.rows else None,
@@ -244,7 +292,7 @@ class Phase:
         payload=amendment.payload(m,s,index)
         text=payload['messages'][0]['content'][0]['text']
         candidate=s['candidate']; endpoint=candidate['endpoint']
-        estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']))
+        estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']),recovery.RESERVED_OUTPUT_TOKENS)
         try:self.budget.reserve(self.budget.known,estimated,self.cap)
         except api.Refusal as error:
             if 'budget' not in str(error):raise
@@ -254,12 +302,12 @@ class Phase:
             if (self.root/'STOP').exists():raise api.Refusal('operator STOP')
             time.sleep(min(30,max(0,due-time.monotonic())))
         if (self.root/'STOP').exists():raise api.Refusal('operator STOP')
-        if api.shutil.disk_usage(self.root).free<recovery.MIN_FREE_BYTES:raise api.Refusal('free disk below28 GiB')
+        if api.shutil.disk_usage(self.root).free<recovery.DISK_STOP_BYTES:raise api.Refusal('free disk below28 GiB floor safety headroom: requires28.5 GiB')
         sample=api.sample_endpoints(self.client,self.out,self.preflights); self.preflights+=1
         endpoint=api.live_endpoint(sample,candidate)
         if endpoint['context_length']<s['depth'] or 'input_cache_read' not in endpoint['pricing']:
             self.skip(s,index,'live context/cache declaration makes this cell impossible'); return None
-        estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']))
+        estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']),recovery.RESERVED_OUTPUT_TOKENS)
         key=self.client.get('/key')['data']; live=api.money(key['usage'])
         if live>self.budget.committed+recovery.ROUNDING:raise api.Refusal('live spend exceeds committed upper bound')
         self.budget.known=max(self.budget.known,live); self.budget.save()
@@ -273,6 +321,7 @@ class Phase:
                  new_tokens_estimate=m['new_tokens'] if index else None,pause_target_seconds=s['pauses'][index],
                  pause_actual_seconds=None if previous_end is None else time.monotonic()-previous_end,started_at=api.utc(),
                  expected_spend_before_usd=str(self.budget.known),maximum_cost_usd=str(estimated),pricing=endpoint['pricing'],
+                 requested_output_tokens=recovery.REQUEST_OUTPUT_TOKENS,reserved_output_tokens=recovery.RESERVED_OUTPUT_TOKENS,
                  request_deadline_seconds=seconds,provider_request=payload['provider'],prompt_sha256=hashlib.sha256(text.encode()).hexdigest(),accepted=False)
         recovery.atomic_json(self.out/('intent-%04d.json'%sequence),row,self.client.secret)
         self.progress(status='in-flight',current_call={k:row[k] for k in ('sequence','provider','cohort','depth','call_index')},next_call_time=None,
@@ -283,7 +332,7 @@ class Phase:
         recovery.atomic_json(self.out/('call-%04d.json'%sequence),row,self.client.secret)
         self.csv()
         usage=row.get('usage')
-        if row.get('cost_usd') is None and isinstance(usage,dict) and usage.get('cost') is not None:
+        if row.get('cost_usd') is None and isinstance(usage,dict) and usage.get('cost') is not None and not row.get('completion_over_cap_censored'):
             row['cost_usd']=float(api.money(usage['cost']))
         if row.get('cost_usd') is not None:
             row['charge_resolution']=self.budget.reported_call(row['cost_usd'],estimated,call_id)
@@ -295,17 +344,14 @@ class Phase:
             except api.Refusal:
                 recovery.atomic_json(self.out/('unresolved-%04d.json'%sequence),dict(samples=samples,expected_usd=str(self.budget.known),maximum_usd=str(estimated)),self.client.secret)
                 raise
-        if not row.get('error'):
-            target=s['depth']-(len(s['pauses'])-1-index)*m['new_tokens']
-            if abs(row['prompt_tokens']-target)>max(512,target*.03):row['error']='measured depth outside tolerance'
-            elif row['completion_tokens']>16:row['error']='completion cap exceeded'
-            else:row['accepted']=True
+        target=s['depth']-(len(s['pauses'])-1-index)*m['new_tokens']
+        recovery.classify_call(row,target,payload['model'],endpoint)
         recovery.atomic_json(self.out/('call-%04d.json'%sequence),row,self.client.secret)
         self.csv()
         print(api.redact(json.dumps({k:row.get(k) for k in ('sequence','provider','cohort','depth','call_index','cached_tokens','timed_out','accepted','error')}),self.client.secret),flush=True)
         self.progress(status='between-calls',current_call=None,next_call_time=timestamp(time.time()+s['pauses'][index+1]) if index+1<len(s['pauses']) else None,next_call_reason='next registered call or new series')
         analysis(self.root)
-        if row.get('error') and any(term in row['error'] for term in ('provider differs','depth outside','cap exceeded','evidence')):
+        if row.get('error') and any(term in row['error'] for term in ('provider differs','model differs','depth outside','evidence')):
             raise api.Refusal('instrument/identity violation; no further spending')
         return ended
 
@@ -408,7 +454,7 @@ def heartbeat(root,client,status='running'):
               next_call_time=progress.get('next_call_time'),next_call_reason=progress.get('next_call_reason','phase transition'),
               current_request_deadline_at=progress.get('current_request_deadline_at'),interval_seconds=600)
     data['free_disk_bytes']=api.shutil.disk_usage(root).free
-    if data['free_disk_bytes']<recovery.MIN_FREE_BYTES:(root/'STOP').touch()
+    if data['free_disk_bytes']<recovery.DISK_STOP_BYTES:(root/'STOP').touch()
     if status!='running':data.update(current_call=None,next_call_time=None,next_call_reason='workflow '+status)
     # Persist custody before a GET, so metadata delays cannot hide an in-flight request.
     recovery.atomic_json(root/'heartbeat.json',data)
@@ -464,7 +510,7 @@ def supervise(root,resume=False):
         if previous['status']!='failed':raise api.Refusal('resume requires failed terminal workflow')
         if list((root/'amendment').glob('call-*.json')):raise api.Refusal('amendment already has data; automatic replay refused')
     elif resume:raise api.Refusal('resume requires existing workflow')
-    if api.shutil.disk_usage(root).free<recovery.MIN_FREE_BYTES:raise api.Refusal('free disk below28 GiB')
+    if api.shutil.disk_usage(root).free<recovery.DISK_STOP_BYTES:raise api.Refusal('free disk below28 GiB floor safety headroom: requires28.5 GiB')
     lock=LOCK_PATH.open('a+')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     client=recovery.Client()
@@ -570,12 +616,19 @@ def main():
     parser.add_argument('--phase',choices=('v1','amendment'))
     parser.add_argument('--lease-fd',type=int)
     parser.add_argument('--resume',action='store_true',help='continue a failed v1 only after every prior intent has a settled receipt')
+    parser.add_argument('--reclassify-output',action='store_true',help='CPU-only migration of settled historical output refusals; no requests or key read')
     args=parser.parse_args()
     root=args.root.resolve()
     try:
         if os.environ.get('PYTHONDONTWRITEBYTECODE')!='1':raise api.Refusal('PYTHONDONTWRITEBYTECODE=1 required')
         scratch=Path(os.environ.get('TMPDIR','')).resolve()
         if scratch!=root/'tmp' or not scratch.is_dir():raise api.Refusal('task-local on-disk TMPDIR required')
+        if args.reclassify_output:
+            if args.phase or args.resume:raise api.Refusal('reclassification is separate from collection')
+            with LOCK_PATH.open('a+') as lease:
+                fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                print(json.dumps(reclassify_over_caps(root)),flush=True)
+            return 0
         if args.phase:
             if args.lease_fd is None:raise api.Refusal('inherited exclusive lease required')
             lease=os.fdopen(args.lease_fd,'a+',closefd=False)

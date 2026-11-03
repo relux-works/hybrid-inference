@@ -18,8 +18,28 @@ from test_openrouter_amendment1 import Handler
 
 class RecoveryHandler(Handler):
     timeout_mode=False
+    output_mode=None
 
     def do_POST(self):
+        if RecoveryHandler.output_mode:
+            body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            Handler.bodies.append(body);Handler.spend+=Handler.cost
+            mode=RecoveryHandler.output_mode
+            if mode=='http-error':
+                self.send_response(429);self.end_headers();self.wfile.write(b'{"error":"unavailable"}');return
+            count=Handler.seen.get(body['session_id'],0);Handler.seen[body['session_id']]=count+1
+            prompt=len(body['messages'][0]['content'][0]['text'].split())
+            usage=dict(prompt_tokens=0 if mode=='wrong-depth' else prompt,completion_tokens=1025 if mode=='usage-bound' else 60 if mode=='overcap' else 2,cost=Handler.cost,
+                       prompt_tokens_details=dict(cached_tokens=prompt-1065 if count and mode!='wrong-depth' else 0))
+            self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
+            items=[dict(id='output-control',model='wrong/model' if mode=='wrong-model' else body['model'],provider='Phala',
+                        choices=[dict(delta=dict(content='x'*1025 if mode=='guard' else 'OK'))]),dict(usage=usage,choices=[])]
+            if mode=='partial-usage':items[0]['usage']=dict(usage,completion_tokens=1025,cost=Handler.cost/2)
+            try:
+                for item in items:self.wfile.write(b'data: '+json.dumps(item).encode()+b'\n\n');self.wfile.flush()
+                self.wfile.write(b'data: [DONE]\n\n')
+            except (BrokenPipeError,ConnectionResetError):pass
+            return
         if not RecoveryHandler.timeout_mode:return super().do_POST()
         body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         Handler.bodies.append(body);Handler.spend+=Handler.cost
@@ -51,6 +71,7 @@ class RecoveryTests(unittest.TestCase):
         Handler.spend=0;Handler.cost=.000001;Handler.provider_override=None
         Handler.seen={};Handler.bodies=[];Handler.cached_known=True;Handler.usage_cost_absent=False
         RecoveryHandler.timeout_mode=False
+        RecoveryHandler.output_mode=None
 
     def phase(self):
         with mock.patch.object(restart,'phase_sessions',return_value=[self.session]):
@@ -113,6 +134,139 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
         self.assertIn('identity violation',phase.reason)
 
+    # Full usage above the requested16 remains cache-eligible, successful availability, and permits the next POST.
+    def test_over_cap_completion_is_accepted_with_flag_and_continues(self):
+        RecoveryHandler.output_mode='overcap';phase=self.phase()
+        self.assertEqual(phase.run(),0)
+        self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(r['accepted'] and r['completion_over_cap']==60 for r in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['rate'],1)
+        self.assertEqual(restart.price_metrics(phase.rows,self.candidate,[32768])['accepted'],1)
+        self.assertEqual(phase.rows[0]['cost_usd'],Handler.cost)
+        self.assertTrue(all(b['max_tokens']==16 for b in Handler.bodies))
+
+    # The paid path reserves1024 output tokens at the live price while still requesting16.
+    def test_reservation_covers_1024_token_completion(self):
+        phase=self.phase();phase.call(self.session,0)
+        row=phase.rows[0];p=row['pricing']
+        prompt=min(len(Handler.bodies[0]['messages'][0]['content'][0]['text'].encode())+512,self.candidate['endpoint']['context_length'])
+        expected=Decimal(prompt)*max(Decimal(p['prompt'])+Decimal(p.get('input_cache_write','0')),Decimal(p['input_cache_read']))+Decimal(1024)*Decimal(p['completion'])
+        self.assertEqual(Decimal(row['maximum_cost_usd']),expected)
+        self.assertEqual(row['reserved_output_tokens'],1024)
+        self.assertEqual(Handler.bodies[0]['max_tokens'],16)
+
+    # A loopback byte guard closes the stream, retains partial evidence, settles its charge, and permits a follow-up.
+    def test_cancel_guard_past_bound_preserves_unknown_usage_and_continues(self):
+        RecoveryHandler.output_mode='guard';phase=self.phase()
+        with mock.patch.object(recovery,'settled_samples',side_effect=lambda client,*args:self.samples(Handler.spend)):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual(len(Handler.bodies),2)
+        row=phase.rows[0]
+        self.assertTrue(row['output_guard_triggered']);self.assertTrue(row['completion_over_cap_censored'])
+        self.assertEqual(row['streamed_output_utf8_bytes'],1025)
+        self.assertIsNone(row['completion_over_cap']);self.assertIsNone(row.get('completion_tokens'))
+        self.assertFalse(row['accepted']);self.assertTrue(row['charge_resolution']['resolved'])
+        journal=(phase.out/'stream-0000.jsonl').read_text()
+        self.assertIn('output-control',journal);self.assertNotIn('prompt_tokens',journal)
+
+    # The guard allows the exact byte bound, cancels at1025 reported tokens, and closes its response context.
+    def test_output_guard_boundary_and_reported_tokens_close_response(self):
+        trace=recovery.StreamTrace(self.root/'guard.jsonl',self.secret);self.addCleanup(trace.close)
+        trace.record(b'data: '+json.dumps(dict(choices=[dict(delta=dict(content='x'*1024))])).encode()+b'\n')
+        self.assertFalse(trace.guard_triggered)
+        response=mock.Mock(status=200)
+        response.__enter__=mock.Mock(return_value=response);response.__exit__=mock.Mock(return_value=False)
+        response.__iter__=mock.Mock(return_value=iter([b'data: '+json.dumps(dict(usage=dict(completion_tokens=1025))).encode()+b'\n']))
+        with self.assertRaisesRegex(api.Refusal,'output guard canceled stream'):
+            with recovery.RecordedResponse(response,trace) as recorded:list(recorded)
+        response.__exit__.assert_called_once()
+        self.assertTrue(trace.guard_triggered);self.assertEqual(trace.output_tokens,1025)
+        self.assertIn('1025',(self.root/'guard.jsonl').read_text())
+
+    # A guard triggered by complete final usage still counts HTTP200 as successful availability.
+    def test_guard_with_full_usage_keeps_over_cap_success(self):
+        RecoveryHandler.output_mode='usage-bound';phase=self.phase()
+        self.assertEqual(phase.run(),0);self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(r['accepted'] and r['output_guard_triggered'] and r['completion_over_cap']==1025 for r in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['rate'],1)
+
+    # Progressive usage in a canceled stream cannot settle its final charge or become a cache result.
+    def test_guard_partial_usage_requires_delta_settlement(self):
+        RecoveryHandler.output_mode='partial-usage';phase=self.phase()
+        with mock.patch.object(recovery,'settled_samples',side_effect=lambda client,*args:self.samples(Handler.spend)):
+            self.assertEqual(phase.run(),0)
+        row=phase.rows[0]
+        self.assertFalse(row['accepted']);self.assertFalse(row['usage_complete'])
+        self.assertTrue(row['completion_over_cap_censored']);self.assertIsNone(row['completion_over_cap'])
+        self.assertIsNone(row.get('cost_usd'));self.assertEqual(row['partial_usage_cost_usd'],Handler.cost/2)
+        self.assertEqual(Decimal(row['charge_resolution']['resolved_observed_charge_usd']),Decimal(str(Handler.cost)))
+        self.assertEqual(len(Handler.bodies),2)
+
+    # A complete over-cap receipt can be migrated without another POST, ledger debit, or seed cache sample.
+    def test_historical_over_cap_reclassification_preserves_receipt_and_corrects_availability(self):
+        RecoveryHandler.output_mode='overcap';phase=self.phase();phase.call(self.session,0)
+        row=phase.rows[0];row.update(accepted=False,error='completion cap exceeded');row.pop('completion_over_cap')
+        path=phase.out/'call-0000.json';recovery.atomic_json(path,row);original=path.read_bytes()
+        recovery.atomic_json(self.root/'workflow.json',dict(status='failed'))
+        ledger=(self.root/'ledger.json').read_bytes()
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]):result=restart.reclassify_over_caps(self.root)
+        updated=json.loads(path.read_text())
+        self.assertTrue(updated['accepted']);self.assertEqual(updated['completion_over_cap'],60)
+        self.assertEqual(result['reclassified'],['v1/call-0000.json'])
+        self.assertEqual((self.root/'reclassification-r15f/v1-call-0000.json').read_bytes(),original)
+        self.assertEqual((self.root/'ledger.json').read_bytes(),ledger);self.assertEqual(len(Handler.bodies),1)
+        own=next(p for p in json.loads((self.root/'analysis.json').read_text())['providers'] if p['provider']==row['provider'])
+        self.assertEqual(own['whole_window_availability']['rate'],1)
+        self.assertEqual(own['output_noncompliance']['over_cap_calls'],1)
+        self.assertEqual(own['phases']['v1']['v1']['cache_sample_attempts'],0)
+
+    # Historical output-only repair cannot bypass a planted wrong model or touch the original row/ledger.
+    def test_named_negative_reclassification_refuses_identity_violation(self):
+        RecoveryHandler.output_mode='overcap';phase=self.phase();phase.call(self.session,0)
+        row=phase.rows[0];row.update(accepted=False,error='completion cap exceeded',observed_models=['wrong/model'])
+        path=phase.out/'call-0000.json';recovery.atomic_json(path,row);original=path.read_bytes()
+        recovery.atomic_json(self.root/'workflow.json',dict(status='failed'))
+        ledger=(self.root/'ledger.json').read_bytes()
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]):
+            with self.assertRaisesRegex(api.Refusal,'failed identity, depth or usage validation'):restart.reclassify_over_caps(self.root)
+        self.assertEqual(path.read_bytes(),original);self.assertEqual((self.root/'ledger.json').read_bytes(),ledger)
+        self.assertFalse((self.root/'reclassification-r15f').exists());self.assertEqual(len(Handler.bodies),1)
+
+    # An explicit wrong model still stops after one settled request; output non-compliance cannot mask identity.
+    def test_named_negative_wrong_model_identity_halts(self):
+        RecoveryHandler.output_mode='wrong-model';phase=self.phase()
+        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
+        self.assertIn('identity violation',phase.reason)
+        self.assertIn('model differs',phase.rows[0]['error'])
+        self.assertFalse(phase.rows[0]['accepted'])
+
+    # Measured prompt depth outside tolerance remains fatal despite the relaxed output classification.
+    def test_named_negative_measured_depth_still_halts(self):
+        RecoveryHandler.output_mode='wrong-depth';phase=self.phase()
+        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
+        self.assertIn('depth outside',phase.rows[0]['error'])
+
+    # A failed HTTP request has no serving identity; lack of one must not become a wrong-identity halt.
+    def test_http_failure_without_identity_retains_availability_classification(self):
+        row=dict(accepted=False,http_status=429,error='HTTP error')
+        recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
+        self.assertEqual(row['error'],'HTTP error');self.assertFalse(row['accepted'])
+
+    # Real HTTP429 responses with bounded settled charges continue instead of being mistaken for wrong identities.
+    def test_http_failure_without_identity_settles_and_continues(self):
+        RecoveryHandler.output_mode='http-error';Handler.cost=0;phase=self.phase()
+        with mock.patch.object(recovery,'settled_samples',side_effect=lambda client,*args:self.samples(0)):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(r['error']=='HTTP error' and not r['accepted'] for r in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+
+    # The stream identity check accepts exactly the frozen endpoint alias, never an arbitrary dated suffix.
+    def test_frozen_stream_model_identity_positive_and_wrong_suffix_negative(self):
+        allowed=recovery.allowed_models(self.candidate['model'],self.candidate['endpoint'])
+        canonical=self.candidate['endpoint']['name'].split(' | ')[1]
+        self.assertIn(canonical,allowed);self.assertNotIn(self.candidate['model']+'-wrong-date',allowed)
+
     # Stable lower/upper edges pass; instability, reset and over-maximum deltas do not.
     def test_usage_delta_boundaries_and_unstable_negative(self):
         self.assertTrue(recovery.resolve_delta(self.samples('2.42'),'2','.42')['resolved'])
@@ -174,6 +328,13 @@ class RecoveryTests(unittest.TestCase):
         phase=self.phase()
         with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=28500000000)):
             with self.assertRaisesRegex(api.Refusal,'free disk below28 GiB'):phase.call(self.session,0)
+        self.assertEqual(Handler.bodies,[])
+
+    # Headroom stops paid requests before the28GiB floor is reached.
+    def test_28_5_gib_headroom_refuses_before_post(self):
+        phase=self.phase()
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))):
+            with self.assertRaisesRegex(api.Refusal,'requires28.5 GiB'):phase.call(self.session,0)
         self.assertEqual(Handler.bodies,[])
 
     # Ready follow-ups run before another seed, preventing the original all-cold scheduling failure.
