@@ -50,6 +50,19 @@ class JournalTests(unittest.TestCase):
         self.messages = [dict(role="system", content="system"), dict(role="user", content="first"),
                          dict(role="assistant", content="answer", reasoning_content="private thought")]
 
+    # Family probes use complete turns even when the real request continues an assistant answer prefix.
+    def test_family_probe_disables_final_message_continuation(self):
+        class ContinuationNode(TemplateNode):
+            def request(self, method, path, data=None):
+                if path == "/apply-template" and data.get("continue_final_message"):
+                    raise JournalConflict("family probe inherited final-message continuation")
+                return super().request(method, path, data)
+        renderer = Renderer(ContinuationNode())
+        body = dict(messages=self.messages, continue_final_message=True, add_generation_prompt=False)
+        self.assertEqual(renderer.family(body), ("<|im_start|>", "<|im_end|>\n"))
+        self.assertTrue(body["continue_final_message"])
+        self.assertFalse(body["add_generation_prompt"])
+
     # Reasoning can be omitted, but supplied conflicting reasoning and ordinary message edits are real divergence.
     def test_missing_reasoning_only_is_ignored(self):
         incoming = copy.deepcopy(self.messages)

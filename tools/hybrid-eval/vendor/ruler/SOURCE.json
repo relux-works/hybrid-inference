@@ -1,0 +1,55 @@
+{
+  "repository": "https://github.com/NVIDIA/RULER",
+  "commit": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+  "license": "Apache-2.0",
+  "files": {
+    "niah.py": {
+      "upstream_path": "scripts/data/synthetic/niah.py",
+      "sha256": "e9cada0a7660d274fe73a1338a90a7087e17b630169f1aaf14a8d3221c6805b5"
+    },
+    "variable_tracking.py": {
+      "upstream_path": "scripts/data/synthetic/variable_tracking.py",
+      "sha256": "9aac483420e158d116ab63fc43b9606bdb284ac0c053288c30776d5c365530e5"
+    },
+    "common_words_extraction.py": {
+      "upstream_path": "scripts/data/synthetic/common_words_extraction.py",
+      "sha256": "2671d4a84a383acef2d9e8f691a0bea4da03f1632ca3f4ad3c1de6d27ccbc6b9"
+    },
+    "freq_words_extraction.py": {
+      "upstream_path": "scripts/data/synthetic/freq_words_extraction.py",
+      "sha256": "29b7af97ffdd2122fde348df20cd02add390a21cd6d64b6fd66c8663dc487f67"
+    },
+    "qa.py": {
+      "upstream_path": "scripts/data/synthetic/qa.py",
+      "sha256": "f00c0b59cf8698e90831bbf461c2c4f40f2a30f2469534c27455808c717281d0"
+    },
+    "constants.py": {
+      "upstream_path": "scripts/data/synthetic/constants.py",
+      "sha256": "6296e901d495ec6200dc3f68993ea13d8282e3c0dbe1a8c47967f111105d1fde"
+    },
+    "synthetic.yaml": {
+      "upstream_path": "scripts/synthetic.yaml",
+      "sha256": "34bc71dcacdc41a829a170f04b528fbf48d62c616338005ab4991680fbf8cb0b"
+    },
+    "metrics.py": {
+      "upstream_path": "scripts/eval/synthetic/constants.py",
+      "sha256": "6740467c17b8dc06b6b30f4f97e54ce8de81db0dd879f1538d0b6b5727f4bd5f"
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+    },
+    "english_words.json": {
+      "upstream_path": "scripts/data/synthetic/json/english_words.json",
+      "sha256": "42df658acd22f38accbe379f5d1e9fa73142db803a1562e1739abc8e36de401f"
+    },
+    "PaulGrahamEssays_URLs.txt": {
+      "upstream_path": "scripts/data/synthetic/json/PaulGrahamEssays_URLs.txt",
+      "sha256": "9862c06b4303b7bb6fe4c4a88671c51d2d36ec65757db54730c703d9cf474099"
+    },
+    "download_paulgraham_essay.py": {
+      "upstream_path": "scripts/data/synthetic/json/download_paulgraham_essay.py",
+      "sha256": "d89622edfe08d4011718bb2634da742d69a56728139fa5e236e00cca703cc84c"
+    }
+  }
+}

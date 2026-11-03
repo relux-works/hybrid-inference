@@ -77,7 +77,7 @@ class Renderer:
         marker, answer, next_user = ["hybrid" + uuid.uuid4().hex for _ in range(3)]
         probe = dict(body, messages=[dict(role="user", content=marker),
             dict(role="assistant", content=answer), dict(role="user", content=next_user)],
-            add_generation_prompt=False)
+            add_generation_prompt=False, continue_final_message=False)
         rendered = self.render(probe)
         if any(rendered.count(value) != 1 for value in (marker, answer, next_user)):
             raise JournalConflict("unknown template family")

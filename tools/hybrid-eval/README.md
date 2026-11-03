@@ -1,5 +1,7 @@
 # Patchwork cache task evaluation
 
+For the paired NVIDIA RULER suite (13 configurations, 390 cases per depth, exact GGUF input depths, offline inputs, restart-safe depth archives and confidence/equivalence analysis), use [RULER-RUNBOOK.md](RULER-RUNBOOK.md). The original synthetic evaluation below remains unchanged.
+
 Python 3.10+ standard library only. This is an offline synthetic quality experiment for the hybrid prototype, not an upstream submission. No datasets, model downloads, packages or native builds are performed by the evaluator or its tests. Reuse the existing [node/client launchers](../hybrid-bench/README.md) and their private state. Run from the repository root.
 
 ## Tasks and depths
@@ -155,3 +157,16 @@ These are planning calculations, not observed GPU runtimes. Historically, with t
 `hybrid-eval` does not yet accept `--reference-logits`. Its current endpoint samples free-running task answers and scores those answers. Different arms can produce different answers, so reusing each answer as its continuation would compare different token positions. The evaluator also does not export its answer-prefix state as a native delta chain. A valid integration needs a per-item fixed continuation and the exact framed answer-prefix token/state identity shared across arms, plus a mapping from each item to its D reference. Adding a file flag alone would not establish those contracts.
 
 Use the fixed-token scorer in [tools/hybrid-bench/README.md](../hybrid-bench/README.md#reference-model-teacher-forced-scoring) for this prototype's KL(D || arm) study. Task accuracy, local partition controls and free-running answer disagreement remain the existing evaluator measures. This is a declared integration gap, not a substitute for the GPU reference-model study.
+
+## RULER tools
+
+| Command | Purpose | Output |
+|---|---|---|
+| `python3 tools/hybrid-eval/ruler_data.py bootstrap --gpu-host-downloads --data DIR` | GPU-host data bootstrap, download audit and SHA-256 lock | Private DIR/json, downloads, inputs.lock.json; prints lock hash |
+| `python3 tools/hybrid-eval/ruler_data.py verify --data DIR` | Verify locked corpus inputs | Lock hash or refusal |
+| `python3 tools/hybrid-eval/ruler_eval.py --help` | Three-arm, one-depth evaluation CLI | Options; runbook has complete commands |
+| `python3 tools/hybrid-eval/ruler_analysis.py ROWS --output DIR --margin .02` | Paired tables, intervals, McNemar and equivalence bounds | per-example.csv, discordant-pairs.jsonl, analysis.json, analysis.md |
+| `python3 -m unittest discover -s tools/hybrid-eval -p test_ruler.py -v` | CPU generator/scoring/statistics and negative controls | Redirect logs to .temp/ |
+| `python3 tools/hybrid-eval/test_native.py ... --ruler-checks` | Existing native checks plus real-GGUF RULER fixture integration | Private native artifact directory; see runbook |
+
+Generator dependencies are pinned in `ruler-requirements.txt`; the original evaluator/tests still use the Python standard library. No generator downloads run implicitly.
