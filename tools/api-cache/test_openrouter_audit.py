@@ -138,6 +138,19 @@ class AuditTests(unittest.TestCase):
         self.assertTrue((self.output/'API-CACHE-REPORT.md').exists())
         self.assertEqual(list(self.live.iterdir()),[]);self.assertEqual(Handler.bodies,[])
 
+    # Smoke/pilot accepted charges are audited, but even warm smoke rows cannot enter research cache/availability.
+    def test_smoke_cost_audited_without_entering_research_analysis(self):
+        directory=restart.old_root(self.live)/'smoke';directory.mkdir(parents=True)
+        row=dict(self.row,generation_id='smoke-gen',cached_tokens=32000)
+        (directory/'call-0000.json').write_text(json.dumps(row))
+        result=self.run_audit()
+        self.assertEqual(result['accepted_calls'],2);self.assertEqual(result['agreement_calls'],2)
+        self.assertEqual(result['research_accepted_calls'],1);self.assertEqual(result['financial_only_accepted_calls'],1)
+        own=next(p for p in json.loads((self.output/'analysis.json').read_text())['providers'] if p['provider']==self.row['provider'])
+        self.assertEqual(own['whole_window_availability']['attempts'],1)
+        self.assertEqual(own['phases']['v1']['v1']['token_hit_rate'],31000/32000)
+        self.assertEqual(json.loads((self.output/'accepted-rows.json').read_text())[-1]['phase'],'legacy-smoke')
+
     # A changed provider price is flagged independently of cost agreement, without editing the frozen snapshot.
     def test_negative_planted_snapshot_price_drift_is_flagged(self):
         before=api.SNAPSHOT.read_bytes();AuditHandler.drift=True

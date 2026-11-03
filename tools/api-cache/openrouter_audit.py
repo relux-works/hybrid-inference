@@ -105,6 +105,14 @@ def capture_rows(live,output):
     rows=restart.read_rows(live)
     recovery.atomic_json(output/'call-rows.json',rows)
     accepted=[r for r in rows if r.get('accepted')]
+    # Pilot/smoke costs are financial evidence only, outside the registered research window.
+    for cohort in ('smoke','full','full-v2'):
+        for path in sorted((restart.old_root(live)/cohort).glob('call-*.json')):
+            row=json.loads(path.read_text())
+            if not row.get('accepted'):continue
+            row['phase']='legacy-'+cohort
+            row.setdefault('provider',row['model']+' / '+row['endpoint_tag'])
+            accepted.append(row)
     recovery.atomic_json(output/'accepted-rows.json',accepted)
     return accepted
 
@@ -152,6 +160,7 @@ def audit(live,output,final=False,client_factory=GetOnlyClient):
     agreements=sum(c['status']=='agreement' for c in checks)
     data=dict(audit='r15e',started_at=started,ended_at=api.utc(),final=final,live_root=str(live),
               source_commit='95671982b',accepted_calls=len(rows),fetched_unique_generations=len(records),agreement_calls=agreements,
+              research_accepted_calls=sum(r['phase'] in ('legacy-v1','v1','amendment') for r in rows),financial_only_accepted_calls=sum(r['phase'] not in ('legacy-v1','v1','amendment') for r in rows),
               mismatch_calls=sum(c['status']=='mismatch' for c in checks),unverified_calls=sum(c['status'] not in ('agreement','mismatch') for c in checks),
               largest_absolute_difference_usd=str(max(differences)) if differences else None,tolerance_usd=str(TOLERANCE),
               sampling='all accepted calls at fixed capture; after a persistent429 the remaining calls are explicitly not fetched' if limited else 'all accepted calls at fixed capture; no sampling',
@@ -172,6 +181,7 @@ def audit(live,output,final=False,client_factory=GetOnlyClient):
     lines=['','## r15e cost source and read-only generation cross-check','',
            'Per-call billed cost is streamed usage.cost; cumulative /key plus the retained-reservation ledger bounds spending. This audit changes no financial or live-run state.',
            'Captured '+str(len(rows))+' accepted calls. Agreements: '+str(agreements)+'; mismatches: '+str(data['mismatch_calls'])+'; unverified: '+str(data['unverified_calls'])+'. Largest absolute difference USD'+str(data['largest_absolute_difference_usd'])+' (toleranceUSD'+str(TOLERANCE)+').',
+           'Cost scope includes '+str(data['financial_only_accepted_calls'])+' accepted smoke/pilot calls for financial verification only. They never enter the research availability, cache metrics or effective-price figures above.',
            data['sampling']+'. Per-call agreement and exact differences: cost-cross-check.csv and audit.json. Missing/limited generation records are unverified, never agreement.','',
            '## Frozen snapshot versus live endpoint prices','',
            'Live requests re-estimate reservations and projected effective prices against per-call live list prices. A rise is accepted if the shared cap permits it; the frozen snapshot remains the declared candidate list and historical comparison, not a price-rise refusal. Raw billed costs use usage.cost.',
