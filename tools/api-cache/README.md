@@ -41,3 +41,17 @@ nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$TMPDIR" sh -c 'printf
 ```
 
 Verify the PID in a separate command. Runtime state, calls.csv, per-call JSON/journals, summary.json and API-CACHE-REPORT.md live in that run directory. ranking.json freezes startup priorities; skipped_or_pending lists every missing provider/depth/cohort. terminal.json and a final done/failed log line show termination. The key is read only after prior custody has ended; no API-key value is passed through the CLI or environment. No automatic resume or replay. The amendment's STOP file affects its own runner only.
+
+## r15d: charge resolution and deadline-bounded restart
+
+[RESTART-r15d.md](RESTART-r15d.md) supersedes the earlier admission and timeout logic. The original engines and evidence stay unchanged. `openrouter_recovery.py` adds stable usage-delta reconciliation with retained reservations and flushed stream evidence. `openrouter_restart.py` supervises sequential v1/amendment children, per-depth deadlines, warm-first scheduling, a shared USD45 ledger, common-window analysis and a 10-minute heartbeat. The new disk guard is 28 GiB (30064771072 bytes).
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/tmp
+python3 -m unittest discover -s tools/api-cache -p 'test_openrouter*.py'
+python3 tools/api-cache/openrouter_restart.py --help
+nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$TMPDIR" python3 -u tools/api-cache/openrouter_restart.py --root /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103 > /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/supervisor.log 2>&1 < /dev/null &
+```
+
+Run that launcher from the committed m3-api-cache-test worktree only once. The initial call34 proof must be at the output root. The supervisor verifies the signed HEAD and refuses uncommitted cache instrumentation or an existing workflow.json. Actual source commit/hashes, PIDs and phase cutoffs are recorded there; inspect them from a separate shell before treating startup as verified. Phase logs, per-call JSON/journals/CSV and skip manifests are in v1/ and amendment/. The root has ledger.json, heartbeat.json, analysis.json, API-CACHE-REPORT.md, terminal.json and SUMMARY.md. The heartbeat samples live usage inside its HTTP process and records the in-flight deadline when the next call time is unknown. This command makes no Matrix or other non-OpenRouter requests. A root STOP file prevents further calls at the next scheduling boundary.
