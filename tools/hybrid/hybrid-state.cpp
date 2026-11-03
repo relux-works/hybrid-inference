@@ -327,6 +327,75 @@ static void validate_chunk_header(const json & h, int64_t n0) {
     require(h.at("fixed_state").is_boolean() && h.at("fixed_state").get<bool>() == (index + 1 == count), "fixed state must occur only in final chunk");
 }
 
+// Qwen35 range bodies keep native f32 metadata; only recurrent tensor payloads shrink.
+std::string transcode_recurrent(std::string_view state, bool pack, bool fixed_state) {
+    require(state.size() <= max_delta_body_bytes, "native state exceeds bf16 body cap");
+    size_t at = 0;
+    auto skip = [&](size_t n) {
+        require(n <= state.size() - at, "truncated bf16 state");
+        at += n;
+    };
+    auto number = [&](size_t n) {
+        require(n <= state.size() - at, "truncated bf16 state");
+        uint64_t value = 0;
+        for (size_t i = 0; i < n; ++i) { value |= uint64_t((unsigned char) state[at++]) << (8 * i); }
+        return value;
+    };
+    skip(8); // native magic and source sequence
+    require(number(4) == 1, "bf16 requires one Qwen35 KV stream");
+    const auto cells = number(4);
+    require(cells > 0 && cells <= (state.size() - at) / 24, "invalid bf16 KV cell count");
+    for (uint64_t i = 0; i < cells; ++i) {
+        skip(4);
+        require(number(4) == 1, "invalid bf16 KV sequence count");
+        skip(16); // M-RoPE metadata and sequence ID
+    }
+    require(number(4) == 0, "bf16 requires row-major KV");
+    const auto layers = number(4);
+    require(layers > 0 && layers <= 1024, "invalid bf16 KV layers");
+    skip(8); // rotation metadata
+    for (uint64_t i = 0; i < 2 * layers; ++i) {
+        require(number(4) == GGML_TYPE_Q8_0, "bf16 requires q8_0 attention");
+        const auto row = number(8);
+        require(row > 0 && row <= (state.size() - at) / cells, "truncated bf16 KV");
+        skip(row * cells);
+    }
+    if (!fixed_state) {
+        require(at == state.size(), "early bf16 recurrent state");
+        return std::string(state);
+    }
+    require(number(4) == 1, "invalid bf16 recurrent cell count");
+    skip(4);
+    require(number(4) == 0 && number(4) == 0, "invalid bf16 recurrent metadata");
+    const auto total_layers = number(4);
+    require(total_layers > layers && total_layers <= 1024, "invalid bf16 recurrent layers");
+    std::string out(state.substr(0, at));
+    for (uint64_t i = 0; i < 2 * (total_layers - layers); ++i) {
+        const size_t meta = at;
+        require(number(4) == GGML_TYPE_F32, "bf16 requires f32 recurrent tensors");
+        const auto row = number(8);
+        require(row > 0 && row <= max_delta_body_bytes && row % 4 == 0, "invalid bf16 recurrent row");
+        const size_t bytes = pack ? row : row / 2;
+        require(bytes <= state.size() - at, "truncated or odd-length bf16 state");
+        require(out.size() <= max_delta_body_bytes - 12 && row <= max_delta_body_bytes - 12 - out.size(), "expanded bf16 state too large");
+        out.append(state.substr(meta, 12));
+        for (size_t j = 0; j < bytes; j += pack ? 4 : 2) {
+            if (pack) {
+                uint32_t bits = (uint32_t) number(4);
+                float input;
+                std::memcpy(&input, &bits, sizeof(input));
+                const uint16_t value = ggml_fp32_to_bf16(input).bits;
+                out += char(value); out += char(value >> 8);
+            } else {
+                const auto value = number(2);
+                out += '\0'; out += '\0'; out += char(value); out += char(value >> 8);
+            }
+        }
+    }
+    require(at == state.size(), "trailing or odd-length bf16 state");
+    return out;
+}
+
 std::string encode_delta_header(json header, size_t state_bytes) {
     llama_trace_span span("envelope.header_encode", state_bytes);
     header["magic"] = "HYBD";
@@ -341,7 +410,9 @@ std::string encode_delta_header(json header, size_t state_bytes) {
     }
     header["body_format"] = "llama-native-chunks-v3";
     header["kv_type"] = "q8_0";
-    header["state_dtype"] = "f32";
+    const auto dtype = header.value("state_dtype", std::string("f32"));
+    require(dtype == "f32" || dtype == "bf16", "unsupported state dtype");
+    header["state_dtype"] = dtype;
     header["sections"] = json::array({{{"name", "llama_seq_state"}, {"offset", 0}, {"bytes", state_bytes}}});
     validate_chunk_header(header, header.at("n0").get<int64_t>());
     const std::string text = header.dump();
@@ -352,14 +423,17 @@ std::string encode_delta_header(json header, size_t state_bytes) {
 
 std::string encode_delta(json header, const std::string & state) {
     llama_trace_span span("envelope.encode_copies", state.size());
-    const std::string text = encode_delta_header(std::move(header), state.size());
+    const auto dtype = header.value("state_dtype", std::string("f32"));
+    const auto compressed = dtype == "bf16" ? transcode_recurrent(state, true, header.value("fixed_state", true)) : std::string();
+    const auto & body = dtype == "bf16" ? compressed : state;
+    const std::string text = encode_delta_header(std::move(header), body.size());
     uint32_t n = text.size();
     std::string out;
     for (int i = 0; i < 4; ++i) { out += (char) (n >> (i * 8)); }
-    out.reserve(4 + text.size() + state.size() + 48);
+    out.reserve(4 + text.size() + body.size() + 48);
     out += text;
-    { llama_trace_span copy("envelope.body_copy", state.size()); out += state; }
-    out += checksums(state);
+    { llama_trace_span copy("envelope.body_copy", body.size()); out += body; }
+    out += checksums(body);
     return out;
 }
 
@@ -376,7 +450,7 @@ delta_view read_delta_view(const std::string & wire, const std::string & model_s
     uint32_t size;
     json h = read_delta_header(wire, size);
     require(h.is_object() && h.at("magic") == "HYBD" && h.at("version").is_number_integer() && h.at("version") == 2, "unsupported delta version");
-    require(h.at("body_format") == "llama-native-chunks-v3" && h.at("kv_type") == "q8_0" && h.at("state_dtype") == "f32", "unsupported delta layout");
+    require(h.at("body_format") == "llama-native-chunks-v3" && h.at("kv_type") == "q8_0" && (h.at("state_dtype") == "f32" || h.at("state_dtype") == "bf16"), "unsupported delta layout");
     require(h.at("model_sha256").is_string() && h.at("model_sha256") == model_sha256, "model hash mismatch");
     require(h.at("session_id").is_string() && !h.at("session_id").get<std::string>().empty(), "invalid session id");
     require(h.at("n0").is_number_integer() && h.at("n1").is_number_integer(), "invalid positions");
@@ -407,7 +481,8 @@ delta_view read_delta_view(const std::string & wire, const std::string & model_s
 delta read_delta(const std::string & wire, const std::string & model_sha256, int64_t n0) {
     auto view = read_delta_view(wire, model_sha256, n0);
     llama_io_timer timer("state_copy", view.state.size());
-    return {std::move(view.header), std::string(view.state)};
+    auto state = view.header.at("state_dtype") == "bf16" ? transcode_recurrent(view.state, false, view.header.at("fixed_state")) : std::string(view.state);
+    return {std::move(view.header), std::move(state)};
 }
 
 void delta_import::clear() {
@@ -418,7 +493,7 @@ void delta_import::clear() {
 }
 
 bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, std::string wire, const std::string & model_hash, const std::string & session_id,
-                         const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab) {
+                         const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab, const std::string & state_dtype) {
     llama_trace_span span("import.stage_parse_validate", wire.size());
     try {
         if (!chunks.empty()) {
@@ -431,6 +506,12 @@ bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, std::string w
         // Heap-owned wires keep borrowed body addresses stable as the staging vectors grow.
         auto source = std::make_unique<std::string>(std::move(wire));
         auto next = read_delta_view(*source, model_hash, chunks.empty() ? current.size() : tokens.size());
+        require(next.header.at("state_dtype") == state_dtype, "state dtype mismatch");
+        if (next.header.at("state_dtype") == "bf16") {
+            auto expanded = std::make_unique<std::string>(transcode_recurrent(next.state, false, next.header.at("fixed_state")));
+            next.state = *expanded;
+            source = std::move(expanded);
+        }
         const auto & h = next.header;
         span.tokens = h.at("n1").get<size_t>() - h.at("n0").get<size_t>();
         require(h.at("session_id") == session_id, "Delta session mismatch");
@@ -443,7 +524,7 @@ bool delta_import::stage(llama_context * ctx, llama_seq_id seq_id, std::string w
         } else {
             require(prefix == current, "slot changed during transfer");
             const auto & first = chunks.front().header;
-            for (const auto * key : {"session_id", "transfer_id", "transfer_n0", "transfer_n1", "chunk_count"}) {
+            for (const auto * key : {"session_id", "transfer_id", "transfer_n0", "transfer_n1", "chunk_count", "state_dtype"}) {
                 require(first.at(key) == h.at(key), "chunk transfer mismatch");
             }
         }

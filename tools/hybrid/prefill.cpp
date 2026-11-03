@@ -218,7 +218,7 @@ int main(int argc, char ** argv) {
             { llama_trace_span upload("node.http_header_receipt_to_body_complete", req.body.size(), 0, trace_receipt_ns); }
             auto owner = owners.find(req.get_header_value("Authorization"));
             if (req.path == "/v1/health") {
-                json health = {{"native_trace_enabled", llama_trace_enabled()}, {"status", "ok"}, {"delta_version", 2}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
+                json health = {{"native_trace_enabled", llama_trace_enabled()}, {"status", "ok"}, {"delta_version", 2}, {"state_dtypes", layout.at("architecture") == "qwen35" ? json::array({"f32", "bf16"}) : json::array({"f32"})}, {"model_sha256", model_hash}, {"layout_fingerprint", fingerprint},
                                    {"model_layout", layout}, {"max_ctx", max_ctx}, {"n_ctx", n_ctx},
                                    {"ram_budget_bytes", ram_budget}, {"max_request_bytes", max_request}};
                 if (!public_node || owner != owners.end()) {
@@ -345,6 +345,10 @@ int main(int argc, char ** argv) {
                     std::vector<llama_token> all = s.tokens;
                     all.insert(all.end(), tokens.begin(), tokens.end());
                     const bool return_delta = body.at("return_delta").get<bool>();
+                    const auto dtype = body.value("state_dtype", std::string("f32"));
+                    if ((dtype != "f32" && dtype != "bf16") || (dtype == "bf16" && layout.at("architecture") != "qwen35")) {
+                        respond(res, 400, {{"error", "unsupported state dtype for model"}}); return;
+                    }
                     json header;
                     bool fixed_state = true;
                     if (body.contains("delta_version") && body.at("delta_version") != 2) {
@@ -363,6 +367,7 @@ int main(int argc, char ** argv) {
                             fixed_state = count > 0 && body.at("chunk_index").get<int64_t>() == count - 1;
                             header["fixed_state"] = fixed_state;
                         }
+                        if (dtype != "f32") { header["state_dtype"] = dtype; }
                         // Use the largest body length so the header budget is checked before inference.
                         hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
                     }

@@ -194,6 +194,18 @@ def main():
     spec_path = root / 'homogeneous.json'
     study.save(spec_path, dict(kind='imported', label='homogeneous', client_model=args.client, node_model=args.client))
     cli('homogeneous', arm_args + ['--spec', spec_path, '--chunk-tokens', '8192', '--ram-budget-mib', '128'])
+    # The same-model imported pair isolates state dtype with identical documents, scoring positions and partitions.
+    cli('bf16', arm_args + ['--kind', 'imported', '--label', 'bf16', '--client-model', args.client,
+                           '--node-model', args.client, '--state-dtype', 'bf16', '--chunk-tokens', '8192', '--ram-budget-mib', '128'])
+    for doc in index['documents']:
+        name = doc['id'] + '.json'
+        normal = study.receipt(prepared / 'arms/homogeneous' / name)
+        compressed = study.receipt(prepared / 'arms/bf16' / name)
+        assert compressed['identity']['arm']['spec']['state_dtype'] == 'bf16'
+        assert normal['deltas'][0]['size'] - compressed['deltas'][0]['size'] == 20201472 // 2 - 1
+        values = study.read(compressed['outputs'][0]['path'])
+        assert len(values) == 16 and all(math.isfinite(v['kl_nats']) for v in values)
+    print('PASS bf16 real node, client import, paired positions and half-sized state payload', flush=True)
     before = {str(p): study.sha256(p) for p in prepared.rglob('*.process.json')}
     cli('reference-resume', ['reference', '--study', prepared, '--model', args.reference] + build)
     cli('imported-resume', imported)

@@ -179,6 +179,9 @@ class Proxy:
         self.model = config["model_sha256"]
         self.node_model = config.get("node_model_sha256", self.model)
         self.hetero_quant = config.get("hetero_quant", False)
+        self.state_dtype = config.get("state_dtype", "f32")
+        if self.state_dtype not in ("f32", "bf16"):
+            raise ValueError("unsupported state dtype")
         self.layout_fingerprint = config.get("layout_fingerprint")
         if self.hetero_quant:
             if (not isinstance(self.layout_fingerprint, str) or len(self.layout_fingerprint) != 64
@@ -241,6 +244,8 @@ class Proxy:
             raise ValueError("invalid delta header")
         if header.get("version") != 2:
             raise DeltaVersionError()
+        if header.get("state_dtype", "f32") != self.state_dtype:
+            raise ValueError("state dtype mismatch")
         if not self.hetero_quant:
             return delta
         if header.get("model_sha256") != self.node_model:
@@ -282,6 +287,8 @@ class Proxy:
         health = node.request("GET", "/v1/health")
         if health.get("delta_version") != 2:
             raise DeltaVersionError()
+        if self.state_dtype not in health.get("state_dtypes", ["f32"]):
+            raise ValueError("node does not support requested state dtype")
         if self.hetero_quant:
             if health.get("model_sha256") != self.node_model or health.get("layout_fingerprint") != self.layout_fingerprint:
                 raise HTTPError(412)
@@ -512,6 +519,38 @@ class Proxy:
                     self.verified(session["id"], False)
                 self.slot_available.notify_all()
 
+    def release_slot_files(self, sid):
+        deadline = time.monotonic() + SLOT_WAIT_SECONDS
+        with self.slot_available:
+            while True:
+                slot = self.store.get(sid)["slot"]
+                if slot is None:
+                    break
+                if slot not in self.pinned:
+                    self.pinned.add(slot)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SlotUnavailable()
+                self.slot_available.wait(min(remaining, 0.1))
+        if slot is not None:
+            idle = False
+            try:
+                self.wait_idle(slot)
+                idle = True
+                self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+                self.store.set_slot(sid, None)
+            finally:
+                with self.slot_available:
+                    self.pinned.remove(slot)
+                    if not idle:
+                        self.quarantined.add(slot)
+                    self.slot_available.notify_all()
+        # Detach before unlinking, so a later lease cannot park this closed session again.
+        for suffix in (".bin", "-resync.bin", "-resync.bin.tmp", "-resync-backup.bin",
+                       "-rewrite-backup.bin", "-delta-backup.bin"):
+            (self.slot_path / (sid + suffix)).unlink(missing_ok=True)
+
     def acquire_slot(self, session):
         # Called only while the slot lease is pinned and the native slot is idle.
         rollback_pending = any((self.slot_path / (session["id"] + suffix)).exists()
@@ -603,7 +642,8 @@ class Proxy:
                             child = self.store.select(client["id"], [])
                             self.decode.request("POST", f"/slots/{session['slot']}?action=save",
                                                 {"filename": child["id"] + ".bin"})
-                            child.update(tokens=list(session["tokens"]), journal=copy.deepcopy(journal))
+                            child.update(tokens=list(session["tokens"]), journal=copy.deepcopy(journal),
+                                         state_dtype=session.get("state_dtype", "f32"), state_imports=copy.deepcopy(session.get("state_imports", [])))
                             with self.lock:
                                 next_ticket = self.reserve(child["id"])
                                 try:
@@ -836,7 +876,7 @@ class Proxy:
         mode = client.get("benchmark_mode")
         session["_bench"] = dict(mode=mode, path="local", depth_before=local_n,
             prompt_depth=len(tokens), server_prefill_ms=None, wire_bytes=0,
-            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None)
+            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None, state_dtype=self.state_dtype, lossy_import=False)
         if self.export_block_size > 1:
             session["_bench"]["export_block_size"] = self.export_block_size
         if mode == "offload":
@@ -863,11 +903,12 @@ class Proxy:
                     n0 = n1
                 with self.delta_transfer(session, slot) as transaction:
                     for index, (n0, n1) in enumerate(starts):
-                        chunk = dict(n0=n0, n1=n1, status="requested", wire_bytes=0, import_ms=0)
+                        chunk = dict(n0=n0, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32", status="requested", wire_bytes=0, import_ms=0)
                         session["_bench"]["chunks"].append(chunk)
                         delta = remote.request("POST", path + "/extend", {
                             "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
                             "tokens": target[n0:n1], "return_delta": True, "delta_version": 2,
+                            **({"state_dtype": self.state_dtype} if self.state_dtype != "f32" else {}),
                             "transfer_id": transfer_id, "transfer_n0": local_n, "transfer_n1": export_end,
                             "chunk_index": index, "chunk_count": len(starts)},
                             headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
@@ -894,7 +935,7 @@ class Proxy:
                                          bytes=len(delta), tokens=n1-n0, n0=n0, n1=n1, transfer_id=transfer_id, chunk_id=index):
                             self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
                                                 {"Content-Type": "application/octet-stream",
-                                                 "X-Hybrid-Session": session["remote_id"]})
+                                                 "X-Hybrid-Session": session["remote_id"], "X-Hybrid-State-Dtype": self.state_dtype})
                         chunk["import_ms"] = (time.monotonic() - import_started) * 1000
                         meter["import_ms"] += chunk["import_ms"]
                         actual = self.decode.request("GET", f"/slots/{slot}/info")
@@ -906,7 +947,10 @@ class Proxy:
                         chunk["status"] = "imported" if index + 1 == len(starts) else "staged"
                         if index + 1 != len(starts):
                             continue
-                        session.update(offload=True, tokens=tokens[:n1], remote_n=n1)
+                        session.update(offload=True, tokens=tokens[:n1], remote_n=n1, state_dtype=self.state_dtype)
+                        meter["lossy_import"] = self.state_dtype != "f32"
+                        entry = dict(n0=local_n, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32")
+                        session.setdefault("state_imports", []).append(entry)
                         session["_remote_applied"] = n1 - local_n
                         LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
                         if "_turn" in session:
@@ -1020,7 +1064,7 @@ class Proxy:
                 layout.append(dict(message_index=len(messages), role="assistant", start=turn["generation_start"],
                                    end=dict(n=len(complete), byte_offset=0)))
                 messages = messages + [capture.message]
-            session["journal"] = dict(identity=turn["identity"], template=turn["template"],
+            session["journal"] = dict(state_imports=session.get("state_imports", []), state_dtype=session.get("state_dtype", "f32"), identity=turn["identity"], template=turn["template"],
                 settings_sha256=turn["settings"], messages=messages, message_boundaries=layout,
                 segments=segments, checkpoints=checkpoints, retired_remote_ids=retired,
                 evaluated_boundary=len(evaluated), sampled_boundary=len(complete),
@@ -1056,6 +1100,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 app.store.benchmark_mode(sid, "closed")
                 ids = [session["remote_id"]] + (session.get("journal") or {}).get("retired_remote_ids", [])
                 remaining = list(dict.fromkeys(value for value in ids if value))
+                app.release_slot_files(sid)
                 for remote_id in remaining[:]:
                     path = "/v1/sessions/" + urllib.parse.quote(remote_id, safe="")
                     release_retry(lambda: app.remote(client).request("DELETE", path))

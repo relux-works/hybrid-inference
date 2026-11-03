@@ -559,6 +559,19 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual((local['catchup_tokens'], local['catchup_seconds'], local['catchup_upload_bytes']), (0, 0, 0))
         self.assertEqual((hybrid['catchup_tokens'], hybrid['catchup_seconds'], hybrid['catchup_upload_bytes']), (5, 2, 20))
 
+    # A lossy-origin snapshot cannot pass the exact gate, even when its measured distributions agree.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_bf16_import_never_exact(self, raw):
+        row = dict(depth=1000, k=64, exact=True, top1_agreed=64, mean_kl_nats=0,
+                   max_abs_logit_diff=0, free_running_first_divergence=-1, status='passed', exit_code=0)
+        growing.validate_checkpoint(row, False, 1000)
+        for status, code, exact in (('passed', 0, True), ('passed', 0, False), ('lossy', 5, True)):
+            with self.assertRaises(Refusal):
+                growing.validate_checkpoint(dict(row, state_dtype='bf16', lossy_import=True,
+                                                 status=status, exit_code=code, exact=exact), False, 1000)
+        growing.validate_checkpoint(dict(row, state_dtype='bf16', lossy_import=True,
+                                         status='lossy', exit_code=5, exact=False), False, 1000)
+
     # Tiny KL and unchanged top-1 cannot satisfy exactness; malformed or weakened checker verdicts refuse.
     @mock.patch.object(growing, "validate_raw_positions")
     def test_checkpoint_exactness_gate(self, raw):

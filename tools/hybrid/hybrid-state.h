@@ -19,6 +19,7 @@ std::string layout_fingerprint(const json & layout);
 std::string export_range(llama_context * ctx, llama_pos n0, llama_pos n1, bool fixed_state = true);
 constexpr size_t max_delta_header_bytes = 1024 * 1024;
 constexpr size_t max_delta_body_bytes = 512 * 1024 * 1024;
+std::string transcode_recurrent(std::string_view state, bool pack, bool fixed_state);
 std::string encode_delta_header(json header, size_t state_bytes);
 std::string encode_delta(json header, const std::string & state);
 struct delta {
@@ -30,6 +31,7 @@ struct delta_view {
     json header;
     std::string_view state;
 };
+// The view retains wire dtype. Use read_delta or delta_import for bf16 expansion.
 // The wire must outlive this view and all tensor writes made from it.
 delta_view read_delta_view(const std::string & wire, const std::string & model_sha256, int64_t n0);
 delta_view read_delta_view(std::string && wire, const std::string & model_sha256, int64_t n0) = delete;
@@ -43,7 +45,7 @@ class delta_import {
 public:
     void clear();
     bool stage(llama_context * ctx, llama_seq_id seq_id, std::string wire, const std::string & model_hash, const std::string & session_id,
-               const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab);
+               const std::vector<llama_token> & current, size_t n_ctx, int32_t n_vocab, const std::string & state_dtype = "f32");
     const std::vector<llama_token> & imported_tokens() const { return tokens; }
     void apply(llama_context * ctx, llama_seq_id seq_id);
 };

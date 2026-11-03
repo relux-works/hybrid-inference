@@ -491,6 +491,7 @@ def checkpoint(app, client, root, turn, heterogeneous, trace, keep_states=False)
     result = scratch / 'result.json'
     captured = dict(trace, events=app.events.copy())
     source = checkpoint_source(client, saved, captured, turn, app.events.state_dir is not None)
+    source['state_dtype'] = app.state_dtype
     private_json(fixture, source)
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
@@ -621,7 +622,7 @@ def validate_raw_positions(row, depth):
         require(math.isclose(measured['mean_kl_nats'], math.fsum(values) / 64, rel_tol=1e-8, abs_tol=1e-12) and
                 math.isclose(measured['p95_kl_nats'], sorted(values)[60], rel_tol=1e-8, abs_tol=1e-12) and
                 measured['top1_agreed'] == sum(p['top1_agreed'] for p in positions) and
-                measured['exact'] == all(p['exact'] for p in positions) and
+                measured.get('logits_exact', measured['exact']) == all(p['exact'] for p in positions) and
                 measured['max_abs_logit_diff'] == max(p['max_abs_logit_diff'] for p in positions),
                 'checkpoint summary contradicts raw logits')
 
@@ -655,6 +656,8 @@ def append_replay_controls(row):
                     equal = equal and state['bytes_equal'] is True
         controls[name + '-' + reference] = equal
     controls['A-L'] = exact(row['factorial']['A-L'])
+    if row.get('state_dtype', 'f32') != 'f32':
+        controls['state_transport_exact'] = False
     return controls
 
 
@@ -698,7 +701,9 @@ def validate_checkpoint(row, heterogeneous, depth):
         controls = append_replay_controls(row)
         require(row['gate_controls'] == controls and row['kl_limit'] is None, 'checkpoint replay gate contradicts controls')
         accepted = all(controls.values()) and row['top1_agreed'] >= 63
-    status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
+    lossy = row.get('state_dtype', 'f32') != 'f32'
+    require(not lossy or (row.get('lossy_import') is True and row['exact'] is False), 'bf16 import cannot be exact')
+    status, code = ('lossy', 5) if lossy else ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
     require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict contradicts acceptance rule')
 
 
@@ -920,6 +925,7 @@ def run(args):
         trace['engine']['cpu_affinity'] = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
         flush()
         trace['heterogeneous'] = client['backend'] != node['backend']
+        trace['state_dtype'] = app.state_dtype
         credential = config['client_credential']
         with proxy_server(app) as proxy_url:
             previous = {}
@@ -1057,7 +1063,7 @@ def run(args):
                         'no verified offload after reconnection')
             trace['status'] = ('measured' if not checkpoints else
                                'failed' if any(r['status'] == 'failed' for r in trace['checkpoints']) else
-                               'heterogeneous' if trace['heterogeneous'] else 'passed')
+                               'lossy' if app.state_dtype != 'f32' else 'heterogeneous' if trace['heterogeneous'] else 'passed')
     except BaseException as error:
         trace.update(status='aborted', error_type=type(error).__name__,
                      reason=str(error) if isinstance(error, Refusal) else 'runtime failure; inspect private logs')
@@ -1253,7 +1259,7 @@ def main():
     try:
         trace = run(args)
         print(json.dumps(dict(status=trace['status'], trace=str(Path(args.output) / 'trace.json'))))
-        return {'heterogeneous': 5, 'failed': 3, 'passed': 0, 'measured': 0}[trace['status']]
+        return {'lossy': 5, 'heterogeneous': 5, 'failed': 3, 'passed': 0, 'measured': 0}[trace['status']]
     except (Refusal, OSError, ValueError, KeyError) as error:
         print('refused: ' + (str(error) if isinstance(error, Refusal) else type(error).__name__), file=sys.stderr)
         return 2

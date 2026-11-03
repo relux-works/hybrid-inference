@@ -210,6 +210,7 @@ struct server_task {
         std::string delta;
         bool abort_delta = false;
         std::string session_id;
+        std::string state_dtype = "f32";
     };
     slot_action slot_action;
 

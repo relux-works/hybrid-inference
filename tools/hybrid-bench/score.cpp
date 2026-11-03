@@ -195,7 +195,7 @@ static hybrid::context_ptr context(llama_model * model, uint32_t depth, bool gpu
 }
 
 static void prefill_arm(llama_context * ctx, const std::vector<llama_token> & tokens,
-                        const std::vector<std::string> & paths, const std::string & source_hash, int64_t local_tail_start) {
+                        const std::vector<std::string> & paths, const std::string & source_hash, int64_t local_tail_start, const std::string & state_dtype) {
     const size_t n = tokens.size();
     if (paths.empty()) {
         hybrid::prefill(ctx, {tokens.begin(), tokens.end() - 1}, 0);
@@ -214,7 +214,7 @@ static void prefill_arm(llama_context * ctx, const std::vector<llama_token> & to
             require(delta.header.at("tokens") == std::vector<llama_token>(tokens.begin() + end, tokens.begin() + n1) &&
                     delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "score delta tokens mismatch");
             if (pending.stage(ctx, 0, wire, source_hash, delta.header.at("session_id").get<std::string>(), committed,
-                              llama_n_ctx(ctx), llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))))) {
+                              llama_n_ctx(ctx), llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))), state_dtype)) {
                 pending.apply(ctx, 0);
                 committed = pending.imported_tokens();
                 pending.clear();
@@ -301,9 +301,9 @@ int main(int argc, char ** argv) {
         hybrid::context_ptr imported;
         if (!paths.empty()) {
             imported = context(model.get(), depth, gpu_layers > 0);
-            prefill_arm(imported.get(), tokens, paths, source_hash, local_tail_start);
+            prefill_arm(imported.get(), tokens, paths, source_hash, local_tail_start, fixture.value("state_dtype", std::string("f32")));
         }
-        prefill_arm(local.get(), tokens, {}, source_hash, n - 1);
+        prefill_arm(local.get(), tokens, {}, source_hash, n - 1, "f32");
         std::vector<llama_token> all = tokens;
         all.insert(all.end(), next.begin(), next.end());
         json header = {{"format", "f16-logsoftmax-le-v1"}, {"model_sha256", model_hash},
@@ -399,7 +399,7 @@ int main(int argc, char ** argv) {
             bool bagreed = true;
             if (has_imported) {
                 probe = context(model.get(), depth, gpu_layers > 0);
-                prefill_arm(probe.get(), tokens, paths, source_hash, local_tail_start);
+                prefill_arm(probe.get(), tokens, paths, source_hash, local_tail_start, fixture.value("state_dtype", std::string("f32")));
                 if (i) { hybrid::prefill(probe.get(), {next.begin(), next.begin() + i}, n); }
                 const auto q = log_probs(llama_get_logits_ith(probe.get(), -1), vocab);
                 b = kl(hybrid_probes[j], q);

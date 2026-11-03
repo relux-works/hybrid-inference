@@ -5,6 +5,8 @@ Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_
 
 ## Prototype tools
 
+Recurrent state transport supports negotiated f32 (default) or lossy bf16 for Qwen35. [Wire layout and CPU commands](tools/hybrid/STATE-BF16.md), [KL GPU procedure](tools/hybrid-bench/STATE-BF16-RUNBOOK.md), and [single-arm RULER procedure](tools/hybrid-eval/RULER-BF16-RUNBOOK.md) list exact entry points and private artifact locations.
+
 The [vLLM bridge guide](tools/hybrid-vllm/README.md) lists the Python exporter/converter, native CPU reader test, exact entry points and `.temp/` artifact locations. Its [design](tools/hybrid-vllm/DESIGN.md) contains the GPU-host plan; only CPU conversion and synthetic native import are qualified here.
 
 The [vLLM node protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [B300 node runbook](tools/hybrid-vllm/GPU-NODE-RUNBOOK.md) cover the HTTP adapter, aligned exports, local decoder tails and supervised deployment. Live CUDA extraction and heterogeneous numerical equivalence remain qualification gates.
@@ -19,6 +21,7 @@ Mirai prototype tools (CPU checks use existing local headers and never download 
 | Backend tests | `OMP_NUM_THREADS=2 nice -n 10 build/bin/test-backend-ops test -b CPU -o MIRAI_MUL_MAT` | Terminal |
 | Fork/port parity | `python3 tools/mirai-s/parity.py collect --help`; `python3 tools/mirai-s/parity.py compare --a .temp/mirai-parity/fork.json --b .temp/mirai-parity/port.json` | JSON and logs under `.temp/mirai-parity/`; full GPU gate in the [r2 report](tools/hybrid-bench/RESULTS-hybrid-c-r2-261101.md#gpu-host-mirai-study-commands-unrun) |
 | Parity gate CPU tests | `python3 -m unittest discover -s tools/mirai-s -p test_parity.py -v` | Terminal; no GPU or model |
+| Paired RULER quality | `python3 tools/hybrid-eval/ruler_eval.py --help`; [GPU runbook](tools/hybrid-eval/RULER-RUNBOOK.md) | Private depth journals and complete archives under `--output`; data bootstrap on GPU host only |
 | Python identity fixtures | `python3 tools/hybrid-bench/test_mirai_identity.py` | Terminal; native cases skipped without local headers |
 | Native header fixtures (glibc) | `python3 tools/hybrid-bench/test_mirai_identity.py --binary build/bin/llama-hybrid-check-identity --headers /path/to/headers --artifacts .temp/mirai-identity` | `.temp/mirai-identity/` |
 | Native model identity | `build/bin/llama-hybrid-check-identity /path/to/model.gguf` | JSON layout and fingerprint, no weight allocation |
@@ -135,6 +138,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [server](tools/server/README.md)
 - [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay, captured-template tests, external Jinja2 oracle and mutation controls; exact commands in the linked guide, artifacts in `.temp/<run>/`, oracle sources via `HYBRID_TEMPLATE_FIXTURES`
 - [hybrid benchmark prototype](tools/hybrid-bench/README.md#tools-and-trace-contract) - Deployment, benchmark, tests and cleanup controls with exact commands and artifact locations
+- [paired RULER evaluation](tools/hybrid-eval/RULER-RUNBOOK.md) - `python3 tools/hybrid-eval/ruler_eval.py --help`; three-arm evaluation, slot disk admission and audited resume, with private state/results under the run directory and CPU test logs under `.temp/`
 - [GBNF grammars](grammars/README.md)
 
 #### Development

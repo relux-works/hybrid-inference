@@ -344,6 +344,8 @@ def arm_spec(args):
     spec['client_model'] = file_record(spec['client_model'])
     spec['node_model'] = file_record(spec['node_model']) if spec.get('node_model') else None
     require(spec['kind'] == 'imported' or spec['node_model'] is None, 'local arm cannot have a node')
+    spec['state_dtype'] = spec.get('state_dtype', getattr(args, 'state_dtype', 'f32'))
+    require(spec['state_dtype'] in ('f32', 'bf16') and (spec['kind'] == 'imported' or spec['state_dtype'] == 'f32'), 'invalid state dtype for arm')
     spec['hetero_quant'] = args.hetero_quant
     if spec['kind'] == 'imported':
         require(spec['node_model']['sha256'] == spec['client_model']['sha256'] or args.hetero_quant, 'node/client mismatch requires --hetero-quant')
@@ -382,6 +384,7 @@ def deltas(args, spec, fixture, attempt, header):
     paths = []
     context = max(256, ((len(fixture['tokens']) + 255) // 256) * 256)
     with node(args, spec, attempt, context) as (base, token, health):
+        require(spec.get('state_dtype', 'f32') in health.get('state_dtypes', ['f32']), 'node state dtype unavailable')
         require(health['layout_fingerprint'] == header['layout_fingerprint'], 'node/reference layout mismatch')
         remote = api(base, '/v1/sessions', dict(model_sha256=spec['node_model']['sha256']), token)['session_id']
         route = '/v1/sessions/' + remote
@@ -389,7 +392,9 @@ def deltas(args, spec, fixture, attempt, header):
             for start in range(0, len(fixture['tokens']) - 1, args.chunk_tokens):
                 end = min(start + args.chunk_tokens, len(fixture['tokens']) - 1)
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in fixture['tokens'][:start])).hexdigest()
-                body = api(base, route + '/extend', dict(n0=start, prefix_hash_n0=prefix, tokens=fixture['tokens'][start:end], return_delta=True), token, binary=True, timeout=args.timeout)
+                body = api(base, route + '/extend', dict(n0=start, prefix_hash_n0=prefix, tokens=fixture['tokens'][start:end], return_delta=True, state_dtype=spec.get('state_dtype', 'f32')), token, binary=True, timeout=args.timeout)
+                length, = struct.unpack_from('<I', body)
+                require(json.loads(body[4:4+length])['state_dtype'] == spec.get('state_dtype', 'f32'), 'state dtype mismatch')
                 path = attempt / (str(start) + '.delta')
                 atomic(path, body)
                 paths.append(path)
@@ -456,7 +461,7 @@ def arm(args):
             require(spec['kind'] != 'imported' or paths, 'missing delta chain')
             delta_records = [file_record(p) for p in paths]
             source = dict(fixture, model_sha256=spec['client_model']['sha256'], max_ctx=index['specification']['n'] + index['specification']['m'],
-                          score_batch=args.score_batch, reference_logits=str(reference_path), reference_model_sha256=reference_hash)
+                          state_dtype=spec['state_dtype'], score_batch=args.score_batch, reference_logits=str(reference_path), reference_model_sha256=reference_hash)
             if paths:
                 source.update(deltas=[str(p) for p in paths], hetero_quant=spec['hetero_quant'],
                               node_model_sha256=spec['node_model']['sha256'], node_layout_fingerprint=header['layout_fingerprint'])
@@ -595,6 +600,7 @@ def parser():
             command.add_argument('--node-build-dir')
             command.add_argument('--reference-model-sha256', required=True)
             command.add_argument('--hetero-quant', action='store_true')
+            command.add_argument('--state-dtype', choices=['f32', 'bf16'], default='f32')
             command.add_argument('--chunk-tokens', type=int, default=4096)
             command.add_argument('--ram-budget-mib', type=int, default=4096)
             command.add_argument('--keep-deltas', action='store_true', help='retain successful imported delta files for debugging')
