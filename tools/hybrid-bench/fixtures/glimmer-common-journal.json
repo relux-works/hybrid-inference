@@ -1,0 +1,15 @@
+{
+  "schema": "hybrid-pairing-contract-v1",
+  "mode": "hybrid-common-journal-v1",
+  "model_sha256": "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e",
+  "architecture": "muse-glimmer",
+  "sliding_window": 2048,
+  "recurrent_layers": 0,
+  "free_running_batch_invariant": false,
+  "evidence": {
+    "run": "rehearsal-glimmer-f-261103",
+    "head": "7d51223846e3b83fd244e91ebf5e64a824bbd063",
+    "trace_sha256": "2c462979aff26108efefa3db9b948470855bf7b686f6a3b672368369f10e165f",
+    "observation": "Same turn-1 generation length, different hybrid/local token journals after different base prefill paths. This declares a measured property for this pinned model and rehearsal, not all SWA models."
+  }
+}

@@ -41,6 +41,51 @@ PAUSE = [.2, 3.8, 7.8, 17.9, 34.8, 340]
 SYSTEM = 'Read synthetic tool results. Reply with decimal digits only.'
 NATIVE_CONTEXT = 262144
 DEPTH_MARGIN = 2048
+COMMON_JOURNAL = 'hybrid-common-journal-v1'
+
+
+def pairing_contract(declaration, client, checkpoints, probes, partition_batch=64, partition_ubatch=32):
+    if declaration is None:
+        return dict(mode='independent-equal-journals')
+    layout = client['model_layout']
+    require(declaration.get('schema') == 'hybrid-pairing-contract-v1' and declaration.get('mode') == COMMON_JOURNAL and
+            declaration.get('free_running_batch_invariant') is False, 'invalid declared pairing contract')
+    require(declaration['model_sha256'] == client['model_sha256'] and
+            declaration['architecture'] == layout['architecture'] and
+            declaration['sliding_window'] == layout.get('sliding_window') and layout.get('sliding_window', 0) > 0 and
+            declaration['recurrent_layers'] == 0 and not any(r['recurrent'] for r in layout['layers']),
+            'common-journal declaration requires matching nonrecurrent SWA model; Qwen equality contract unchanged')
+    require(checkpoints and probes, 'common-journal fidelity requires checkpoints and state probes')
+    require(1 <= partition_ubatch <= partition_batch <= 256, 'invalid common-journal partition')
+    return dict(mode=COMMON_JOURNAL, declaration=declaration,
+                reference_batches=dict(L=dict(batch=256, ubatch=256), P=dict(batch=partition_batch, ubatch=partition_ubatch)))
+
+
+def common_journal(trace):
+    return trace.get('pairing', {}).get('mode') == COMMON_JOURNAL
+
+
+def require_paired_journal(row, reference):
+    row['paired_journal_equal'] = row['journal_hash'] == reference['journal_hash']
+    require(row['paired_journal_equal'], 'paired journal hashes differ')
+
+
+def validate_common_pairing(row):
+    pairing = row['pairing']
+    require(pairing['mode'] == COMMON_JOURNAL and len(pairing['journal_hash']) == 64,
+            'invalid common-journal result binding')
+    continuations = row['continuations']
+    teacher = continuations['L']['teacher_tokens']
+    require(len(teacher) == 64 and all(type(t) is int and 0 <= t < row['raw_logits']['vocab'] for t in teacher),
+            'invalid common-journal teacher tokens')
+    for name in ('H', 'L', 'P'):
+        require(continuations[name]['teacher_tokens'] == teacher, 'common-journal teacher-forced inputs differ: ' + name)
+        free = continuations[name]['free_tokens']
+        require(len(free) == 64 and all(type(t) is int and 0 <= t < row['raw_logits']['vocab'] for t in free),
+                'invalid common-journal free tokens')
+    for name, metrics in (('H', row), ('P', row['partition'])):
+        first = next((i for i, (a, b) in enumerate(zip(continuations['L']['free_tokens'], continuations[name]['free_tokens'])) if a != b), -1)
+        require(metrics['free_running_first_divergence'] == first, 'common-journal free divergence contradicts tokens')
 
 
 def sample(points, u):
@@ -469,11 +514,13 @@ def replay_schedules(trace, turn, depth):
 
 
 def checkpoint_source(client, saved, trace, turn, probes=True):
-    local = saved[1]
+    local = saved[0] if common_journal(trace) else saved[1]
     source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'], acceptance_rule='session_append_replay_exact',
         model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=trace['heterogeneous'],
         snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
         replay=replay_schedules(trace, turn, len(local['tokens'])))
+    if common_journal(trace):
+        source['pairing'] = dict(trace['pairing'], journal_hash=prefix_hash(local['tokens']))
     if client.get('model_layout', {}).get('sliding_window'):
         source['state_component'] = 'window'
     if probes:
@@ -482,9 +529,10 @@ def checkpoint_source(client, saved, trace, turn, probes=True):
 
 
 def checkpoint(app, client, root, turn, heterogeneous, trace, keep_states=False):
-    saved = [app.saved[(arm, turn)] for arm in ('hybrid', 'local', 'local_partition')]
-    hybrid, local, partition = saved
-    require(hybrid['tokens'] == local['tokens'] == partition['tokens'], 'checkpoint journal mismatch between arms')
+    arms = ('hybrid',) if common_journal(trace) else ('hybrid', 'local', 'local_partition')
+    saved = [app.saved[(arm, turn)] for arm in arms]
+    hybrid, local = saved[0], saved[0] if common_journal(trace) else saved[1]
+    require(all(item['tokens'] == local['tokens'] for item in saved), 'checkpoint journal mismatch between arms')
     scratch = root / ('check-' + str(turn))
     scratch.mkdir(mode=0o700)
     fixture = scratch / 'input.json'
@@ -507,6 +555,8 @@ def checkpoint(app, client, root, turn, heterogeneous, trace, keep_states=False)
     row = json.loads(result.read_text())
     require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
     require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
+    if common_journal(trace):
+        require(row.get('pairing') == source['pairing'], 'checkpoint common-journal binding changed')
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
     row.update(turn=turn, checker_exit_code=process.returncode, fidelity_flag=fidelity_flags(row),
                snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
@@ -675,6 +725,8 @@ def fidelity_flags(row):
 
 
 def validate_checkpoint(row, heterogeneous, depth):
+    if 'pairing' in row:
+        validate_common_pairing(row)
     require(row['depth'] == depth and row['k'] == 64 and type(row['exact']) is bool and
             type(row['top1_agreed']) is int and 0 <= row['top1_agreed'] <= 64 and
             math.isfinite(row['mean_kl_nats']) and row['mean_kl_nats'] >= 0 and
@@ -778,6 +830,7 @@ def parser():
     p.add_argument('--state-probes', action='store_true', help='capture private live node states and isolate serialization/import factors')
     p.add_argument('--turns', type=int, default=40)
     p.add_argument('--keep-checkpoint-states', action='store_true', help='retain saved states for checkpoint-only rechecks')
+    p.add_argument('--pairing-contract', help='explicit model-bound common-journal fidelity declaration; default requires equal independent journals')
     p.add_argument('--checkpoint-turns', help='none for capture-free hybrid/local timing; otherwise increasing turns, default every 10 and final')
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
@@ -824,6 +877,11 @@ def run(args):
         require(sha256(Path(client['build_dir']) / 'bin' / binary) == client['binaries'][binary], 'client binary changed: ' + binary)
     require(not root.exists() and root.parent.is_dir(), 'output must be a new directory in an existing parent')
     layout = client['model_layout']
+    declaration = json.loads(Path(args.pairing_contract).read_text()) if args.pairing_contract else None
+    pairing = pairing_contract(declaration, client, checkpoints, args.state_probes, args.partition_batch, args.partition_ubatch)
+    if declaration is not None:
+        pairing['declaration_sha256'] = sha256(args.pairing_contract)
+        arms = ['hybrid']
     require(config.get('state_dtype','f32')=='f32', 'hybrid/local require f32 client configuration; use --include-bf16')
     if args.include_bf16:
         recurrent_tensor_bytes(layout)
@@ -879,6 +937,10 @@ def run(args):
         disconnect=dict(turn=args.disconnect_turn, turns=args.disconnect_turns),
         driver=dict(source_sha256=sha256(__file__), proxy_sha256=sha256(Path(__file__).parents[1] / 'hybrid-proxy/proxy.py')),
         started_utc=datetime.now(timezone.utc).isoformat())
+    trace['pairing'] = pairing
+    if common_journal(trace):
+        trace['client']['model_layout'] = layout
+        trace['reference_arms'] = dict(local='teacher-forced replay at checkpoints', local_partition='teacher-forced partition replay at checkpoints')
 
     def flush():
         trace['events'] = events.copy()
@@ -1024,7 +1086,7 @@ def run(args):
                     reference = next(r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] == step['turn'])
                     row['paired_journal_equal']=row['journal_hash']==reference['journal_hash']
                     if arm != 'hybrid-bf16':
-                        require(row['paired_journal_equal'], 'paired journal hashes differ')
+                        require_paired_journal(row, reference)
                 return sid, messages + [message]
 
             initial = dict(turn=0, output_tokens=1, seed=args.seed)
@@ -1039,7 +1101,7 @@ def run(args):
                            bytes=(app.slot_path / filename).stat().st_size, seconds=time.monotonic() - started)
 
             if args.start == 'pre-staged':
-                for arm in ('hybrid', 'local'):
+                for arm in (('hybrid',) if common_journal(trace) else ('hybrid', 'local')):
                     stage_base(arm)
             for arm in trace['arms']:
                 if arm=='hybrid-bf16':
@@ -1101,7 +1163,7 @@ def run(args):
                             catchup_seconds=sum(r['seconds'] for r in catchup),
                             upload_body_bytes=sum(r['upload_body_bytes'] for r in catchup))
                         reconnect_events = None
-                    if arm == 'local_partition' and turn in checkpoints:
+                    if (arm == 'hybrid' if common_journal(trace) else arm == 'local_partition') and turn in checkpoints:
                         result = checkpoint(app, client, root, turn, trace['heterogeneous'], trace, args.keep_checkpoint_states)
                         trace['checkpoints'].append(result)
                         flush()
@@ -1172,11 +1234,12 @@ def verify_recheck(trace_path, turn):
     source = read_private(fixture)
     require(isinstance(source, dict) and all(key in source for key in
             ('tokens', 'snapshots', 'snapshot_sha256', 'probes')), 'invalid preserved checkpoint input')
-    require(len(source['snapshots']) == len(source['snapshot_sha256']) == 3, 'checkpoint needs three preserved states')
+    arms = ('hybrid',) if common_journal(trace) else ('hybrid', 'local', 'local_partition')
+    require(len(source['snapshots']) == len(source['snapshot_sha256']) == len(arms), 'checkpoint preserved state count mismatch')
     tokens = source['tokens']
     journal_hash = prefix_hash(tokens)
     saved = []
-    for arm, path, digest in zip(('hybrid', 'local', 'local_partition'), source['snapshots'], source['snapshot_sha256']):
+    for arm, path, digest in zip(arms, source['snapshots'], source['snapshot_sha256']):
         rows = [r for r in trace['calls'] if r['arm'] == arm and r['turn'] == turn]
         require(len(rows) == 1 and rows[0]['journal_hash'] == journal_hash and
                 rows[0]['depth_after'] == len(tokens), 'preserved checkpoint journal mismatch: ' + arm)
@@ -1251,6 +1314,8 @@ def recheck(args):
         record['checker_exit_code'] = process.wait()
         require((root / 'result.json').is_file(), 'checkpoint checker produced no metrics; inspect its log')
         row = json.loads((root / 'result.json').read_text())
+        if common_journal(trace):
+            require(row.get('pairing') == source['pairing'], 'recheck common-journal binding changed')
         require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
         require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
         validate_checkpoint(row, trace['heterogeneous'], len(source['tokens']))

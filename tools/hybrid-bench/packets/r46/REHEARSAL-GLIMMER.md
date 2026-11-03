@@ -1,14 +1,20 @@
 # Glimmer CUDA-to-CUDA checkpoint rehearsal
 
-Functional qualification on one RTX PRO 6000 96GB over loopback. It is not a timing comparison: node, decoder and checker share the card. Use the signed r46 source and the exact same Glimmer30B Q4_K_M file on both roles, SWA2048, no recurrent state, native context131072. Stage the node with README-NODE.md. Do not run this on agents1. Plan3-6h compute/checker/storage allowance, 120GB initial free disk after staging weights/build, 96GB host RAM, 96GB GPU RAM. Allow roughly 40-60GB loopback capture traffic and 5-10GB selective evidence archive; all-turn capture reservation below is a conservative bound, not a physical counter. Target runtime and SWA exactness are unmeasured; preserve failures.
+Functional qualification on one RTX PRO 6000 96GB over loopback. It is not a timing comparison: node, decoder and checker share the card. Use the signed r46 source and the exact same Glimmer30B Q4_K_M file on both roles, SWA2048, no recurrent state, native context131072. Stage the node with README-NODE.md. Do not run this on agents1. Use the explicit [common-journal design](COMMON-JOURNAL.md) and model declaration below. Plan4-7h compute/checker/storage allowance, 120GB initial free disk after staging weights/build, 96GB host RAM, 96GB GPU RAM. Allow roughly 40-60GB loopback capture traffic and 5-10GB selective evidence archive; all-turn capture reservation below is a conservative bound, not a physical counter. Target runtime and SWA exactness are unmeasured; preserve failures.
 
 ## Start depth
 
-Use76000, seed1,40 sampled turns and the real rendered-template framing. With framing32, the sampler grows52011 tokens to128011, leaving3061 below131072 (1013 beyond the mandatory2048 margin). At framing16 it ends127371. An80000 start fails with the existing depth-conditioned sampler. Do not truncate turns or outputs. The driver repeats the bound with actual framing before any arm.
+Use76000, seed1,40 sampled turns and the real rendered-template framing. Node F at7d512238 measured framing7:51011 tokens of growth, final depth127011, leaving4061 below native131072. The policy generator's conservative framing32 plan ends128011, still with3061 margin. The new mode never resamples or truncates turns/outputs. The driver recomputes the actual bound with the current template before any arm. An80000 start is not substituted.
+
+## Declared pairing contract
+
+Pass `--pairing-contract tools/hybrid-bench/fixtures/glimmer-common-journal.json`. It binds the pinned GGUF hash, architecture, SWA2048 and absence of recurrence, and declares the measured property free_running_batch_invariant=false from node F. There is no fallback on a journal mismatch. Omitting the contract keeps the original independent-arm equality gate, which remains required for Qwen. Common mode requires checkpoints and state probes and is refused for recurrent Qwen.
+
+Hybrid alone generates the live40-turn conversation. At each checkpoint, its native H snapshot and exact token IDs define the common history. The checker independently replays L and P from those IDs: L uses256/256, P uses64/32; generated spans are evaluated one token at a time. Both cross a native save/restore boundary before the final held token. Neither reference samples its own past or re-tokenizes hybrid text. These are teacher-forced reference histories, not live free-running timing arms. The checker records the common journal hash,64 teacher token IDs and each64-token independent free continuation. Divergence is measured over those64 positions, not an alternate40-turn conversation.
 
 ## Ten exact controls
 
-A is deterministic local-batch replay, B the node-batch replay, L the live local snapshot, H the live hybrid snapshot, and CHAIN the recorded sequence of real imported envelopes and local gaps. Window means the serialized SWA cache including physical cell placement/head and metadata, not a recurrent tensor. Non-SWA attention rows and SWA window are the two native memory components (`llama_kv_cache_iswa.get_base/get_swa`).
+A is deterministic local-batch replay, B the node-batch replay, L the native-roundtripped teacher-forced local reference, H the live hybrid snapshot, and CHAIN the recorded sequence of real imported envelopes and local gaps. Window means the serialized SWA cache including physical cell placement/head and metadata, not a recurrent tensor. Non-SWA attention rows and SWA window are the two native memory components (`llama_kv_cache_iswa.get_base/get_swa`).
 
 | Control | Glimmer contract and reason |
 |---|---|
@@ -21,9 +27,9 @@ A is deterministic local-batch replay, B the node-batch replay, L the live local
 | CHAIN-H | Captured import chain reproduces live hybrid continuation; unchanged |
 | CHAIN_ATTENTION-B | Replace the chain's full-attention component with node reference; window bytes must already equal node's, and the result equals B. Full-attention provenance is isolated as in Qwen |
 | CHAIN_WINDOW-H | Replace the already imported window with the identical node window; require window_equal and equality to H. Replaces CHAIN_RECURRENT-H, which would be vacuous on a model without recurrence |
-| A-L | Local deterministic replay equals the live local checkpoint; unchanged |
+| A-L | Independent local replay equals the teacher-forced local reference after its native checkpoint roundtrip; exact bytes/logits remain required |
 
-All10 must be exact (zero KL and logit difference,64/64, no free-running divergence inside each identity), plus journal/hash/raw-logit integrity. L-H teacher-forced top1 must be >=63/64; KL, noise flags and L-H free-running divergence remain report-only. No tolerance is added for GPU/SWA. A missing/failed window or native-save/restore identity is a failed rehearsal, not permission to remove a control. Native slot compaction and physical SWA layout must be exercised beyond2048; no small SWA weight file exists on agents1, so those real inference paths are an explicit qualification gap. CPU Qwen and synthetic window gate tests cannot close it.
+All10 must be exact (zero KL and logit difference,64/64, no free-running divergence inside each identity), plus journal/hash/raw-logit integrity. L-H teacher-forced top1 must be >=63/64. Actual teacher token IDs must match for H/L/P. KL, noise flags and cross-path H-L/L-P free-running divergence remain report-only; continuation token IDs bind each reported first divergence. Divergence within an exact identity still fails that identity. No tolerance is added for GPU/SWA. A missing/failed window or native-save/restore identity is a failed rehearsal, not permission to remove a control. Native slot compaction and physical SWA layout must be exercised beyond2048; no small SWA weight file exists on agents1, so those real inference paths are an explicit qualification gap. CPU Qwen and synthetic window gate tests cannot close it.
 
 ## Run
 
@@ -46,7 +52,18 @@ tools/hybrid-bench/setup-client.sh --state "$CLIENT_ROOT/client" --stop > "$CLIE
 Execute this command through the existing foreground command/PID/exit recorder (r44 `run-session.execute` accepts an arbitrary argument list), or the GPU operator's equivalent recorder. Do not use r44 runner's fixed Mac CLI, which would overwrite these depth/checkpoint parameters.
 
 ```bash
-python3 tools/hybrid-bench/growing_session.py --client-state "$CLIENT_ROOT/client" --output "$CLIENT_ROOT/rehearsal" --depth 76000 --turns 40 --seed 1 --start pre-staged --disconnect-turn 20 --disconnect-turns 3 --checkpoint-turns 10,20,30,40 --keep-checkpoint-states --state-probes --policy "$CLIENT_ROOT/rehearsal-policy.json" --link-label 'PRO 6000 same card CUDA loopback; illustrative routing policy, not timing evidence' --request-timeout 3600
+python3 tools/hybrid-bench/growing_session.py --client-state "$CLIENT_ROOT/client" --output "$CLIENT_ROOT/rehearsal" --depth 76000 --turns 40 --seed 1 --start pre-staged --disconnect-turn 20 --disconnect-turns 3 --checkpoint-turns 10,20,30,40 --keep-checkpoint-states --state-probes --pairing-contract tools/hybrid-bench/fixtures/glimmer-common-journal.json --policy "$CLIENT_ROOT/rehearsal-policy.json" --link-label 'PRO 6000 same card CUDA loopback; illustrative routing policy, not timing evidence' --request-timeout 3600
 ```
 
-Keep states for offline rechecks. Expected successful exit0/statuspassed, 120 turn calls (hybrid/local/local_partition), checkpoints10/20/30/40 each with10 green controls and top1>=63, connected local and offload routes, local turns20-22, verified resync after23 and final cleanup with no remaining remote sessions. A trace aborted before completion or any failed checkpoint is not accepted. Record actual checkpoint durations, all events and node counters; archive selective trace/results/raw-logits/deltas and model/build/source identities privately, keeping native snapshots on the run volume for rechecks. Actual GPU execution and independent acceptance remain external gates.
+Keep states for offline rechecks. Expected successful exit0/statuspassed, 40 live hybrid turn calls plus its forced base, and L/P teacher-forced references at four checkpoints, checkpoints10/20/30/40 each with10 green controls and top1>=63, connected local and offload routes, local turns20-22, verified resync after23 and final cleanup with no remaining remote sessions. A trace aborted before completion or any failed checkpoint is not accepted. Record actual checkpoint durations, all continuation tokens, actual route counts, all events and node counters; archive selective trace/results/raw-logits/deltas and model/build/source identities privately, keeping native snapshots on the run volume for rechecks. Actual GPU execution and independent acceptance remain external gates.
+
+
+After successful driver cleanup and verified zero remaining owned sessions, stop the owned node:
+
+```bash
+tools/hybrid-bench/deploy-prefill-node.sh --state "$NODE_ROOT/glimmer-node" --stop > "$NODE_ROOT/stop-01.log" 2>&1
+```
+
+## Full-run time estimate
+
+The node-F hybrid calls took593.19s plus789.44s sampled pauses, about23.0min; use25min for the live hybrid stage. There were27142 generated tokens. This does not include the new four checkpoint programs. Each program creates L/P teacher-forced histories, four factorial histories and nine exact state/transport probes, including sequential generated-token evaluation,64-position teacher/free observations, state read/write and model/context startup. Reserve4-7 GPU hours for a fresh build/setup/full run. This is an engineering allowance, not a measured full result. Measure checkpoint10 and update the remaining estimate from its actual durations. Keep120GB free after weights/build,96GB host/GPU memory and the28GB runtime disk floor; the shared-lock client build retains25GiB admission. The packet author ran CPU tests only and did not execute CUDA or download weights.

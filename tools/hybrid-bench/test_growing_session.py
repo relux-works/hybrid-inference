@@ -20,6 +20,70 @@ import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # Common pairing is explicit and hash/layout bound; recurrent Qwen cannot opt out of journal equality.
+    def test_common_journal_declaration_admission(self):
+        path = Path(growing.__file__).parent / 'fixtures/glimmer-common-journal.json'
+        declaration = json.loads(path.read_text())
+        client = dict(model_sha256=declaration['model_sha256'], model_layout=dict(
+            architecture='muse-glimmer', sliding_window=2048, layers=[dict(recurrent=False)]))
+        self.assertEqual(growing.pairing_contract(None, client, {10}, True)['mode'], 'independent-equal-journals')
+        self.assertEqual(growing.pairing_contract(declaration, client, {10}, True)['mode'], growing.COMMON_JOURNAL)
+        with self.assertRaisesRegex(Refusal, 'requires checkpoints and state probes'):
+            growing.pairing_contract(declaration, client, set(), True)
+        with self.assertRaisesRegex(Refusal, 'requires checkpoints and state probes'):
+            growing.pairing_contract(declaration, client, {10}, False)
+        for changed in (dict(client, model_sha256='0'*64), dict(client, model_layout=dict(
+                architecture='qwen35', layers=[dict(recurrent=True)]))):
+            with self.assertRaisesRegex(Refusal, 'matching nonrecurrent SWA model'):
+                growing.pairing_contract(declaration, changed, {10}, True)
+
+    # The unchanged Qwen pairing gate accepts identical journals and refuses a same-length divergent journal.
+    def test_qwen_divergent_journal_still_refuses(self):
+        reference = dict(journal_hash=prefix_hash([1,2,3]))
+        same = dict(reference)
+        growing.require_paired_journal(same, reference)
+        self.assertTrue(same['paired_journal_equal'])
+        divergent = dict(journal_hash=prefix_hash([1,2,9]))
+        with self.assertRaisesRegex(Refusal, '^paired journal hashes differ$'):
+            growing.require_paired_journal(divergent, reference)
+        self.assertFalse(divergent['paired_journal_equal'])
+
+    # Identical teacher inputs can pass while independent free token journals diverge; raw scoring is tested separately.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_common_journal_divergent_free_history_is_report_only(self, raw):
+        row = self.append_gate_row()
+        row['state_component'] = 'window'
+        row['probes']['CHAIN_WINDOW'] = row['probes'].pop('CHAIN_RECURRENT')
+        row['gate_controls']['CHAIN_WINDOW-H'] = row['gate_controls'].pop('CHAIN_RECURRENT-H')
+        for name in ('CHAIN_ATTENTION', 'CHAIN_WINDOW'):
+            state = row['probes'][name]['roundtrips'][0]
+            state['window_equal'] = state.pop('recurrent_equal')
+        row.update(pairing=dict(mode=growing.COMMON_JOURNAL,journal_hash=prefix_hash([1,2,3])),
+                   raw_logits=dict(vocab=4),free_running_first_divergence=0,exact=False,top1_agreed=63,
+                   mean_kl_nats=.01,max_abs_logit_diff=1,local_partition_mean_kl_nats=.02,
+                   local_partition_p95_kl_nats=.04,kl_to_partition_ratio=.5,kl_to_partition_ratio_status='finite')
+        row['partition'].update(free_running_first_divergence=2,mean_kl_nats=.02,p95_kl_nats=.04)
+        row['continuations'] = {name:dict(teacher_tokens=[0]*64,free_tokens=[0]*64) for name in ('H','L','P')}
+        row['continuations']['H']['free_tokens'][0] = 1
+        row['continuations']['P']['free_tokens'][2] = 2
+        self.assertNotEqual(prefix_hash(row['continuations']['H']['free_tokens']), prefix_hash(row['continuations']['L']['free_tokens']))
+        growing.validate_checkpoint(row, False, 1000)
+        self.assertEqual(row['free_running_first_divergence'], 0)
+        self.assertEqual(len(row['gate_controls']), 10)
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(dict(row, top1_agreed=62), False, 1000)
+        broken_window = copy.deepcopy(row)
+        broken_window['probes']['CHAIN_WINDOW']['H']['exact'] = False
+        with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+            growing.validate_checkpoint(broken_window, False, 1000)
+        changed = copy.deepcopy(row)
+        changed['continuations']['H']['teacher_tokens'][0] = 1
+        with self.assertRaisesRegex(Refusal, 'teacher-forced inputs differ: H'):
+            growing.validate_checkpoint(changed, False, 1000)
+        changed = copy.deepcopy(row)
+        changed['free_running_first_divergence'] = -1
+        with self.assertRaisesRegex(Refusal, 'free divergence contradicts tokens'):
+            growing.validate_checkpoint(changed, False, 1000)
     @staticmethod
     def packet_module(name):
         path = Path(growing.__file__).parent / 'packets/r46' / (name + '.py')
@@ -915,6 +979,25 @@ class ProtocolTests(unittest.TestCase):
 
 
 class RecheckTests(unittest.TestCase):
+    # Common recheck reconstructs one live hybrid snapshot and its journal; divergent free histories are never substituted.
+    def test_common_journal_recheck_uses_hybrid_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            path = run / 'trace.json'
+            trace = json.loads(path.read_text())
+            trace['pairing'] = dict(mode=growing.COMMON_JOURNAL,reference_batches=dict(
+                L=dict(batch=256,ubatch=256),P=dict(batch=64,ubatch=32)))
+            trace['calls'] = [r for r in trace['calls'] if r['arm']=='hybrid']
+            source = json.loads((run/'check-1/input.json').read_text())
+            saved = [dict(tokens=source['tokens'],path=source['snapshots'][0],sha256=source['snapshot_sha256'][0])]
+            expected = growing.checkpoint_source(trace['client'],saved,trace,1)
+            (run/'check-1/input.json').write_text(json.dumps(expected,indent=2)+'\n')
+            path.write_text(json.dumps(trace,indent=2)+'\n')
+            _, bound, _, verified = growing.verify_recheck(path,1)
+            self.assertEqual(bound['tokens'],list(range(12)))
+            self.assertEqual(bound['pairing']['journal_hash'],prefix_hash(list(range(12))))
+            self.assertEqual(len(bound['snapshots']),1)
+            self.assertIn(str(run/'slots/hybrid-checkpoint-1.bin'), verified)
     @staticmethod
     def fixture(root):
         run = root / 'run'

@@ -156,10 +156,11 @@ static double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
-static hybrid::context_ptr context(llama_model * model, int depth, bool gpu, int threads = 2) {
+static hybrid::context_ptr context(llama_model * model, int depth, bool gpu, int threads = 2, int batch = 256, int ubatch = 256) {
     auto cp = llama_context_default_params();
     cp.n_ctx = depth;
-    cp.n_batch = cp.n_ubatch = 256;
+    cp.n_batch = batch;
+    cp.n_ubatch = ubatch;
     cp.swa_full = false;
     cp.n_threads = cp.n_threads_batch = threads;
     cp.n_seq_max = 1;
@@ -196,6 +197,7 @@ struct checkpoint_observation {
 
 static checkpoint_observation observe(llama_context * ctx, llama_model * model, size_t depth, int k,
                                       const std::vector<llama_token> & teacher = {}) {
+    require(teacher.empty() || teacher.size() == size_t(k), "invalid teacher continuation width");
     checkpoint_observation result;
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const auto state = hybrid::save_state(ctx);
@@ -281,6 +283,13 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     require(threads >= 1 && threads <= 8, "invalid checkpoint threads");
     std::map<std::string, checkpoint_observation> observations;
     const bool bf16_replay = fixture.value("bf16_replay", false);
+    const bool common = fixture.contains("pairing");
+    if (common) {
+        require(!bf16_replay && k == 64 && fixture.value("acceptance_rule", "") == "session_append_replay_exact" &&
+                fixture.contains("snapshots"), "common journal requires exact f32 checkpoint controls");
+        require(fixture.at("pairing").at("mode") == "hybrid-common-journal-v1" &&
+                fixture.at("pairing").at("journal_hash") == hybrid::prefix_hash(tokens), "common journal binding mismatch");
+    }
     require(!bf16_replay || hybrid::model_layout(model).at("architecture") == "qwen35", "bf16 replay requires Qwen35");
     hybrid::json result = {{"state_dtype", bf16_replay ? std::string("bf16") : fixture.value("state_dtype", std::string("f32"))}, {"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
         {"raw_logits", {{"dtype", "float32-le"}, {"vocab", vocab}, {"files", hybrid::json::object()}}}};
@@ -293,13 +302,46 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
         raw.close();
         require(raw.good(), "cannot write raw checkpoint logits");
         result["raw_logits"]["files"][name] = {{"path", path}, {"sha256", hybrid::file_hash(path.c_str())}};
+        if (common) {
+            result["continuations"][name] = {{"teacher_tokens", observation.teacher}, {"free_tokens", observation.free_tokens}};
+        }
         observations[name] = std::move(observation);
     };
+    if (common) {
+        result["pairing"] = fixture.at("pairing");
+        for (const std::string name : {"L", "P"}) {
+            const auto & shape = fixture.at("pairing").at("reference_batches").at(name);
+            const int batch = shape.at("batch"), ubatch = shape.at("ubatch");
+            require(batch >= 1 && batch <= 256 && ubatch >= 1 && ubatch <= batch, "invalid common reference batch");
+            require(name != "L" || (batch == 256 && ubatch == 256), "common local reference requires 256/256");
+            auto schedule = fixture.at("replay").at("A");
+            require(!schedule.empty() && schedule.back().at("n0") == tokens.size() - 1 &&
+                    schedule.back().at("n1") == tokens.size(), "common reference needs final single-token boundary");
+            schedule.erase(schedule.size() - 1);
+            hybrid::json partition = hybrid::json::array();
+            for (const auto & step : schedule) {
+                const size_t n0 = step.at("n0"), n1 = step.at("n1");
+                require(n1 > n0 && n1 <= tokens.size() - 1 && n1 - n0 <= 256, "invalid common reference segment");
+                for (size_t n = n0; n < n1; n += batch) {
+                    const size_t end = std::min(n + batch, n1);
+                    partition.push_back({{"n0", n}, {"n1", end}, {"logits", end == n1 && step.at("logits").get<bool>()}});
+                }
+            }
+            auto ctx = context(model, max_ctx, gpu, threads, batch, ubatch);
+            replay_schedule(ctx.get(), {tokens.begin(), tokens.end() - 1}, partition, 0, false);
+            const auto state = hybrid::save_state(ctx.get());
+            hybrid::load_state(ctx.get(), state);
+            hybrid::prefill(ctx.get(), {tokens.back()}, tokens.size() - 1);
+            record(name, observe(ctx.get(), model, tokens.size(), k,
+                name == "L" ? std::vector<llama_token>() : observations.at("L").teacher));
+        }
+    }
     if (fixture.contains("snapshots")) {
 #ifdef LLAMA_HYBRID_SERVER_SNAPSHOTS
         const auto paths = fixture.at("snapshots").get<std::vector<std::string>>();
         const auto hashes = fixture.at("snapshot_sha256").get<std::vector<std::string>>();
-        require((paths.size() == 2 || paths.size() == 3) && hashes.size() == paths.size(), "need hybrid, local and optional partition snapshots");
+        require((common ? paths.size() == 1 : (paths.size() == 2 || paths.size() == 3)) && hashes.size() == paths.size(),
+                "need hybrid and matching reference snapshots");
         // Score the live local first so every cell receives the same teacher-forced continuation.
         for (size_t i : {size_t(1), size_t(0), size_t(2)}) {
             if (i >= paths.size()) { continue; }
@@ -337,6 +379,10 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             result["factorial"]["B-H"] = score_observations(observations.at("B"), observations.at("H"), tokens.size(), k);
             result["factorial"]["A-L"] = score_observations(observations.at("A"), observations.at("L"), tokens.size(), k);
         }
+    }
+    if (common) {
+        require(observations.at("H").teacher == observations.at("L").teacher &&
+                observations.at("P").teacher == observations.at("L").teacher, "common teacher-forced inputs differ");
     }
     if (fixture.contains("probes")) {
         require(fixture.at("probes").is_array() && fixture.at("probes").size() <= 16, "too many state probes");
@@ -522,6 +568,24 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--test-teacher-forcing") {
+            // Non-greedy forced IDs must reach the real decoder; free generation remains a separate observation.
+            llama_backend_init();
+            auto mp = llama_model_default_params();
+            mp.n_gpu_layers = 0;
+            hybrid::model_ptr model(llama_model_load_from_file(argv[2], mp));
+            require(bool(model), "cannot load teacher forcing test model");
+            auto ctx = context(model.get(), 4096, false);
+            hybrid::prefill(ctx.get(), {1, 2, 3}, 0);
+            const auto greedy = hybrid::greedy(ctx.get(), model.get());
+            const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            std::vector<llama_token> forced(4, (greedy + 1) % vocab);
+            const auto observation = observe(ctx.get(), model.get(), 3, 4, forced);
+            require(observation.teacher == forced && observation.free_tokens.front() == greedy &&
+                    observation.teacher.front() != observation.free_tokens.front(), "teacher forcing was replaced by free generation");
+            std::cout << "PASS test_common_journal_teacher_forcing\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--test-append-controls") {
             // Each gate rejects changed distributions and component bytes; this does not exercise a model.
             const hybrid::json exact = {{"exact", true}, {"max_abs_logit_diff", 0}, {"mean_kl_nats", 0},
