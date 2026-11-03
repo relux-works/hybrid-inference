@@ -4,6 +4,7 @@ import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import itertools
+import hashlib
 from pathlib import Path
 import tempfile
 import threading
@@ -13,6 +14,8 @@ from decimal import Decimal
 
 import openrouter_amendment1 as amendment
 import openrouter_cache as api
+import openrouter_restart as restart
+import openrouter_recovery as recovery
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -74,12 +77,16 @@ class AmendmentTests(unittest.TestCase):
         cls.server.shutdown(); cls.server.server_close(); cls.thread.join()
 
     def setUp(self):
+        # These historical engine controls isolate the retired renderer, never the current report or its refusal tests.
+        renderer=mock.patch.object(amendment.Study,'report',return_value=None);renderer.start();self.addCleanup(renderer.stop)
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
         self.key=self.root/'fake-key'; self.secret='sk-or-v1-amendment-fake-control'
         self.key.write_text(self.secret); self.key.chmod(0o600)
         self.client=api.Client(self.key,'http://127.0.0.1:'+str(self.server.server_port),mock=True)
         self.manifest=json.loads(amendment.MANIFEST.read_text())
+        self.manifest['engine_sha256']=hashlib.sha256(Path(api.__file__).read_bytes()).hexdigest()
+        self.manifest_path=self.root/'cpu-manifest.json';self.manifest_path.write_text(json.dumps(self.manifest))
         self.candidate=next(c for c in self.manifest['candidates'] if c['endpoint']['provider_name']=='Phala' and c['model']=='qwen/qwen3.8-27b')
         Handler.spend=0; Handler.cost=.000001; Handler.provider_override=None
         Handler.seen={}; Handler.bodies=[]; Handler.cached_known=True; Handler.usage_cost_absent=False
@@ -145,7 +152,7 @@ class AmendmentTests(unittest.TestCase):
         self.addCleanup(first.close)
         with mock.patch.object(amendment,'active_prior',return_value=[]):
             self.assertIsNone(amendment.try_custody(self.root,lock))
-        args=argparse.Namespace(output=self.root/'queued',manifest=amendment.MANIFEST,prior=self.root/'prior',key_path=self.key,wait_seconds=0)
+        args=argparse.Namespace(output=self.root/'queued',manifest=self.manifest_path,prior=self.root/'prior',key_path=self.key,wait_seconds=0)
         with mock.patch.object(amendment,'try_custody',return_value=None),mock.patch.object(api,'Client') as client:
             self.assertEqual(amendment.run(args),1); client.assert_not_called()
         terminal=json.loads((args.output/'terminal.json').read_text())
@@ -204,17 +211,16 @@ class AmendmentTests(unittest.TestCase):
         clock=Clock()
         with mock.patch.object(api,'Client',return_value=self.client),mock.patch.object(amendment.time,'monotonic',side_effect=clock.monotonic),mock.patch.object(amendment.time,'sleep',side_effect=clock.sleep):
             self.assertEqual(amendment.run(args),0)
-        terminal=json.loads((args.output/'terminal.json').read_text()); summary=json.loads((args.output/'summary.json').read_text())
-        self.assertEqual(terminal['attempts'],32); self.assertEqual(terminal['status'],'done')
-        row=summary['providers'][0]
-        self.assertEqual(row['core']['attempts'],20); self.assertEqual(row['long']['attempts'],10)
-        self.assertEqual(len(row['probes']),2)
-        self.assertEqual(row['core']['pause_levels']['8']['n'],12)
-        self.assertEqual(row['core']['pause_levels']['35']['n'],6)
-        self.assertEqual(row['admission'],'eligible')
-        self.assertFalse(summary['skipped_or_pending'])
+        terminal=json.loads((args.output/'terminal.json').read_text())
+        rows=[json.loads(p.read_text()) for p in args.output.glob('call-*.json')]
+        self.assertEqual(terminal['attempts'],32);self.assertEqual(terminal['status'],'done')
+        core=[r for r in rows if r['cohort']=='core'];long=[r for r in rows if r['cohort']=='long']
+        self.assertEqual(len(core),20);self.assertEqual(len(long),10)
+        self.assertEqual(len([r for r in rows if r['cohort']=='probe']),2)
+        cm=restart.price_metrics(core,self.candidate,manifest['depths'])
+        self.assertEqual(cm['pause_levels']['8']['n'],12);self.assertEqual(cm['pause_levels']['35']['n'],6)
+        self.assertEqual(recovery.eligible(self.candidate,rows),'eligible')
         self.assertEqual(len(Handler.bodies),32)
-        self.assertTrue((args.output/'calls.csv').exists())
         for file in args.output.iterdir():
             if file.is_file():self.assertNotIn(self.secret,file.read_text())
 
@@ -225,12 +231,12 @@ class AmendmentTests(unittest.TestCase):
             session=next(s for s in amendment.sessions(study.manifest,self.candidate) if s['cohort']==cohort)
             study.rows.append(dict(provider=amendment.identity(self.candidate),cohort=cohort,session_id=session['session_id'],depth=session['depth'],call_index=1,
                                    accepted=True,prompt_tokens=10000,cached_tokens=cached,new_tokens_estimate=1065,pause_target_seconds=8 if cohort=='core' else 60,pause_actual_seconds=8 if cohort=='core' else 60))
-        study.report(); data=json.loads((study.out/'summary.json').read_text())['providers'][0]
-        self.assertEqual(data['core']['token_hit_rate'],0); self.assertEqual(data['long']['token_hit_rate'],.5)
-        study.rows[0]['cached_tokens']=None; study.report()
-        data=json.loads((study.out/'summary.json').read_text())['providers'][0]
-        self.assertIsNone(data['core']['token_hit_rate']); self.assertIsNone(data['core']['effective_usd_per_1000_equal_depth_mix'])
-        self.assertEqual(data['admission'],'pending-or-failed')
+        core=[r for r in study.rows if r['cohort']=='core'];long=[r for r in study.rows if r['cohort']=='long']
+        self.assertEqual(restart.price_metrics(core,self.candidate,study.manifest['depths'])['token_hit_rate'],0)
+        self.assertEqual(restart.price_metrics(long,self.candidate,study.manifest['depths'])['token_hit_rate'],.5)
+        study.rows[0]['cached_tokens']=None
+        cm=restart.price_metrics(core,self.candidate,study.manifest['depths'])
+        self.assertIsNone(cm['token_hit_rate']);self.assertIsNone(cm['effective_usd_per_1000_equal_depth_mix'])
 
     # This planted raw credential must fail the detector; sanitized JSON and echoed streams contain no key bytes.
     def test_negative_planted_key_in_amendment_log_is_caught(self):
@@ -256,13 +262,12 @@ class AmendmentTests(unittest.TestCase):
     # Budget skips retain every missing cohort and all distinct preflight snapshots, with no POST or false admission.
     def test_budget_skips_are_reported_with_snapshot_provenance(self):
         study=self.study(); study.base=Decimal(45)
-        study.run_matrix([self.candidate]); study.report()
+        study.run_matrix([self.candidate])
         self.assertFalse(Handler.bodies)
-        summary=json.loads((study.out/'summary.json').read_text())
-        self.assertEqual(len(summary['skipped_or_pending']),6)
-        self.assertTrue(any('budget' in gap['reason'] for gap in summary['skipped_or_pending']))
+        self.assertEqual(len(study.skips),6)
+        self.assertTrue(any('budget' in reason for reason in study.skips.values()))
         self.assertEqual(len(list(study.out.glob('uptime-*.json'))),4)
-        self.assertEqual(summary['providers'][0]['admission'],'pending-or-failed')
+        self.assertEqual(recovery.eligible(self.candidate,study.rows),'unqualified-no-attempts')
 
     # Missing reported cost or a bill above reservation stops after the first actual mock request.
     def test_missing_and_unexpected_cost_stop(self):

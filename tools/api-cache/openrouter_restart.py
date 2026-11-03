@@ -97,8 +97,9 @@ def price_metrics(rows,candidate,depths):
     return measured
 
 
-def analysis(root,final=False):
-    rows=read_rows(root)
+def analysis(root,final=False,output=None,rows=None):
+    rows=read_rows(root) if rows is None else rows
+    output=root if output is None else output
     providers=[]
     all_candidates=candidates()
     for name,c in all_candidates.items():
@@ -114,9 +115,10 @@ def analysis(root,final=False):
                 phases[phase][cohort]=price_metrics(subset,c,ds) if ds else None
         million=[r for r in own if r['depth']==1000000 and r['cohort'] not in ('probe','long') and r['phase']!='legacy-v1']
         metrics=price_metrics(million,c,[1000000])
+        by_phase={phase:price_metrics([r for r in million if r['phase']==phase],c,[1000000]) for phase in ('v1','amendment')}
         providers.append(dict(provider=name,provider_name=c['endpoint']['provider_name'],model=c['model'],
                               eligibility=recovery.eligible(c,own),eligibility_final=final,
-                              whole_window_availability=recovery.availability(own),million=metrics,phases=phases,
+                              whole_window_availability=recovery.availability(own),million=metrics,million_by_phase=by_phase,phases=phases,
                               depths=depths))
     comparisons={}
     for model in ('qwen/qwen3.8-27b','z-ai/glm-5.3-flash'):
@@ -144,26 +146,27 @@ def analysis(root,final=False):
         own=[r for r in rows if r['provider']==p['provider']]
         p['cold_probe_latencies']=[dict(depth=r['depth'],call_index=r['call_index'],**amendment.miss_latency(r)) for r in own if r.get('cohort')=='probe']
     _,excluded=api.matrix(json.loads(api.SNAPSHOT.read_text()))
-    data=dict(protocol='r15d',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
+    data=dict(protocol='r15d+r15e-analysis',million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
               providers=providers,million_token_comparison=comparisons,
               remote_uptime_samples=len(samples),remote_sample_times=[s['at'] for s in samples],
               smoke_used_for_cache=False,seed_calls_used_for_cache=False,
               rules='Only context/no declared cache/whole-window availability exclude. Zero hits are priced. Daily windows overlap.')
-    recovery.atomic_json(root/'analysis.json',data)
+    recovery.atomic_json(output/'analysis.json',data)
     lines=['# API cache report - r15d','', 'Whole window: '+WINDOW_START+' through '+data['window_observed_through']+'. Final: '+str(final)+'.','',
            'The whole Chutes smoke and every call_index0 are excluded from cache metrics. All attempted calls, including seeds and charge-resolved timeouts, count toward availability. Old full-v3 attempts join both new phases; pilot/configuration cohorts do not.','',
            'Known zero hits are priced at the measured rate. Missing usage stays unknown. Core and long-pause prices stay separate. Remote rolling daily statistics are metadata, not a substitute for whole-window own availability.','',
-           '| Endpoint | Attempts | Errors | Timeouts | Availability | Cache analysis calls at1M | USD/1000 at1M | Eligibility |','|---|---:|---:|---:|---:|---:|---:|---|']
+           'Headline1M is pooled across restarted-v1 multi-pause cadence and amendment core cadence. Per-phase1M figures are beside it; the separate long-pause substudy and probes are excluded.','',
+           '| Endpoint | Attempts | Errors | Timeouts | Availability | Cache analysis calls at1M | Pooled1M USD/1000 | V1-only1M USD/1000 | Amendment-core1M USD/1000 | Eligibility |','|---|---:|---:|---:|---:|---:|---:|---:|---:|---|']
     def fmt(v):return 'unknown' if v is None else '%.6g'%v
     for p in providers:
         av=p['whole_window_availability']; m=p['million']
-        lines.append('| '+' | '.join([p['provider'],str(av['attempts']),str(av['errors']),str(av['timeouts']),fmt(av['rate']),str(m['cache_sample_attempts']),fmt(m['effective_usd_per_1000_by_depth']['1000000']),p['eligibility']+(' (provisional)' if not final else '')])+' |')
+        lines.append('| '+' | '.join([p['provider'],str(av['attempts']),str(av['errors']),str(av['timeouts']),fmt(av['rate']),str(m['cache_sample_attempts']),fmt(m['effective_usd_per_1000_by_depth']['1000000']),fmt(p['million_by_phase']['v1']['effective_usd_per_1000_by_depth']['1000000']),fmt(p['million_by_phase']['amendment']['effective_usd_per_1000_by_depth']['1000000']),p['eligibility']+(' (provisional)' if not final else '')])+' |')
     lines+=['','## Profile and logs comparison','','| Endpoint | Phase/cohort | Warm accepted | Cached fraction | Uncached/call | Delta vs3200 | USD/1000 measured depth mix |','|---|---|---:|---:|---:|---:|---:|']
     for p in providers:
         for phase,cohorts in p['phases'].items():
             for cohort,m in cohorts.items():
                 if m is not None:lines.append('| '+' | '.join([p['provider'],phase+'/'+cohort,str(m['accepted']),fmt(m['token_hit_rate']),fmt(m['mean_uncached_tokens']),fmt(m['delta_uncached_vs_logs']),fmt(m['effective_usd_per_1000_measured_depth_mix'])])+' |')
-    lines+=['','## 1M with and without Alibaba','']
+    lines+=['','## Pooled1M with and without Alibaba','']
     for model,result in comparisons.items():
         for label,value in result.items():
             lines.append(model+' / '+label+': '+fmt(value['mean_effective_usd_per_1000'])+' USD/1000 over '+str(len(value['priced_providers']))+' qualified, measured providers; all retained provider identities are in analysis.json.')
@@ -171,7 +174,7 @@ def analysis(root,final=False):
     for p in providers:
         for probe in p['cold_probe_latencies']:lines.append('| '+p['provider']+' | '+str(probe['depth'])+' | '+probe['status']+' | '+fmt(probe['ttft_seconds'])+' |')
     lines+=['','Equal provider weights in these aggregates; per-provider prices retain disclosed depth/profile assumptions. The JSON contains core/long pause hit rates, measured depth mixes and differences from the logs baseline (98.1% cached, 3200 uncached tokens/call). Availability is request-sampled over the whole stated window and does not prove continuous uptime. Rolling daily observations and missing samples are retained per provider in JSON. No surface table or independent review was supplied.','']
-    (root/'API-CACHE-REPORT.md').write_text('\n'.join(lines))
+    (output/'API-CACHE-REPORT.md').write_text('\n'.join(lines))
     return data
 
 

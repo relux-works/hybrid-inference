@@ -23,6 +23,8 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 HERE = Path(__file__).resolve().parent
 SNAPSHOT = HERE / 'snapshots/2026-11-03.json'
+LIVE_REPORT_PATH = Path('/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103/API-CACHE-REPORT.md')
+MIN_FREE_BYTES = 28 * 1024**3
 KEY_PATH = Path('/home/agent/lanes/hybrid/.temp/openrouter/api_key')
 PAUSES = [0, 0, 60, 60, 300, 300, 900, 900, 3600, 3600]
 WORDS = list('abcdefghijklmnopqrstuvwxyz')
@@ -282,106 +284,12 @@ def validate_live_price(frozen, live):
 
 
 def report(out, snapshot, status, reason='', secret=''):
-    sessions, excluded = matrix(snapshot)
-    rows = [json.loads(p.read_text()) for p in sorted(out.glob('call-*.json'))]
-    groups = {}
-    samples = [json.loads(p.read_text()) for p in sorted(out.glob('uptime-*.json'))]
-    for session in sessions:
-        key = session['model'] + ' / ' + session['endpoint']['tag']
-        groups.setdefault(key, dict(endpoint=session['endpoint'], rows=[], depths=[]))['depths'].append(session['depth'])
-    for row in rows:
-        groups[row['model'] + ' / ' + row['endpoint_tag']]['rows'].append(row)
-    summary = []
-    for key, group in groups.items():
-        attempts = group['rows']
-        valid = [r for r in attempts if r.get('accepted')]
-        prices = group['endpoint']['pricing']
-        prompt = sum(r['prompt_tokens'] for r in valid)
-        cached = sum(r.get('cached_tokens') or 0 for r in valid)
-        known = valid and all(r.get('cached_tokens') is not None for r in valid)
-        fraction = cached / prompt if known and prompt else None
-        errors = sum(not r.get('accepted', False) for r in attempts)
-        by_pause = {}
-        for pause in (0, 60, 300, 900, 3600):
-            subset = [r for r in valid if r['pause_target_seconds'] == pause and r['call_index'] > 0]
-            tokens = sum(r['prompt_tokens'] for r in subset)
-            reliable = subset and all(r.get('cached_tokens') is not None for r in subset)
-            by_pause[str(pause)] = dict(n=len(subset), hit_calls=sum((r.get('cached_tokens') or 0) > 0 for r in subset),
-                                       token_hit_rate=sum(r.get('cached_tokens') or 0 for r in subset) / tokens if tokens and reliable else None,
-                                       actual_pauses_seconds=[r['pause_actual_seconds'] for r in subset])
-        effective = []
-        for depth in sorted(set(group['depths'])):
-            subset = [r for r in valid if r['depth'] == depth and r['call_index'] > 0]
-            if not subset or any(r.get('cached_tokens') is None for r in subset):
-                effective.append(None)
-                continue
-            # Estimate prefix retention separately from new input; cold seed calls are excluded.
-            retention = sum(min(1, r['cached_tokens'] / max(1, r['prompt_tokens'] - r['new_tokens_estimate'])) for r in subset) / len(subset)
-            cached_profile = max(0, depth - 1065) * retention
-            charge = ((depth - cached_profile) * float(prices['prompt']) + cached_profile * float(prices['input_cache_read'])
-                      + 512 * float(prices['completion']))
-            if prices.get('input_cache_write'):
-                charge += (depth - cached_profile) * float(prices['input_cache_write'])
-            effective.append(charge * 1000)
-        uptimes = []
-        uptime_times = []
-        for sample in samples:
-            for model in sample['models']:
-                for endpoint in model['data']['endpoints']:
-                    if key == model['data']['id'] + ' / ' + endpoint['tag']:
-                        value = endpoint.get('uptime_last_1d')
-                        if value is not None:
-                            uptimes.append(value)
-                            uptime_times.append(sample['at'])
-        availability = 1 - errors / len(attempts) if attempts else None
-        availability_gate = (len(set(uptime_times)) >= 3 and uptimes and min(uptimes) >= 95
-                             and availability is not None and availability >= .95)
-        expected = len(set(group['depths'])) * 10
-        coverage = len(attempts) == expected
-        admission = 'eligible' if coverage and availability_gate and fraction is not None and cached > 0 else 'pending-or-failed'
-        item = dict(provider=key, attempts=len(attempts), accepted=len(valid), errors=errors,
-                    availability_observed=availability, uptime_last_1d_min=min(uptimes) if uptimes else None,
-                    uptime_last_1d_max=max(uptimes) if uptimes else None,
-                    uptime_window='provider rolling 1 day; overlapping samples, not independent trials',
-                    admission=admission, complete_coverage=coverage, token_hit_rate=fraction,
-                    mean_uncached_tokens=(prompt-cached)/len(valid) if known and valid else None,
-                    baseline_cached_fraction=.981, baseline_uncached_tokens=3200, paper_new_tokens=1065,
-                    hit_rate_delta_vs_logs=None if fraction is None else fraction-.981,
-                    uncached_delta_vs_logs=None if not known else (prompt-cached)/len(valid)-3200,
-                    pause_levels=by_pause, depths=sorted(set(group['depths'])),
-                    effective_usd_per_1000_by_depth=effective,
-                    effective_usd_per_1000_equal_depth_mix=(sum(effective)/len(effective) if effective and None not in effective else None))
-        summary.append(item)
-    write_json(out/'summary.json', dict(status=status, reason=reason, providers=summary, excluded=excluded), secret)
-    lines = ['# API cache report', '', 'Status: ' + status, '', 'Reason: ' + reason, '',
-             'Protocol and frozen provider list: tools/api-cache/PROTOCOL.md and snapshots/2026-11-03.json.', '',
-             'Own availability is accepted calls / attempted calls in the recorded test window. Provider uptime is a rolling 1-day value sampled repeatedly; samples overlap. Neither establishes long-term 95% reliability. Admission requires all scheduled calls, known cache usage with measured hits, three daily-uptime samples >=95%, and own availability >=95%.', '',
-             'Commercial logs reference: 98.1% cached input, about 3,200 uncached tokens/call. Paper extrapolation: 1,065 new input tokens and 512 output tokens, equal weights over measured target depths; no supplied empirical paper depth mix. Seed calls are excluded from retention estimates; missing evidence remains null. Output/decode measurements use at most 16 tokens and do not establish 512-token throughput.', '',
-             '| Endpoint | Attempts | Accepted | Cached input | Mean uncached | Own availability | Daily uptime min | USD/1000 | Admission |',
-             '|---|---:|---:|---:|---:|---:|---:|---:|---|']
-    def fmt(value):
-        return 'unknown' if value is None else '%.6g' % value
-    for item in summary:
-        lines.append('| ' + ' | '.join([item['provider'],str(item['attempts']),str(item['accepted']),fmt(item['token_hit_rate']),
-                     fmt(item['mean_uncached_tokens']),fmt(item['availability_observed']),fmt(item['uptime_last_1d_min']),
-                     fmt(item['effective_usd_per_1000_equal_depth_mix']),item['admission']]) + ' |')
-    lines += ['', '## Excluded endpoints', '']
-    lines += [r['model'] + ' / ' + r['endpoint'] + ': ' + ', '.join(r['reasons']) for r in excluded]
-    lines += ['', 'Per-pause counts, actual pauses, cost by depth and comparison deltas are in summary.json. Every raw usage field is preserved in call JSON. Missing cache fields are unknown, never zero. Requests contain deterministic synthetic public-domain text; prompt hashes and reconstruction seeds are stored instead of duplicating large prompts.', '']
-    text = redact('\n'.join(lines), secret)
-    assert_no_secret(text, secret)
-    (out/'API-CACHE-REPORT.md').write_text(text)
-    if rows:
-        fields = list(dict.fromkeys(k for row in rows for k in [*row, 'error'] if k not in ('stream','usage','error_body')))
-        with (out/'calls.csv').open('w', newline='') as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({k: redact(json.dumps(v) if isinstance(v,(list,dict)) else str(v), secret) for k,v in row.items() if k in fields})
+    raise Refusal('Legacy cache report retired; live report: '+str(LIVE_REPORT_PATH))
 
 
 def run(args):
     out = args.output.resolve()
+    report(out,None,'retired')
     out.mkdir(parents=True, exist_ok=False)
     snapshot = json.loads(args.snapshot.read_text())
     sessions, excluded = matrix(snapshot)
@@ -415,8 +323,8 @@ def run(args):
                 raise Refusal('operator STOP file; no further requests')
             if time.monotonic() < due:
                 time.sleep(due-time.monotonic())
-            if shutil.disk_usage(out).free < 28_000_000_000:
-                raise Refusal('free disk below 28 GB')
+            if shutil.disk_usage(out).free < MIN_FREE_BYTES:
+                raise Refusal('free disk below 28 GiB')
             sample = sample_endpoints(client, out, sequence)
             session = sessions[number]
             endpoint = live_endpoint(sample, session)

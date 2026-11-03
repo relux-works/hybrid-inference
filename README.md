@@ -138,6 +138,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [OpenRouter API cache measurement](tools/api-cache/README.md) - CPU mock tests and guarded streaming requests; `python3 tools/api-cache/openrouter_cache.py --help`, outputs under `.temp/hybrid-d-r15b-261103/`
 - [OpenRouter cache Amendment 1](tools/api-cache/AMENDMENT-1.md) - Log-matched deep-context study; `python3 tools/api-cache/openrouter_amendment1.py --help`, queued/live evidence in `.temp/hybrid-d-r15c-261103/`
 - [OpenRouter r15d recovery/restart](tools/api-cache/RESTART-r15d.md) - `python3 tools/api-cache/openrouter_restart.py --help`; CPU controls use `python3 -m unittest discover -s tools/api-cache -p 'test_openrouter*.py'`. Detached sequential runs, reports and 10-minute heartbeat go to `.temp/hybrid-d-r15d-261103/`; see the tool README for the exact launch.
+- [OpenRouter GET-only audit](tools/api-cache/README.md) - `python3 tools/api-cache/openrouter_audit.py --help`; generation-cost checks, price drift and pooled/per-phase1M labels. Now/end artifacts and the detached observer PID/state go to `.temp/hybrid-d-r15e-261103/`; legacy report entry points are retired on this branch.
 - [GBNF grammars](grammars/README.md)
 
 #### Development

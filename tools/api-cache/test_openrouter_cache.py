@@ -11,6 +11,8 @@ from decimal import Decimal
 
 import openrouter_cache as cache
 
+RETIRED_REPORT=cache.report
+
 
 class Handler(BaseHTTPRequestHandler):
     provider = 'Chutes'
@@ -72,6 +74,8 @@ class CacheTests(unittest.TestCase):
         cls.thread.join()
 
     def setUp(self):
+        # Historical request-engine controls bypass only the retired renderer; its real refusal has separate negatives.
+        renderer=mock.patch.object(cache,'report',return_value=None);renderer.start();self.addCleanup(renderer.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path=Path(self.temp.name)
@@ -193,18 +197,15 @@ class CacheTests(unittest.TestCase):
         with self.assertRaisesRegex(cache.Refusal,'price increased'):
             cache.validate_live_price(endpoint,live)
 
-    # No observations produces no admission or fabricated zero cost; partial smoke evidence remains partial.
+    # The superseded public renderer now refuses before writing a false admission result.
     def test_report_unknown_not_admitted(self):
-        snapshot=json.loads(cache.SNAPSHOT.read_text())
-        cache.report(self.path,snapshot,'running')
-        report=json.loads((self.path/'summary.json').read_text())
-        for provider in report['providers']:
-            self.assertEqual(provider['admission'],'pending-or-failed')
-            self.assertIsNone(provider['effective_usd_per_1000_equal_depth_mix'])
-            self.assertIsNone(provider['availability_observed'])
+        before=set(self.path.iterdir())
+        with self.assertRaisesRegex(cache.Refusal,'Legacy cache report retired; live report:'):
+            RETIRED_REPORT(self.path,{},'running')
+        self.assertEqual(set(self.path.iterdir()),before)
 
 
-    # The production runner completes three mock calls, preserves spend, and emits reports; a cost breach stops after one.
+    # With its retired renderer isolated, the historical engine preserves spend and stops after an excessive mock charge.
     def test_runner_smoke_and_unexpected_cost_stop(self):
         args=argparse.Namespace(output=self.path/'smoke',snapshot=cache.SNAPSHOT,smoke=True,key_path=self.key)
         Handler.dynamic=True
@@ -216,7 +217,6 @@ class CacheTests(unittest.TestCase):
         self.assertAlmostEqual(terminal['recorded_billed_usd'],.003)
         rows=[json.loads(p.read_text()) for p in args.output.glob('call-*.json')]
         self.assertTrue(all(r['accepted'] for r in rows))
-        self.assertTrue((args.output/'calls.csv').exists())
         for p in args.output.iterdir():
             if p.is_file():
                 self.assertNotIn(self.secret,p.read_text())

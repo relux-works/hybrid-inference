@@ -228,70 +228,7 @@ class Study:
         return '' if self.client is None else self.client.secret
 
     def report(self):
-        providers, gaps = [], []
-        for candidate in self.manifest['candidates']:
-            name = identity(candidate)
-            rows = [r for r in self.rows if r['provider']==name]
-            core = [r for r in rows if r['cohort']=='core']
-            cm = metrics(core,candidate,self.manifest['depths'])
-            uptime, stamps = [], set()
-            for sample in self.samples:
-                try:endpoint=api.live_endpoint(sample,candidate)
-                except api.Refusal:continue
-                if endpoint.get('uptime_last_1d') is not None:
-                    uptime.append(endpoint['uptime_last_1d']); stamps.add(sample['at'])
-            complete = {(r['depth'],r['call_index']) for r in core} == {(d,i) for d in self.manifest['depths'] for i in range(10)}
-            hits = all(any(r.get('accepted') and r['depth']==d and r['call_index']>0 and (r.get('cached_tokens') or 0)>0 for r in core) for d in self.manifest['depths'])
-            admitted = (complete and cm['token_hit_rate'] is not None and hits and cm['availability']>=.95
-                        and len(stamps)>=3 and min(uptime)>=95)
-            probes = [dict(depth=r['depth'], **miss_latency(r)) for r in rows if r['cohort']=='probe']
-            providers.append(dict(provider=name, admission='eligible' if admitted else 'pending-or-failed', core=cm,
-                                  long=metrics([r for r in rows if r['cohort']=='long'],candidate,self.manifest['depths']),
-                                  probes=probes, probe_availability=metrics([r for r in rows if r['cohort']=='probe'],candidate,self.manifest['depths'])['availability'],
-                                  daily_uptime_min=min(uptime) if uptime else None, daily_uptime_samples=len(stamps)))
-            for session in sessions(self.manifest,candidate):
-                seen = {r['call_index'] for r in rows if r['session_id']==session['session_id']}
-                missing = [i for i in range(len(session['pauses'])) if i not in seen]
-                if missing:
-                    gaps.append(dict(provider=name,cohort=session['cohort'],depth=session['depth'],missing_call_indices=missing,
-                                     reason=self.skips.get(session['session_id'], 'not yet attempted' if self.status in ('queued','running') else self.reason)))
-        data = dict(amendment=1, run=self.manifest['run'], status=self.status, reason=self.reason, pid=os.getpid(),
-                    prior_spend_floor_usd=str(self.base), reported_amendment_cost_usd=str(self.total),
-                    budget_cap_usd=45, ranking=self.ranking, providers=providers, skipped_or_pending=gaps,
-                    excluded=self.manifest['excluded'],
-                    reference=dict(cached_fraction=.981,uncached_tokens=3200,paper_new_tokens=1065,paper_output_tokens=512))
-        api.write_json(self.out/'summary.json',data,self.secret)
-        lines = ['# API cache report - Amendment 1', '', 'Run: '+self.manifest['run'], '',
-                 'Status: '+self.status+'. '+self.reason, '',
-                 'Protocol: tools/api-cache/AMENDMENT-1.md. Separate from r15b; v1 is never pooled into amendment admission.', '',
-                 'Core pauses: median target 8s, p90 target 35s. Actual gaps and target-group hit rates are in summary.json. Long pauses are a separate cohort.', '',
-                 'Price profile: 1065 new input tokens, 512 output tokens, equal 524288/1000000 depth weights; empirical paper depth weights were not supplied. Compare with supplied logs: 98.1% cached input and about 3200 uncached tokens/call.', '',
-                 'Provider uptime is the rolling 1-day field sampled before calls; overlapping windows and this short experiment do not establish long-term reliability. Admission requires complete core attempts, measured hits at both depths, known counters and >=95% own and sampled daily availability.', '',
-                 '| Endpoint | Core attempts | Core cached fraction | Uncached/call | USD/1000 | Core availability | Admission |',
-                 '|---|---:|---:|---:|---:|---:|---|']
-        def fmt(v):return 'unknown' if v is None else '%.6g'%v
-        for item in providers:
-            core=item['core']
-            lines.append('| '+' | '.join([item['provider'],str(core['attempts']),fmt(core['token_hit_rate']),fmt(core['mean_uncached_tokens']),fmt(core['effective_usd_per_1000_equal_depth_mix']),fmt(core['availability']),item['admission']])+' |')
-        lines += ['', '## Explicit cold-probe latency', '', '| Endpoint | Nominal depth | Actual prompt | Classification | TTFT seconds | TTFT minutes |', '|---|---:|---:|---|---:|---:|']
-        for item in providers:
-            for probe in item['probes']:
-                lines.append('| '+' | '.join([item['provider'],str(probe['depth']),str(probe['actual_prompt_tokens']),probe['status'],fmt(probe['ttft_seconds']),fmt(probe['ttft_minutes'])])+' |')
-        lines += ['', '## Excluded endpoints', '']
-        lines += [item['model']+' / '+item['endpoint']+': '+', '.join(item['reasons']) for item in self.manifest['excluded']]
-        lines += ['', '## Budget and coverage', '', 'Known starting spend floor USD'+str(self.base)+'. Amendment reported cost USD'+str(self.total)+'. Combined cap USD45. Analyst USD5/provider is a planning estimate, not a measured ceiling.', '',
-                  'Missing provider/depth/cohort cells: '+str(len(gaps))+'. Full reasons and missing call indices are in summary.json. Provisional ranking never asserts admission. No price winner is selected from incomplete evidence.', '',
-                  'The 1800-second wall-clock deadline permits minute-scale 1M measurements. Confirmed miss TTFT requires explicitly zero cached input and observed tokens; failed/unknown/hit probes are not miss latencies. Sixteen output tokens cannot establish 512-token throughput. No surface table or independent review was supplied.', '']
-        if gaps:
-            lines += ['| Endpoint | Cohort | Depth | Missing calls | Reason |', '|---|---|---:|---:|---|']
-            lines += ['| '+' | '.join([g['provider'],g['cohort'],str(g['depth']),str(len(g['missing_call_indices'])),g['reason']])+' |' for g in gaps]
-        (self.out/'API-CACHE-REPORT.md').write_text(api.redact('\n'.join(lines),self.secret))
-        api.write_json(self.out/'state.json',dict(amendment=1,status=self.status,reason=self.reason,at=api.utc(),pid=os.getpid()),self.secret)
-        fields = list(dict.fromkeys(k for row in self.rows for k in [*row,'error'] if k not in ('stream','usage','error_body')))
-        with (self.out/'calls.csv').open('w',newline='') as handle:
-            writer=csv.DictWriter(handle,fieldnames=fields); writer.writeheader()
-            for row in self.rows:
-                writer.writerow({k:api.redact(json.dumps(v) if isinstance(v,(dict,list)) else str(v),self.secret) for k,v in row.items() if k in fields})
+        raise api.Refusal('Legacy amendment report retired; live report: '+str(api.LIVE_REPORT_PATH))
 
     def call(self, session, index, previous_end=None):
         request=payload(self.manifest,session,index)
@@ -301,7 +238,7 @@ class Study:
                 if (self.out/'STOP').exists():raise api.Refusal('operator STOP')
                 time.sleep(min(30,max(0,previous_end+pause-time.monotonic())))
         if (self.out/'STOP').exists():raise api.Refusal('operator STOP')
-        if api.shutil.disk_usage(self.out).free<28_000_000_000:raise api.Refusal('free disk below 28 GB')
+        if api.shutil.disk_usage(self.out).free<api.MIN_FREE_BYTES:raise api.Refusal('free disk below 28 GiB')
         candidate=session['candidate']
         sequence=len(self.rows)
         sample_sequence=len(self.samples)
@@ -389,6 +326,7 @@ class Study:
 
 
 def run(args):
+    Study({},args.output).report()
     args.output.mkdir(parents=True,exist_ok=False)
     manifest=json.loads(args.manifest.read_text())
     study=Study(manifest,args.output)

@@ -1,3 +1,23 @@
+# r15e read-only audit and legacy retirement
+
+On m3-api-cache-r15e, both legacy report functions and standalone run routes refuse before reading a key or making requests, and name the live r15d report path. Their older commands below are historical records. The paid live run stays on95671982b in its original worktree and is not changed by this branch. See RESTART-r15d.md for the explicit cost/price acceptance and pooled1M label.
+
+From this isolated worktree:
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15e-261103/tmp
+python3 -m unittest discover -s tools/api-cache -p 'test_openrouter*.py'
+python3 tools/api-cache/openrouter_audit.py --output /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15e-261103/audit-now
+nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$TMPDIR" python3 -u tools/api-cache/openrouter_audit.py --watch-end --output /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15e-261103/audit-end > /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15e-261103/end-observer.log 2>&1 < /dev/null &
+```
+
+Audit output paths must be new and outside the live runtime. The auditor permits only GET/key, GET/generation and GET/models/.../endpoints; it cannot send completions. A fixed call-row snapshot, per-call cost agreement CSV, redacted generation records, current endpoint prices, drift/provenance JSON and a labelled API-CACHE-REPORT.md go into each audit directory. Every accepted call is attempted; persistent429 limits leave an explicitly disclosed ordered sample and unverified remainder. The now audit and final audit fetch records independently. Streamed usage.cost stays authoritative and no reconciliation/ledger is mutated.
+
+The observer records end-observer.pid and end-observer.json in the r15e task root, checks terminal state every30s without opening the key while waiting, and appends final results to SUMMARY.md. It has a2026-11-05 06:10Z wait deadline and refuses below28.5GiB free disk. Verify its actual PID after launch. The live supervisor, child PIDs, source and data paths are read-only. The full dependency evidence is .temp/hybrid-d-r15e-261103/RUNTIME-LOAD-EVIDENCE.md. Old manifests/hashes remain unchanged and the standalone amendment's historical hash is intentionally not regenerated for a retired route.
+
+---
+
 # OpenRouter cache measurement
 
 Standard-library Python 3 tool for run hybrid-d-r15b-261103. Read PROTOCOL.md before paid use. The signed snapshot and protocol precede smoke; no downloads or external dependencies are needed.
