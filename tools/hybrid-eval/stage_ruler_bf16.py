@@ -12,7 +12,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'hybrid-bench'))
-from gpu_stage import (build, clean_source, disk, exclusive, gpu_identity, interrupted, no_evaluator, read, require, run,
+from gpu_stage import (add_disk_floor_argument, build, clean_source, disk, exclusive, gpu_identity, interrupted, no_evaluator, read, require, run,
                        save, sha, terminal, verify_archive)
 
 ROLES = ('node', 'client', 'partition')
@@ -166,6 +166,7 @@ def execute(args, manifests):
     gpu = gpu_identity()
     args.stage.mkdir(mode=0o700)
     save(args.stage/'gpu.json', dict(identity=gpu))
+    disk(args.stage, floor=args.disk_floor_bytes, log=args.stage/'disk.log')
     (args.stage/'services').mkdir(mode=0o700)
     (args.stage/'original-services').mkdir(mode=0o700)
     os.environ.update(PYTHONDONTWRITEBYTECODE='1', TMPDIR=str(args.stage/'tmp'))
@@ -176,7 +177,7 @@ def execute(args, manifests):
     require(all(sha(args.original_build/'bin'/name) == value for name, value in
                 read(args.original_build/'hybrid-bench-build.json')['binaries'].items()), 'original build changed')
     plan: dict = dict(source=str(args.source), original_source=str(args.original_source), original_run=str(args.original_run),
-                original_ref=original_ref, candidate_ref=args.ref,
+                original_ref=original_ref, candidate_ref=args.ref, disk_floor_bytes=args.disk_floor_bytes,
                 restore=launch_plan(args.original_source, args.original_build, original_ref, args.original_run, args.original_run, False),
                 candidate=launch_plan(args.source, args.build, args.ref, args.stage/'services', args.original_run, True))
     plan['original_live'] = live_identity(args.original_run)
@@ -189,7 +190,7 @@ def execute(args, manifests):
                  '--state', state, '--stop'], args.stage/'services.log')
             state.rename(args.stage/'original-services'/role)
         with exclusive(args.original_run/'build.lock'):
-            build(args.source, args.build, args.ref, args.stage/'build.log')
+            build(args.source, args.build, args.ref, args.stage/'build.log', disk_floor_bytes=args.disk_floor_bytes)
         for role in ROLES:
             run(plan['candidate'][role], args.stage/'services.log')
         # All selected depths must pass the real evaluator's complete manifest/input gate before any example runs.
@@ -197,7 +198,8 @@ def execute(args, manifests):
             run([*evaluator_command(args, manifest), '--preflight-only'], args.stage/f"preflight-{manifest['depth']}.log")
         for manifest in manifests:
             depth = manifest['depth']
-            disk(args.stage, 2*((442685280*(depth+130)+8191)//8192) + 1024**3)
+            disk(args.stage, 2*((442685280*(depth+130)+8191)//8192) + 1024**3,
+                 floor=args.disk_floor_bytes, log=args.stage/'disk.log')
             run(evaluator_command(args, manifest), args.stage/f'arm-{depth}.log')
             verify_archive(args.stage/f'results/depth-{depth}')
     finally:
@@ -206,6 +208,7 @@ def execute(args, manifests):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_disk_floor_argument(parser)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument('--ref', required=True, help='full reviewed candidate SHA, already installed locally')
     parser.add_argument('--original-source', type=Path, default=Path('/root/proto/src-ruler'))
@@ -236,7 +239,7 @@ def main():
             return
         clean_source(args.source, args.ref)
         require(not args.stage.exists() and args.stage.parent.is_dir(), 'stage must be absent with an existing parent')
-        disk(args.stage.parent, 8*1024**3)
+        disk(args.stage.parent, 8*1024**3, floor=args.disk_floor_bytes)
         require(len(set(args.depths)) == len(args.depths) and args.depths == sorted(args.depths), 'depths must be unique and ordered')
         manifests = []
         for depth in args.depths:

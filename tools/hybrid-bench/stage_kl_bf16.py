@@ -16,7 +16,7 @@ import time
 import urllib.parse
 
 import hetero_study as study
-from gpu_stage import build, clean_source, disk, exclusive, gpu_identity, interrupted, read, require, run, save, sha, terminal
+from gpu_stage import FLOOR, add_disk_floor_argument, build, clean_source, disk, exclusive, gpu_identity, interrupted, read, require, run, save, sha, terminal
 
 LABELS = ['state-Q4-local', 'state-f32', 'state-bf16']
 
@@ -80,7 +80,7 @@ def validate_lock(lock, report, report_sha, mode):
     return evidence
 
 
-def download_models(lock, root):
+def download_models(lock, root, disk_floor_bytes=FLOOR):
     result = {}
     for label, pin in lock['models'].items():
         folder = root/label
@@ -90,7 +90,7 @@ def download_models(lock, root):
             if not target.exists():
                 temporary = target.with_suffix('.partial')
                 require(not temporary.exists(), 'partial model download exists; preserve/inspect it before retrying')
-                disk(root, item['size'] + 8*1024**3)
+                disk(root, item['size'] + 8*1024**3, floor=disk_floor_bytes, log=root/'download.log')
                 url = 'https://huggingface.co/' + pin['repo'] + '/resolve/' + pin['revision'] + '/' + urllib.parse.quote(item['name'])
                 run(['curl', '--fail', '--location', '--proto', '=https', '--proto-redir', '=https', '--retry', '3',
                      '--max-filesize', str(item['size']), '--output', temporary, url], root/'download.log')
@@ -165,14 +165,16 @@ def bootstrap_new_lock(args, previous, report_sha):
     target = root/'new-provenance-lock.json'
     require(not target.exists(), 'new provenance lock already exists; use it for the study instead of repinning')
     pins = read(Path(__file__).with_name('state_bf16_model_pins.json'))['models']
-    disk(root, sum(f['size'] for p in pins.values() for f in p['files']) + 20_344_176_640 + 14*1024**3)
+    disk(root, sum(f['size'] for p in pins.values() for f in p['files']) + 20_344_176_640 + 14*1024**3,
+         floor=args.disk_floor_bytes, log=root/'disk.log')
     os.environ.update(PYTHONDONTWRITEBYTECODE='1', TMPDIR=str(root/'tmp'))
     (root/'tmp').mkdir(exist_ok=True)
     with exclusive(root/'stage.lock'):
+        save(root/'bootstrap-plan.json', dict(source_ref=args.ref, disk_floor_bytes=args.disk_floor_bytes))
         with exclusive(root/'build.lock'):
-            build(source, args.build.resolve(), args.ref, root/'build.log')
+            build(source, args.build.resolve(), args.ref, root/'build.log', disk_floor_bytes=args.disk_floor_bytes)
         (root/'models').mkdir(exist_ok=True)
-        models = download_models(dict(models=pins), root/'models')
+        models = download_models(dict(models=pins), root/'models', disk_floor_bytes=args.disk_floor_bytes)
         sources = Path(__file__).with_name('gutenberg_sources.json')
         require([r['id'] for r in read(sources)['documents']] == audit(previous)['documents'], 'source IDs/order differ')
         with exclusive(root/'gpu.lock'):
@@ -187,12 +189,13 @@ def bootstrap_new_lock(args, previous, report_sha):
                     source='Fresh pinned-model tokenization of Gutenberg bytes; not recovered stage-2 inputs.'))
         validate_lock(lock, previous, report_sha, 'new-study')
         save(target, lock)
-        save(root/'bootstrap.json', dict(source_ref=args.ref, gpu_identity=gpu, index_sha256=study.digest(index), provenance_lock_sha256=sha(target)))
+        save(root/'bootstrap.json', dict(source_ref=args.ref, gpu_identity=gpu, disk_floor_bytes=args.disk_floor_bytes, index_sha256=study.digest(index), provenance_lock_sha256=sha(target)))
         print(f'new-study lock: {target}; historical document/token identity remains unverified', flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_disk_floor_argument(parser)
     parser.add_argument('--historical-archive', type=Path, required=True)
     parser.add_argument('--provenance-lock', type=Path, help='independently recovered or newly pinned hashes, never inferred from aggregates')
     parser.add_argument('--mode', choices=['reproduce', 'new-study'], default='reproduce')
@@ -226,11 +229,12 @@ def main():
     models_bytes = sum(item['size'] for name, pin in lock['models'].items() for item in pin['files']
                        if not (root/'models'/name/item['name']).exists())
     reference_bytes = sum(p.stat().st_size for p in (root/'study/references').glob('*/reference.bin'))
-    disk(root, models_bytes + max(0, 20_344_176_640-reference_bytes) + 14*1024**3)
+    disk(root, models_bytes + max(0, 20_344_176_640-reference_bytes) + 14*1024**3,
+         floor=args.disk_floor_bytes, log=root/'disk.log')
     os.environ.update(PYTHONDONTWRITEBYTECODE='1', TMPDIR=str(root/'tmp'))
     (root/'tmp').mkdir(exist_ok=True)
     with exclusive(root/'stage.lock'):
-        manifest = dict(version=1, mode=args.mode, source_ref=args.ref, source_sha256=sha(__file__), gpu_identity=gpu,
+        manifest = dict(version=1, mode=args.mode, source_ref=args.ref, source_sha256=sha(__file__), gpu_identity=gpu, disk_floor_bytes=args.disk_floor_bytes,
                         provenance_lock_sha256=sha(args.provenance_lock), historical_archive_sha256=sha(args.historical_archive),
                         historical_report_sha256=report_sha, settings=lock['settings'],
                         historical_limitations=evidence, python=sys.version, models=lock['models'], documents=lock['documents'])
@@ -239,13 +243,13 @@ def main():
         else:
             save(root/'manifest.json', manifest)
         with exclusive(root/'build.lock'):
-            build(source, args.build.resolve(), args.ref, root/'build.log')
+            build(source, args.build.resolve(), args.ref, root/'build.log', disk_floor_bytes=args.disk_floor_bytes)
         (root/'models').mkdir(exist_ok=True)
-        models = download_models(lock, root/'models')
+        models = download_models(lock, root/'models', disk_floor_bytes=args.disk_floor_bytes)
         save(root/'document-pins.json', dict(documents=[{k: r[k] for k in ('id', 'url', 'sha256', 'size')} for r in lock['documents']]))
         driver = source/'tools/hybrid-bench/hetero_study.py'
         def call(*command):
-            disk(root, 7*1024**3)
+            disk(root, 7*1024**3, floor=args.disk_floor_bytes, log=root/'disk.log')
             run([sys.executable, driver, '--lock', root/'gpu.lock', *command], root/'study.log')
         if not (root/'documents/manifest.json').exists():
             call('fetch', '--manifest', root/'document-pins.json', '--output', root/'documents')

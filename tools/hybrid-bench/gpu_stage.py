@@ -1,4 +1,5 @@
 """Shared, GPU-host-only stage primitives. Importing this module starts no work."""
+import argparse
 import contextlib
 import fcntl
 import hashlib
@@ -73,9 +74,31 @@ def run(command, log=None):
     require(code == 0, f'command PID {process.pid} exited {code}; see {log or "terminal"}')
 
 
-def disk(path, extra=0):
+def disk_floor_bytes(value):
+    try:
+        floor = int(value)
+    except (ValueError, TypeError) as error:
+        raise argparse.ArgumentTypeError('disk floor must be integer bytes, at least 1073741824 (1 GiB)') from error
+    if floor < 1024**3:
+        raise argparse.ArgumentTypeError('disk floor must be at least 1073741824 bytes (1 GiB)')
+    return floor
+
+
+def add_disk_floor_argument(parser):
+    parser.add_argument('--disk-floor-bytes', type=disk_floor_bytes, default=FLOOR,
+                        help='GPU-stage free-space floor in bytes, default 28000000000; minimum 1073741824 (1 GiB)')
+
+
+def disk(path, extra=0, floor=FLOOR, log=None):
+    require(type(floor) is int and floor >= 1024**3, 'disk floor must be integer bytes, at least 1073741824 (1 GiB)')
     free = shutil.disk_usage(path).free
-    require(free >= FLOOR + extra, f'disk gate: {free} free bytes; need {FLOOR + extra}')
+    event = json.dumps(dict(event='disk_gate', path=str(path), floor_bytes=floor, extra_bytes=extra,
+                            required_bytes=floor + extra, free_bytes=free), sort_keys=True)
+    print(event, flush=True)
+    if log is not None:
+        with Path(log).open('a') as output:
+            output.write(event+'\n')
+    require(free >= floor + extra, f'disk gate: {free} free bytes; need {floor + extra} (floor {floor} + extra {extra})')
     return free
 
 
@@ -107,7 +130,7 @@ def clean_source(source, ref):
             'candidate source must be clean')
 
 
-def build(source, directory, ref, log):
+def build(source, directory, ref, log, disk_floor_bytes=FLOOR):
     clean_source(source, ref)
     targets = ['llama-server', 'llama-hybrid-prefill', 'llama-hybrid-score', 'llama-hybrid-bench-check']
     stamp = directory/'hybrid-bench-build.json'
@@ -120,14 +143,14 @@ def build(source, directory, ref, log):
                 'candidate build binaries changed')
         return
     require(not directory.exists(), 'unrecorded build directory exists; preserve and inspect it')
-    disk(directory.parent, 6 * 1024**3)
+    disk(directory.parent, 6 * 1024**3, floor=disk_floor_bytes, log=log)
     run(['uptime'], log)
     check = subprocess.run(['pgrep', '-u', str(os.getuid()), 'cc1plus'], capture_output=True, text=True)
     require(check.returncode == 1, 'native compiler already active, or pgrep failed')
     run(['nice', '-n', '10', 'cmake', '-S', source, '-B', directory, *FLAGS], log)
-    disk(directory.parent, 4 * 1024**3)
+    disk(directory.parent, 4 * 1024**3, floor=disk_floor_bytes, log=log)
     run(['nice', '-n', '10', 'cmake', '--build', directory, '-j4', '--target', *targets], log)
-    disk(directory.parent)
+    disk(directory.parent, floor=disk_floor_bytes, log=log)
     names = sorted(p for p in (directory/'bin').iterdir() if p.name in targets or '.so' in p.name)
     require(all((directory/'bin'/name).is_file() for name in targets), 'missing build target')
     save(stamp, dict(commit=ref, source_path=str(source), flags=FLAGS, source_dirty=False,

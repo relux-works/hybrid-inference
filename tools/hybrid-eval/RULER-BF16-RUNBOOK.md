@@ -78,10 +78,14 @@ export PY="$RUN/venv/bin/python"
 # If the existing venv has another path, use that exact environment.
 export STAGE="$RUN/bf16-stage-8192-32768"
 export BF16_BUILD="$CAND/build-state-bf16"
+# Dedicated 50 GB GPU host; this override does not apply to agents1.
+export GPU_DISK_FLOOR_BYTES=4000000000
 "$PY" "$CAND/tools/hybrid-eval/stage_ruler_bf16.py" \
+  --disk-floor-bytes "$GPU_DISK_FLOOR_BYTES" \
   --ref "$CANDIDATE_SHA" --build "$BF16_BUILD" --stage "$STAGE" --depths 8192 32768
 # The command above checks completed archives/locks/disk and changes no services.
 "$PY" "$CAND/tools/hybrid-eval/stage_ruler_bf16.py" \
+  --disk-floor-bytes "$GPU_DISK_FLOOR_BYTES" \
   --ref "$CANDIDATE_SHA" --build "$BF16_BUILD" --stage "$STAGE" --depths 8192 32768 --execute
 ```
 
@@ -95,6 +99,7 @@ A SIGTERM/Control-C reaches restoration. A SIGKILL, host crash or power loss can
 
 ```bash
 "$PY" "$CAND/tools/hybrid-eval/stage_ruler_bf16.py" \
+  --disk-floor-bytes "$GPU_DISK_FLOOR_BYTES" \
   --ref "$CANDIDATE_SHA" --build "$BF16_BUILD" --stage "$STAGE" --execute --restore-only
 ```
 
@@ -102,6 +107,20 @@ If an interrupted launch left a directory without any `*.pid` file, recovery fir
 
 CPU regression command: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/hybrid-eval -p test_ruler_restore.py`. It exercises real `manage.py` stop/status and the real restore/restore-only paths with owned CPU worker stand-ins; it does not qualify GPU service startup.
 
-The recovery command also refuses an active original evaluator and never kills by pattern. Keep `service-plan.json`, `services.log`, `build.log`, `preflight-*.log`, `arm-*.log`, `restore.log`, `restored.json` and all original/candidate service directories private. Do not restart later depths until restoration succeeds. Normal exits have a terminal `done ruler-bf16-stage seconds=...` line; any refusal/error has `failed ruler-bf16-stage: ...` and exit 1.
+The recovery command also refuses an active original evaluator and never kills by pattern. Keep `service-plan.json`, `disk.log`, `services.log`, `build.log`, `preflight-*.log`, `arm-*.log`, `restore.log`, `restored.json` and all original/candidate service directories private. Do not restart later depths until restoration succeeds. Normal exits have a terminal `done ruler-bf16-stage seconds=...` line; any refusal/error has `failed ruler-bf16-stage: ...` and exit 1.
 
-Admission needs at least 28 GB plus 8 GiB free before staging; allow 6 GiB for the candidate build, 2 GiB for logs/archives, and the per-example slot gate (1.97 GB at 8k, 4.63 GB at 32k). Both gates are checked independently. Models, original build and frozen results are additional retained disk. Planning: new arm 33.4 min at 8k and 2.13 h at 32k from the measured three-arm rates. Reserve 45-60 min and 3-4 h, plus 10-25 min for a first CUDA build and 5-15 min for service transitions. Both depths in one window: reserve 4.5-6 h. These are estimates, not bf16 GPU measurements. After all services are restored and no candidate process remains, the operator may remove only `build-state-bf16`; retain its build record and logs first. Never remove or rebuild `build-ruler`.
+`--disk-floor-bytes` sets the GPU-stage reserve in integer bytes (default 28,000,000,000; minimum 1,073,741,824 = 1 GiB). The default is unchanged. On this dedicated 50 GB RULER node, choose 4,000,000,000 bytes (4 GB) to leave operating-system and temporary-file headroom while the existing extras reserve the build and slot work. This is an operator choice for this GPU host; agents1 still requires 28 GB free. The shell variable above is passed explicitly through the CLI. The selected floor is recorded in `service-plan.json`, terminal disk-gate events and `disk.log`/`build.log`; each event includes free, floor, extra and required bytes.
+
+Using the node's measured approximately 30,000,000,000 free bytes, the stage checks are:
+
+| Gate | Extra above floor (B) | Required with 4 GB floor (B) | Headroom from 30 GB (B) |
+|---|---:|---:|---:|
+| Staging (6 GiB build + 2 GiB logs/archives) | 8,589,934,592 | 12,589,934,592 | 17,410,065,408 |
+| 8k slot | 1,973,162,454 | 5,973,162,454 | 24,026,837,546 |
+| 32k slot | 4,629,274,134 | 8,629,274,134 | 21,370,725,866 |
+
+The slot extra is `2*saved_session_bytes + 1 GiB`, so the table already includes that 1 GiB margin. The default staging gate would require 36,589,934,592 B and refuse at 30 GB. Every gate uses current free space; the headroom column is a comparison at the measured starting free space, not a prediction after building. Build checks still add 6 GiB before configuration and 4 GiB before compilation to the selected floor. Models, original build and frozen results are already retained in that starting measurement.
+
+The existing service launchers separately require 25 GiB (26,843,545,600 B) free on their source filesystem; this option changes only the GPU-stage gates. With 30 GB initially free, at most 3,156,454,400 B can be newly consumed before a launcher refuses. Recheck free space after the candidate build and before scheduling the operator window; do not assume the stage override relaxes that independent check.
+
+Planning: new arm 33.4 min at 8k and 2.13 h at 32k from the measured three-arm rates. Reserve 45-60 min and 3-4 h, plus 10-25 min for a first CUDA build and 5-15 min for service transitions. Both depths in one window: reserve 4.5-6 h. These are estimates, not bf16 GPU measurements. After all services are restored and no candidate process remains, the operator may remove only `build-state-bf16`; retain its build record and logs first. Never remove or rebuild `build-ruler`.

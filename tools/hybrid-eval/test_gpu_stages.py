@@ -1,4 +1,5 @@
 """CPU contract tests for stage orchestration; no CUDA, downloads or live service stops."""
+import argparse
 import copy
 import contextlib
 import hashlib
@@ -7,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -123,7 +125,7 @@ class StageTests(unittest.TestCase):
                 common.save(build/'hybrid-bench-build.json', dict(commit='18d3f114'+'0'*32, binaries={}))
                 args = SimpleNamespace(stage=root/'stage', original_run=original, original_build=build,
                                        original_source=root/'old-source', source=root/'new-source', ref='a'*40,
-                                       build=root/'new-build')
+                                       build=root/'new-build', disk_floor_bytes=4_000_000_000)
                 commands = []
                 def invoke(command, log=None):
                     commands.append([str(x) for x in command])
@@ -132,16 +134,23 @@ class StageTests(unittest.TestCase):
                 manifests = [dict(depth=d, input_lock_sha256='hash', samples_per_task=30, seed=42, margin=.02, tasks=['qa_1'])
                              for d in (8192, 32768)]
                 with patch.object(ruler, 'launch_plan', return_value={r: ['start', r] for r in ruler.ROLES}), \
-                     patch.object(ruler, 'clean_source'), patch.object(ruler, 'no_evaluator'), patch.object(ruler, 'build'), \
+                     patch.object(ruler, 'clean_source'), patch.object(ruler, 'no_evaluator'), patch.object(ruler, 'build') as compile_build, \
                      patch.object(ruler, 'live_identity', return_value={}), patch.object(ruler, 'gpu_identity', return_value='fixture'), \
                      patch.object(ruler, 'run', side_effect=invoke), patch.object(ruler, 'restore') as restore, \
-                     patch.object(ruler, 'disk'), patch.object(ruler, 'verify_archive'), patch.dict(os.environ):
+                     patch.object(ruler, 'disk', wraps=common.disk) as disk_checks, \
+                     patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=30_000_000_000)), \
+                     patch.object(ruler, 'verify_archive'), patch.dict(os.environ):
                     if failure:
                         with self.assertRaisesRegex(RuntimeError, 'planted manifest mismatch'):
                             ruler.execute(args, manifests)
                     else:
                         ruler.execute(args, manifests)
                     restore.assert_called_once()
+                    self.assertEqual(common.read(args.stage/'service-plan.json')['disk_floor_bytes'], 4_000_000_000)
+                    self.assertEqual(compile_build.call_args.kwargs['disk_floor_bytes'], 4_000_000_000)
+                    self.assertTrue(all(c.kwargs['floor'] == 4_000_000_000 for c in disk_checks.call_args_list))
+                    self.assertTrue(all(json.loads(line)['floor_bytes'] == 4_000_000_000 for line in
+                                        (args.stage/'disk.log').read_text().splitlines()))
                 trials = [c for c in commands if '--paired-depth' in c]
                 self.assertEqual([('--preflight-only' in c) for c in trials], [True, True] if failure else [True, True, False, False])
 
@@ -279,6 +288,120 @@ class KlStageTests(unittest.TestCase):
         self.assertFalse(kl.compare_intervals(new, old, 'old', 'new')[0]['passed'])
         with self.assertRaisesRegex(RuntimeError, 'missing comparator'):
             kl.compare_intervals(new, old, 'absent', 'new')
+
+
+class DiskFloorTests(unittest.TestCase):
+    # Default admission stays at 28 GB; an explicit 4 GB admits the measured 30 GB host, with extras still required.
+    def test_default_low_floor_and_extra_boundaries(self):
+        parser = argparse.ArgumentParser()
+        common.add_disk_floor_argument(parser)
+        self.assertEqual(parser.parse_args([]).disk_floor_bytes, 28_000_000_000)
+        low = parser.parse_args(['--disk-floor-bytes', '4000000000']).disk_floor_bytes
+        self.assertEqual(low, 4_000_000_000)
+        self.assertEqual(parser.parse_args(['--disk-floor-bytes', str(1024**3)]).disk_floor_bytes, 1024**3)
+        with patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=30_000_000_000)):
+            with self.assertRaisesRegex(RuntimeError, 'need 36589934592'):
+                common.disk('.', 8*1024**3)
+            self.assertEqual(common.disk('.', 8*1024**3, floor=low), 30_000_000_000)
+        for extra in (8*1024**3, 2*((442685280*(8192+130)+8191)//8192)+1024**3,
+                      2*((442685280*(32768+130)+8191)//8192)+1024**3):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp)/'disk.log'
+                with patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=low+extra)):
+                    common.disk('.', extra, floor=low, log=log)
+                event = json.loads(log.read_text())
+                self.assertEqual((event['floor_bytes'], event['extra_bytes'], event['required_bytes']), (low, extra, low+extra))
+                with patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=low+extra-1)):
+                    with self.assertRaisesRegex(RuntimeError, 'disk gate'):
+                        common.disk('.', extra, floor=low)
+
+    # Both real CLIs reject invalid floors before file/GPU work; an explicit valid floor reaches help successfully.
+    def test_invalid_floor_cli_with_positive_controls(self):
+        root = Path(ruler.__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            commands = [[sys.executable, str(root/'tools/hybrid-eval/stage_ruler_bf16.py'), '--ref', 'a'*40,
+                         '--build', str(folder/'build'), '--stage', str(folder/'stage')],
+                        [sys.executable, str(root/'tools/hybrid-bench/stage_kl_bf16.py'), '--historical-archive', str(folder/'missing.tar.gz')]]
+            for command in commands:
+                valid = subprocess.run([*command, '--disk-floor-bytes', '4000000000', '--help'], capture_output=True, text=True)
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                self.assertIn('default 28000000000', ' '.join(valid.stdout.split()))
+                for value in (str(1024**3-1), '-1', 'not-a-number'):
+                    with self.subTest(script=command[1], value=value):
+                        result = subprocess.run([*command, '--disk-floor-bytes', value], capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn('argument --disk-floor-bytes:', result.stderr)
+                        self.assertIn('1 GiB', result.stderr)
+            self.assertEqual(list(folder.iterdir()), [])
+
+    # Every fresh-build guard receives the selected floor; the simulated build creates only tiny fixture files.
+    def test_build_preserves_extras_and_selected_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source = root/'source'; source.mkdir()
+            directory = root/'build'
+            def compile_fixture(command, log=None):
+                if '--build' in command:
+                    (directory/'bin').mkdir(parents=True)
+                    for name in ('llama-server', 'llama-hybrid-prefill', 'llama-hybrid-score', 'llama-hybrid-bench-check'):
+                        (directory/'bin'/name).write_bytes(b'CPU fixture')
+            with patch.object(common, 'clean_source'), patch.object(common, 'run', side_effect=compile_fixture), \
+                 patch.object(common.subprocess, 'run', return_value=SimpleNamespace(returncode=1)), \
+                 patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=30_000_000_000)), \
+                 patch.object(common, 'disk', wraps=common.disk) as checks:
+                with self.assertRaisesRegex(RuntimeError, 'disk gate'):
+                    common.build(source, directory, 'a'*40, root/'default-build.log')
+                checks.reset_mock()
+                common.build(source, directory, 'a'*40, root/'build.log', disk_floor_bytes=4_000_000_000)
+                self.assertEqual([c.args[1] if len(c.args)>1 else 0 for c in checks.call_args_list], [6*1024**3, 4*1024**3, 0])
+                self.assertTrue(all(c.kwargs['floor'] == 4_000_000_000 for c in checks.call_args_list))
+                events = [json.loads(line) for line in (root/'build.log').read_text().splitlines()]
+                self.assertEqual([e['extra_bytes'] for e in events], [6*1024**3, 4*1024**3, 0])
+
+    # KL downloads retain their file-size plus 8 GiB reserve on top of the selected floor, without network access here.
+    def test_download_floor_and_reservation_propagation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); payload = b'fixture model'
+            pin = dict(repo='fixture/model', revision='a'*40, primary='model.gguf', files=[dict(name='model.gguf',
+                       size=len(payload), sha256=hashlib.sha256(payload).hexdigest())])
+            def download(command, log=None):
+                Path(command[command.index('--output')+1]).write_bytes(payload)
+            with patch.object(kl, 'run', side_effect=download), \
+                 patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=4_000_000_000+8*1024**3+len(payload))), \
+                 patch.object(kl, 'disk', wraps=common.disk) as checks:
+                kl.download_models(dict(models=dict(q4=pin)), root, disk_floor_bytes=4_000_000_000)
+                checks.assert_called_once_with(root, len(payload)+8*1024**3, floor=4_000_000_000, log=root/'download.log')
+                self.assertEqual(json.loads((root/'download.log').read_text())['floor_bytes'], 4_000_000_000)
+
+    # KL bootstrap/measurement record and forward the CLI floor before their first corpus operation; GPU boundaries are mocked.
+    def test_kl_plans_and_floor_propagation_before_corpus_work(self):
+        previous, lock = KlStageTests().fixture()
+        class StopBeforeCorpus(RuntimeError):
+            pass
+        for bootstrap in (True, False):
+            with self.subTest(bootstrap=bootstrap), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); pin_path = root/'lock.json'; common.save(pin_path, lock)
+                (root/'old.tar.gz').write_bytes(b'fixture historical archive')
+                command = ['stage_kl_bf16.py', '--historical-archive', str(root/'old.tar.gz'), '--mode', 'new-study',
+                           '--root', str(root), '--build', str(root/'build'), '--ref', 'a'*40, '--execute',
+                           '--disk-floor-bytes', '4000000000']
+                command += ['--bootstrap-new-lock'] if bootstrap else ['--provenance-lock', str(pin_path)]
+                with patch.object(sys, 'argv', command), patch.object(kl, 'historical_report', return_value=(previous, 'c'*64)), \
+                     patch.object(kl, 'gpu_identity', return_value='fixture'), patch.object(kl, 'clean_source'), \
+                     patch.object(kl, 'build') as compile_build, patch.dict(os.environ), \
+                     patch('gpu_stage.shutil.disk_usage', return_value=SimpleNamespace(free=135_000_000_000, total=160_000_000_000)), \
+                     patch.object(kl, 'disk', wraps=common.disk) as checks, \
+                     patch.object(kl, 'download_models', side_effect=StopBeforeCorpus('before models') if bootstrap else None,
+                                  return_value=dict(q4=root/'q4.gguf', bf16=root/'bf16.gguf')) as downloads, \
+                     patch.object(kl, 'run', side_effect=StopBeforeCorpus('before corpus')):
+                    with self.assertRaises(StopBeforeCorpus):
+                        kl.main()
+                    plan = common.read(root/('bootstrap-plan.json' if bootstrap else 'manifest.json'))
+                    self.assertEqual(plan['disk_floor_bytes'], 4_000_000_000)
+                    self.assertEqual(compile_build.call_args.kwargs['disk_floor_bytes'], 4_000_000_000)
+                    self.assertEqual(downloads.call_args.kwargs['disk_floor_bytes'], 4_000_000_000)
+                    self.assertTrue(all(c.kwargs['floor'] == 4_000_000_000 for c in checks.call_args_list))
+                    self.assertEqual(len(checks.call_args_list), 1 if bootstrap else 2)
 
 
 if __name__ == '__main__':
