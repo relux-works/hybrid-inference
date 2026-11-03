@@ -1,5 +1,8 @@
 # Sequential depth quality: r47 CPU handoff
 
+Review correction r47c: historical factor-two 512k fixtures are superseded. The current study uses static YaRN factor 4 at both depths above original 262,144 for kit/vLLM74/1M comparability; regenerate old inputs. The handoff verifier now refuses absent/null engine revisions, which previously skipped the engine check. Licence declarations and GPU-side hashed evidence are recorded in the corpus pins and README. Historical CPU outcomes below do not qualify this corrected profile at 512k/1M. See `RESULTS-hybrid-b-r47c-261103.md` for revalidation.
+
+
 Ready for review. Base: `m3-state-bf16` at `8d876c71b798651a8c5df768dc374468ced77544`; local branch: `m3-depth-quality`. No push or GPU/model/corpus download on agents1. This is implementation and CPU mechanics evidence, not a 512k/1M quality result.
 
 ## Delivered experiment

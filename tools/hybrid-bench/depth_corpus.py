@@ -31,6 +31,13 @@ def documents(manifest):
                 'https://huggingface.co/datasets/roneneldan/TinyStories/resolve/' + revision + '/')
             study.require(item['url'].startswith(allowed) and url.scheme == 'https' and not url.query and not url.fragment and
                           not url.username and '..' not in urllib.parse.unquote(url.path).split('/'), 'only pinned public corpus URLs are allowed')
+        license = row.get('license', {})
+        revision = row['files'][0]['revision']
+        prefix = row['files'][0]['url'].split(revision + '/', 1)[0] + revision + '/'
+        filename = 'LICENSE' if row['kind'] == 'code' else 'README.md'
+        study.require(license.get('identifier') in ('MIT', 'apache-2.0', 'cdla-sharing-1.0') and
+                      license.get('revision') == revision and license.get('url') == prefix + filename and
+                      license.get('declaration'), 'corpus requires pinned source license declaration')
     return rows
 
 
@@ -76,12 +83,35 @@ def convert(row, paths):
     return text.replace('<|', '< |')
 
 
+def fetch_license(row, folder):
+    license = row['license']
+    target = folder/('LICENSE' if row['kind'] == 'code' else 'license-metadata.md')
+    study.require(not target.exists(), 'license output exists; use a fresh root')
+    study.run(['curl', '--fail', '--location', '--proto', '=https', '--proto-redir', '=https', '--retry', '3',
+               '--max-time', '600', '--max-filesize', str(256*1024), '--output', target, license['url']], folder, 'license', 660)
+    raw = target.read_bytes()
+    study.require(0 < len(raw) <= 256*1024, 'license metadata size exceeds limit')
+    if row['kind'] == 'code':
+        study.require(len(raw) == license['size'] and study.sha256(target) == license['sha256'], 'license SHA256/size mismatch')
+        study.require(raw.decode('utf-8').splitlines()[0].strip() == 'MIT License', 'source license declaration differs')
+    else:
+        text = raw.decode('utf-8')
+        frontmatter = text.split('---', 2)
+        study.require(len(frontmatter) == 3 and not frontmatter[0].strip() and
+                      re.search(r'(?m)^license: *' + re.escape(license['identifier']) + r' *$', frontmatter[1]),
+                      'source license declaration differs')
+    record = dict(license, path=str(target), sha256=study.sha256(target), size=len(raw))
+    study.save(folder/'license.json', record)
+    return record
+
+
 def fetch(manifest, root):
     rows = documents(manifest)
     root = study.private_dir(root)
     result = []
     for row in rows:
         folder = study.private_dir(root/row['id'])
+        license = fetch_license(row, folder)
         paths = []
         for i, item in enumerate(row['files']):
             target = folder/f'source-{i}.raw'
@@ -92,7 +122,7 @@ def fetch(manifest, root):
             paths.append(target)
         text = folder/'document.txt'
         study.atomic(text, convert(row, paths).encode())
-        record = dict(row, derived_sha256=study.sha256(text), derived_size=text.stat().st_size,
+        record = dict(row, license=license, derived_sha256=study.sha256(text), derived_size=text.stat().st_size,
                       transform='english-first-path-and-quoted-specials-v1' if row['kind'] == 'chat' else 'ordered-text-and-quoted-specials-v1',
                       path=str(text), observation_unit='one constructed document')
         study.save(folder/'identity.json', record)

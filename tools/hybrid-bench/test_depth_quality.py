@@ -9,6 +9,7 @@ import sys
 import os
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -50,9 +51,9 @@ class DepthContracts(unittest.TestCase):
             with self.assertRaisesRegex(study.Refusal, 'document or YaRN mismatch'):
                 depth.verify_arm(record, identity, path)
 
-    # Context settings match the model-card depth recommendations, and estimates expose their assumptions.
+    # Both study depths use the same static factor; estimates expose their assumptions.
     def test_yarn_and_estimate_accounting(self):
-        self.assertEqual(depth.settings(524288)['yarn_factor'], 2)
+        self.assertEqual(depth.settings(524288)['yarn_factor'], 4)
         self.assertEqual(depth.settings(1040000)['yarn_factor'], 4)
         for tokens in (524288, 1040000):
             plan = stage.estimates(tokens)
@@ -62,6 +63,38 @@ class DepthContracts(unittest.TestCase):
             if tokens == 1040000:
                 self.assertEqual([r['hours_per_document'] for r in plan['scenarios']], [1,1.5])
             self.assertEqual(plan['needle_restores_per_arm'],1)
+
+    # Static factor four starts immediately above the original context; all other YaRN parameters stay fixed.
+    def test_yarn_factor_512k_static_four(self):
+        self.assertEqual(depth.settings(262144)['yarn_factor'], 2)
+        for tokens in (262145, 524288, 1040000):
+            settings = depth.settings(tokens)
+            self.assertEqual(settings['yarn_factor'], 4)
+            self.assertEqual(settings['original_context'], 262144)
+            self.assertEqual(settings['rope_theta'], 10000000)
+            self.assertEqual(settings['yarn_beta_fast'], 32)
+            self.assertEqual(settings['yarn_beta_slow'], 1)
+            self.assertEqual(settings['yarn_ext_factor'], 1)
+
+    # Missing and null engine identities must refuse before fixture access or any native probe.
+    def test_handoff_missing_engine_ref_refuses(self):
+        self.check_unrecorded_engine({})
+
+    def test_handoff_null_engine_ref_refuses(self):
+        self.check_unrecorded_engine(dict(engine_ref=None))
+
+    def check_unrecorded_engine(self, producer):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root/'handoff.json'
+            study.save(manifest, dict(schema='depth-slot-handoff-1', logits_dtype='float32-le',
+                positions='forced inputs at depth..depth+63; logits predict depth+1..depth+64', rows=64, producer=producer))
+            args = argparse.Namespace(handoff=manifest, output=root/'check', fixture=root/'absent.json')
+            with patch.object(depth, 'invoke') as invoke:
+                with self.assertRaisesRegex(study.Refusal, 'requires a recorded engine source revision'):
+                    depth.verify_handoff(args)
+                invoke.assert_not_called()
+            self.assertFalse((args.output/'probe.job.json').exists())
 
     # The single-state reservation refuses a pre-existing file and never deletes it.
     def test_stale_state_preserved(self):
@@ -137,13 +170,19 @@ class DepthContracts(unittest.TestCase):
         for row,data in zip(rows,payloads):
             row['files']=row['files'][:1]
             row['files'][0].update(sha256=hashlib.sha256(data).hexdigest(),size=len(data))
+        licenses=[b'MIT License\n', b'---\nlicense: apache-2.0\n---\n', b'---\nlicense: cdla-sharing-1.0\n---\n']
+        rows[0]['license'].update(sha256=hashlib.sha256(licenses[0]).hexdigest(),size=len(licenses[0]))
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);manifest=root/'pins.json';study.save(manifest,dict(schema='depth-corpus-1',documents=rows))
             def fetch_fixture(command,directory,name,timeout):
                 idx=next(i for i,r in enumerate(rows) if r['id']==directory.name)
-                Path(command[command.index('--output')+1]).write_bytes(payloads[idx])
+                Path(command[command.index('--output')+1]).write_bytes(licenses[idx] if name == 'license' else payloads[idx])
             with patch.object(corpus.study,'run',side_effect=fetch_fixture):
                 records=corpus.fetch(manifest,root/'good')
+            for record in records:
+                evidence=record['license']
+                self.assertEqual(study.sha256(Path(evidence['path'])), evidence['sha256'])
+                self.assertEqual(study.read(Path(evidence['path']).parent/'license.json'), evidence)
             chat=Path(records[1]['path']).read_text()
             self.assertIn('User: Question\nAssistant: First English answer',chat)
             self.assertNotIn('omit-this-metadata',chat)
@@ -155,6 +194,21 @@ class DepthContracts(unittest.TestCase):
                 with self.assertRaisesRegex(study.Refusal,'source SHA256/size mismatch'):
                     corpus.fetch(manifest,root/'bad')
             self.assertFalse((root/'bad/manifest.json').exists())
+
+    # Missing provenance refuses before retrieval; a wrong downloaded declaration publishes no license receipt.
+    def test_corpus_license_missing_or_changed_refuses(self):
+        good=study.read(Path(corpus.__file__).with_name('depth_corpus_pins.json'))
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); path=root/'pins.json'
+            bad=copy.deepcopy(good); del bad['documents'][1]['license']; study.save(path,bad)
+            with self.assertRaisesRegex(study.Refusal,'requires pinned source license declaration'):
+                corpus.documents(path)
+            def wrong_license(command,directory,name,timeout):
+                Path(command[command.index('--output')+1]).write_bytes(b'---\nlicense: wrong-license\n---\n')
+            with patch.object(corpus.study,'run',side_effect=wrong_license):
+                with self.assertRaisesRegex(study.Refusal,'source license declaration differs'):
+                    corpus.fetch_license(good['documents'][1],root)
+            self.assertFalse((root/'license.json').exists())
 
     # Local/private URLs, mutable revisions and missing hashes are refused before any retrieval.
     def test_corpus_private_or_unpinned_source_refuses(self):
@@ -269,6 +323,8 @@ class NativeDepth(unittest.TestCase):
                 ('positions',lambda x:x.update(positions='before forced inputs'),'position convention'),
                 ('continuation',lambda x:x['continuation'].__setitem__(0,x['continuation'][0]+1),'document, continuation or YaRN'),
                 ('state',lambda x:x['state'].update(sha256='0'*64),'state hash/size'),
+                ('engine-missing',lambda x:x['producer'].pop('engine_ref'),'requires a recorded engine'),
+                ('engine-null',lambda x:x['producer'].update(engine_ref=None),'requires a recorded engine'),
                 ('engine',lambda x:x['producer'].update(engine_ref='0'*40),'engine source revision'),
                 ('reference',lambda x:x['reference'].update(sha256='0'*64),'reference hash/size')]:
                 changed=copy.deepcopy(good); mutate(changed)
@@ -279,7 +335,8 @@ class NativeDepth(unittest.TestCase):
                 self.assertFalse((bad.output/'probe.job.json').exists())
                 self.assertEqual(study.sha256(state),original)
         with patch.object(depth,'publish_handoff',side_effect=check_handoff):
-            report = depth.run_case(self.binary,self.model,fixture_path,root,0,8,7,600,256,callback)
+            engine_ref = subprocess.check_output(['git', '-C', Path(depth.__file__).resolve().parents[2], 'rev-parse', 'HEAD'], text=True).strip()
+            report = depth.run_case(self.binary,self.model,fixture_path,root,0,8,7,600,256,callback,engine_ref=engine_ref)
         self.assertEqual(report['context_depth'],512)
         self.assertEqual(report['position_range'],[504,511])
         self.assertEqual(study.read(root/'offload.json')['snapshot_depth'],512)

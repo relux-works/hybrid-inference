@@ -32,7 +32,7 @@ def estimates(depth_tokens, rows=4096, count=16, hourly=1.57, documents=None, ne
             hours_per_document=per_document/3600, cost_usd=documents*per_document/3600*hourly,
             prefill_seconds=documents*3*prefill_per_arm, prefill_seconds_per_arm=prefill_per_arm,
             checks_restore_allowance_seconds=documents*checks, extra_independent_restore_seconds=documents*extra_restores))
-    return dict(depth=depth_tokens, documents=documents, observation_unit='document', state_bytes=state,
+    return dict(depth=depth_tokens, yarn_settings=depth.settings(depth_tokens), documents=documents, observation_unit='document', state_bytes=state,
         needle_mode=needle_mode, needle_restores_per_arm=1 if needle_mode == 'sequential' else count,
         hourly_usd_assumption=hourly, reference_positions_per_arm=64, scenarios=result,
         assumptions='At 1M: three 15-20 minute prefills plus 15-30 minutes for logits, reference probes, state I/O and needle questions; analyst planning envelope, not measured RTX timing.',

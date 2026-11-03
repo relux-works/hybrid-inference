@@ -19,7 +19,7 @@ HANDOFF_POSITIONS = 'forced inputs at depth..depth+63; logits predict depth+1..d
 
 
 def settings(depth):
-    return dict(yarn_factor=2 if depth <= 524288 else 4, rope_theta=10000000,
+    return dict(yarn_factor=2 if depth <= 262144 else 4, rope_theta=10000000,
                 original_context=262144, kv_type='q8_0', recurrent_type='f32',
                 yarn_ext_factor=1, yarn_attn_factor=1, yarn_beta_fast=32, yarn_beta_slow=1)
 
@@ -224,14 +224,15 @@ def verify_handoff(args):
     manifest = study.read(args.handoff)
     study.require(manifest.get('schema') == 'depth-slot-handoff-1' and manifest.get('logits_dtype') == 'float32-le' and
                   manifest.get('positions') == HANDOFF_POSITIONS and manifest.get('rows') == 64, 'handoff format or position convention mismatch')
+    engine_ref = manifest.get('producer', {}).get('engine_ref')
+    study.require(isinstance(engine_ref, str) and len(engine_ref) == 40 and all(c in '0123456789abcdef' for c in engine_ref),
+                  'handoff requires a recorded engine source revision')
+    current = subprocess.check_output(['git', '-C', str(Path(__file__).resolve().parents[2]), 'rev-parse', 'HEAD'], text=True).strip()
+    study.require(current == engine_ref, 'handoff engine source revision mismatch')
+    dirty = subprocess.check_output(['git', '-C', str(Path(__file__).resolve().parents[2]), 'status', '--porcelain'], text=True).strip()
+    study.require(not dirty, 'handoff engine source must be clean')
     fixture = study.read(args.fixture)
     identity = validate_fixture(fixture)
-    engine_ref = manifest.get('producer', {}).get('engine_ref')
-    if engine_ref is not None:
-        current = subprocess.check_output(['git', '-C', str(Path(__file__).resolve().parents[2]), 'rev-parse', 'HEAD'], text=True).strip()
-        study.require(current == engine_ref, 'handoff engine source revision mismatch')
-        dirty = subprocess.check_output(['git', '-C', str(Path(__file__).resolve().parents[2]), 'status', '--porcelain'], text=True).strip()
-        study.require(not dirty, 'handoff engine source must be clean')
     study.require(manifest['binding'] == identity and manifest['continuation'] == fixture['probe_tokens'], 'handoff document, continuation or YaRN mismatch')
     study.require(manifest['depth'] == fixture['context_depth'], 'handoff depth mismatch')
     study.require(study.sha256(args.model) == identity['model_sha256'], 'handoff model mismatch')
