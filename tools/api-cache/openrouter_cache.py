@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 SNAPSHOT = HERE / 'snapshots/2026-11-03.json'
 KEY_PATH = Path('/home/agent/lanes/hybrid/.temp/openrouter/api_key')
 PAUSES = [0, 0, 60, 60, 300, 300, 900, 900, 3600, 3600]
-WORDS = ' red blue green white black gold silver small large long short old new good clear soft hard warm cold bright'.split()
+WORDS = list('abcdefghijklmnopqrstuvwxyz')
 
 
 class Refusal(RuntimeError):
@@ -164,14 +164,14 @@ def matrix(snapshot):
             for depth in depths:
                 ident = data['id'] + ':' + endpoint['tag'] + ':' + str(depth)
                 sessions.append(dict(model=data['id'], endpoint=endpoint, depth=depth,
-                                     session_id='r15b-' + hashlib.sha256(ident.encode()).hexdigest()[:20]))
+                                     session_id='r15b-v2-' + hashlib.sha256(ident.encode()).hexdigest()[:20]))
     random.Random(261103).shuffle(sessions)
     return sessions, excluded
 
 
 def synthetic(target, seed):
     rng = random.Random(seed)
-    # Common English words preceded by spaces are expected to tokenize singly; usage checks the approximation.
+    # Space-prefixed letters limit proxy character estimates; returned usage checks token depth.
     return ''.join(' ' + rng.choice(WORDS) for _ in range(max(0, target)))
 
 
@@ -189,7 +189,7 @@ def build_payload(session, index, smoke=False):
     payload = dict(model=session['model'], messages=[dict(role='user', content=content)], max_tokens=16,
                    stream=True, stream_options={'include_usage': True}, temperature=0,
                    session_id=session['session_id'], provider=dict(order=[endpoint['tag']], only=[endpoint['tag']],
-                   allow_fallbacks=False), reasoning={'enabled': False})
+                   allow_fallbacks=False))
     return payload
 
 
@@ -381,16 +381,18 @@ def run(args):
     started = utc()
     try:
         initial_key = client.get('/key')['data']
-        initial_spend = money(initial_key['usage'])
+        initial_spend = max(money(initial_key['usage']), money(getattr(args, 'prior_spend_floor', 0)))
         write_json(out/'run.json', dict(started=started, pid=os.getpid(), smoke=args.smoke,
                    snapshot_sha256=hashlib.sha256(args.snapshot.read_bytes()).hexdigest(),
                    script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                   initial_key_usage=float(initial_spend), cap_usd=float(cap), sessions=len(sessions),
+                   initial_key_usage=float(money(initial_key['usage'])), accounting_spend_floor=float(initial_spend), cap_usd=float(cap), sessions=len(sessions),
                    excluded=excluded), client.secret)
         queue = [(time.monotonic(), i, 0, None) for i in range(len(sessions))]
         heapq.heapify(queue)
         while queue:
             due, number, index, previous_end = heapq.heappop(queue)
+            if (out/'STOP').exists():
+                raise Refusal('operator STOP file; no further requests')
             if time.monotonic() < due:
                 time.sleep(due-time.monotonic())
             if shutil.disk_usage(out).free < 28_000_000_000:
@@ -445,7 +447,7 @@ def run(args):
             report(out,snapshot,'running',secret=client.secret)
             if row.get('error'):
                 # HTTP availability failures are measured; unknown billing or pin/depth violations stop spending.
-                if row.get('http_status') not in (400,404,408,429,500,502,503,504):
+                if row.get('http_status') not in (404,408,429,500,502,503,504):
                     raise Refusal('call failed or unverifiable; no further spending')
             if index+1 < count:
                 pause = 0 if args.smoke else PAUSES[index+1]
@@ -469,6 +471,7 @@ def main():
     parser.add_argument('--key-path',type=Path,default=KEY_PATH)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--smoke',action='store_true')
+    parser.add_argument('--prior-spend-floor',default='0',help='Known cumulative prior costs, retained if live spend lags')
     parser.add_argument('--report-only',action='store_true')
     args=parser.parse_args()
     if args.report_only:

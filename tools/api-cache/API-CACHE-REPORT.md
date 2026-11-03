@@ -33,3 +33,11 @@ Twelve standard-library CPU tests pass, exit 0 (.temp/hybrid-d-r15b-261103/tests
 | Restore pause reference after bookkeeping | Gap includes time from previous response completion | test_pause_includes_post_response_bookkeeping_regression | Killed: 300 != 400, exit 1; pause-mutant-01.log |
 
 Matrix notifications and remote-base freshness require an exception to the owner's OpenRouter-only outbound-network rule. That question was asked; without an exception no Matrix or GitHub network access is performed. Requested messages are saved locally with the run evidence.
+
+## Initial full-attempt instrument failures and signed v2 correction
+
+The initial full attempt was stopped after eight response records. GLM rejected disabled reasoning, and a Qwen 250k request was rejected because the proxy estimated 325235 input tokens from long-word text. These request-configuration errors do not establish provider availability or caching. All original intents and responses remain under .temp/hybrid-d-r15b-261103/full/ with a failed terminal record. An in-flight response was recorded before terminating the owned PID; no automatic retry or uncertain duplicate call was made.
+
+Reported initial-full cost was USD0.1438775125; with smoke the known total is USD0.1467192205. The live spend endpoint showed only USD0.09313342 at reconciliation, so full-v2 must retain the higher known total as its prior-spend floor. It leaves optional reasoning unspecified, uses compact space-prefixed lowercase letters, and gives every session a fresh r15b-v2 prefix. It keeps the same endpoints, prices, admission criteria, target depths, pauses and 16-token completion cap. HTTP400 now stops the experiment for diagnosis. This is preregistered in PROTOCOL.md before full-v2.
+
+Fourteen CPU tests pass after the correction (tests-07.log), including a mandatory-reasoning mock that rejects the old request flag and accepts default reasoning, and a restart-spend-floor negative control. The corrected experiment writes to .temp/hybrid-d-r15b-261103/full-v2/ with log full-v2-01.log and PID full-v2.pid. The earlier full/ attempt is retained separately and is not pooled into provider admission statistics. For current experiment status use full-v2/terminal.json or the live log; absence of terminal.json means the experiment has not reached a terminal record.

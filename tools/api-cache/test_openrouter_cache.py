@@ -21,6 +21,7 @@ class Handler(BaseHTTPRequestHandler):
     live_spend = 44.99
     dynamic = False
     cost = .001
+    reject_disabled_reasoning = False
 
     def log_message(self, *args):
         pass
@@ -43,6 +44,11 @@ class Handler(BaseHTTPRequestHandler):
                                  prompt_tokens_details=dict(cached_tokens=0 if Handler.calls==1 else 32000+(Handler.calls-2)*1000,cache_write_tokens=0))
             Handler.live_spend += Handler.cost
         Handler.payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if Handler.reject_disabled_reasoning and Handler.payload.get('reasoning',{}).get('enabled') is False:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}}')
+            return
         self.send_response(200)
         self.send_header('Content-Type','text/event-stream')
         self.end_headers()
@@ -79,6 +85,7 @@ class CacheTests(unittest.TestCase):
         Handler.calls=0
         Handler.dynamic=False
         Handler.cost=.001
+        Handler.reject_disabled_reasoning=False
         Handler.live_spend=44.99
         Handler.provider='Chutes'
         Handler.usage=dict(prompt_tokens=32768,completion_tokens=3,cost=.001,
@@ -90,6 +97,7 @@ class CacheTests(unittest.TestCase):
         result=cache.stream_call(self.client,payload,self.session['endpoint'])
         self.assertNotIn('error',result)
         self.assertEqual(Handler.payload['provider'],dict(order=['chutes/fp8'],only=['chutes/fp8'],allow_fallbacks=False))
+        self.assertNotIn('reasoning',Handler.payload)
         self.assertEqual(result['cached_tokens'],30000)
         self.assertEqual(result['cache_write_tokens'],2000)
         self.assertEqual(result['http_status'],200)
@@ -172,6 +180,8 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(b.startswith(a))
         self.assertEqual(len(b.split())-len(a.split()),1000)
         self.assertEqual(a,cache.build_payload(self.session,0)['messages'][0]['content'][0]['text'])
+        self.assertLess(len(a.encode()),2*32768)
+        self.assertTrue(self.session['session_id'].startswith('r15b-v2-'))
 
     # Any live price rise blocks requests; a lower price and cache-write surcharge are handled conservatively.
     def test_live_price_and_max_cost(self):
@@ -251,6 +261,33 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(cache.run(args),0)
         row=json.loads((args.output/'call-0001.json').read_text())
         self.assertEqual(row['pause_actual_seconds'],400)
+
+
+    # A restart cannot forget known earlier charges just because the live usage endpoint lags.
+    def test_prior_spend_floor_blocks_restart(self):
+        args=argparse.Namespace(output=self.path/'floor',snapshot=cache.SNAPSHOT,smoke=True,key_path=self.key,prior_spend_floor='45')
+        Handler.live_spend=0
+        with mock.patch.object(cache,'Client',return_value=self.client):
+            self.assertEqual(cache.run(args),1)
+        self.assertEqual(Handler.calls,0)
+        self.assertIn('budget',json.loads((args.output/'terminal.json').read_text())['reason'])
+
+
+    # A mandatory-reasoning mock rejects the old flag and accepts the default without raising the output cap.
+    def test_mandatory_reasoning_default_regression(self):
+        session=next(s for s in self.sessions if s['model']=='z-ai/glm-5.3-flash' and s['endpoint']['tag']=='morph/fp8' and s['depth']==250000)
+        Handler.provider='Morph'
+        Handler.reject_disabled_reasoning=True
+        payload=cache.build_payload(session,0)
+        self.assertNotIn('reasoning',payload)
+        self.assertEqual(payload['max_tokens'],16)
+        self.assertLess(len(payload['messages'][0]['content'][0]['text'].encode())/4+16,262144)
+        valid=cache.stream_call(self.client,payload,session['endpoint'])
+        self.assertNotIn('error',valid)
+        payload['reasoning']={'enabled':False}
+        rejected=cache.stream_call(self.client,payload,session['endpoint'])
+        self.assertEqual(rejected['http_status'],400)
+        self.assertIn('Reasoning is mandatory',rejected['error_body'])
 
 
 if __name__=='__main__':
