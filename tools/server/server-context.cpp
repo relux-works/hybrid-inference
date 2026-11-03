@@ -3265,7 +3265,7 @@ private:
                             } else {
                                 const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
                                 const bool final = slot->hybrid_import.stage(ctx_tgt, slot->id, std::move(task.slot_action.delta), hybrid_model_hash,
-                                        task.slot_action.session_id, tokens, slot->n_ctx, llama_vocab_n_tokens(vocab));
+                                        task.slot_action.session_id, tokens, slot->n_ctx, llama_vocab_n_tokens(vocab), task.slot_action.state_dtype);
                                 if (final) {
                                     auto imported_tokens = slot->hybrid_import.imported_tokens();
                                     server_tokens imported(imported_tokens, false);
@@ -6881,6 +6881,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
         for (const auto & header : req.headers) {
             std::string name = header.first;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (name == "x-hybrid-state-dtype") {
+                task.slot_action.state_dtype = header.second;
+            }
             if (name == "x-hybrid-session") {
                 task.slot_action.session_id = header.second;
             }

@@ -136,6 +136,9 @@ class Proxy:
         self.model = config["model_sha256"]
         self.node_model = config.get("node_model_sha256", self.model)
         self.hetero_quant = config.get("hetero_quant", False)
+        self.state_dtype = config.get("state_dtype", "f32")
+        if self.state_dtype not in ("f32", "bf16"):
+            raise ValueError("unsupported state dtype")
         self.layout_fingerprint = config.get("layout_fingerprint")
         if self.hetero_quant:
             if (not isinstance(self.layout_fingerprint, str) or len(self.layout_fingerprint) != 64
@@ -195,6 +198,8 @@ class Proxy:
             raise ValueError("invalid delta header")
         if header.get("version") != 2:
             raise DeltaVersionError()
+        if header.get("state_dtype", "f32") != self.state_dtype:
+            raise ValueError("state dtype mismatch")
         if not self.hetero_quant:
             return delta
         if header.get("model_sha256") != self.node_model:
@@ -235,6 +240,8 @@ class Proxy:
         health = node.request("GET", "/v1/health")
         if health.get("delta_version") != 2:
             raise DeltaVersionError()
+        if self.state_dtype not in health.get("state_dtypes", ["f32"]):
+            raise ValueError("node does not support requested state dtype")
         if self.hetero_quant:
             if health.get("model_sha256") != self.node_model or health.get("layout_fingerprint") != self.layout_fingerprint:
                 raise HTTPError(412)
@@ -584,7 +591,8 @@ class Proxy:
                             child = self.store.select(client["id"], [])
                             self.decode.request("POST", f"/slots/{session['slot']}?action=save",
                                                 {"filename": child["id"] + ".bin"})
-                            child.update(tokens=list(session["tokens"]), journal=copy.deepcopy(journal))
+                            child.update(tokens=list(session["tokens"]), journal=copy.deepcopy(journal),
+                                         state_dtype=session.get("state_dtype", "f32"), state_imports=copy.deepcopy(session.get("state_imports", [])))
                             with self.lock:
                                 next_ticket = self.reserve(child["id"])
                                 try:
@@ -811,7 +819,7 @@ class Proxy:
         mode = client.get("benchmark_mode")
         session["_bench"] = dict(mode=mode, path="local", depth_before=local_n,
             prompt_depth=len(tokens), server_prefill_ms=None, wire_bytes=0,
-            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None)
+            server_shadow_ms=0, transfer_ms=0, import_ms=0, remote_prepare_ms=0, chunks=[], fallback_reason=None, state_dtype=self.state_dtype, lossy_import=False)
         if self.export_block_size > 1:
             session["_bench"]["export_block_size"] = self.export_block_size
         if mode == "offload":
@@ -838,11 +846,12 @@ class Proxy:
                     n0 = n1
                 with self.delta_transfer(session, slot) as transaction:
                     for index, (n0, n1) in enumerate(starts):
-                        chunk = dict(n0=n0, n1=n1, status="requested", wire_bytes=0, import_ms=0)
+                        chunk = dict(n0=n0, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32", status="requested", wire_bytes=0, import_ms=0)
                         session["_bench"]["chunks"].append(chunk)
                         delta = remote.request("POST", path + "/extend", {
                             "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
                             "tokens": target[n0:n1], "return_delta": True, "delta_version": 2,
+                            **({"state_dtype": self.state_dtype} if self.state_dtype != "f32" else {}),
                             "transfer_id": transfer_id, "transfer_n0": local_n, "transfer_n1": export_end,
                             "chunk_index": index, "chunk_count": len(starts)},
                             headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
@@ -865,7 +874,7 @@ class Proxy:
                             transaction["backup"] = filename
                         self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
                                             {"Content-Type": "application/octet-stream",
-                                             "X-Hybrid-Session": session["remote_id"]})
+                                             "X-Hybrid-Session": session["remote_id"], "X-Hybrid-State-Dtype": self.state_dtype})
                         chunk["import_ms"] = (time.monotonic() - import_started) * 1000
                         meter["import_ms"] += chunk["import_ms"]
                         actual = self.decode.request("GET", f"/slots/{slot}/info")
@@ -877,7 +886,10 @@ class Proxy:
                         chunk["status"] = "imported" if index + 1 == len(starts) else "staged"
                         if index + 1 != len(starts):
                             continue
-                        session.update(offload=True, tokens=tokens[:n1], remote_n=n1)
+                        session.update(offload=True, tokens=tokens[:n1], remote_n=n1, state_dtype=self.state_dtype)
+                        meter["lossy_import"] = self.state_dtype != "f32"
+                        entry = dict(n0=local_n, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32")
+                        session.setdefault("state_imports", []).append(entry)
                         session["_remote_applied"] = n1 - local_n
                         LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
                         if "_turn" in session:
@@ -989,7 +1001,7 @@ class Proxy:
                 layout.append(dict(message_index=len(messages), role="assistant", start=turn["generation_start"],
                                    end=dict(n=len(complete), byte_offset=0)))
                 messages = messages + [capture.message]
-            session["journal"] = dict(identity=turn["identity"], template=turn["template"],
+            session["journal"] = dict(state_imports=session.get("state_imports", []), state_dtype=session.get("state_dtype", "f32"), identity=turn["identity"], template=turn["template"],
                 settings_sha256=turn["settings"], messages=messages, message_boundaries=layout,
                 segments=segments, checkpoints=checkpoints, retired_remote_ids=retired,
                 evaluated_boundary=len(evaluated), sampled_boundary=len(complete),

@@ -149,6 +149,57 @@ def write_analysis(root, rows, margin=.02):
     return tables
 
 
+def write_bf16_analysis(root, rows, margin=.02):
+    require(rows, 'empty bf16 data')
+    examples = []
+    seen = set()
+    for row in rows:
+        results = row['results']
+        key = (row['depth'], row['task'], row['index'])
+        require(key not in seen and set(results) == set(ARMS) | {'offload_bf16'}, 'invalid bf16 paired row')
+        seen.add(key)
+        require(len({v['prompt_sha256'] for v in results.values()}) == 1 and
+                all(isinstance(v['answer'], str) and 0 <= v['score'] <= 1 for v in results.values()), 'bf16 paired input/score differs')
+        item = {k: row[k] for k in ('depth', 'task', 'index')}
+        for arm, value in results.items():
+            item[arm+'_answer'], item[arm+'_score'] = value['answer'], value['score']
+        for arm in ('offload', 'offload_bf16', 'local_partition'):
+            item[arm+'_changed'] = results[arm]['answer'].strip() != results['local']['answer'].strip()
+            item[arm+'_score_disagrees_local'] = results[arm]['score'] != results['local']['score']
+        item['bf16_score_disagrees_f32'] = results['offload_bf16']['score'] != results['offload']['score']
+        examples.append(item)
+    tables: list[dict[str, Any]] = []
+    for depth in sorted({r['depth'] for r in rows}):
+        for task in ['ALL'] + sorted({r['task'] for r in rows if r['depth'] == depth}):
+            group = [r for r in examples if r['depth'] == depth and (task == 'ALL' or r['task'] == task)]
+            changes = paired_cells([r['offload_bf16_changed'] for r in group], [r['offload_changed'] for r in group])
+            accuracy = paired_cells([r['offload_bf16_score'] == 1 for r in group], [r['offload_score'] == 1 for r in group])
+            tables.append(dict(depth=depth, task=task, n=len(group),
+                bf16_answer_changes=sum(r['offload_bf16_changed'] for r in group),
+                f32_answer_changes=sum(r['offload_changed'] for r in group),
+                partition_answer_changes=sum(r['local_partition_changed'] for r in group),
+                bf16_local_score_disagreements=sum(r['offload_bf16_score_disagrees_local'] for r in group),
+                bf16_f32_score_disagreements=sum(r['bf16_score_disagrees_f32'] for r in group),
+                answer_change_pairs=dict(**changes, mcnemar_p=mcnemar(changes['left_only'], changes['right_only'])),
+                accuracy_pairs=dict(**accuracy, mcnemar_p=mcnemar(accuracy['left_only'], accuracy['right_only'])),
+                score_means={arm: sum(r[arm+'_score'] for r in group)/len(group) for arm in (*ARMS, 'offload_bf16')}))
+    (root/'analysis.json').write_text(json.dumps(tables, indent=2)+'\n')
+    with (root/'per-example.csv').open('w', newline='') as output:
+        writer = csv.DictWriter(output, fieldnames=list(examples[0]))
+        writer.writeheader(); writer.writerows(examples)
+    (root/'discordant-pairs.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in examples
+        if r['offload_bf16_changed'] != r['offload_changed'] or r['bf16_score_disagrees_f32']))
+    lines = ['# RULER bf16 state arm', '', 'Only offload_bf16 was run. Local, f32 offload and partition rows are frozen baseline observations.',
+        'Answer changes use outer-whitespace equality; score disagreements compare full fractional RULER scores. Accuracy is score == 1.',
+        'McNemar is two-sided exact, unadjusted, bf16 versus f32. Non-significance does not establish equivalence. Apply Holm across four primary depths.', '',
+        '| Depth | Task | n | bf16 changes | f32 changes | bf16/local score disagreements | bf16/f32 score disagreements | Change McNemar p | Accuracy McNemar p |',
+        '|---:|---|---:|---:|---:|---:|---:|---:|---:|']
+    for t in tables:
+        lines.append(f"| {t['depth']} | {t['task']} | {t['n']} | {t['bf16_answer_changes']} | {t['f32_answer_changes']} | {t['bf16_local_score_disagreements']} | {t['bf16_f32_score_disagreements']} | {t['answer_change_pairs']['mcnemar_p']:.6g} | {t['accuracy_pairs']['mcnemar_p']:.6g} |")
+    (root/'analysis.md').write_text('\n'.join(lines)+'\n')
+    return tables
+
+
 def exact_power(n, p_left=.15, p_right=.05, alpha=.05):
     # Condition on total discordants, then average the exact test's rejection probability.
     q = p_left+p_right

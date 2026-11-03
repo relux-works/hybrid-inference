@@ -57,6 +57,11 @@ class Store:
             self.db.execute("ALTER TABLE sessions ADD COLUMN journal TEXT")
         if "benchmark_mode" not in {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}:
             self.db.execute("ALTER TABLE sessions ADD COLUMN benchmark_mode TEXT")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}
+        if "state_dtype" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN state_dtype TEXT NOT NULL DEFAULT 'f32'")
+        if "state_imports" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN state_imports TEXT NOT NULL DEFAULT '[]'")
         row = self.db.execute("SELECT model FROM meta").fetchone()
         if row and row[0] != model:
             self.db.close()
@@ -78,6 +83,7 @@ class Store:
             raise KeyError("session not found")
         row = dict(row)
         row["tokens"] = json.loads(row["tokens"])
+        row["state_imports"] = json.loads(row["state_imports"])
         row["hashes"] = json.loads(row["hashes"])
         row["journal"] = json.loads(row["journal"]) if row["journal"] else None
         return row
@@ -90,10 +96,11 @@ class Store:
         prefix_hash(tokens)
         with self.db:
             self.db.execute("""UPDATE sessions SET tokens=?,hashes=?,remote_id=?,remote_n=?,
-                used=?,offload=?,journal=? WHERE id=?""", (
+                used=?,offload=?,journal=?,state_dtype=?,state_imports=? WHERE id=?""", (
                 json.dumps(tokens), json.dumps(block_hashes(tokens)), session["remote_id"],
                 session["remote_n"], time.time(), int(session["offload"]),
-                json.dumps(session.get("journal")) if session.get("journal") else None, session["id"]))
+                json.dumps(session.get("journal")) if session.get("journal") else None, session.get("state_dtype", "f32"),
+                json.dumps(session.get("state_imports", [])), session["id"]))
 
     @locked
     def benchmark_mode(self, sid, mode):

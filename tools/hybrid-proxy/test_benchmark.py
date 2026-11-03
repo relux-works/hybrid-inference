@@ -41,6 +41,30 @@ class BenchmarkProxyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'delta body/header bound'):
                     Proxy(config, str(Path(directory) / 'over.sqlite'))
 
+    # An envelope must match the configured dtype before import; each dtype has a matching positive control.
+    def test_state_dtype_mismatch_and_controls(self):
+        import json
+        import struct
+        app = self.fixture.app
+        def envelope(dtype):
+            text = json.dumps(dict(version=2, state_dtype=dtype)).encode()
+            return struct.pack('<I', len(text)) + text + bytes(48)
+        for dtype, other in (('f32', 'bf16'), ('bf16', 'f32')):
+            app.state_dtype = dtype
+            self.assertEqual(app.client_delta(envelope(dtype)), envelope(dtype))
+            with self.assertRaisesRegex(ValueError, 'state dtype mismatch'):
+                app.client_delta(envelope(other))
+
+    # State import origin survives the session database and appears in per-chunk trace records.
+    def test_state_dtype_persisted_and_traced(self):
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        sid, _ = fixture.chat([1, 2, 3])
+        session = fixture.app.store.get(sid)
+        self.assertEqual(session['state_dtype'], 'f32')
+        self.assertEqual(session['state_imports'][-1]['state_dtype'], 'f32')
+        self.assertFalse(session['state_imports'][-1]['lossy'])
+
     # Benchmark headers have no authority unless the operator enables them; invalid modes also refuse.
     def test_switch_requires_opt_in(self):
         fixture = self.fixture

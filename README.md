@@ -5,6 +5,8 @@ Prototype builds disable UI assets: configure with `cmake -S . -B build -DLLAMA_
 
 ## Prototype tools
 
+Recurrent state transport supports negotiated f32 (default) or lossy bf16 for Qwen35. [Wire layout and CPU commands](tools/hybrid/STATE-BF16.md), [KL GPU procedure](tools/hybrid-bench/STATE-BF16-RUNBOOK.md), and [single-arm RULER procedure](tools/hybrid-eval/RULER-BF16-RUNBOOK.md) list exact entry points and private artifact locations.
+
 The [vLLM bridge guide](tools/hybrid-vllm/README.md) lists the Python exporter/converter, native CPU reader test, exact entry points and `.temp/` artifact locations. Its [design](tools/hybrid-vllm/DESIGN.md) contains the GPU-host plan; only CPU conversion and synthetic native import are qualified here.
 
 The [vLLM node protocol](tools/hybrid-vllm/NODE-PROTOCOL.md) and [B300 node runbook](tools/hybrid-vllm/GPU-NODE-RUNBOOK.md) cover the HTTP adapter, aligned exports, local decoder tails and supervised deployment. Live CUDA extraction and heterogeneous numerical equivalence remain qualification gates.

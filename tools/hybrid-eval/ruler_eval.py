@@ -19,7 +19,7 @@ import uuid
 from hybrid_eval import (Refusal, digest, http, model_identity, public_trace, read_private, require,
                          sha256, validate_identity, validate_partition)
 from hybrid_bench import mode_session, release_session, stream_chat, verify_meter
-from ruler_analysis import ARMS, write_analysis
+from ruler_analysis import ARMS, write_analysis, write_bf16_analysis
 from ruler_data import SOURCE, verify_data, verify_source
 from ruler_generate import Generator, body_for, configurations, runtime_identity, score
 
@@ -59,6 +59,7 @@ def resume_manifest(root, manifest, allow_cleanup):
     previous = json.loads(path.read_text())
     if previous == manifest:
         return
+    require('declared_arm' not in previous and 'declared_arm' not in manifest, 'paired arm resume identity changed')
     changed = {name for name in previous['source_hashes'].keys() | manifest['source_hashes'].keys()
                if previous['source_hashes'].get(name) != manifest['source_hashes'].get(name)}
     compatible = (dict(previous, source_hashes={}) == dict(manifest, source_hashes={}) and
@@ -77,11 +78,11 @@ def resume_manifest(root, manifest, allow_cleanup):
     atomic_json(path, manifest)
 
 
-def recover_sessions(path, config, pcfg, record):
+def recover_sessions(path, config, pcfg, record, arms=ARMS):
     if not path.exists():
         return
     sessions = json.loads(path.read_text())
-    require(isinstance(sessions, dict) and set(sessions) == set(ARMS), 'invalid recovery arms')
+    require(isinstance(sessions, dict) and set(sessions) == set(arms), 'invalid recovery arms')
     for sid in sessions.values():
         require(isinstance(sid, str) and len(sid) == 38 and sid.startswith('ruler-') and
                 all(c in '0123456789abcdef' for c in sid[6:]), 'invalid recovery session')
@@ -100,13 +101,13 @@ def recover_sessions(path, config, pcfg, record):
 
 
 @contextmanager
-def example_sessions(path, config, pcfg, record):
-    sessions = {arm: 'ruler-'+uuid.uuid4().hex for arm in ARMS}
+def example_sessions(path, config, pcfg, record, arms=ARMS):
+    sessions = {arm: 'ruler-'+uuid.uuid4().hex for arm in arms}
     atomic_json(path, sessions)
     try:
         yield sessions
     finally:
-        recover_sessions(path, config, pcfg, record)
+        recover_sessions(path, config, pcfg, record, arms)
 
 
 def interrupt_run(signum, frame):
@@ -136,9 +137,9 @@ def load_clients(state, partition):
     return config, client, pcfg, pclient, node
 
 
-def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record=None, sessions=None):
+def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record=None, sessions=None, arms=ARMS):
     results = {}
-    order = list(ARMS)
+    order = list(arms)
     random.Random(digest([seed, spec['task'], spec['index'], spec['depth']])).shuffle(order)
     releases = []
     def event(row):
@@ -147,7 +148,7 @@ def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record
             record(row)
     for arm in order:
         cfg, info = (pcfg, pclient) if arm == 'local_partition' else (config, client)
-        mode = 'local' if arm == 'local_partition' else arm
+        mode = 'local' if arm == 'local_partition' else 'offload' if arm == 'offload_bf16' else arm
         health = http(cfg['prefill_url'], '/v1/health', timeout=10)
         require(health['model_sha256'] == node['model_sha256'], 'live node model changed')
         body = dict(body_for(spec['input'], spec['answer_prefix']), temperature=0, seed=seed,
@@ -159,6 +160,11 @@ def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record
             require(returned == sid, 'proxy changed session identity')
             verify_meter(trace, 0, mode)
             require(not trace.get('fallback_reason'), 'RULER fallback invalidates comparison')
+            expected_dtype = 'bf16' if arm == 'offload_bf16' else 'f32'
+            require(cfg.get('state_dtype', 'f32') == expected_dtype, 'RULER arm dtype differs')
+            if mode == 'offload':
+                require(trace.get('state_dtype', 'f32') == expected_dtype and
+                        bool(trace.get('lossy_import')) == (expected_dtype == 'bf16'), 'offload trace dtype differs')
             require(mode != 'offload' or trace['remote_applied'] > 0, 'offload did not import state')
             slot = http(cfg['decode_url'], f"/slots/{trace['slot']}/info", cfg['decode_token'], timeout=timeout)
             tokens = slot['tokens']
@@ -175,13 +181,13 @@ def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record
     return dict(**{k: v for k, v in spec.items() if k != 'input'}, results=results, order=order, releases=releases)
 
 
-def archive_depth(root, manifest, expected):
+def archive_depth(root, manifest, expected, bf16=False):
     paths = sorted((root/'rows').glob('*.json'))
     require(len(paths) == expected, 'incomplete depth cannot be archived as complete')
     rows = [json.loads(p.read_text()) for p in paths]
     require(len({(r['task'], r['index']) for r in rows}) == expected, 'duplicate depth rows')
     (root/'rows.jsonl').write_text(''.join(json.dumps(r, sort_keys=True)+'\n' for r in rows))
-    write_analysis(root, rows, manifest['margin'])
+    (write_bf16_analysis if bf16 else write_analysis)(root, rows, manifest['margin'])
     files = {name: (root/name).read_bytes() for name in
              ('rows.jsonl', 'analysis.json', 'analysis.md', 'per-example.csv', 'discordant-pairs.jsonl', 'manifest.json')}
     for name in ('manifest-before-slot-cleanup.json', 'slot-cleanup-migration.json'):
@@ -202,6 +208,118 @@ def archive_depth(root, manifest, expected):
     return target
 
 
+def pairing_manifest(manifest, label):
+    # Only treatment implementation identities move into the declared arm. All other fields compare verbatim.
+    value = json.loads(json.dumps(manifest))
+    implementation = dict(source_hashes=value.pop('source_hashes'), services={})
+    for name, service in value['clients'].items():
+        implementation['services'][name] = {key: service.pop(key) for key in ('commit', 'binaries') if key in service}
+    value['declared_arm'] = dict(label=label, state_dtype='bf16' if label == 'offload_bf16' else 'f32',
+                                 implementation=implementation)
+    return value
+
+
+def require_paired_manifest(previous, current):
+    require('declared_arm' in previous and 'declared_arm' in current, 'missing declared arm')
+    require(digest({k: v for k, v in previous.items() if k != 'declared_arm'}) ==
+            digest({k: v for k, v in current.items() if k != 'declared_arm'}),
+            'paired depth manifest differs outside declared arm')
+
+
+def paired_inputs(depth, expected_manifest):
+    manifest = json.loads((depth/'manifest.json').read_text())
+    require_paired_manifest(pairing_manifest(manifest, 'offload'), expected_manifest)
+    archived = None
+    if (depth/'complete.json').exists():
+        seal = json.loads((depth/'complete.json').read_text())
+        require(seal['manifest_sha256'] == sha256(depth/'manifest.json') and
+                seal['archive_sha256'] == sha256(depth/'complete.tar.gz'), 'baseline depth seal changed')
+        with tarfile.open(depth/'complete.tar.gz') as archive:
+            member = archive.getmember('rows.jsonl')
+            require(member.isfile() and member.size <= 256*1024**2, 'invalid sealed baseline rows')
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise Refusal('missing sealed baseline rows')
+            sealed_rows = [json.loads(line) for line in stream]
+        archived = {(r['task'], r['index']): r for r in sealed_rows}
+        require(len(archived) == len(sealed_rows) == seal['n'], 'duplicate or incomplete sealed baseline rows')
+    inputs = []
+    expected = {(task, index) for task in manifest['tasks'] for index in range(manifest['samples_per_task'])}
+    for path in sorted((depth/'rows').glob('*.json')):
+        row = json.loads(path.read_text())
+        if archived is not None:
+            require(digest(row) == digest(archived.get((row['task'], row['index']))), 'baseline row differs from sealed archive')
+        checksum = row.pop('row_sha256')
+        spec_path = depth/'specs'/path.name
+        spec = json.loads(spec_path.read_text())
+        spec_checksum = spec.pop('spec_sha256')
+        require(checksum == digest(row) and spec_checksum == digest(spec) == row['spec_sha256'], 'baseline row/spec hash differs')
+        require(set(row['results']) == set(ARMS) and row['depth'] == manifest['depth'] == spec['depth'] and
+                (row['task'], row['index']) == (spec['task'], spec['index']) and
+                (row['task'], row['index']) in expected, 'baseline row outside manifest')
+        require(path.name == row['task']+f"-{row['index']:04d}.json", 'baseline row name differs')
+        require(spec['input_sha256'] == digest([spec['input'], spec['answer_prefix']]) and
+                all(r['prompt_sha256'] == spec['prompt_sha256'] for r in row['results'].values()), 'baseline paired input differs')
+        inputs.append((path.name, spec, row, checksum))
+    require(inputs and (archived is None or len(inputs) == len(archived)), 'baseline committed row set differs or is empty')
+    require(len({(r['task'], r['index']) for _, _, r, _ in inputs}) == len(inputs), 'duplicate baseline row')
+    return inputs
+
+
+def run_single_arm(args, manifest, config, client, pcfg, pclient, node):
+    require(config.get('state_dtype') == 'bf16' and pcfg.get('state_dtype', 'f32') == 'f32', 'single arm requires bf16 proxy and f32 partition')
+    current = pairing_manifest(manifest, 'offload_bf16')
+    baseline = args.paired_depth.resolve()
+    candidate = (args.output/f'depth-{args.depth}').resolve()
+    require(candidate != baseline and baseline not in candidate.parents and candidate not in baseline.parents, 'paired output overlaps baseline')
+    # Hold the baseline lock while freezing committed row identities, never while running inference.
+    with (baseline/'.lock').open('r') as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        inputs = paired_inputs(baseline, current)
+        baseline_manifest = pairing_manifest(json.loads((baseline/'manifest.json').read_text()), 'offload')
+        current['declared_arm']['baseline'] = dict(implementation=baseline_manifest['declared_arm']['implementation'],
+            manifest_sha256=sha256(baseline/'manifest.json'),
+            rows={name: checksum for name, _, _, checksum in inputs})
+    root = args.output/f'depth-{args.depth}'
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (root/'.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        resume_manifest(root, current, False)
+        for name in ('rows', 'specs'):
+            (root/name).mkdir(exist_ok=True, mode=0o700)
+        def record(event):
+            with (root/'events.jsonl').open('a') as output:
+                output.write(json.dumps(event, sort_keys=True)+'\n')
+        pending = root/'pending-sessions.json'
+        recover_sessions(pending, config, pcfg, record, ('offload_bf16',))
+        for name, spec, previous, checksum in inputs:
+            target = root/'rows'/name
+            if target.exists():
+                saved = json.loads(target.read_text())
+                own_checksum = saved.pop('row_sha256')
+                require(own_checksum == digest(saved) and saved['baseline_row_sha256'] == checksum and
+                        saved['spec_sha256'] == digest(spec) and set(saved['results']) == set(ARMS) | {'offload_bf16'} and
+                        all(saved['results'][arm] == previous['results'][arm] for arm in ARMS), 'saved paired arm changed')
+                continue
+            check_slot_space((config,), args.saved_session_bytes, args.slot_margin_bytes)
+            atomic_json(root/'specs'/name, dict(spec, spec_sha256=digest(spec)))
+            with example_sessions(pending, config, pcfg, record, ('offload_bf16',)) as sessions:
+                new = run_example(spec, config, client, pcfg, pclient, node, args.seed, args.request_timeout,
+                                  record, sessions, ('offload_bf16',))
+                result = dict(previous, results=dict(previous['results'], **new['results']),
+                              order=new['order'], releases=new['releases'], baseline_row_sha256=checksum)
+                atomic_json(target, dict(result, row_sha256=digest(result)))
+            print(f"{args.depth} {spec['task']} {spec['index']} offload_bf16", flush=True)
+        if (root/'complete.json').exists():
+            completed = json.loads((root/'complete.json').read_text())
+            require(completed['n'] == len(inputs) and completed['manifest_sha256'] == sha256(root/'manifest.json') and
+                    completed['archive_sha256'] == sha256(root/'complete.tar.gz'), 'completed bf16 archive changed')
+            print(root/'complete.tar.gz')
+        else:
+            print(archive_depth(root, current, len(inputs), bf16=True))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--client-state', type=Path, required=True)
@@ -217,6 +335,8 @@ def main():
     parser.add_argument('--request-timeout', type=int, default=7200)
     parser.add_argument('--saved-session-bytes', type=int, required=True, help='upper bound at this depth, including output tokens and native overhead')
     parser.add_argument('--slot-margin-bytes', type=int, default=1024**3)
+    parser.add_argument('--arm', choices=['all', 'offload_bf16'], default='all')
+    parser.add_argument('--paired-depth', type=Path, help='read-only existing depth with committed f32 rows')
     parser.add_argument('--resume-slot-cleanup', action='store_true', help='audit migration from accepted b63d9019 without rerunning committed rows')
     args = parser.parse_args()
     require(512 <= args.depth <= 1048576 and 1 <= args.samples_per_task <= 1000, 'invalid run size')
@@ -245,6 +365,10 @@ def main():
                     clients={name: {k: info[k] for k in keys if k in info} for name, info in
                              (('client', client), ('partition', pclient), ('node', node))},
                     data_provenance={'inputs.lock.json': lock, 'downloads.json': json.loads((args.data/'downloads.json').read_text())})
+    require((args.arm == 'offload_bf16') == (args.paired_depth is not None), 'single arm requires --paired-depth')
+    if args.arm == 'offload_bf16':
+        return run_single_arm(args, manifest, config, client, pcfg, pclient, node)
+    require(config.get('state_dtype', 'f32') == pcfg.get('state_dtype', 'f32') == 'f32', 'three-arm run requires f32 state')
     root = args.output/f'depth-{args.depth}'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     run_lock = (root/'.lock').open('a')

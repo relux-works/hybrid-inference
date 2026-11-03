@@ -24,6 +24,17 @@ from hybrid_bench import classify_equivalence, PROVENANCE, bundle, quantile_samp
 from policy import extend_chunk_limit
 
 
+class Bf16GateTests(unittest.TestCase):
+    # Numerical identity does not override a lossy import origin; f32 keeps its exact positive control.
+    def test_bf16_import_never_passes_exact_gate(self):
+        from hybrid_bench import classify_equivalence
+        row = dict(backend='cpu', same_partition_within_floor=True, same_partition_agreed=64, k=64,
+                   numerical_within_bounds=True)
+        self.assertEqual(classify_equivalence(row, False), ('passed', 0))
+        self.assertEqual(classify_equivalence(dict(row, state_dtype='bf16'), False), ('lossy', 5))
+        self.assertEqual(classify_equivalence(dict(row, lossy_import=True), False), ('lossy', 5))
+
+
 class BenchmarkTests(unittest.TestCase):
     # Client partitions are bounded before preflight or state writes; the native node's fixed partition cannot be mislabeled.
     def test_client_partition_bounds(self):

@@ -3,6 +3,7 @@
 #include "llama-model.h"
 
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -300,6 +301,122 @@ static void chunk_tests(llama_model * model, const std::string & hash, bool fres
     std::cout << "PASS chunk_owned_wire_lifetime after request destruction and reuse\n";
 }
 
+static void bf16_tests(llama_model * model, const std::string & hash) {
+    // A real Qwen35 range preserves KV and f32 wire; bf16 round trips before native validation and import.
+    auto source = hybrid::make_context(model, 512);
+    auto dest = hybrid::make_context(model, 512);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const std::vector<llama_token> tokens(16, 100);
+    hybrid::prefill(source.get(), tokens, 0);
+    const auto raw = hybrid::export_range(source.get(), 0, tokens.size());
+    hybrid::json h = {{"model_sha256", hash}, {"session_id", "bf16-test"}, {"n0", 0}, {"n1", tokens.size()},
+        {"tokens", tokens}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
+    const auto f32_wire = hybrid::encode_delta(h, raw);
+    const auto parsed = hybrid::read_delta(f32_wire, hash, 0);
+    require(parsed.state == raw, "f32 body changed");
+    // Re-encoding the accepted legacy envelope is byte-identical, including checksum bytes and field order.
+    require(hybrid::encode_delta(parsed.header, raw) == f32_wire, "f32 default wire changed");
+    hybrid::delta_import pending;
+    require(pending.stage(dest.get(), 0, f32_wire, hash, "bf16-test", {}, 512, vocab), "f32 stage failed");
+    pending.apply(dest.get(), 0); pending.clear();
+    require(hybrid::save_state(dest.get()) == hybrid::save_state(source.get()), "f32 import not bit-exact");
+    std::cout << "PASS test_f32_default_wire_and_bit_exact_import\n";
+    hybrid::load_state(dest.get(), "");
+    const auto before = hybrid::save_state(dest.get());
+    h["state_dtype"] = "bf16";
+    const auto wire = hybrid::encode_delta(h, raw);
+    const auto expanded = hybrid::read_delta(wire, hash, 0);
+    const auto compressed = hybrid::read_delta_view(wire, hash, 0);
+    require(expanded.state.size() == raw.size() && expanded.state != raw, "real bf16 state did not round");
+    const auto state_bytes = 18ull * 4 * (128 * 2048 + 3 * (2048 + 2 * 16 * 128));
+    require(state_bytes == 20201472 && raw.size() - compressed.state.size() == state_bytes / 2, "state payload did not halve");
+    require(wire.size() == 4 + compressed.header.dump().size() + raw.size() - state_bytes / 2 + 48, "wire formula differs");
+    auto reject = [&](const char * name, const std::string & candidate, const std::string & dtype, const std::string & reason) {
+        bool refused = false;
+        try { pending.stage(dest.get(), 0, candidate, hash, "bf16-test", {}, 512, vocab, dtype); }
+        catch (const std::exception & e) { refused = std::string(e.what()).find(reason) != std::string::npos; }
+        require(refused && hybrid::save_state(dest.get()) == before, name);
+        std::cout << "PASS " << name << '\n';
+    };
+    reject("test_bf16_dtype_mismatch_preserves_slot", wire, "f32", "state dtype mismatch");
+    reject("test_f32_dtype_mismatch_preserves_slot", f32_wire, "bf16", "state dtype mismatch");
+    // Correct checksums bind malformed bf16 bodies, so these negatives reach the tensor-length guard.
+    for (size_t removed : {size_t(1), size_t(2)}) {
+        const std::string bad_body(compressed.state.substr(0, compressed.state.size() - removed));
+        auto forged = h; forged["state_dtype"] = "f32";
+        const auto envelope = hybrid::encode_delta(forged, bad_body);
+        auto bad_header = hybrid::read_delta_view(envelope, hash, 0).header;
+        bad_header["state_dtype"] = "bf16";
+        reject(removed == 1 ? "test_odd_bf16_preserves_slot" : "test_truncated_bf16_preserves_slot",
+               replace_header(envelope, bad_header), "bf16", "truncated or odd-length bf16 state");
+    }
+    require(pending.stage(dest.get(), 0, wire, hash, "bf16-test", {}, 512, vocab, "bf16"), "bf16 positive stage failed");
+    require(hybrid::save_state(dest.get()) == before, "bf16 stage mutated slot");
+    pending.apply(dest.get(), 0); pending.clear();
+    require(hybrid::save_state(dest.get()) != before, "bf16 positive import failed");
+    require(hybrid::export_range(dest.get(), 0, tokens.size()) == expanded.state, "bf16 native import differs from expanded f32");
+    std::cout << "PASS test_bf16_positive_import_and_wire_bytes state_f32=" << state_bytes << " state_bf16=" << state_bytes / 2
+              << " wire_f32=" << f32_wire.size() << " wire_bf16=" << wire.size() << '\n';
+    // A non-final chunk contains no recurrent tensor; negotiation changes only its envelope.
+    const auto kv = hybrid::export_range(source.get(), 0, tokens.size(), false);
+    require(raw.substr(0, kv.size()) == expanded.state.substr(0, kv.size()), "bf16 changed attention KV");
+    double maximum = 0;
+    size_t at = kv.size() + 20;
+    for (int row_index = 0; row_index < 36; ++row_index) {
+        require(at + 12 <= raw.size(), "short real recurrent metadata");
+        uint64_t row; std::memcpy(&row, raw.data() + at + 4, 8); at += 12;
+        require(row <= raw.size() - at, "short real recurrent row");
+        for (size_t i = 0; i < row; i += 4) {
+            float original, rounded;
+            std::memcpy(&original, raw.data() + at + i, 4);
+            std::memcpy(&rounded, expanded.state.data() + at + i, 4);
+            if (std::isnormal(original)) {
+                const double error = std::abs((double(rounded) - original) / original);
+                require(error <= std::ldexp(1., -8), "real bf16 relative error exceeds 2^-8");
+                maximum = std::max(maximum, error);
+            }
+        }
+        at += row;
+    }
+    require(at == raw.size(), "real recurrent layout not fully checked");
+    std::cout << "PASS test_real_bf16_roundtrip_bound_and_kv_unchanged max_relative_error=" << maximum << '\n';
+    require(hybrid::transcode_recurrent(kv, true, false) == kv && hybrid::transcode_recurrent(kv, false, false) == kv,
+            "non-final KV changed");
+    std::cout << "PASS test_bf16_nonfinal_kv_unchanged\n";
+    // Staging a KV-only bf16 chunk is inert; a mismatched final chunk clears staging and a valid retry applies both chunks.
+    auto chunked = hybrid::make_context(model, 512);
+    hybrid::load_state(dest.get(), "");
+    const auto empty = hybrid::save_state(dest.get());
+    hybrid::prefill(chunked.get(), {tokens.begin(), tokens.begin() + 8}, 0);
+    auto first = h;
+    first["n1"] = 8; first["tokens"] = std::vector<llama_token>(tokens.begin(), tokens.begin() + 8);
+    first["prefix_hash_n1"] = hybrid::prefix_hash(first["tokens"].get<std::vector<llama_token>>());
+    first["transfer_id"] = "bf16-chunks"; first["transfer_n0"] = 0; first["transfer_n1"] = 16;
+    first["chunk_index"] = 0; first["chunk_count"] = 2; first["fixed_state"] = false;
+    const auto first_wire = hybrid::encode_delta(first, hybrid::export_range(chunked.get(), 0, 8, false));
+    hybrid::prefill(chunked.get(), {tokens.begin() + 8, tokens.end()}, 8);
+    auto last = first;
+    last["n0"] = 8; last["n1"] = 16; last["chunk_index"] = 1; last["fixed_state"] = true;
+    last["tokens"] = std::vector<llama_token>(tokens.begin() + 8, tokens.end());
+    last["prefix_hash_n1"] = hybrid::prefix_hash(tokens);
+    const auto last_raw = hybrid::export_range(chunked.get(), 8, 16);
+    const auto last_wire = hybrid::encode_delta(last, last_raw);
+    require(!pending.stage(dest.get(), 0, first_wire, hash, "bf16-test", {}, 512, vocab, "bf16"), "early fixed state");
+    require(hybrid::save_state(dest.get()) == empty, "bf16 nonfinal stage mutated slot");
+    auto mismatch = last; mismatch["state_dtype"] = "f32";
+    bool rejected = false;
+    try { pending.stage(dest.get(), 0, hybrid::encode_delta(mismatch, last_raw), hash, "bf16-test", {}, 512, vocab, "bf16"); }
+    catch (const std::exception & e) { rejected = std::string(e.what()) == "state dtype mismatch"; }
+    require(rejected && hybrid::save_state(dest.get()) == empty, "mixed dtype changed slot");
+    require(!pending.stage(dest.get(), 0, first_wire, hash, "bf16-test", {}, 512, vocab, "bf16"), "bf16 retry stage failed");
+    require(pending.stage(dest.get(), 0, last_wire, hash, "bf16-test", {}, 512, vocab, "bf16"), "bf16 final stage failed");
+    pending.apply(dest.get(), 0); pending.clear();
+    require(hybrid::export_range(dest.get(), 0, 16) == hybrid::transcode_recurrent(
+        hybrid::transcode_recurrent(hybrid::export_range(chunked.get(), 0, 16), true, true), false, true), "bf16 chunk import differs");
+    std::cout << "PASS test_bf16_chunks_mixed_dtype_refusal_and_retry\n";
+
+}
+
 int main(int argc, char ** argv) {
     try {
         if (argc < 3) {
@@ -312,6 +429,7 @@ int main(int argc, char ** argv) {
         hybrid::model_ptr model(llama_model_load_from_file(argv[1], params));
         require(bool(model), "cannot load model");
         const auto hash = hybrid::file_hash(argv[1]);
+        if (argc == 3 && std::string(argv[2]) == "--bf16") { bf16_tests(model.get(), hash); return 0; }
         if (argc == 3 && std::string(argv[2]) == "--chunks") { chunk_tests(model.get(), hash, true); chunk_tests(model.get(), hash, false); return 0; }
         for (int i = 2; i < argc; ++i) { run(model.get(), hash, argv[i]); }
         return 0;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """CPU-only contract tests with local corpus fixtures; no downloads."""
+import copy
 import hashlib
 import io
 import json
@@ -14,10 +15,11 @@ import zipfile
 from unittest.mock import patch
 
 from hybrid_eval import Refusal, digest, http
-from ruler_analysis import analyze, excess_interval, mcnemar, wilson, write_analysis
+from ruler_analysis import write_bf16_analysis, analyze, excess_interval, mcnemar, wilson, write_analysis
 from ruler_data import DATA_FILES, PUNKT_FILES, SOURCE, VENDOR, bootstrap, verify_data, verify_source
 from ruler_eval import (SLOT_CLEANUP_PREDECESSOR, archive_depth, atomic_json, check_slot_space,
-                        example_sessions, main as evaluate_main, recover_sessions, resume_manifest, run_example)
+                        example_sessions, main as evaluate_main, recover_sessions, resume_manifest, run_example,
+                        pairing_manifest, require_paired_manifest, paired_inputs, run_single_arm)
 from ruler_generate import Generator, body_for, configurations, score
 
 
@@ -46,6 +48,118 @@ def table_row(index, offload=False, partition=False) -> dict:
     return dict(depth=8192, task='niah_single_1', index=index, results={arm: dict(answer=answer, score=float(answer == 'a'),
                 prompt_sha256='same') for arm, answer in [('local', 'a'), ('offload', 'b' if offload else 'a'),
                                                          ('local_partition', 'b' if partition else 'a')]})
+
+
+class Bf16RulerTests(unittest.TestCase):
+    def manifest(self):
+        return dict(depth=8192, samples_per_task=1, tasks=['niah_single_1'], seed=17, margin=.02,
+                    generator='pinned', source_hashes={'eval.py': 'old'}, packages={'numpy': 'fixed'},
+                    data_provenance={'inputs.lock.json': {'data': 'frozen'}},
+                    clients={name: dict(model_sha256='model', backend='cuda', context=16384, batch=64,
+                                       ubatch=64, threads=2, commit='old', binaries={'server': 'old'})
+                             for name in ('client', 'partition', 'node')})
+
+    # Every common manifest field is exact; only the declared treatment carries changed executable identities.
+    def test_manifest_every_nondeclared_field_refuses(self):
+        baseline = self.manifest()
+        current = copy.deepcopy(baseline)
+        current['source_hashes']['eval.py'] = 'bf16'
+        current['clients']['client']['binaries']['server'] = 'bf16'
+        before = pairing_manifest(baseline, 'offload')
+        after = pairing_manifest(current, 'offload_bf16')
+        require_paired_manifest(before, after)
+        for key in after:
+            if key == 'declared_arm': continue
+            bad = copy.deepcopy(after)
+            bad[key] = 'changed'
+            with self.subTest(key=key), self.assertRaisesRegex(Refusal, 'outside declared arm'):
+                require_paired_manifest(before, bad)
+        for role in after['clients']:
+            for key in after['clients'][role]:
+                bad = copy.deepcopy(after)
+                bad['clients'][role][key] = 'changed'
+                with self.subTest(role=role, key=key), self.assertRaises(Refusal):
+                    require_paired_manifest(before, bad)
+        bad = copy.deepcopy(after)
+        bad['samples_per_task'] = True
+        with self.assertRaisesRegex(Refusal, 'outside declared arm'):
+            require_paired_manifest(before, bad)
+        self.assertEqual(baseline['clients']['client']['commit'], 'old')
+
+    def baseline(self, folder):
+        folder.mkdir()
+        (folder/'.lock').touch()
+        for name in ('specs', 'rows'): (folder/name).mkdir()
+        manifest = self.manifest()
+        atomic_json(folder/'manifest.json', manifest)
+        spec = dict(depth=8192, task='niah_single_1', index=0, input='text', answer_prefix='prefix',
+                    answers=['a'], max_tokens=8, prompt_sha256='same', input_sha256=digest(['text', 'prefix']))
+        row = dict(table_row(0), spec_sha256=digest(spec))
+        name = 'niah_single_1-0000.json'
+        atomic_json(folder/'specs'/name, dict(spec, spec_sha256=digest(spec)))
+        atomic_json(folder/'rows'/name, dict(row, row_sha256=digest(row)))
+        return manifest, spec, row, name
+
+    # A committed row/spec pair is reused once; broken content or hashes fail before inference and preserve baseline files.
+    def test_single_arm_reuses_committed_rows_and_refuses_corruption(self):
+        from ruler_eval import sha256
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest, spec, previous, name = self.baseline(root/'old')
+            args = SimpleNamespace(paired_depth=root/'old', output=root/'new', depth=8192, seed=17,
+                                   saved_session_bytes=1, slot_margin_bytes=0, request_timeout=10)
+            config, pcfg = {'state_dtype': 'bf16'}, {'state_dtype': 'f32'}
+            before = {str(p): sha256(p) for p in (root/'old').rglob('*') if p.is_file()}
+            new = dict(results={'offload_bf16': dict(answer='b', score=0., prompt_sha256='same')},
+                       order=['offload_bf16'], releases=[])
+            with patch('ruler_eval.run_example', return_value=new) as run, \
+                 patch('ruler_eval.check_slot_space'), patch('ruler_eval.recover_sessions'):
+                self.assertEqual(run_single_arm(args, manifest, config, {}, pcfg, {}, {}), 0)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_args.args[-1], ('offload_bf16',))
+                sealed = (root/'new/depth-8192/complete.tar.gz').read_bytes()
+                self.assertEqual(run_single_arm(args, manifest, config, {}, pcfg, {}, {}), 0)
+                self.assertEqual(run.call_count, 1, 'resume reran committed arm')
+                self.assertEqual((root/'new/depth-8192/complete.tar.gz').read_bytes(), sealed)
+            self.assertEqual(before, {str(p): sha256(p) for p in (root/'old').rglob('*') if p.is_file()})
+            saved = json.loads((root/'new/depth-8192/rows'/name).read_text())
+            for arm in ('local', 'offload', 'local_partition'):
+                self.assertEqual(saved['results'][arm], previous['results'][arm])
+            path = root/'old/rows'/name
+            path.write_text(path.read_text().replace('same', 'changed'))
+            with patch('ruler_eval.run_example') as run, self.assertRaisesRegex(Refusal, 'hash differs'):
+                run_single_arm(args, manifest, config, {}, pcfg, {}, {})
+            run.assert_not_called()
+
+    # A self-rehashed disk row cannot replace an already sealed baseline observation.
+    def test_sealed_baseline_rehashed_row_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)/'old'
+            manifest, spec, row, name = self.baseline(root)
+            archive_depth(root, manifest, 1)
+            expected = pairing_manifest(manifest, 'offload_bf16')
+            self.assertEqual(len(paired_inputs(root, expected)), 1)
+            row['results']['offload']['answer'] = 'changed'
+            atomic_json(root/'rows'/name, dict(row, row_sha256=digest(row)))
+            with self.assertRaisesRegex(Refusal, 'differs from sealed archive'):
+                paired_inputs(root, expected)
+
+    # Fractional scores and exact text changes are distinct, and the paired McNemar direction is bf16 versus f32.
+    def test_bf16_analysis_disagreements_and_missing_arm_negative(self):
+        rows = [table_row(i, offload=i == 1) for i in range(3)]
+        for row in rows:
+            row['results']['offload_bf16'] = dict(answer='b', score=.5, prompt_sha256='same')
+        with tempfile.TemporaryDirectory() as tmp:
+            tables = write_bf16_analysis(Path(tmp), rows)
+            all_rows = tables[0]
+            self.assertEqual(all_rows['bf16_answer_changes'], 3)
+            self.assertEqual(all_rows['bf16_f32_score_disagreements'], 3)
+            self.assertEqual(all_rows['answer_change_pairs']['left_only'], 2)
+            self.assertEqual(all_rows['answer_change_pairs']['mcnemar_p'], .5)
+            bad = copy.deepcopy(rows)
+            del bad[0]['results']['offload_bf16']
+            with self.assertRaisesRegex(Refusal, 'invalid bf16 paired row'):
+                write_bf16_analysis(Path(tmp), bad)
 
 
 class RulerTests(unittest.TestCase):

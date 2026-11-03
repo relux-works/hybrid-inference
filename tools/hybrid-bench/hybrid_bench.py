@@ -219,7 +219,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
-                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2,
+                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2, state_dtype=config.get('state_dtype', 'f32'),
                              transfer_id=transfer_id, transfer_n0=transfer_n0, transfer_n1=endpoint,
                              chunk_index=index, chunk_count=chunk_count),
                         timeout=args.request_timeout or 120, binary=True)
@@ -251,7 +251,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
-                                     deltas=paths, max_ctx=client['context'],
+                                     deltas=paths, max_ctx=client['context'], state_dtype=config.get('state_dtype', 'f32'),
                                      local_tail_start=n0,
                                      noise_chunks=args.noise_chunks, backend=client['backend'], uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
@@ -345,6 +345,8 @@ def validate_checker_result(result):
 
 def classify_equivalence(result, cross_backend, backend='cpu'):
     require(result['backend'] == backend, 'checker backend label/device mismatch')
+    if result.get('state_dtype', 'f32') != 'f32' or result.get('lossy_import'):
+        return ('lossy', 5)
     if cross_backend:
         return ('uncalibrated', 5)
     return ('passed', 0) if result['same_partition_within_floor'] and result['same_partition_agreed'] == result['k'] and (backend != 'cpu' or result['numerical_within_bounds']) else ('failed', 3)
@@ -626,7 +628,7 @@ def main():
         aborted += len(release_errors)
         if not interrupted:
             code = 2
-    rows.append(dict(stage='summary', status='interrupted' if interrupted else 'aborted' if aborted else 'failed' if code == 3 else 'uncalibrated' if code == 5 else 'partial' if code else 'passed',
+    rows.append(dict(stage='summary', status='interrupted' if interrupted else 'aborted' if aborted else 'failed' if code == 3 else 'lossy' if code == 5 and config.get('state_dtype', 'f32') != 'f32' else 'uncalibrated' if code == 5 else 'partial' if code else 'passed',
                      skipped=skipped, aborted=aborted, checks=checks, exit_code=code,
                      release_failed=bool(release_errors),
                      checker_exit_codes=[r['checker_exit_code'] for r in rows if r.get('stage') == 'checker']))

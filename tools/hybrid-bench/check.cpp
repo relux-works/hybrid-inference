@@ -129,6 +129,7 @@ static hybrid::json append_replay_controls(const hybrid::json & result) {
         controls[pair.first + "-" + pair.second] = equal;
     }
     controls["A-L"] = exact(result.at("factorial").at("A-L"));
+    if (result.value("state_dtype", std::string("f32")) != "f32") { controls["state_transport_exact"] = false; }
     return controls;
 }
 
@@ -264,7 +265,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     const int threads = fixture.value("threads", 2);
     require(threads >= 1 && threads <= 8, "invalid checkpoint threads");
     std::map<std::string, checkpoint_observation> observations;
-    hybrid::json result = {{"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
+    hybrid::json result = {{"state_dtype", fixture.value("state_dtype", std::string("f32"))}, {"stage", "checkpoint"}, {"depth", tokens.size()}, {"k", k},
         {"raw_logits", {{"dtype", "float32-le"}, {"vocab", vocab}, {"files", hybrid::json::object()}}}};
     auto record = [&](const std::string & name, checkpoint_observation observation) {
         const uint32_t endian = 1;
@@ -359,13 +360,13 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
                     const std::string path = step.at("delta");
                     require(hybrid::file_hash(path.c_str()) == step.at("sha256"), "state probe delta checksum mismatch");
                     auto wire = read_file(path.c_str());
-                    const auto delta = hybrid::read_delta_view(wire, fixture.at("model_sha256"), n);
+                    const auto delta = hybrid::read_delta(wire, fixture.at("model_sha256"), n);
                     const size_t end = delta.header.at("n1");
                     require(end <= tokens.size() && delta.header.at("tokens").get<std::vector<llama_token>>() ==
                             std::vector<llama_token>(tokens.begin() + n, tokens.begin() + end), "state probe delta journal mismatch");
                     if (!pending_delta) { committed.assign(tokens.begin(), tokens.begin() + n); }
                     const bool final = pending.stage(ctx.get(), 0, std::move(wire), fixture.at("model_sha256"),
-                        delta.header.at("session_id"), committed, max_ctx, llama_vocab_n_tokens(llama_model_get_vocab(model)));
+                        delta.header.at("session_id"), committed, max_ctx, llama_vocab_n_tokens(llama_model_get_vocab(model)), fixture.value("state_dtype", std::string("f32")));
                     if (final) {
                         pending.apply(ctx.get(), 0);
                         pending.clear();
@@ -461,9 +462,14 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             result["status_rule"] = "session_append_replay_exact";
             result["kl_limit"] = nullptr;
         }
+        const bool lossy = fixture.value("state_dtype", std::string("f32")) != "f32";
+        result["state_dtype"] = fixture.value("state_dtype", std::string("f32"));
+        result["lossy_import"] = lossy;
+        result["logits_exact"] = result.at("exact");
+        if (lossy) { result["exact"] = false; }
         const bool heterogeneous = fixture.value("heterogeneous", false);
-        result["status"] = heterogeneous ? "heterogeneous" : accepted ? "passed" : "failed";
-        result["exit_code"] = heterogeneous ? 5 : accepted ? 0 : 3;
+        result["status"] = lossy ? "lossy" : heterogeneous ? "heterogeneous" : accepted ? "passed" : "failed";
+        result["exit_code"] = lossy || heterogeneous ? 5 : accepted ? 0 : 3;
     }
     std::ofstream target(output);
     target << result.dump(2) << '\n';
@@ -554,7 +560,7 @@ int main(int argc, char ** argv) {
             require(delta.header.at("tokens").get<std::vector<llama_token>>() ==
                     std::vector<llama_token>(tokens.begin() + n, tokens.begin() + n1), "check delta tokens mismatch");
             require(delta.header.at("prefix_hash_n1") == hybrid::prefix_hash({tokens.begin(), tokens.begin() + n1}), "check prefix mismatch");
-            const bool final = pending.stage(imported.get(), 0, wire, model_hash, delta.header.at("session_id").get<std::string>(), committed, ctx, vocab);
+            const bool final = pending.stage(imported.get(), 0, wire, model_hash, delta.header.at("session_id").get<std::string>(), committed, ctx, vocab, fixture.value("state_dtype", std::string("f32")));
             if (final) {
                 pending.apply(imported.get(), 0);
                 committed = pending.imported_tokens();
@@ -690,10 +696,15 @@ int main(int argc, char ** argv) {
         result["noise_free_running_first_divergence"] = noise_divergence;
         result["kl_to_noise_ratio"] = noise_max > 0 ? hybrid::json(kl / noise_max) : hybrid::json(nullptr);
         result["kl_to_noise_ratio_status"] = noise_max > 0 ? "finite" : kl == 0 ? "both_zero" : "zero_noise_floor";
-        const bool uncalibrated = fixture.value("uncalibrated", false);
+        const bool lossy = fixture.value("state_dtype", std::string("f32")) != "f32";
+        result["state_dtype"] = fixture.value("state_dtype", std::string("f32"));
+        result["lossy_import"] = lossy;
+        result["same_partition_logits_exact"] = result.at("same_partition_exact");
+        if (lossy) { result["same_partition_exact"] = false; result["same_partition_within_floor"] = false; }
+        const bool uncalibrated = fixture.value("uncalibrated", false) || lossy;
         const bool passed = same == k && within_floor && (gpu || result["numerical_within_bounds"].get<bool>());
-        result["status_rule"] = uncalibrated ? "uncalibrated_client_noise" : repeat_exact ? "same_backend_same_partition_exact" : "same_backend_same_partition_measured_floor";
-        result["status"] = uncalibrated ? "uncalibrated" : passed ? "passed" : "failed";
+        result["status_rule"] = lossy ? "lossy_state_import" : uncalibrated ? "uncalibrated_client_noise" : repeat_exact ? "same_backend_same_partition_exact" : "same_backend_same_partition_measured_floor";
+        result["status"] = lossy ? "lossy" : uncalibrated ? "uncalibrated" : passed ? "passed" : "failed";
         result["exit_code"] = uncalibrated ? 5 : passed ? 0 : 3;
         std::ofstream target(argv[4]);
         target << result.dump(2) << '\n';

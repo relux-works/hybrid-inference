@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'tools/hybrid'), str(ROOT / 'tools/hybrid-proxy')]
 from bench_common import context_plan, host_info, model_identity, private_json, sha256
 from native_fixture import native_server
-from proxy import Handler, Node, Proxy
+from proxy import Handler, Node, Proxy, HTTPError
 from policy import extend_chunk_limit
 from store import prefix_hash
 from stub_server import xxh128
@@ -26,10 +26,10 @@ from test_limits import Node as PrefillNode
 
 
 @contextlib.contextmanager
-def proxy_server(args, root, prefill, decode, slots):
+def proxy_server(args, root, prefill, decode, slots, state_dtype="f32"):
     credential = secrets.token_hex(24)
     plan = context_plan(args.model, host_info(), 2048, True)
-    config = dict(benchmark=True, model_sha256=sha256(args.model), prefill_url=prefill.base,
+    config = dict(benchmark=True, state_dtype=state_dtype, model_sha256=sha256(args.model), prefill_url=prefill.base,
         decode_url=decode.url, decode_token="", prefill_timeout=120, decode_timeout=120, slots=1, slot_path=str(slots),
         client_credential=credential, clients={credential: dict(id='a', prefill_token=prefill.clients['a'])},
         policy=dict(kv_bytes=plan['kv_bytes_per_token'], state_bytes=plan['recurrent_state_bytes']))
@@ -345,13 +345,56 @@ def test_equivalence_noise(args):
             assert 'no GPU offload device' in (root / 'gpu-unavailable.log').read_text()
 
 
+def test_bf16_transport(args, decode, slots):
+    # Real node/client negotiation refuses a mismatch before mutation and records a successful bf16 import durably.
+    with PrefillNode(args, 'bf16-node', context='2048') as prefill:
+        assert prefill.health['state_dtypes'] == ['f32', 'bf16']
+        model_hash = prefill.health['model_sha256']
+        sid = prefill.request('POST', '/v1/sessions', dict(model_sha256=model_hash))['session_id']
+        path = '/v1/sessions/' + sid
+        prefill.request('POST', path + '/extend', dict(n0=0, prefix_hash_n0=prefix_hash([]), tokens=[100],
+                        return_delta=True, state_dtype='fp16'), expected=400)
+        assert prefill.request('GET', path)['n'] == 0, 'unsupported dtype mutated node'
+        wire = prefill.request('POST', path + '/extend', dict(n0=0, prefix_hash_n0=prefix_hash([]), tokens=[100] * 16,
+                               return_delta=True, state_dtype='bf16'))
+        headers = {'Content-Type': 'application/octet-stream', 'X-Hybrid-Session': sid}
+        before = decode.request('GET', '/slots/2/info')
+        try:
+            decode.request('POST', '/slots/2?action=import_delta', wire, headers)
+            raise AssertionError('bf16 accepted as default f32')
+        except HTTPError as error:
+            assert error.status == 400 and b'state dtype mismatch' in error.body
+        assert decode.request('GET', '/slots/2/info') == before
+        imported = decode.request('POST', '/slots/2?action=import_delta', wire,
+                                  dict(headers, **{'X-Hybrid-State-Dtype': 'bf16'}))
+        assert imported['tokens'] == [100] * 16
+        prefill.request('DELETE', path, expected=204)
+        print('PASS real HTTP mismatch preserves slot; matching bf16 header imports', flush=True)
+        root = Path(args.artifacts) / 'bf16-proxy'
+        root.mkdir()
+        with proxy_server(args, root, prefill, decode, slots, 'bf16') as (app, client, config):
+            response = client.request('POST', '/v1/chat/completions', dict(messages=[dict(role='user',
+                content='The river carries water past the old bridge. ' * 16)], max_tokens=2, temperature=0,
+                stream=False, chat_template_kwargs=dict(enable_thinking=False)), {'X-Hybrid-Bench-Mode': 'offload'})
+            trace = response['hybrid_bench']
+            assert trace['remote_applied'] > 0 and not trace.get('fallback_reason'), trace
+            assert trace['state_dtype'] == 'bf16' and trace['lossy_import'] is True
+            assert all(c['state_dtype'] == 'bf16' and c['lossy'] for c in trace['chunks'])
+            session = app.store.occupant(trace["slot"])
+            assert session['state_dtype'] == 'bf16' and session['state_imports'][-1]['lossy']
+            assert session['journal']['state_dtype'] == 'bf16' and session['journal']['state_imports'] == session['state_imports']
+            private_json(root/'evidence.json', dict(trace=trace, state_dtype=session['state_dtype'],
+                         state_imports=session['state_imports'], journal_state_dtype=session['journal']['state_dtype']))
+            print('PASS real bf16 proxy import: session, journal, trace and chunks record lossy dtype', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prefill-binary', required=True)
     parser.add_argument('--server-binary', required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--artifacts', required=True)
-    parser.add_argument('--case', choices=('all', 'timing', 'chunk', 'noise'), default='all')
+    parser.add_argument('--case', choices=('all', 'timing', 'chunk', 'noise', 'bf16'), default='all')
     parser.add_argument('--checker-binary', default=str(ROOT / 'build/bin/llama-hybrid-bench-check'))
     parser.add_argument('--gpu-available', action='store_true', help='skip CPU-only GPU-request refusal control')
     parser.add_argument('--baseline-checker', help='optional unchanged M1 executable for bit-for-bit CPU regression')
@@ -372,6 +415,9 @@ def main():
         test_native_defaults(args)
         test_native_chunk_slope(args)
     with native_server(args.server_binary, args.model, root / 'decoder') as (decode, slots):
+        if args.case == 'bf16':
+            test_bf16_transport(args, decode, slots)
+            return
         test_prefill_timing(args, decode, slots)
         if args.case == 'all':
             test_eviction_replay(args, decode, slots)

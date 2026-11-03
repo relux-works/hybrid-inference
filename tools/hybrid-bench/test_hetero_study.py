@@ -31,6 +31,20 @@ class StudyTests(unittest.TestCase):
         self.args = argparse.Namespace(manifest=str(self.manifest), documents=str(self.docs), model=str(self.model),
                                        output=str(self.root / 'prepared'), tokenizer_url='http://127.0.0.1:8080', d=1, n=64, m=16, timeout=2)
 
+    # bf16 is an explicit imported arm; f32 is the legacy default, and local bf16 or unsupported dtype refuses.
+    def test_state_dtype_arm_contract(self):
+        def arguments(kind, dtype):
+            argv = ['arm', '--study', str(self.root), '--kind', kind, '--label', 'dtype',
+                    '--client-model', str(self.model), '--reference-model-sha256', study.sha256(self.model)]
+            if kind == 'imported': argv += ['--node-model', str(self.model)]
+            if dtype is not None: argv += ['--state-dtype', dtype]
+            return study.parser().parse_args(argv)
+        self.assertEqual(study.arm_spec(arguments('imported', None))['state_dtype'], 'f32')
+        self.assertEqual(study.arm_spec(arguments('imported', 'bf16'))['state_dtype'], 'bf16')
+        self.assertEqual(study.arm_spec(arguments('local', None))['state_dtype'], 'f32')
+        with self.assertRaisesRegex(study.Refusal, 'invalid state dtype'):
+            study.arm_spec(arguments('local', 'bf16'))
+
     def arm_fixture(self, keep=False):
         with patch.object(study, 'api', side_effect=self.tokenizer):
             study.prepare(self.args)
