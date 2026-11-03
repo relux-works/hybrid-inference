@@ -135,6 +135,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [server](tools/server/README.md)
 - [hybrid client proxy prototype](tools/hybrid-proxy/README.md) - Python proxy, stub, policy replay, captured-template tests, external Jinja2 oracle and mutation controls; exact commands in the linked guide, artifacts in `.temp/<run>/`, oracle sources via `HYBRID_TEMPLATE_FIXTURES`
 - [hybrid benchmark prototype](tools/hybrid-bench/README.md#tools-and-trace-contract) - Deployment, benchmark, tests and cleanup controls with exact commands and artifact locations
+- [OpenRouter API cache measurement](tools/api-cache/README.md) - CPU mock tests and guarded streaming requests; `python3 tools/api-cache/openrouter_cache.py --help`, outputs under `.temp/hybrid-d-r15b-261103/`
 - [GBNF grammars](grammars/README.md)
 
 #### Development
