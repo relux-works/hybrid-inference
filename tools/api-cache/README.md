@@ -24,3 +24,5 @@ nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.temp/hybrid-d-r1
 ```
 
 Check the recorded PID from a separate shell and verify run.json has that PID before reporting successful startup. Do not repeat the launch into an existing output directory.
+
+For the corrected experiment, use output full-v3/, log full-v3-01.log and full-v3.pid. Include --prior-spend-floor with the reconciled sum of all earlier API-reported costs (smoke, full, full-v2); never launch while a prior intent lacks a response record. The exact launch and actual floor are persisted in .temp/tasks.md and full-v3/run.json. An optional file named STOP in a running output directory stops spending at the next scheduler boundary after the current response is recorded. The prior cohorts are retained with failed terminal records and explanations.

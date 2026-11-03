@@ -164,7 +164,8 @@ def matrix(snapshot):
             for depth in depths:
                 ident = data['id'] + ':' + endpoint['tag'] + ':' + str(depth)
                 sessions.append(dict(model=data['id'], endpoint=endpoint, depth=depth,
-                                     session_id='r15b-v2-' + hashlib.sha256(ident.encode()).hexdigest()[:20]))
+                                     routing_ignore=[e['tag'] for e in data['endpoints'] if e.get('tag','').startswith(endpoint['tag']+'/')],
+                                     session_id='r15b-v3-' + hashlib.sha256(ident.encode()).hexdigest()[:20]))
     random.Random(261103).shuffle(sessions)
     return sessions, excluded
 
@@ -190,6 +191,8 @@ def build_payload(session, index, smoke=False):
                    stream=True, stream_options={'include_usage': True}, temperature=0,
                    session_id=session['session_id'], provider=dict(order=[endpoint['tag']], only=[endpoint['tag']],
                    allow_fallbacks=False))
+    if session.get('routing_ignore'):
+        payload['provider']['ignore'] = session['routing_ignore']
     return payload
 
 
@@ -412,7 +415,7 @@ def run(args):
             before = utc()
             actual_pause = None if previous_end is None else time.monotonic()-previous_end
             row = dict(sequence=sequence, model=session['model'], endpoint_tag=endpoint['tag'],
-                       expected_provider=endpoint['provider_name'],depth=session['depth'],session_id=session['session_id'],
+                       expected_provider=endpoint['provider_name'],provider_request=payload['provider'],depth=session['depth'],session_id=session['session_id'],
                        call_index=index, started_at=before,pause_target_seconds=0 if args.smoke else PAUSES[index],
                        pause_actual_seconds=actual_pause,new_tokens_estimate=1000 if index else None,
                        prompt_sha256=hashlib.sha256(text.encode()).hexdigest(),prompt_bytes=len(text.encode()),

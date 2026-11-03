@@ -181,7 +181,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(len(b.split())-len(a.split()),1000)
         self.assertEqual(a,cache.build_payload(self.session,0)['messages'][0]['content'][0]['text'])
         self.assertLess(len(a.encode()),2*32768)
-        self.assertTrue(self.session['session_id'].startswith('r15b-v2-'))
+        self.assertTrue(self.session['session_id'].startswith('r15b-v3-'))
 
     # Any live price rise blocks requests; a lower price and cache-write surcharge are handled conservatively.
     def test_live_price_and_max_cost(self):
@@ -288,6 +288,20 @@ class CacheTests(unittest.TestCase):
         rejected=cache.stream_call(self.client,payload,session['endpoint'])
         self.assertEqual(rejected['http_status'],400)
         self.assertIn('Reasoning is mandatory',rejected['error_body'])
+
+
+    # Root slugs also match regional descendants; explicit ignores isolate both root endpoints in the frozen list.
+    def test_exact_endpoint_root_excludes_regional_descendants(self):
+        for root,child in [('fireworks','fireworks/us'),('baseten/fp8','baseten/fp8/us')]:
+            session=next(s for s in self.sessions if s['model']=='z-ai/glm-5.3-flash' and s['endpoint']['tag']==root)
+            routing=cache.build_payload(session,0)['provider']
+            self.assertEqual(routing['order'],[root])
+            self.assertEqual(routing['only'],[root])
+            self.assertEqual(routing['ignore'],[child])
+            region=next(s for s in self.sessions if s['model']=='z-ai/glm-5.3-flash' and s['endpoint']['tag']==child)
+            routing=cache.build_payload(region,0)['provider']
+            self.assertEqual(routing['only'],[child])
+            self.assertNotIn('ignore',routing)
 
 
 if __name__=='__main__':
