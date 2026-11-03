@@ -2,6 +2,20 @@
 
 For the paired NVIDIA RULER suite (13 configurations, 390 cases per depth, exact GGUF input depths, offline inputs, restart-safe depth archives and confidence/equivalence analysis), use [RULER-RUNBOOK.md](RULER-RUNBOOK.md). The original synthetic evaluation below remains unchanged.
 
+## Preregistered RULER equivalence tools
+
+`ruler_equivalence.py` reads completed-depth `rows.jsonl` with its sibling `manifest.json`. For `per-example.csv`, it also requires sibling `rows.jsonl` because the evaluator CSV omits seeds and prompt identities. It refuses incomplete or mismatched pairs and seed changes. Run one model family at a time:
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR="$PWD/.temp/hybrid-d-r16-261103/tmp"
+mkdir -p "$TMPDIR"
+python3 tools/hybrid-eval/ruler_equivalence.py /path/to/depth/rows.jsonl --family Qwen --output .temp/ruler-equivalence/qwen
+python3 -m unittest discover -s tools/hybrid-eval -p test_ruler_equivalence.py -v
+```
+
+The analysis uses only the standard library and writes `equivalence.json` and a paper table, `equivalence.md`, under `--output`. Repeat the input path for each available depth; default family depths are 8192, 32768, 65536, 131072. Glimmer uses `--depths 8192 32768 65536 122880`. Optional bf16 scores use the explicit `results.bf16` arm on every example of a completed depth; they are compared with both local and f32 offload. Unlabelled f32 rows are never relabelled as bf16. See [RULER-EQUIVALENCE-RESULTS.md](RULER-EQUIVALENCE-RESULTS.md) for the fixed interval rule, limitations, verified archive hashes, results and regeneration commands. Committed JSON snapshots are in `equivalence-results/`.
+
 Python 3.10+ standard library only. This is an offline synthetic quality experiment for the hybrid prototype, not an upstream submission. No datasets, model downloads, packages or native builds are performed by the evaluator or its tests. Reuse the existing [node/client launchers](../hybrid-bench/README.md) and their private state. Run from the repository root.
 
 ## Tasks and depths
