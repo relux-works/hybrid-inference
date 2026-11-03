@@ -1,3 +1,9 @@
+# r15i disk headroom admission wait
+
+[RESTART-r15i.md](RESTART-r15i.md) registers the bounded disk wait from accepted0929c1de. Below28.5GiB, the active runner, startup and GET-only auditor recheck every60s for up to1200s before refusing. Below28GiB the guard refuses immediately. Waiting starts before an intent or paid POST; previous responses and charges are already recorded. Every wait logs start/rechecks/end with free bytes. disk-waits.jsonl and progress.json disclose paid-worker waits. Heartbeats report soft headroom without writing a sticky STOP; hard-floor observations still block future calls.
+
+If a dip occurs during metadata, wait before POST then refresh live prices/spend; recheck the fixed cutoff after recovery. Operator STOP is always honored. The r15i restart reversibly archives only the evidenced automatic zero-byte STOP from the previous failed soft-headroom heartbeat; no general STOP-clearing mechanism is added. Resume from the signed m3-api-cache-r15g head with the same r15d --resume command below, preserving every original row/receipt, the22/45 caps, cutoffs, r15g filter, r15h settlement and600s heartbeat. Use a fresh .temp/hybrid-d-r15i-261103/audit-end for the new GET-only final observer. Keep source frozen after launch; independently verified PIDs, head, ledger and stop-archive evidence are in the r15i task SUMMARY.md.
+
 # r15h settlement deadline and guarded restart
 
 [RESTART-r15h.md](RESTART-r15h.md) registers the sequence153 diagnosis and continuation from accepted31c017ed. The phase's600s recovery window expired before earlier-call debits reached the key counter; the supervisor then settled the charge at zero debit. Recovery now allows a bounded1200s window and reserves that time plus120s metadata allowance before a paid call. Three stable bounded samples, immediate overshoot refusal, retained reservations, USD22/USD45 caps and both fixed phase cutoffs stay unchanged. Failure diagnostics retain the actual poll history.

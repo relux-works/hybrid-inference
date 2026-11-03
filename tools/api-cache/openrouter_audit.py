@@ -18,7 +18,6 @@ import openrouter_recovery as recovery
 import openrouter_restart as restart
 
 LIVE_ROOT=Path('/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15d-261103')
-MIN_FREE_BYTES=57*1024**3//2
 TOLERANCE=Decimal('0.00000001')
 PRICE_FIELDS=('prompt','completion','input_cache_read','input_cache_write')
 
@@ -32,8 +31,7 @@ class GetOnlyClient(recovery.Client):
 
 
 def disk_guard(path):
-    if api.shutil.disk_usage(path).free<MIN_FREE_BYTES:
-        raise api.Refusal('audit stopped: free disk below28.5 GiB safety threshold (28 GiB floor)')
+    recovery.wait_for_disk(path)
 
 
 def output_guard(live,output):

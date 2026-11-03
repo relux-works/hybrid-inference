@@ -34,6 +34,16 @@ def timestamp(value):
     return datetime.fromtimestamp(value,timezone.utc).isoformat()
 
 
+def check_stop(root):
+    if (root/'STOP').exists():raise api.Refusal('operator STOP')
+
+
+def disk_wait_event(root,event,phase):
+    line=api.redact(json.dumps(dict(pid=os.getpid(),phase=phase,**event)))
+    with (root/'disk-waits.jsonl').open('a') as handle:handle.write(line+'\n')
+    print(line,flush=True)
+
+
 def old_root(root):
     return root.parent/'hybrid-d-r15b-261103'
 
@@ -298,11 +308,25 @@ class Phase:
     def skip(self,s,index,reason):
         self.skips.append(dict(provider=amendment.identity(s['candidate']),cohort=s['cohort'],depth=s['depth'],session_id=s['session_id'],missing_call_indices=list(range(index,len(s['pauses']))),reason=reason))
 
+    def wait_for_disk(self):
+        def event(data):
+            disk_wait_event(self.root,data,self.name)
+            waiting=data['event'] in ('start','check')
+            self.progress(status='waiting-disk' if waiting else 'disk-'+data['reason'],current_call=None,
+                          next_call_time=timestamp(time.time()+data['next_check_seconds']) if waiting else None,
+                          next_call_reason='disk headroom recheck' if waiting else data['reason'],disk_wait=data)
+        return recovery.wait_for_disk(self.root,on_event=event,check_stop=lambda:check_stop(self.root))
+
+    def fits_call(self,s,index,seconds,due=None):
+        delay=0 if due is None else max(0,due-time.monotonic())
+        if time.time()+delay+seconds+recovery.SETTLEMENT_DEADLINE_SECONDS+120>self.end:
+            self.skip(s,index,'insufficient phase time for unchanged pause and complete deadline/recovery');return False
+        return True
+
     def call(self,s,index,previous_end=None):
         seconds=recovery.deadline_for_depth(s['depth'])
         due=time.monotonic() if previous_end is None else previous_end+s['pauses'][index]
-        if time.time()+max(0,due-time.monotonic())+seconds+recovery.SETTLEMENT_DEADLINE_SECONDS+120>self.end:
-            self.skip(s,index,'insufficient phase time for unchanged pause and complete deadline/recovery'); return None
+        if not self.fits_call(s,index,seconds,due):return None
         m=dict(new_tokens=1000 if self.name=='v1' else 1065,framing_reserve=128,max_tokens=16)
         payload=amendment.payload(m,s,index)
         text=payload['messages'][0]['content'][0]['text']
@@ -316,20 +340,24 @@ class Phase:
         while time.monotonic()<due:
             if (self.root/'STOP').exists():raise api.Refusal('operator STOP')
             time.sleep(min(30,max(0,due-time.monotonic())))
-        if (self.root/'STOP').exists():raise api.Refusal('operator STOP')
-        if api.shutil.disk_usage(self.root).free<recovery.DISK_STOP_BYTES:raise api.Refusal('free disk below28 GiB floor safety headroom: requires28.5 GiB')
-        sample=api.sample_endpoints(self.client,self.out,self.preflights); self.preflights+=1
-        endpoint=api.live_endpoint(sample,candidate)
-        if endpoint['context_length']<s['depth'] or 'input_cache_read' not in endpoint['pricing']:
-            self.skip(s,index,'live context/cache declaration makes this cell impossible'); return None
-        estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']),recovery.RESERVED_OUTPUT_TOKENS)
-        key=self.client.get('/key')['data']; live=api.money(key['usage'])
-        if live>self.budget.committed+recovery.ROUNDING:raise api.Refusal('live spend exceeds committed upper bound')
-        self.budget.known=max(self.budget.known,live); self.budget.save()
-        try:self.budget.reserve(live,estimated,self.cap,key.get('limit_remaining'))
-        except api.Refusal as error:
-            if 'budget' not in str(error):raise
-            self.skip(s,index,str(error)); return None
+        while True:
+            self.wait_for_disk()
+            if not self.fits_call(s,index,seconds):return None
+            sample=api.sample_endpoints(self.client,self.out,self.preflights); self.preflights+=1
+            endpoint=api.live_endpoint(sample,candidate)
+            if endpoint['context_length']<s['depth'] or 'input_cache_read' not in endpoint['pricing']:
+                self.skip(s,index,'live context/cache declaration makes this cell impossible'); return None
+            estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']),recovery.RESERVED_OUTPUT_TOKENS)
+            key=self.client.get('/key')['data']; live=api.money(key['usage'])
+            if live>self.budget.committed+recovery.ROUNDING:raise api.Refusal('live spend exceeds committed upper bound')
+            self.budget.known=max(self.budget.known,live); self.budget.save()
+            try:self.budget.reserve(live,estimated,self.cap,key.get('limit_remaining'))
+            except api.Refusal as error:
+                if 'budget' not in str(error):raise
+                self.skip(s,index,str(error)); return None
+            if not self.fits_call(s,index,seconds):return None
+            # A dip during metadata must recover before intent/POST, then prices and spend are refreshed.
+            if not self.wait_for_disk():break
         sequence=len(self.rows); call_id=self.name+'/%04d'%sequence
         row=dict(protocol='r15d',phase=self.name,sequence=sequence,provider=amendment.identity(candidate),model=candidate['model'],
                  endpoint_tag=endpoint['tag'],cohort=s['cohort'],depth=s['depth'],session_id=s['session_id'],call_index=index,
@@ -474,7 +502,10 @@ def heartbeat(root,client,status='running'):
               next_call_time=progress.get('next_call_time'),next_call_reason=progress.get('next_call_reason','phase transition'),
               current_request_deadline_at=progress.get('current_request_deadline_at'),interval_seconds=600)
     data['free_disk_bytes']=api.shutil.disk_usage(root).free
-    if data['free_disk_bytes']<recovery.DISK_STOP_BYTES:(root/'STOP').touch()
+    data['disk_status']='ready'
+    if data['free_disk_bytes']<recovery.MIN_FREE_BYTES:
+        data['disk_status']='hard-floor';(root/'STOP').touch()
+    elif data['free_disk_bytes']<recovery.DISK_STOP_BYTES:data['disk_status']='waiting-headroom'
     if status!='running':data.update(current_call=None,next_call_time=None,next_call_reason='workflow '+status)
     # Persist custody before a GET, so metadata delays cannot hide an in-flight request.
     recovery.atomic_json(root/'heartbeat.json',data)
@@ -530,9 +561,9 @@ def supervise(root,resume=False):
         if previous['status']!='failed':raise api.Refusal('resume requires failed terminal workflow')
         if list((root/'amendment').glob('call-*.json')):raise api.Refusal('amendment already has data; automatic replay refused')
     elif resume:raise api.Refusal('resume requires existing workflow')
-    if api.shutil.disk_usage(root).free<recovery.DISK_STOP_BYTES:raise api.Refusal('free disk below28 GiB floor safety headroom: requires28.5 GiB')
     lock=LOCK_PATH.open('a+')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    recovery.wait_for_disk(root,on_event=lambda event:disk_wait_event(root,event,'startup'),check_stop=lambda:check_stop(root))
     client=recovery.Client()
     if resume:
         ledger=recovery.Budget.load(root/'ledger.json')

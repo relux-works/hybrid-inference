@@ -404,12 +404,105 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(api.Refusal,'free disk below28 GiB'):phase.call(self.session,0)
         self.assertEqual(Handler.bodies,[])
 
-    # Headroom stops paid requests before the28GiB floor is reached.
+    # Sustained low headroom refuses before any POST after the bounded1200s wait.
     def test_28_5_gib_headroom_refuses_before_post(self):
-        phase=self.phase()
-        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))):
+        phase=self.phase();now=[0]
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
             with self.assertRaisesRegex(api.Refusal,'requires28.5 GiB'):phase.call(self.session,0)
         self.assertEqual(Handler.bodies,[])
+        self.assertEqual(now[0],1200)
+
+    # A real loopback POST waits until headroom returns, then sends the original next index exactly once.
+    def test_disk_headroom_dip_recovers_and_continues(self):
+        phase=self.phase();now=[0];reads=[0];sleeps=[];ledger=(self.root/'ledger.json').read_bytes()
+        def disk(path):
+            reads[0]+=1
+            if reads[0]<=2:
+                self.assertEqual(Handler.bodies,[]);self.assertFalse(list(phase.out.glob('intent-*.json')))
+                self.assertEqual((self.root/'ledger.json').read_bytes(),ledger)
+                return mock.Mock(free=int(28.4*1024**3))
+            return mock.Mock(free=30*1024**3)
+        def sleep(seconds):sleeps.append(seconds);now[0]+=seconds
+        with mock.patch.object(api.shutil,'disk_usage',side_effect=disk),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=sleep):
+            phase.call(self.session,0)
+        self.assertEqual(sleeps,[60,60]);self.assertEqual(len(Handler.bodies),1)
+        self.assertTrue(phase.rows[0]['accepted']);self.assertEqual(phase.rows[0]['call_index'],0)
+        events=[json.loads(line) for line in (self.root/'disk-waits.jsonl').read_text().splitlines()]
+        self.assertEqual((events[0]['event'],events[-1]['event'],events[-1]['reason']),('start','end','recovered'))
+        self.assertEqual(events[-1]['elapsed_seconds'],120);self.assertEqual(events[-1]['free_bytes'],30*1024**3)
+
+    # Low headroom for the entire window stops with recorded start/end and no intent, POST or ledger change.
+    def test_named_negative_disk_headroom_never_recovers_stops(self):
+        phase=self.phase();now=[0];ledger=(self.root/'ledger.json').read_bytes()
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            with self.assertRaisesRegex(api.Refusal,'1200s'):phase.call(self.session,0)
+        self.assertEqual(now[0],1200);self.assertEqual(Handler.bodies,[])
+        self.assertFalse(list(phase.out.glob('intent-*.json')));self.assertEqual((self.root/'ledger.json').read_bytes(),ledger)
+        events=[json.loads(line) for line in (self.root/'disk-waits.jsonl').read_text().splitlines()]
+        self.assertEqual((events[0]['event'],events[-1]['event'],events[-1]['reason']),('start','end','timeout'))
+
+    # Dropping under28GiB during a soft wait stops at that check, without sleeping out the remaining window.
+    def test_named_negative_disk_hard_floor_stops_immediately(self):
+        now=[0];events=[]
+        with mock.patch.object(api.shutil,'disk_usage',side_effect=[mock.Mock(free=int(28.4*1024**3)),mock.Mock(free=28*1024**3-1)]),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            with self.assertRaisesRegex(api.Refusal,'28 GiB hard floor'):recovery.wait_for_disk(self.root,on_event=events.append)
+        self.assertEqual(now[0],60);self.assertEqual(events[-1]['reason'],'hard-floor')
+
+    # A heartbeat below soft headroom cannot leave a sticky STOP; a hard-floor observation still sets it.
+    def test_heartbeat_soft_dip_waits_but_hard_floor_sets_stop(self):
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))):data=restart.heartbeat(self.root,self.client)
+        self.assertFalse((self.root/'STOP').exists());self.assertEqual(data['disk_status'],'waiting-headroom')
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=28*1024**3-1)):data=restart.heartbeat(self.root,self.client)
+        self.assertTrue((self.root/'STOP').exists());self.assertEqual(data['disk_status'],'hard-floor')
+
+    # A wait after a completed call cannot delay its JSON or charge receipt, and resumes at the next index.
+    def test_disk_wait_preserves_previous_call_and_resumes_next_index(self):
+        phase=self.phase();now=[0];reads=[0]
+        def disk(path):
+            reads[0]+=1
+            if reads[0] in (3,4):
+                self.assertTrue(json.loads((phase.out/'call-0000.json').read_text())['accepted'])
+                self.assertIn('v1/0000',recovery.Budget.load(self.root/'ledger.json').receipts)
+                self.assertEqual(len(Handler.bodies),1);self.assertFalse((phase.out/'intent-0001.json').exists())
+                return mock.Mock(free=int(28.4*1024**3))
+            return mock.Mock(free=30*1024**3)
+        with mock.patch.object(api.shutil,'disk_usage',side_effect=disk),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual([r['call_index'] for r in phase.rows],[0,1]);self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(r['accepted'] for r in phase.rows));self.assertEqual(now[0],120)
+
+    # A late recovery cannot bypass the fixed cutoff; remaining time is checked again before any metadata or POST.
+    def test_disk_recovery_rechecks_fixed_phase_cutoff(self):
+        phase=self.phase();now=[0];wall=time.time();phase.end=wall+1600;reads=[0]
+        def disk(path):
+            reads[0]+=1;return mock.Mock(free=int(28.4*1024**3) if reads[0]<=5 else 30*1024**3)
+        with mock.patch.object(api.shutil,'disk_usage',side_effect=disk),mock.patch.object(recovery.time,'time',side_effect=lambda:wall+now[0]),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            self.assertIsNone(phase.call(self.session,0))
+        self.assertEqual(now[0],300);self.assertEqual(Handler.bodies,[])
+        self.assertFalse(list(phase.out.glob('intent-*.json')));self.assertIn('insufficient phase time',phase.skips[0]['reason'])
+
+    # A dip during metadata waits before intent, then repeats live price/spend preflight after recovery.
+    def test_disk_dip_during_metadata_refreshes_preflight(self):
+        phase=self.phase();now=[0];reads=[0]
+        def disk(path):
+            reads[0]+=1
+            if reads[0]==2:
+                self.assertEqual(Handler.bodies,[]);return mock.Mock(free=int(28.4*1024**3))
+            return mock.Mock(free=30*1024**3)
+        with mock.patch.object(api.shutil,'disk_usage',side_effect=disk),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            phase.call(self.session,0)
+        self.assertEqual(now[0],60);self.assertEqual(phase.preflights,2)
+        self.assertEqual(len(Handler.bodies),1);self.assertTrue(phase.rows[0]['accepted'])
+
+    # An operator STOP during a headroom wait is not cleared or turned into a recovery.
+    def test_named_negative_operator_stop_during_disk_wait_is_preserved(self):
+        phase=self.phase();now=[0]
+        def sleep(seconds):now[0]+=seconds;(self.root/'STOP').touch()
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=sleep):
+            with self.assertRaisesRegex(api.Refusal,'operator STOP'):phase.call(self.session,0)
+        self.assertTrue((self.root/'STOP').exists());self.assertEqual(Handler.bodies,[]);self.assertEqual(now[0],60)
+        events=[json.loads(line) for line in (self.root/'disk-waits.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['reason'],'stopped')
 
     # Ready follow-ups run before another seed, preventing the original all-cold scheduling failure.
     def test_due_warm_call_precedes_next_cold_seed(self):

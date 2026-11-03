@@ -237,12 +237,13 @@ class AuditTests(unittest.TestCase):
             if path.is_file():self.assertNotIn(self.secret,path.read_text())
         self.assertIn('[REDACTED]',(self.output/'cost-cross-check.csv').read_text())
 
-    # The proactive28.5GiB threshold refuses before client creation; legacy numerical floors are binary28GiB.
+    # Unrecovered soft headroom waits1200s and refuses before client creation or output; hard floors remain binary28GiB.
     def test_negative_disk_headroom_stops_before_key_read(self):
-        factory=mock.Mock()
-        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=28*1024**3+1024**3//4)):
-            with self.assertRaisesRegex(api.Refusal,'below28.5 GiB'):audit.audit(self.live,self.output,client_factory=factory)
+        factory=mock.Mock();now=[0]
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=28*1024**3+1024**3//4)),mock.patch.object(audit.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(audit.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            with self.assertRaisesRegex(api.Refusal,'requires28.5 GiB'):audit.audit(self.live,self.output,client_factory=factory)
         factory.assert_not_called();self.assertFalse(self.output.exists());self.assertEqual(api.MIN_FREE_BYTES,28*1024**3)
+        self.assertEqual(now[0],1200)
 
     # The pooled headline is explicitly named and both phase-only1M figures appear beside it.
     def test_pooled_million_label_next_to_phase_figures(self):

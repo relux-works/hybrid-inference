@@ -9,6 +9,8 @@ import openrouter_cache as api
 
 MIN_FREE_BYTES = 28 * 1024**3
 DISK_STOP_BYTES = int(28.5 * 1024**3)
+DISK_WAIT_SECONDS = 1200
+DISK_POLL_SECONDS = 60
 REQUEST_OUTPUT_TOKENS = 16
 RESERVED_OUTPUT_TOKENS = 1024
 ROUNDING = Decimal('.00000001')
@@ -29,6 +31,37 @@ def atomic_json(path, data, secret=''):
     temporary=path.with_name(path.name+'.new')
     temporary.write_text(text)
     temporary.replace(path)
+
+
+def wait_for_disk(path,on_event=None,check_stop=None):
+    """Wait before admission; callers must finish recording any previous request first."""
+    started=None;last_free=None;started_at=None
+    def event(kind,free,reason):
+        data=dict(at=api.utc(),event=kind,reason=reason,free_bytes=free,wait_started_at=started_at,
+                  elapsed_seconds=0 if started is None else time.monotonic()-started,
+                  wait_limit_seconds=DISK_WAIT_SECONDS,next_check_seconds=DISK_POLL_SECONDS)
+        if on_event is None:print(json.dumps(dict(disk_wait=data)),flush=True)
+        else:on_event(data)
+    while True:
+        if check_stop is not None:
+            try:check_stop()
+            except api.Refusal:
+                if started is not None:event('end',last_free,'stopped')
+                raise
+        free=api.shutil.disk_usage(path).free;last_free=free;now=time.monotonic()
+        if free<MIN_FREE_BYTES:
+            event('hard-floor' if started is None else 'end',free,'hard-floor')
+            raise api.Refusal('free disk below28 GiB hard floor')
+        if free>=DISK_STOP_BYTES:
+            if started is not None:event('end',free,'recovered')
+            return started is not None
+        if started is None:
+            started=now;started_at=api.utc();event('start',free,'requires-headroom')
+        elif now-started>=DISK_WAIT_SECONDS:
+            event('end',free,'timeout')
+            raise api.Refusal('free disk requires28.5 GiB after1200s headroom wait')
+        else:event('check',free,'requires-headroom')
+        time.sleep(min(DISK_POLL_SECONDS,DISK_WAIT_SECONDS-(now-started)))
 
 
 def resolve_delta(samples, expected, maximum):
