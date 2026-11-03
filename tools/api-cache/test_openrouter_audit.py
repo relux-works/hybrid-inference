@@ -9,6 +9,8 @@ import unittest
 from unittest import mock
 import os
 import io
+import subprocess
+import sys
 from contextlib import redirect_stdout
 from urllib.parse import parse_qs,urlparse
 
@@ -59,6 +61,7 @@ class AuditTests(unittest.TestCase):
         self.client=audit.GetOnlyClient(self.key,'http://127.0.0.1:'+str(self.server.server_port),mock=True)
         self.candidate=next(c for c in restart.candidates().values() if c['endpoint']['provider_name']=='Phala' and c['model']=='qwen/qwen3.8-27b')
         self.row=dict(phase='v1',sequence=0,provider=amendment.identity(self.candidate),model=self.candidate['model'],endpoint_tag='phala',cohort='v1',depth=32768,session_id='fake',call_index=1,accepted=True,started_at=api.utc(),ended_at=api.utc(),generation_id='gen-1',usage={'cost':.1},cost_usd=.1,prompt_tokens=32000,cached_tokens=31000,new_tokens_estimate=1000,pause_target_seconds=0,pause_actual_seconds=.1,pricing=self.candidate['endpoint']['pricing'])
+        self.row['observed_providers']=['Phala']
         AuditHandler.generation_cost=.1;AuditHandler.generation_model=self.row['model'];AuditHandler.drift=False;AuditHandler.limited=False;AuditHandler.gets=0;Handler.bodies=[]
 
     def run_audit(self,rows=None):
@@ -75,6 +78,45 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(api.Refusal,'Legacy amendment report retired; live report:') as refusal:
             amendment.Study({},self.output).report()
         self.assertIn(str(api.LIVE_REPORT_PATH),str(refusal.exception));self.assertFalse(self.output.exists())
+
+    # Actual CLI processes expose the refusal and live path before touching a nonexistent key or output.
+    def test_named_negative_retired_cli_surfaces_live_report_refusal(self):
+        for module in (api,amendment):
+            result=subprocess.run([sys.executable,module.__file__,'--output',str(self.output),'--key-path',str(self.root/'absent-key')],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            self.assertIn('retired; live report:',result.stdout);self.assertIn(str(api.LIVE_REPORT_PATH),result.stdout)
+            self.assertEqual(result.stderr,'');self.assertFalse(self.output.exists())
+
+    # Analysis rejects a provider-less accepted warm row while preserving raw evidence and financial cost coverage.
+    def test_named_negative_analysis_filters_accepted_row_without_observed_provider(self):
+        row=dict(self.row,observed_providers=[])
+        result=self.run_audit([row])
+        analysis=json.loads((self.output/'analysis.json').read_text())
+        self.assertEqual(analysis['provider_identity_filter']['rejected_count'],1)
+        own=next(p for p in analysis['providers'] if p['provider']==row['provider'])
+        self.assertEqual(own['whole_window_availability']['errors'],1)
+        self.assertEqual(own['phases']['v1']['v1']['accepted'],0)
+        self.assertTrue(row['accepted']);self.assertEqual(result['accepted_calls'],1)
+        self.assertEqual(result['agreement_calls'],1)
+        self.assertEqual(result['provider_identity_filter']['rejected_count'],1)
+        self.assertIn('Identity-refused accepted rows: 1',(self.output/'API-CACHE-REPORT.md').read_text())
+
+    # Explicit empty observations cannot borrow a legacy serving-provider label; genuine legacy observations still pass.
+    def test_analysis_identity_filter_legacy_positive_and_explicit_empty_negative(self):
+        row=dict(self.row);row.pop('observed_providers');row['serving_provider']=['Phala']
+        valid,proof=restart.filter_provider_identity([row]);self.assertEqual(proof['rejected_count'],0)
+        self.assertTrue(valid[0]['accepted'])
+        row['observed_providers']=[]
+        invalid,proof=restart.filter_provider_identity([row]);self.assertEqual(proof['rejected_count'],1)
+        self.assertFalse(invalid[0]['accepted']);self.assertTrue(row['accepted'])
+
+    # Audit labels distinguish the live workflow's actual source from the checkout doing the audit.
+    def test_audit_source_commit_comes_from_live_workflow(self):
+        (self.live/'workflow.json').write_text(json.dumps(dict(source_commit='runtime-signed-head',source_sha256={'module':'runtime-hash'})))
+        result=self.run_audit()
+        self.assertEqual(result['source_commit'],'runtime-signed-head')
+        self.assertEqual(result['live_source_sha256'],{'module':'runtime-hash'})
+        self.assertRegex(result['audit_source_commit'],r'^[0-9a-f]{40}$')
 
     # The standalone routes refuse before constructing a key-reading client or sending even one request.
     def test_negative_retired_runners_make_no_key_read_or_request(self):
@@ -216,11 +258,27 @@ class AuditTests(unittest.TestCase):
         workflow=self.live/'workflow.json';workflow.write_text(json.dumps({'status':'running'}))
         def terminate_fixture(seconds):
             workflow.write_text(json.dumps({'status':'done'}));(self.live/'terminal.json').write_text('{"status":"done"}')
-        result=dict(accepted_calls=1,agreement_calls=1,mismatch_calls=0,unverified_calls=0,largest_absolute_difference_usd='0')
+        result=dict(accepted_calls=1,agreement_calls=1,mismatch_calls=0,unverified_calls=0,largest_absolute_difference_usd='0',provider_identity_filter={'rejected_count':0})
         with mock.patch.object(audit.time,'sleep',side_effect=terminate_fixture) as sleep,mock.patch.object(audit,'audit',return_value=result) as run,mock.patch.object(api,'Client') as client:
             self.assertEqual(audit.observe_end(self.live,self.output),result)
             sleep.assert_called_once_with(30);run.assert_called_once_with(self.live,self.output,final=True);client.assert_not_called()
         self.assertEqual(json.loads((self.root/'end-observer.json').read_text())['status'],'done')
+        self.assertEqual(json.loads((self.root/'end-observer.json').read_text())['identity_refused_rows'],0)
+
+    # The real terminal-audit path applies the filter too; factory injection only substitutes the CPU GET client.
+    def test_end_report_refuses_providerless_accepted_row(self):
+        (self.live/'workflow.json').write_text(json.dumps(dict(status='done',source_commit='live-source')))
+        (self.live/'terminal.json').write_text('{"status":"done"}')
+        row=dict(self.row,observed_providers=[]);original=audit.audit
+        def loopback(live,output,final):return original(live,output,final=final,client_factory=lambda:self.client)
+        with mock.patch.object(restart,'read_rows',return_value=[row]),mock.patch.object(audit,'audit',side_effect=loopback):
+            result=audit.observe_end(self.live,self.output)
+        self.assertEqual(result['provider_identity_filter']['rejected_count'],1)
+        self.assertTrue(json.loads((self.output/'analysis.json').read_text())['window_final'])
+        self.assertEqual(json.loads((self.root/'end-observer.json').read_text())['identity_refused_rows'],1)
+        self.assertIn('Identity-refused accepted rows: 1',(self.root/'SUMMARY.md').read_text())
+        self.assertIn('Identity-refused accepted rows: 1',(self.output/'API-CACHE-REPORT.md').read_text())
+        self.assertTrue(row['accepted']);self.assertEqual(Handler.bodies,[])
 
 
 if __name__=='__main__':unittest.main()

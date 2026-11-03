@@ -413,5 +413,5 @@ if __name__=='__main__':
         sys.exit(main())
     except Exception as error:
         # Never emit a traceback containing request headers or remote exception payloads.
-        print('failed '+type(error).__name__,flush=True)
+        print('failed '+(redact(str(error)) if isinstance(error,Refusal) else type(error).__name__),flush=True)
         sys.exit(1)

@@ -35,6 +35,8 @@ class RecoveryHandler(Handler):
             items=[dict(id='output-control',model='wrong/model' if mode=='wrong-model' else body['model'],provider='Phala',
                         choices=[dict(delta=dict(content='x'*1025 if mode=='guard' else 'OK'))]),dict(usage=usage,choices=[])]
             if mode=='partial-usage':items[0]['usage']=dict(usage,completion_tokens=1025,cost=Handler.cost/2)
+            if mode=='guard-no-provider':
+                items[0].pop('provider');items[1]['usage']['completion_tokens']=2000
             try:
                 for item in items:self.wfile.write(b'data: '+json.dumps(item).encode()+b'\n\n');self.wfile.flush()
                 self.wfile.write(b'data: [DONE]\n\n')
@@ -190,6 +192,40 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(all(r['accepted'] and r['output_guard_triggered'] and r['completion_over_cap']==1025 for r in phase.rows))
         self.assertEqual(recovery.availability(phase.rows)['rate'],1)
 
+    # Reviewer F1: a complete-usage guard must not bypass missing provider identity or allow another POST.
+    def test_named_negative_guard_completed_absent_provider_halts(self):
+        RecoveryHandler.output_mode='guard-no-provider';phase=self.phase()
+        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
+        row=phase.rows[0]
+        self.assertTrue(row['output_guard_triggered']);self.assertTrue(row['usage_complete'])
+        self.assertEqual(row['observed_providers'],[]);self.assertFalse(row['accepted'])
+        self.assertEqual(row['completion_over_cap'],2000)
+        self.assertIn('serving provider differs or is absent',row['error'])
+        self.assertIn('identity violation',phase.reason)
+
+    # Missing identity wins for both poppable presets; the same completed row with Phala remains accepted.
+    def test_reviewer_guard_and_legacy_presets_require_observed_provider(self):
+        for preset in ('output guard canceled stream','completion cap exceeded','HTTP error',None):
+            with self.subTest(preset=preset):
+                row=dict(http_status=200,error=preset,output_guard_triggered=True,usage_complete=True,observed_providers=[],
+                         usage=dict(prompt_tokens=32768,completion_tokens=2000,cost=.001),completion_tokens=2000)
+                recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
+                self.assertFalse(row['accepted']);self.assertIn('serving provider differs or is absent',row['error'])
+        row.update(observed_providers=['Phala'],error='output guard canceled stream')
+        recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
+        self.assertTrue(row['accepted']);self.assertEqual(row['completion_over_cap'],2000)
+
+    # A parse failure replaces an obsolete output label while an actual identity refusal remains primary.
+    def test_parse_failure_surfaces_usage_error_instead_of_stale_output_label(self):
+        for preset in ('completion cap exceeded','output guard canceled stream'):
+            row=dict(http_status=200,error=preset,observed_providers=['Phala'],usage=None)
+            recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
+            self.assertFalse(row['accepted']);self.assertIn('usage parsing failed',row['error'])
+            row.update(error=preset,observed_providers=[])
+            recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
+            self.assertIn('serving provider differs or is absent',row['error'])
+            self.assertIn('usage parsing failed',row['usage_error'])
+
     # Progressive usage in a canceled stream cannot settle its final charge or become a cache result.
     def test_guard_partial_usage_requires_delta_settlement(self):
         RecoveryHandler.output_mode='partial-usage';phase=self.phase()
@@ -232,6 +268,17 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(),original);self.assertEqual((self.root/'ledger.json').read_bytes(),ledger)
         self.assertFalse((self.root/'reclassification-r15f').exists());self.assertEqual(len(Handler.bodies),1)
 
+    # A settled legacy cap receipt without observed provider cannot be promoted or rewrite financial/original evidence.
+    def test_named_negative_reclassification_absent_provider_refuses(self):
+        RecoveryHandler.output_mode='overcap';phase=self.phase();phase.call(self.session,0)
+        row=phase.rows[0];row.update(accepted=False,error='completion cap exceeded',observed_providers=[],serving_provider=[])
+        path=phase.out/'call-0000.json';recovery.atomic_json(path,row);original=path.read_bytes()
+        recovery.atomic_json(self.root/'workflow.json',dict(status='failed'));ledger=(self.root/'ledger.json').read_bytes()
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]):
+            with self.assertRaisesRegex(api.Refusal,'failed identity, depth or usage validation'):restart.reclassify_over_caps(self.root)
+        self.assertEqual(path.read_bytes(),original);self.assertEqual((self.root/'ledger.json').read_bytes(),ledger)
+        self.assertFalse((self.root/'reclassification-r15f').exists());self.assertEqual(len(Handler.bodies),1)
+
     # An explicit wrong model still stops after one settled request; output non-compliance cannot mask identity.
     def test_named_negative_wrong_model_identity_halts(self):
         RecoveryHandler.output_mode='wrong-model';phase=self.phase()
@@ -246,20 +293,22 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
         self.assertIn('depth outside',phase.rows[0]['error'])
 
-    # A failed HTTP request has no serving identity; lack of one must not become a wrong-identity halt.
+    # Under r15g missing identity is refused regardless of preset error, and remains an availability failure.
     def test_http_failure_without_identity_retains_availability_classification(self):
         row=dict(accepted=False,http_status=429,error='HTTP error')
         recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
-        self.assertEqual(row['error'],'HTTP error');self.assertFalse(row['accepted'])
+        self.assertIn('serving provider differs or is absent',row['error']);self.assertFalse(row['accepted'])
+        self.assertEqual(recovery.availability([row])['errors'],1)
 
-    # Real HTTP429 responses with bounded settled charges continue instead of being mistaken for wrong identities.
-    def test_http_failure_without_identity_settles_and_continues(self):
+    # The stricter prospective source still settles a failed charge before halting for absent identity.
+    def test_http_failure_without_identity_settles_then_halts(self):
         RecoveryHandler.output_mode='http-error';Handler.cost=0;phase=self.phase()
         with mock.patch.object(recovery,'settled_samples',side_effect=lambda client,*args:self.samples(0)):
-            self.assertEqual(phase.run(),0)
-        self.assertEqual(len(Handler.bodies),2)
-        self.assertTrue(all(r['error']=='HTTP error' and not r['accepted'] for r in phase.rows))
-        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+            self.assertEqual(phase.run(),1)
+        self.assertEqual(len(Handler.bodies),1)
+        self.assertIn('serving provider differs or is absent',phase.rows[0]['error'])
+        self.assertTrue(phase.rows[0]['charge_resolution']['resolved'])
+        self.assertEqual(recovery.availability(phase.rows)['errors'],1)
 
     # The stream identity check accepts exactly the frozen endpoint alias, never an arbitrary dated suffix.
     def test_frozen_stream_model_identity_positive_and_wrong_suffix_negative(self):
@@ -369,7 +418,7 @@ class RecoveryTests(unittest.TestCase):
     def test_analysis_with_and_without_alibaba_same_whole_window_rule(self):
         alibaba=json.loads(json.dumps(self.candidate));alibaba['endpoint'].update(provider_name='Alibaba',tag='alibaba')
         names={amendment.identity(c):c for c in (self.candidate,alibaba)}
-        rows=[dict(provider=n,phase='amendment',model=c['model'],cohort='core',depth=1000000,call_index=1,accepted=True,prompt_tokens=999000,cached_tokens=0,new_tokens_estimate=1065,pause_target_seconds=8,pause_actual_seconds=8) for n,c in names.items()]
+        rows=[dict(provider=n,observed_providers=[c['endpoint']['provider_name']],phase='amendment',model=c['model'],cohort='core',depth=1000000,call_index=1,accepted=True,prompt_tokens=999000,cached_tokens=0,new_tokens_estimate=1065,pause_target_seconds=8,pause_actual_seconds=8) for n,c in names.items()]
         rows.append(dict(rows[0],accepted=False,timed_out=True,error='deadline',call_index=0))
         with mock.patch.object(restart,'candidates',return_value=names),mock.patch.object(restart,'read_rows',return_value=rows):data=restart.analysis(self.root,final=True)
         comparison=data['million_token_comparison']['qwen/qwen3.8-27b']

@@ -389,5 +389,5 @@ def main():
 if __name__=='__main__':
     try:raise SystemExit(main())
     except Exception as error:
-        print('failed amendment=1 '+type(error).__name__,flush=True)
+        print('failed amendment=1 '+(api.redact(str(error)) if isinstance(error,api.Refusal) else type(error).__name__),flush=True)
         raise SystemExit(1)

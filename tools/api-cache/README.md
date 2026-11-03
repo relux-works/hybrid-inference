@@ -1,3 +1,20 @@
+# r15g identity closure and authoritative filtered analysis
+
+Muse r7au2 found a prospective missing-provider bypass on03ad1a09c; no collected row was invalidated. The fixed source is isolated on m3-api-cache-r15g. Never edit the running r15e checkout or signal its supervisor, runner or observer. Amendment continues from that same original source: its supervisor has no alternate-head handoff or phase-boundary hash check. See REVIEW-r15g.md and .temp/hybrid-d-r15g-261103/AMENDMENT-BOUNDARY.md for the exact load chain and custody decision.
+
+classify_call now rejects missing observed provider regardless of preset error, including guard-completed usage and historical output-only repair. Complete over-cap usage with the pinned provider is still accepted. The analysis filter independently rejects any accepted research row lacking provider observations, counts it as an availability failure, and excludes it from cache/price metrics. Raw rows and paid financial receipts stay unchanged; legacy serving_provider observations apply only when observed_providers is absent, never when explicitly empty. Reports disclose the refusal count and rejected row identities. Financial generation-cost checks still cover those charges. Audit source_commit comes from live workflow.json; audit_source_commit and module hashes identify this separate analysis source.
+
+From the signed isolated checkout:
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR=/home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15g-261103/tmp
+python3 -m unittest discover -s tools/api-cache -p 'test_openrouter*.py' -v
+nohup setsid --fork env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$TMPDIR" python3 -u tools/api-cache/openrouter_audit.py --watch-end --output /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15g-261103/audit-end > /home/agent/Werkstatt/hybrid-d/llama.cpp/.temp/hybrid-d-r15g-261103/end-observer-01.log 2>&1 < /dev/null &
+```
+
+The r15g observer is additional read-only analysis custody; the three original processes remain untouched. It reads no key while waiting and performs only allowlisted OpenRouter GETs after terminal state. Its authoritative filtered end report is .temp/hybrid-d-r15g-261103/audit-end/API-CACHE-REPORT.md. The prior live/r15f reports remain runtime diagnostics and do not contain the r15g filter. The task SUMMARY.md records the CPU-only current-data snapshot, observed refusal count and separately verified observer PID. End results append the final identity-refusal count there. No replay, ledger change or new completion is made by this workflow.
+
 # r15f output-length non-compliance and continuation
 
 [RESTART-r15f.md](RESTART-r15f.md) registers the owner-approved output classification and guard. Full HTTP200 usage above the requested16 tokens is accepted, flagged with its actual count, and priced at its real cost. Reservations use1024 output tokens. The client closes a stream above1024 reported completion tokens or1024 exposed UTF-8 output bytes, retaining the partial journal and reconciling unknown charges before another request. The byte limit is conservative and can cancel before1024 actual tokens; SSE chunks are never counted as tokens.

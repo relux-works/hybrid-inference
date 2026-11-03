@@ -6,6 +6,7 @@ from decimal import Decimal
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import time
@@ -117,10 +118,21 @@ def capture_rows(live,output):
     return accepted
 
 
+def source_provenance(live):
+    path=live/'workflow.json'
+    workflow=json.loads(path.read_text()) if path.exists() else {}
+    try:head=subprocess.check_output(['git','-C',str(Path(__file__).resolve().parent),'rev-parse','HEAD'],text=True,stderr=subprocess.DEVNULL).strip()
+    except (OSError,subprocess.CalledProcessError):head=None
+    return dict(source_commit=workflow.get('source_commit'),live_source_sha256=workflow.get('source_sha256'),
+                source_commit_basis='live workflow.json at row capture; null if unavailable',audit_source_commit=head)
+
+
 def audit(live,output,final=False,client_factory=GetOnlyClient):
     output_guard(live,output);disk_guard(output.parent)
     output.mkdir(parents=True,exist_ok=False)
     rows=capture_rows(live,output)
+    provenance=source_provenance(live)
+    analyzed=restart.analysis(live,final=final,output=output,rows=json.loads((output/'call-rows.json').read_text()))
     started=api.utc();client=client_factory()
     before=usage_record(client)
     snapshot=json.loads(api.SNAPSHOT.read_text());live_prices=dict(at=api.utc(),models=[],errors=[])
@@ -159,7 +171,7 @@ def audit(live,output,final=False,client_factory=GetOnlyClient):
     differences=[api.money(c['absolute_difference_usd']) for c in checks if c.get('absolute_difference_usd') is not None]
     agreements=sum(c['status']=='agreement' for c in checks)
     data=dict(audit='r15e',started_at=started,ended_at=api.utc(),final=final,live_root=str(live),
-              source_commit='95671982b',accepted_calls=len(rows),fetched_unique_generations=len(records),agreement_calls=agreements,
+              **provenance,provider_identity_filter=analyzed['provider_identity_filter'],accepted_calls=len(rows),fetched_unique_generations=len(records),agreement_calls=agreements,
               research_accepted_calls=sum(r['phase'] in ('legacy-v1','v1','amendment') for r in rows),financial_only_accepted_calls=sum(r['phase'] not in ('legacy-v1','v1','amendment') for r in rows),
               mismatch_calls=sum(c['status']=='mismatch' for c in checks),unverified_calls=sum(c['status'] not in ('agreement','mismatch') for c in checks),
               largest_absolute_difference_usd=str(max(differences)) if differences else None,tolerance_usd=str(TOLERANCE),
@@ -176,7 +188,6 @@ def audit(live,output,final=False,client_factory=GetOnlyClient):
         fields=['phase','sequence','provider','depth','call_index','generation_id','status','streamed_cost_usd','generation_cost_usd','difference_usd']
         writer=csv.DictWriter(handle,fieldnames=fields,extrasaction='ignore');writer.writeheader()
         for check in checks:writer.writerow({k:api.redact(str(v),client.secret) for k,v in check.items() if k in fields})
-    restart.analysis(live,final=final,output=output,rows=json.loads((output/'call-rows.json').read_text()))
     report=output/'API-CACHE-REPORT.md'
     lines=['','## r15e cost source and read-only generation cross-check','',
            'Per-call billed cost is streamed usage.cost; cumulative /key plus the retained-reservation ledger bounds spending. This audit changes no financial or live-run state.',
@@ -208,10 +219,11 @@ def observe_end(live,output):
         if time.time()>restart.epoch('2026-11-05T06:10:00+00:00'):raise api.Refusal('end observer deadline; no terminal workflow observed')
         time.sleep(30)
     result=audit(live,output,final=True)
-    recovery.atomic_json(state,dict(at=api.utc(),pid=os.getpid(),status='done',accepted_calls=result['accepted_calls'],mismatch_calls=result['mismatch_calls'],unverified_calls=result['unverified_calls'],output=str(output)))
+    refused=result.get('provider_identity_filter',{}).get('rejected_count')
+    recovery.atomic_json(state,dict(at=api.utc(),pid=os.getpid(),status='done',accepted_calls=result['accepted_calls'],mismatch_calls=result['mismatch_calls'],unverified_calls=result['unverified_calls'],identity_refused_rows=refused,output=str(output)))
     summary=output.parent/'SUMMARY.md'
     with summary.open('a') as handle:
-        handle.write('\nEnd audit '+api.utc()+': '+str(result['accepted_calls'])+' accepted calls; agreements '+str(result['agreement_calls'])+', mismatches '+str(result['mismatch_calls'])+', unverified '+str(result['unverified_calls'])+', largest difference USD'+str(result['largest_absolute_difference_usd'])+'. Report: '+str(output/'API-CACHE-REPORT.md')+'. Live source/run untouched.\n')
+        handle.write('\nEnd audit '+api.utc()+': '+str(result['accepted_calls'])+' accepted calls; agreements '+str(result['agreement_calls'])+', mismatches '+str(result['mismatch_calls'])+', unverified '+str(result['unverified_calls'])+', largest difference USD'+str(result['largest_absolute_difference_usd'])+'. Identity-refused accepted rows: '+str(refused)+'. Report: '+str(output/'API-CACHE-REPORT.md')+'. Live source/run untouched.\n')
     return result
 
 

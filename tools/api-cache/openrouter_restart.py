@@ -140,8 +140,22 @@ def price_metrics(rows,candidate,depths):
     return measured
 
 
+def filter_provider_identity(rows):
+    filtered=[];rejected=[];accepted=0
+    for source in rows:
+        row=dict(source)
+        if row.get('accepted'):
+            accepted+=1
+            if not recovery.provider_observations(row):
+                rejected.append({k:row.get(k) for k in ('phase','sequence','provider','session_id','call_index')})
+                row.update(accepted=False,analysis_original_accepted=True,error='analysis identity refusal: serving provider absent')
+        filtered.append(row)
+    return filtered,dict(rule='Accepted research rows require observed provider; legacy serving_provider evidence is used only if observed_providers is absent.',
+                         original_accepted_count=accepted,rejected_count=len(rejected),rejected_rows=rejected)
+
+
 def analysis(root,final=False,output=None,rows=None):
-    rows=read_rows(root) if rows is None else rows
+    rows,identity_filter=filter_provider_identity(read_rows(root) if rows is None else rows)
     output=root if output is None else output
     providers=[]
     all_candidates=candidates()
@@ -193,13 +207,14 @@ def analysis(root,final=False,output=None,rows=None):
         own=[r for r in rows if r['provider']==p['provider']]
         p['cold_probe_latencies']=[dict(depth=r['depth'],call_index=r['call_index'],**amendment.miss_latency(r)) for r in own if r.get('cohort')=='probe']
     _,excluded=api.matrix(json.loads(api.SNAPSHOT.read_text()))
-    data=dict(protocol='r15d+r15e+r15f-analysis',million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
+    data=dict(protocol='r15d+r15e+r15f+r15g-analysis',provider_identity_filter=identity_filter,million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
               providers=providers,million_token_comparison=comparisons,
               remote_uptime_samples=len(samples),remote_sample_times=[s['at'] for s in samples],
               smoke_used_for_cache=False,seed_calls_used_for_cache=False,
               rules='Only context/no declared cache/whole-window availability exclude. Zero hits are priced. Daily windows overlap.')
     recovery.atomic_json(output/'analysis.json',data)
     lines=['# API cache report - r15d','', 'Whole window: '+WINDOW_START+' through '+data['window_observed_through']+'. Final: '+str(final)+'.','',
+           'Identity-refused accepted rows: '+str(identity_filter['rejected_count'])+'. The r15g analysis filter refuses provider-less accepted rows from cache/price metrics and counts them as availability failures. Original raw rows and financial charges stay unchanged; rejected identities are recorded in analysis.json.','',
            'The whole Chutes smoke and every call_index0 are excluded from cache metrics. All attempted calls, including seeds and charge-resolved timeouts, count toward availability. Old full-v3 attempts join both new phases; pilot/configuration cohorts do not.','',
            'Known zero hits are priced at the measured rate. Missing usage stays unknown. Core and long-pause prices stay separate. Remote rolling daily statistics are metadata, not a substitute for whole-window own availability.','',
            'Headline1M is pooled across restarted-v1 multi-pause cadence and amendment core cadence. Per-phase1M figures are beside it; the separate long-pause substudy and probes are excluded.','',
