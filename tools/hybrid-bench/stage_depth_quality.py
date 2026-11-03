@@ -13,27 +13,30 @@ import sys
 import tarfile
 
 import depth_quality as depth
+import depth_corpus as corpus
 import hetero_study as study
 from gpu_stage import FLAGS, add_disk_floor_argument, clean_source, disk, exclusive, gpu_identity, interrupted, read, require, run, save, sha, stream_sha, terminal
 from stage_kl_bf16 import download_models
 
 
-def estimates(depth_tokens, rows=4096, count=16, hourly=1.57):
-    # Six prefills cover two documents and three arms; all rates are planning assumptions.
-    result = []
+def estimates(depth_tokens, rows=4096, count=16, hourly=1.57, documents=None, needle_mode='sequential'):
+    documents = documents or (3 if depth_tokens <= 524288 else 2)
     state = depth_tokens * 34816 + 160_000_000
-    for label, prefill, tail_rate, io_rate in [('optimistic', 3000, 120, 5e9), ('conservative', 1000, 40, 2e9)]:
-        prefill_seconds = 6 * depth_tokens / prefill
-        tail_seconds = 6 * rows / tail_rate
-        io_seconds = (6 * count + 20) * state / io_rate
-        needle_seconds = 6 * count * 32 / 20
-        seconds = prefill_seconds + tail_seconds + io_seconds + needle_seconds
-        result.append(dict(scenario=label, gpu_hours=seconds/3600, cost_usd=seconds/3600*hourly,
-            prefill_tokens_per_second=prefill, tail_tokens_per_second=tail_rate, state_io_bytes_per_second=io_rate,
-            prefill_seconds=prefill_seconds, tail_seconds=tail_seconds, state_io_seconds=io_seconds,
-            needle_generation_seconds=needle_seconds))
-    return dict(depth=depth_tokens, documents=2, state_bytes=state, hourly_usd_assumption=hourly, scenarios=result,
-                excludes='setup, build, downloads, logit comparisons/hashes, archive, query prefill and rental billing granularity; no measured RTX rates')
+    result = []
+    for label, prefill_seconds_at_million, checks_at_million in [('lower', 900, 900), ('upper', 1200, 1800)]:
+        prefill_per_arm = prefill_seconds_at_million * depth_tokens/1040000
+        checks = checks_at_million * max(.6, depth_tokens/1040000)
+        extra_restores = 0 if needle_mode == 'sequential' else 3*(count-1)*state/2e9
+        per_document = 3*prefill_per_arm + checks + extra_restores
+        result.append(dict(scenario=label, gpu_hours=documents*per_document/3600,
+            hours_per_document=per_document/3600, cost_usd=documents*per_document/3600*hourly,
+            prefill_seconds=documents*3*prefill_per_arm, prefill_seconds_per_arm=prefill_per_arm,
+            checks_restore_allowance_seconds=documents*checks, extra_independent_restore_seconds=documents*extra_restores))
+    return dict(depth=depth_tokens, documents=documents, observation_unit='document', state_bytes=state,
+        needle_mode=needle_mode, needle_restores_per_arm=1 if needle_mode == 'sequential' else count,
+        hourly_usd_assumption=hourly, reference_positions_per_arm=64, scenarios=result,
+        assumptions='At 1M: three 15-20 minute prefills plus 15-30 minutes for logits, reference probes, state I/O and needle questions; analyst planning envelope, not measured RTX timing.',
+        excludes='setup, build, downloads, remote handoff transfer, archive and billing granularity; more than 4096 logits or 16 needles requires recalibration')
 
 
 def build_depth(source, directory, ref, log, floor):
@@ -90,13 +93,19 @@ def main():
     parser.add_argument('--needles', type=int, default=16)
     parser.add_argument('--batch', type=int, default=2048)
     parser.add_argument('--partition-batch', type=int, default=1024)
-    parser.add_argument('--document-pins', type=Path, help='optional pre-existing manifest with two pinned Gutenberg documents; otherwise freeze first fetch')
+    parser.add_argument('--corpus-pins', type=Path, default=Path(__file__).with_name('depth_corpus_pins.json'))
+    parser.add_argument('--million-documents', type=int, choices=[2, 3], default=2)
+    parser.add_argument('--needle-mode', choices=['sequential', 'independent'], default='sequential')
+    parser.add_argument('--handoff-command', type=Path, help='executable receiving each manifest while its sole state exists; transport must finish before return')
     add_disk_floor_argument(parser)
     args = parser.parse_args()
     require(args.depths and all(64 <= d and d+args.rows+767 <= 1048576 for d in args.depths) and
             0 < args.rows <= 65536 and 0 < args.needles <= 64 and args.hourly_usd > 0 and 0 < args.batch <= 8192 and 8192 % args.batch == 0 and
             0 < args.partition_batch <= 8192 and args.batch != args.partition_batch, 'invalid stage dimensions, batches or price')
-    planning = [estimates(d, args.rows, args.needles, args.hourly_usd) for d in args.depths]
+    if args.handoff_command is not None:
+        require(args.handoff_command.is_file() and os.access(args.handoff_command, os.X_OK), 'handoff command must be an existing executable')
+    corpus_rows = corpus.documents(args.corpus_pins)
+    planning = [estimates(d, args.rows, args.needles, args.hourly_usd, len(corpus.select(corpus_rows, d, args.million_documents)), args.needle_mode) for d in args.depths]
     print(json.dumps(planning, indent=2), flush=True)
     if not args.execute:
         return
@@ -114,7 +123,8 @@ def main():
     with exclusive(root/'stage.lock'), exclusive(root/'gpu.lock'):
         require(not (root/'manifest.json').exists(), 'stage output exists; use a fresh root')
         pin = read(source/'tools/hybrid-bench/state_bf16_model_pins.json')['models']['q4']
-        logits_bytes = len(args.depths)*2*3*args.rows*248320*4
+        cases = sum(p['documents'] for p in planning)
+        logits_bytes = cases*3*(args.rows+64)*248320*4
         state_bytes = max(args.depths)*34816+160_000_000
         available = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))) * 1024
         require(available >= state_bytes + pin['files'][0]['size'] + 16*1024**3, 'insufficient available host RAM for delta staging, weights and margin')
@@ -124,13 +134,7 @@ def main():
              environment={key:os.environ.get(key) for key in ('CUDA_VISIBLE_DEVICES', 'GGML_CUDA_ENABLE_UNIFIED_MEMORY')}, estimates=planning, args={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}, model_pin=pin))
         (root/'models').mkdir()
         models = download_models(dict(models={'q4': pin}), root/'models', args.disk_floor_bytes)
-        # Freeze source bytes before building any seeded documents; later executions can pass these exact pins.
-        sources = args.document_pins or source/'tools/hybrid-bench/gutenberg_sources.json'
-        entries = study.documents(sources, pinned=args.document_pins is not None)[:2]
-        require(len(entries) == 2, 'exactly two public documents required')
-        save(root/'sources.json', dict(documents=entries))
-        study.fetch(argparse.Namespace(manifest=str(root/'sources.json'), output=str(root/'documents')))
-        pins = study.read(root/'documents/manifest.json')['documents']
+        pins = corpus.fetch(args.corpus_pins, root/'documents')
         build = root/'build'
         require(not build.exists(), 'build exists')
         try:
@@ -138,15 +142,22 @@ def main():
                 build_depth(source, build, args.ref, root/'build.log', args.disk_floor_bytes)
             binary = build/'bin/llama-hybrid-depth'
             for tokens in args.depths:
-                for i, pin in enumerate(pins):
-                    case = study.private_dir(root/f'depth-{tokens}-doc-{i}')
-                    disk(root, state_bytes+3*args.rows*248320*4, floor=args.disk_floor_bytes, log=root/'disk.log')
-                    text = root/'documents'/(pin['id']+'.txt')
-                    require(sha(text) == pin['sha256'], 'document changed before preparation')
-                    fixture = depth.prepare(binary, models['q4'], text, pin, case, tokens, args.rows, 42+i, args.needles, 14400, args.window)
-                    depth.run_case(binary, models['q4'], fixture, case, 999, args.batch, args.partition_batch, 14400)
+                for i, pin in enumerate(corpus.select(pins, tokens, args.million_documents)):
+                    case = study.private_dir(root/f'depth-{tokens}-{pin["id"]}')
+                    disk(root, state_bytes+3*(args.rows+64)*248320*4, floor=args.disk_floor_bytes, log=root/'disk.log')
+                    text = Path(pin['path'])
+                    require(sha(text) == pin['derived_sha256'], 'document changed before preparation')
+                    fixture = depth.prepare(binary, models['q4'], text, pin, case, tokens, args.rows, 42+i, args.needles, 14400, args.window, args.needle_mode)
+                    depth.run_case(binary, models['q4'], fixture, case, 999, args.batch, args.partition_batch, 14400,
+                                   handoff_command=None if args.handoff_command is None else args.handoff_command.resolve(), engine_ref=args.ref)
                     archive_case(case)
                     print(f'done depth={tokens} document={pin["id"]} report={case/"report.md"}', flush=True)
+            observations = [read(p) for p in root.glob('depth-*/report.json')]
+            save(root/'document-observations.json', dict(observation_unit='document',
+                note='Positions and needles within a document are correlated; no pooled-position confidence interval.',
+                documents=[dict(depth=r['context_depth'], id=r['document']['id'], kind=r['document']['kind'],
+                    local_needle_accuracy=r['local_needle_accuracy'], needle_accuracy=r['needle_accuracy'],
+                    all_arms_missed_all_needles=r['all_arms_missed_all_needles'], logit_comparison=r['offload_against_local']) for r in observations]))
             metadata = [p for p in root.rglob('*') if p.is_file() and build not in p.parents and
                         root/'models' not in p.parents and p.suffix not in ('.f32', '.gz')]
             with tarfile.open(root/'stage-metadata.tar.gz', 'x:gz') as bundle:

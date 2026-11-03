@@ -1,0 +1,57 @@
+{
+  "schema": "depth-corpus-1",
+  "documents": [
+    {
+      "id": "llama-source",
+      "kind": "code",
+      "format": "text",
+      "files": [
+        {
+          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e0f142d5ddc1461ce721644d92af33db23545105/src/llama-context.cpp",
+          "revision": "e0f142d5ddc1461ce721644d92af33db23545105",
+          "sha256": "63645057d8f017d651544499fc1f3bcff5997cf25270b06479558ebfb5f9f3d2",
+          "size": 172132
+        },
+        {
+          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e0f142d5ddc1461ce721644d92af33db23545105/ggml/src/ggml-cpu/ggml-cpu.c",
+          "revision": "e0f142d5ddc1461ce721644d92af33db23545105",
+          "sha256": "e857ca9f6bf99d194a24c9d29dd58ae7fabd7b83f57fcadb792c9dd7de0f3db8",
+          "size": 133633
+        },
+        {
+          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e0f142d5ddc1461ce721644d92af33db23545105/src/llama-model.cpp",
+          "revision": "e0f142d5ddc1461ce721644d92af33db23545105",
+          "sha256": "0428a8e43eed0a11470ac12e55fde8d6d9c76d25d31dc9ec597e4f2df13e92d2",
+          "size": 190415
+        }
+      ]
+    },
+    {
+      "id": "oasst-public",
+      "kind": "chat",
+      "format": "oasst-trees-gzip",
+      "files": [
+        {
+          "url": "https://huggingface.co/datasets/OpenAssistant/oasst1/resolve/fdf72ae0827c1cda404aff25b6603abec9e3399b/2023-04-12_oasst_ready.trees.jsonl.gz",
+          "revision": "fdf72ae0827c1cda404aff25b6603abec9e3399b",
+          "sha256": "2a9a8fd343e9b28e04a895a669d3253f82d93e9c174d440199ae19d5fafbdff7",
+          "size": 34145252
+        }
+      ]
+    },
+    {
+      "id": "tiny-stories",
+      "kind": "prose",
+      "format": "text",
+      "synthetic": true,
+      "files": [
+        {
+          "url": "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStories-valid.txt",
+          "revision": "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64",
+          "sha256": "94e431816c4cce81ff71e4408ff8d3bda9a42e8d2663986697c3954288cb38b4",
+          "size": 19447282
+        }
+      ]
+    }
+  ]
+}

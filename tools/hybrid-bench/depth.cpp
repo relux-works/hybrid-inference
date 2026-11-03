@@ -62,7 +62,7 @@ static json binding(const json & fixture) {
     const auto tokens = fixture.at("tokens").get<std::vector<llama_token>>();
     const auto tail = fixture.at("tail").get<std::vector<llama_token>>();
     return {{"model_sha256", fixture.at("model_sha256")}, {"tokens_sha256", hybrid::prefix_hash(tokens)},
-            {"tail_sha256", hybrid::prefix_hash(tail)}, {"window", fixture.value("window", std::string("after"))}, {"settings", fixture.at("settings")}, {"needles", fixture.at("needles")}};
+            {"tail_sha256", hybrid::prefix_hash(tail)}, {"window", fixture.value("window", std::string("after"))}, {"needle_mode", fixture.at("needle_mode")}, {"probe_tokens", fixture.at("probe_tokens")}, {"source", fixture.at("source")}, {"settings", fixture.at("settings")}, {"needles", fixture.at("needles")}};
 }
 
 static void save_state(llama_context * ctx, const std::string & path, const std::vector<llama_token> & tokens, const json & identity) {
@@ -144,6 +144,25 @@ static void load_state(llama_context * ctx, const std::string & path, const std:
     require(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == int64_t(tokens.size() - 1), "restored state depth mismatch");
 }
 
+static void write_logits(llama_context * ctx, const std::vector<llama_token> & tokens, size_t begin, int batch_size, int vocab, const std::string & path) {
+    const uint16_t endian = 1;
+    require(*reinterpret_cast<const uint8_t *>(&endian) == 1 && sizeof(float) == 4, "float32 little-endian host required");
+    require(!std::filesystem::exists(path), "logits already exist");
+    std::ofstream out(path, std::ios::binary);
+    for (size_t i = begin; i < tokens.size(); i += batch_size) {
+        const size_t end = std::min(tokens.size(), i + batch_size);
+        decode(ctx, tokens, i, end, batch_size, true);
+        for (size_t j = 0; j < end - i; ++j) {
+            const float * row = llama_get_logits_ith(ctx, j);
+            require(row, "missing logits");
+            for (int k = 0; k < vocab; ++k) { require(std::isfinite(row[k]), "nonfinite logits"); }
+            out.write(reinterpret_cast<const char *>(row), vocab * sizeof(float));
+        }
+    }
+    out.close();
+    require(out.good(), "logit write failed");
+}
+
 static json metrics(const std::vector<float> & a, const std::vector<float> & b) {
     require(!a.empty() && a.size() == b.size(), "logit shape mismatch");
     double za = 0, zb = 0, maximum = 0;
@@ -201,9 +220,11 @@ static void prepare(llama_model * model, const json & job, const std::string & h
     auto tokens = tokenize(vocab, "<|im_start|>user\nRead this document and remember its secret records.\n");
     const size_t begin = tokens.size();
     const size_t rotation = job.at("seed").get<uint64_t>() % body.size();
+    const std::string needle_mode = job.value("needle_mode", std::string("sequential"));
+    require(needle_mode == "sequential" || needle_mode == "independent", "invalid needle mode");
     const int total = final_window ? depth : depth + rows;
     const int split = final_window ? depth - rows : depth;
-    for (int i = tokens.size(); i < total; ++i) { tokens.push_back(body[(rotation + i - begin) % body.size()]); }
+    for (int i = tokens.size(); i < std::max(total, depth + 64); ++i) { tokens.push_back(body[(rotation + i - begin) % body.size()]); }
     json needles = json::array();
     const auto entries = job.at("needles");
     size_t previous_end = begin;
@@ -214,14 +235,24 @@ static void prepare(llama_model * model, const json & job, const std::string & h
         require(position >= previous_end && position + text.size() < size_t(depth), "needles overlap or exceed document");
         std::copy(text.begin(), text.end(), tokens.begin() + position);
         auto query = tokenize(vocab, "\nWhat is the value of secret record " + key + "? Reply with only its value.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n");
-        needles.push_back({{"key", key}, {"expected", answer}, {"position", position}, {"inserted_tokens", text}, {"query", query}});
+        auto next_query = tokenize(vocab, "<|im_end|>\n<|im_start|>user\nWhat is the value of secret record " + key + "? Reply with only its value.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n");
+        needles.push_back({{"query_next", next_query}, {"key", key}, {"expected", answer}, {"position", position}, {"inserted_tokens", text}, {"query", query}});
         previous_end = position + text.size();
     }
-    const std::vector<llama_token> tail(tokens.begin() + split, tokens.end());
+    const std::vector<llama_token> tail(tokens.begin() + split, tokens.begin() + total);
+    const std::vector<llama_token> probe(tokens.begin() + depth, tokens.begin() + depth + 64);
     tokens.resize(split);
     auto settings = job.at("settings");
-    settings["n_ctx"] = (total + 512 + 255) / 256 * 256;
-    write_json(job.at("output"), {{"version", 1}, {"context_depth", depth}, {"window", final_window ? "final" : "after"}, {"model_sha256", hash}, {"settings", settings}, {"tokens", tokens}, {"tail", tail}, {"needles", needles}, {"source", job.at("source")}, {"seed", job.at("seed")}});
+    size_t reserve = 512;
+    if (needle_mode == "sequential") {
+        size_t query_tokens = 0;
+        for (const auto & needle : needles) { query_tokens += std::max(needle.at("query").size(), needle.at("query_next").size()) + 32; }
+        reserve = std::max(reserve, query_tokens + 64);
+    }
+    const size_t capacity = std::max<size_t>(total + 512, depth + reserve);
+    require(capacity + 255 <= 1048576, "sequential queries exceed context capacity");
+    settings["n_ctx"] = (capacity + 255) / 256 * 256;
+    write_json(job.at("output"), {{"version", 2}, {"needle_mode", needle_mode}, {"probe_tokens", probe}, {"context_depth", depth}, {"window", final_window ? "final" : "after"}, {"model_sha256", hash}, {"settings", settings}, {"tokens", tokens}, {"tail", tail}, {"needles", needles}, {"source", job.at("source")}, {"seed", job.at("seed")}});
 }
 
 int main(int argc, char ** argv) {
@@ -243,25 +274,31 @@ int main(int argc, char ** argv) {
         hybrid::model_ptr model(llama_model_load_from_file(model_path.c_str(), mp));
         require(bool(model), "model load failed");
         if (mode == "prepare") { prepare(model.get(), job, hash); return 0; }
-        require(mode == "export" || mode == "evaluate", "unknown mode");
+        require(mode == "export" || mode == "evaluate" || mode == "probe", "unknown mode");
         require(!gpu || llama_model_n_devices(model.get()) > 0, "no GPU model device");
         auto fixture = read_json(job.at("fixture"));
         require(fixture.at("model_sha256") == hash, "fixture model mismatch");
+        require(fixture.at("version") == 2, "regenerate depth fixture v2");
         const auto identity = binding(fixture);
         const bool final_window = fixture.value("window", std::string("after")) == "final";
         require(same_json(job.at("binding"), identity), "document or YaRN mismatch");
         auto tokens = fixture.at("tokens").get<std::vector<llama_token>>();
         const auto tail = fixture.at("tail").get<std::vector<llama_token>>();
+        const auto probe = fixture.at("probe_tokens").get<std::vector<llama_token>>();
+        require(probe.size() == 64, "exactly 64 handoff probe tokens required");
         const auto settings = fixture.at("settings");
         const int n_ctx = settings.at("n_ctx"), batch_size = job.at("batch_size"), vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         require(n_ctx > 0 && n_ctx <= 1048576 && !tokens.empty() && !tail.empty() && tokens.size() + tail.size() + 512 <= size_t(n_ctx), "invalid context bounds");
         require(batch_size > 0 && batch_size <= 8192, "invalid prefill batch");
-        for (auto sequence : {tokens, tail}) {
+        for (auto sequence : {tokens, tail, probe}) {
             for (auto t : sequence) { require(t >= 0 && t < vocab, "invalid token"); }
         }
         for (const auto & needle : fixture.at("needles")) {
             require(needle.at("query").size() < 256, "query too long");
-            for (auto t : needle.at("query").get<std::vector<llama_token>>()) { require(t >= 0 && t < vocab, "invalid query token"); }
+            for (const auto * key : {"query", "query_next"}) {
+                require(needle.at(key).size() < 256, "query too long");
+                for (auto t : needle.at(key).get<std::vector<llama_token>>()) { require(t >= 0 && t < vocab, "invalid query token"); }
+            }
         }
         auto cp = llama_context_default_params();
         cp.n_ctx = n_ctx;
@@ -287,6 +324,17 @@ int main(int argc, char ** argv) {
         hybrid::context_ptr ctx(llama_init_from_model(model.get(), cp));
         require(bool(ctx), "context load failed");
         const std::string state = job.at("state");
+        if (mode == "probe") {
+            if (final_window) { tokens.insert(tokens.end(), tail.begin(), tail.end()); }
+            load_state(ctx.get(), state, tokens, identity, true);
+            const size_t depth = tokens.size();
+            tokens.insert(tokens.end(), probe.begin(), probe.end());
+            const std::string path = job.at("logits");
+            write_logits(ctx.get(), tokens, depth, 1, vocab, path);
+            write_json(job.at("output"), {{"binding", identity}, {"vocab", vocab}, {"rows", 64}, {"depth", depth},
+                       {"logits_sha256", hybrid::file_hash(path)}, {"probe_tokens", probe}});
+            return 0;
+        }
         if (mode == "export") {
             export_transfer(ctx.get(), state, tokens, batch_size, job.value("chunk_tokens", 8192), identity);
             return 0;
@@ -298,33 +346,32 @@ int main(int argc, char ** argv) {
             if (!final_window) { save_state(ctx.get(), state, tokens, identity); }
         }
         const std::string logits_path = job.at("logits");
-        require(!std::filesystem::exists(logits_path), "logits already exist");
-        std::ofstream logits(logits_path, std::ios::binary);
         auto stream = tokens;
         stream.insert(stream.end(), tail.begin(), tail.end());
-        const int score_batch = 32;
-        for (size_t i = tokens.size(); i < stream.size(); i += score_batch) {
-            const size_t end = std::min(stream.size(), i + score_batch);
-            decode(ctx.get(), stream, i, end, score_batch, true);
-            for (size_t j = 0; j < end - i; ++j) {
-                const float * row = llama_get_logits_ith(ctx.get(), j);
-                require(row, "missing logits");
-                for (int k = 0; k < vocab; ++k) { require(std::isfinite(row[k]), "nonfinite logits"); }
-                logits.write(reinterpret_cast<const char *>(row), vocab * sizeof(float));
-            }
-        }
-        logits.close();
-        require(logits.good(), "logit write failed");
+        write_logits(ctx.get(), stream, tokens.size(), 32, vocab, logits_path);
         const auto & checkpoint = final_window ? stream : tokens;
         if (final_window) { save_state(ctx.get(), state, checkpoint, identity); }
+        size_t restores = 0;
+        if (!final_window) { load_state(ctx.get(), state, checkpoint, identity, false); ++restores; }
+        auto reference = checkpoint;
+        reference.insert(reference.end(), probe.begin(), probe.end());
+        const std::string reference_path = job.at("reference_logits");
+        write_logits(ctx.get(), reference, checkpoint.size(), 1, vocab, reference_path);
         json answers = json::array();
+        const bool sequential = fixture.at("needle_mode") == "sequential";
+        auto query = checkpoint;
         for (const auto & needle : fixture.at("needles")) {
-            // A sequence snapshot does not restore logits. Every query is decoded before sampling.
-            load_state(ctx.get(), state, checkpoint, identity, false);
-            auto query = checkpoint;
-            const auto suffix = needle.at("query").get<std::vector<llama_token>>();
+            // Restore once for a sequential chat. Independent probes restore before every question.
+            if (!sequential || answers.empty()) {
+                load_state(ctx.get(), state, checkpoint, identity, false);
+                ++restores;
+                query = checkpoint;
+            }
+            const size_t begin = query.size();
+            const auto suffix = needle.at(sequential && !answers.empty() ? "query_next" : "query").get<std::vector<llama_token>>();
             query.insert(query.end(), suffix.begin(), suffix.end());
-            decode(ctx.get(), query, checkpoint.size(), query.size(), std::min(batch_size, 256));
+            require(query.size() + 32 <= llama_n_ctx(ctx.get()), "needle chain exceeds context capacity");
+            decode(ctx.get(), query, begin, query.size(), 32);
             std::vector<llama_token> generated;
             for (int i = 0; i < 32; ++i) {
                 const auto token = hybrid::greedy(ctx.get(), model.get());
@@ -341,7 +388,8 @@ int main(int argc, char ** argv) {
         }
         write_json(job.at("output"), {{"binding", identity}, {"vocab", vocab}, {"rows", tail.size()}, {"batch_size", batch_size}, {"gpu_layers", gpu},
                    {"logits_sha256", hybrid::file_hash(logits_path)}, {"state", read_json(state + ".json")}, {"imported_transfer", transfer}, {"answers", answers},
-                   {"logit_positions", "after each forced token; first at prefix token count"}, {"snapshot_depth", checkpoint.size()}});
+                   {"logit_positions", "after each forced token; first at prefix token count"}, {"snapshot_depth", checkpoint.size()}, {"state_restores", restores}, {"needle_mode", fixture.at("needle_mode")},
+                   {"reference_logits_sha256", hybrid::file_hash(reference_path)}, {"reference_rows", 64}, {"probe_tokens", probe}});
     } catch (const std::exception & error) {
         std::cerr << "depth refused: " << error.what() << '\n';
         return 2;
