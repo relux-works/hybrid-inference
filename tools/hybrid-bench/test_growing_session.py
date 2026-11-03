@@ -20,6 +20,17 @@ import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # Ten attention chunks at 100k carry one fixed recurrent state, not ten copies; headers remain an allowance.
+    def test_packet_traffic_counts_final_state_once(self):
+        path = Path(growing.__file__).parent / 'packets/r46/estimate.py'
+        spec = importlib.util.spec_from_file_location('r46_estimate', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.delta_wire_estimate(100000, dict(kv_bytes=34816, state_bytes=157000000)), 3641840960)
+        run = module.estimate('qwen', 5.19e6)
+        self.assertEqual(run['policy_offloads'], [])
+        self.assertLess(run['down_body_estimate_bytes'], 3.65e9)
+
     # A measured positive control is accepted; placeholders, wrong models, background and incomplete rates refuse.
     def test_pri31_fixture_admission(self):
         fixture = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-qwen-pri31.json').read_text())

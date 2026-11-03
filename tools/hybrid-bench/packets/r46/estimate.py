@@ -18,6 +18,13 @@ def curve(depth, rows, key):
     return rate
 
 
+def delta_wire_estimate(tokens, geometry):
+    chunk = extend_chunk_limit(**geometry)
+    # Protocol v2 carries fixed state only in the final chunk; reserve 4096 header bytes per chunk.
+    return ((geometry['kv_bytes'] + 32) * tokens + geometry['state_bytes'] + geometry.get('window_bytes', 0) +
+            4096 * ((tokens + chunk - 1) // chunk))
+
+
 def estimate(kind, link, local=100, decode=18):
     qwen = kind == 'qwen'
     fixture = json.loads((ROOT / 'tools/hybrid-bench/fixtures/m3-max-qwen-pri31.json').read_text())
@@ -33,10 +40,8 @@ def estimate(kind, link, local=100, decode=18):
     policy = Policy(local_rates=tuple([(0, prefill(0))] + [(r['depth'], r['prefill']) for r in rows]) if qwen else ((0, local),),
         server_rate=1767 if qwen else 2823, link_rate=link, fixed=.1406, import_fixed=1.498,
         import_per_token=.0000487, kv_bytes=geometry['kv_bytes'], state_bytes=state)
-    chunk = extend_chunk_limit(**geometry)
-    def wire(n):
-        return (geometry['kv_bytes'] + 32) * n + (state + 4096) * ((n + chunk - 1) // chunk)
-    down = wire(depth - 1)
+    base_down = delta_wire_estimate(depth - 1, geometry)
+    down = base_down
     uploads = 11 * depth
     previous, offloads = True, []
     hybrid_prefill = local_prefill = 0
@@ -47,14 +52,14 @@ def estimate(kind, link, local=100, decode=18):
         previous = remote
         if remote:
             offloads.append(r['turn'])
-            down += wire(n)
+            down += delta_wire_estimate(n, geometry)
         hybrid_prefill += choice['offload_seconds'] if remote else n / prefill(r['conditioning_depth'])
         local_prefill += n / prefill(r['conditioning_depth'])
         uploads += 11 * (r['input_tokens'] + framing + r['output_tokens'])
     generated = sum(r['output_tokens'] / decoded(r['conditioning_depth']) for r in plan['sequence'])
     pauses = sum(r['pause_seconds'] for r in plan['sequence'])
     local_base = sum(min(256, depth - d) / prefill(d) for d in range(0, depth, 256))
-    hybrid_base = policy.fixed + depth / policy.server_rate + down / (link * policy.eta)
+    hybrid_base = policy.fixed + depth / policy.server_rate + base_down / (link * policy.eta)
     timing = dict(hybrid_turn_h=(generated + pauses + hybrid_prefill) / 3600,
                   local_turn_h=(generated + pauses + local_prefill) / 3600,
                   base_h=(local_base + hybrid_base) / 3600)

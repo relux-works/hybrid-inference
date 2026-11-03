@@ -15,13 +15,13 @@
       "seconds_model": {
         "hybrid_turn_h": 1.0166519066239887,
         "local_turn_h": 1.0166519066239887,
-        "base_h": 0.5277765002506438
+        "base_h": 0.438804495263678
       },
-      "subtotal_h": 2.5610803134986213,
-      "down_body_estimate_bytes": 5054806112,
+      "subtotal_h": 2.4721083085116553,
+      "down_body_estimate_bytes": 3641806112,
       "up_token_json_upper_estimate_bytes": 1577829,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 5459037125,
+      "planning_traffic_bytes": 4046037125,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -39,13 +39,13 @@
       "seconds_model": {
         "hybrid_turn_h": 1.0166519066239887,
         "local_turn_h": 1.0166519066239887,
-        "base_h": 0.37891720979397997
+        "base_h": 0.33155672713937967
       },
-      "subtotal_h": 2.4122210230419574,
-      "down_body_estimate_bytes": 5054806112,
+      "subtotal_h": 2.3648605403873573,
+      "down_body_estimate_bytes": 3641806112,
       "up_token_json_upper_estimate_bytes": 1577829,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 5459037125,
+      "planning_traffic_bytes": 4046037125,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -69,13 +69,13 @@
       "seconds_model": {
         "hybrid_turn_h": 1.0055470269347417,
         "local_turn_h": 1.0166519066239887,
-        "base_h": 0.33497806060678376
+        "base_h": 0.28387512792704517
       },
-      "subtotal_h": 2.3571769941655143,
-      "down_body_estimate_bytes": 6143805696,
+      "subtotal_h": 2.3060740614857758,
+      "down_body_estimate_bytes": 4730805696,
       "up_token_json_upper_estimate_bytes": 1577829,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 6548036709,
+      "planning_traffic_bytes": 5135036709,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -101,13 +101,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.994567868551124,
         "local_turn_h": 1.0166519066239887,
-        "base_h": 0.2949107767375027
+        "base_h": 0.25709714180939813
       },
-      "subtotal_h": 2.3061305519126156,
-      "down_body_estimate_bytes": 6534549184,
+      "subtotal_h": 2.268316916984511,
+      "down_body_estimate_bytes": 5121549184,
       "up_token_json_upper_estimate_bytes": 1577829,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 6938780197,
+      "planning_traffic_bytes": 5525780197,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     }
   ],
@@ -138,13 +138,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.9175136835605225,
         "local_turn_h": 0.9855136881883078,
-        "base_h": 0.5055630415684007
+        "base_h": 0.4664755868100041
       },
-      "subtotal_h": 2.408590413317231,
-      "down_body_estimate_bytes": 1204183488,
+      "subtotal_h": 2.3695029585588343,
+      "down_body_estimate_bytes": 1160668592,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1608244793,
+      "planning_traffic_bytes": 1564729897,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -166,13 +166,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.6923656851337282,
         "local_turn_h": 0.7071152313981843,
-        "base_h": 0.2712273472341481
+        "base_h": 0.25536447569889303
       },
-      "subtotal_h": 1.6707082637660606,
-      "down_body_estimate_bytes": 835344592,
+      "subtotal_h": 1.6548453922308055,
+      "down_body_estimate_bytes": 791829696,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1239405897,
+      "planning_traffic_bytes": 1195891001,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -193,13 +193,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.574668743995305,
         "local_turn_h": 0.5794109104105301,
-        "base_h": 0.1970610626496656
+        "base_h": 0.18499410532852267
       },
-      "subtotal_h": 1.3511407170555008,
-      "down_body_estimate_bytes": 775060160,
+      "subtotal_h": 1.3390737597343576,
+      "down_body_estimate_bytes": 731545264,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1179121465,
+      "planning_traffic_bytes": 1135606569,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -228,13 +228,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.9005343052480119,
         "local_turn_h": 0.9855136881883078,
-        "base_h": 0.4701009693085438
+        "base_h": 0.44929441646792034
       },
-      "subtotal_h": 2.3561489627448635,
-      "down_body_estimate_bytes": 1204183488,
+      "subtotal_h": 2.33534240990424,
+      "down_body_estimate_bytes": 1160668592,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1608244793,
+      "planning_traffic_bytes": 1564729897,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -263,13 +263,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.6776830706801107,
         "local_turn_h": 0.7071152313981843,
-        "base_h": 0.2589898581974327
+        "base_h": 0.23818330535680926
       },
-      "subtotal_h": 1.6437881602757276,
-      "down_body_estimate_bytes": 1204183488,
+      "subtotal_h": 1.6229816074351042,
+      "down_body_estimate_bytes": 1160668592,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1608244793,
+      "planning_traffic_bytes": 1564729897,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -292,13 +292,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.5679714464065513,
         "local_turn_h": 0.5794109104105301,
-        "base_h": 0.1781312585661272
+        "base_h": 0.16781293498643887
       },
-      "subtotal_h": 1.3255136153832086,
-      "down_body_estimate_bytes": 891267168,
+      "subtotal_h": 1.3151952918035201,
+      "down_body_estimate_bytes": 847752272,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1295328473,
+      "planning_traffic_bytes": 1251813577,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -331,13 +331,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.8864632675523674,
         "local_turn_h": 0.9855136881883078,
-        "base_h": 0.44786668767154025
+        "base_h": 0.4373659368218671
       },
-      "subtotal_h": 2.3198436434122156,
-      "down_body_estimate_bytes": 1386727424,
+      "subtotal_h": 2.309342892562542,
+      "down_body_estimate_bytes": 1343212528,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1790788729,
+      "planning_traffic_bytes": 1747273833,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -366,13 +366,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.665894690460905,
         "local_turn_h": 0.7071152313981843,
-        "base_h": 0.2343693813185991
+        "base_h": 0.22625482571075595
       },
-      "subtotal_h": 1.6073793031776884,
-      "down_body_estimate_bytes": 1204183488,
+      "subtotal_h": 1.5992647475698454,
+      "down_body_estimate_bytes": 1160668592,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1608244793,
+      "planning_traffic_bytes": 1564729897,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     },
     {
@@ -401,13 +401,13 @@
       "seconds_model": {
         "hybrid_turn_h": 0.5567061102139914,
         "local_turn_h": 0.5794109104105301,
-        "base_h": 0.16399901094822872
+        "base_h": 0.15588445534038559
       },
-      "subtotal_h": 1.3001160315727502,
-      "down_body_estimate_bytes": 1204183488,
+      "subtotal_h": 1.292001475964907,
+      "down_body_estimate_bytes": 1160668592,
       "up_token_json_upper_estimate_bytes": 1408121,
       "link_probe_both_directions_bytes": 402653184,
-      "planning_traffic_bytes": 1608244793,
+      "planning_traffic_bytes": 1564729897,
       "limits": "Delta payload/header allowance plus token JSON; excludes SSH/TCP retransmission, HTTP framing and calibration. No captures/checker. Time omits save/restore, background serialization, catch-up waits and thermal tails; add 25-50 percent operational margin."
     }
   ]
