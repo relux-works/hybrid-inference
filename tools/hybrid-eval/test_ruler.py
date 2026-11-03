@@ -7,6 +7,7 @@ from pathlib import Path
 import random
 import re
 import tempfile
+from types import SimpleNamespace
 import unittest
 import tarfile
 import zipfile
@@ -15,7 +16,8 @@ from unittest.mock import patch
 from hybrid_eval import Refusal, digest, http
 from ruler_analysis import analyze, excess_interval, mcnemar, wilson, write_analysis
 from ruler_data import DATA_FILES, PUNKT_FILES, SOURCE, VENDOR, bootstrap, verify_data, verify_source
-from ruler_eval import archive_depth, atomic_json, main as evaluate_main, run_example
+from ruler_eval import (SLOT_CLEANUP_PREDECESSOR, archive_depth, atomic_json, check_slot_space,
+                        example_sessions, main as evaluate_main, recover_sessions, resume_manifest, run_example)
 from ruler_generate import Generator, body_for, configurations, score
 
 
@@ -40,7 +42,7 @@ def fixture_sentences(text):
     return PunktSentenceTokenizer().tokenize(text)
 
 
-def table_row(index, offload=False, partition=False):
+def table_row(index, offload=False, partition=False) -> dict:
     return dict(depth=8192, task='niah_single_1', index=index, results={arm: dict(answer=answer, score=float(answer == 'a'),
                 prompt_sha256='same') for arm, answer in [('local', 'a'), ('offload', 'b' if offload else 'a'),
                                                          ('local_partition', 'b' if partition else 'a')]})
@@ -265,6 +267,160 @@ class RulerTests(unittest.TestCase):
                     self.assertEqual(hashlib.sha256(member.read()).hexdigest(), digest)
                 self.assertNotIn('specs', archive.getnames())
 
+    # Each slot volume gets 2*S+margin admission; one byte below the floor refuses before session writes.
+    def test_slot_disk_floor_refuses_before_writing(self):
+        configs = [dict(slot_path='client'), dict(slot_path='partition')]
+        with patch('ruler_eval.shutil.disk_usage', side_effect=[SimpleNamespace(free=250), SimpleNamespace(free=249)]) as usage:
+            with self.assertRaisesRegex(Refusal, 'slot disk floor: free=249 required=250.*no example started'):
+                check_slot_space(configs, 100, 50)
+            self.assertEqual([call.args[0] for call in usage.call_args_list], ['client', 'partition'])
+        with patch('ruler_eval.shutil.disk_usage', return_value=SimpleNamespace(free=250)):
+            check_slot_space(configs, 100, 50)
+        for size, margin in ((0, 1), (-1, 1), (100, -1)):
+            with self.assertRaisesRegex(Refusal, 'invalid slot disk budget'):
+                check_slot_space(configs, size, margin)
+
+    # Exceptions, interrupt and commit failure all release every allocated ID, including the arm never started.
+    def test_example_sessions_cleanup_on_errors_and_abort(self):
+        config = dict(proxy_url='fixture', client_credential='')
+        for error in (Refusal('stream failed'), KeyboardInterrupt(), OSError('commit failed')):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)/'pending.json'
+                with patch('ruler_eval.release_session', return_value=True) as release:
+                    with self.assertRaises(type(error)):
+                        with example_sessions(path, config, config, lambda event: None) as sessions:
+                            self.assertEqual(json.loads(path.read_text()), sessions)
+                            raise error
+                    self.assertEqual(release.call_count, 3)
+                    self.assertEqual({call.args[1] for call in release.call_args_list}, set(sessions.values()))
+                    self.assertFalse(path.exists())
+
+    # An unsuccessful release keeps the exact recovery IDs; relaunch retries them and allocates fresh IDs.
+    def test_pending_sessions_recovered_after_hard_stop(self):
+        import uuid
+        config = dict(proxy_url='fixture', client_credential='')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'pending.json'
+            stale = {arm: 'ruler-'+uuid.uuid4().hex for arm in ('local', 'offload', 'local_partition')}
+            atomic_json(path, stale)
+            with patch('ruler_eval.release_session', return_value=False) as release:
+                with self.assertRaisesRegex(Refusal, 'pending RULER sessions could not be released'):
+                    recover_sessions(path, config, config, lambda event: None)
+                self.assertEqual(release.call_count, 3)
+                self.assertEqual(json.loads(path.read_text()), stale)
+            with patch('ruler_eval.release_session', return_value=True) as release:
+                recover_sessions(path, config, config, lambda event: None)
+                self.assertEqual({call.args[1] for call in release.call_args_list}, set(stale.values()))
+                with example_sessions(path, config, config, lambda event: None) as fresh:
+                    self.assertFalse(set(fresh.values()) & set(stale.values()))
+                self.assertFalse(path.exists())
+
+    # An interrupted/erroring DELETE cannot prevent attempts for the other two arms; its ledger survives for relaunch.
+    def test_recovery_attempts_all_arms_when_release_raises(self):
+        import uuid
+        config = dict(proxy_url='fixture', client_credential='')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'pending.json'
+            sessions = {arm: 'ruler-'+uuid.uuid4().hex for arm in ('local', 'offload', 'local_partition')}
+            for error in (KeyboardInterrupt(), OSError('event log unavailable')):
+                atomic_json(path, sessions)
+                with patch('ruler_eval.release_session', side_effect=[error, True, True]) as release:
+                    with self.assertRaises(type(error)):
+                        recover_sessions(path, config, config, lambda event: None)
+                    self.assertEqual(release.call_count, 3)
+                    self.assertEqual(json.loads(path.read_text()), sessions)
+
+    # Only the accepted source repair can migrate an incomplete depth; scoring/data/client identity stays pinned.
+    def test_slot_cleanup_manifest_migration_rejects_other_changes(self):
+        before: dict = dict(seed=17, source_hashes=dict(SLOT_CLEANUP_PREDECESSOR, **{'hybrid-eval/ruler_generate.py': 'unchanged'}))
+        after: dict = dict(before, source_hashes=dict.fromkeys(SLOT_CLEANUP_PREDECESSOR, 'new'))
+        after['source_hashes']['hybrid-eval/ruler_generate.py'] = 'unchanged'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atomic_json(root/'manifest.json', before)
+            with self.assertRaisesRegex(Refusal, 'resume identity changed'):
+                resume_manifest(root, after, False)
+            for bad in (dict(after, seed=18), dict(after, source_hashes=dict(after['source_hashes'], **{'hybrid-eval/ruler_generate.py': 'bad'}))):
+                with self.assertRaisesRegex(Refusal, 'resume identity changed'):
+                    resume_manifest(root, bad, True)
+                self.assertEqual(json.loads((root/'manifest.json').read_text()), before)
+            resume_manifest(root, after, True)
+            self.assertEqual(json.loads((root/'manifest-before-slot-cleanup.json').read_text()), before)
+            self.assertEqual(json.loads((root/'manifest.json').read_text()), after)
+            resume_manifest(root, after, False)
+
+    # Reproduce the 17-row stop: a source-only migration and fresh services reuse every committed byte and run only row 18.
+    def test_resume_slot_cleanup_reuses_17_committed_rows_and_disk_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root/'data'
+            data.mkdir()
+            (data/'inputs.lock.json').write_text('{}')
+            (data/'downloads.json').write_text('[]')
+            client = dict(model_sha256='fixture', context=4096, batch=64)
+            partition = dict(client, batch=256)
+            config = dict(decode_url='fixture', decode_token='', proxy_url='fixture', client_credential='', slot_path=str(root))
+            argv = ['ruler_eval', '--client-state', str(root), '--partition-client-state', str(root), '--data', str(data),
+                    '--input-lock-sha256', hashlib.sha256(b'{}').hexdigest(), '--output', str(root/'out'), '--depth', '512',
+                    '--tasks', 'niah_single_1', '--samples-per-task', '18', '--saved-session-bytes', '1024',
+                    '--slot-margin-bytes', '256']
+            def generate(index, depth, render):
+                return dict(depth=depth, task='niah_single_1', index=index, input='x'*511, answer_prefix='y', answers=['a'],
+                            prompt_sha256=digest(list('x'*511+'y')), input_sha256=digest(['x'*511, 'y']))
+            def fake_http(base, path, token=None, body=None, **kwargs):
+                assert body is not None
+                if path == '/apply-template':
+                    return dict(prompt=''.join(m['content'] for m in body['messages']))
+                return dict(tokens=list(body['content']))
+            def run(spec, *args):
+                if spec['index'] == 17:
+                    raise KeyboardInterrupt
+                row: dict = dict(table_row(spec['index']), depth=512)
+                row.update({k: v for k, v in spec.items() if k != 'input'})
+                for arm in row['results'].values():
+                    arm['prompt_sha256'] = spec['prompt_sha256']
+                return row
+            with patch('sys.argv', argv), patch('ruler_eval.verify_data', return_value={}), \
+                 patch('ruler_eval.load_clients', return_value=(config, client, config, partition, client)), \
+                 patch('ruler_eval.http', side_effect=fake_http), patch('ruler_eval.Generator') as generator, \
+                 patch('ruler_eval.run_example', side_effect=run) as execute, \
+                 patch('ruler_eval.release_session', return_value=True) as release:
+                generator.return_value.generate.side_effect = generate
+                with self.assertRaises(KeyboardInterrupt):
+                    evaluate_main()
+                depth = root/'out'/'depth-512'
+                rows = {p.name: p.read_bytes() for p in (depth/'rows').glob('*.json')}
+                self.assertEqual(len(rows), 17)
+                manifest = json.loads((depth/'manifest.json').read_text())
+                manifest['source_hashes'].update(SLOT_CLEANUP_PREDECESSOR)
+                atomic_json(depth/'manifest.json', manifest)
+                argv.append('--resume-slot-cleanup')
+                calls = execute.call_count
+                release.reset_mock()
+                with patch('ruler_eval.shutil.disk_usage', return_value=SimpleNamespace(free=2303)):
+                    with self.assertRaisesRegex(Refusal, 'free=2303 required=2304'):
+                        evaluate_main()
+                self.assertEqual(execute.call_count, calls)
+                self.assertEqual(release.call_count, 0)
+                self.assertFalse((depth/'pending-sessions.json').exists())
+                execute.side_effect = None
+                spec = json.loads((depth/'specs'/'niah_single_1-0017.json').read_text())
+                spec.pop('spec_sha256')
+                last_row: dict = dict(table_row(17), depth=512)
+                execute.return_value = last_row
+                for arm in last_row['results'].values():
+                    arm['prompt_sha256'] = spec['prompt_sha256']
+                self.assertEqual(evaluate_main(), 0)
+                self.assertEqual(execute.call_count, calls+1)
+                self.assertEqual(execute.call_args.args[0]['index'], 17)
+                self.assertEqual(generator.return_value.generate.call_count, 18)
+                for name, raw in rows.items():
+                    self.assertEqual((depth/'rows'/name).read_bytes(), raw)
+                self.assertTrue((depth/'manifest-before-slot-cleanup.json').exists())
+                with tarfile.open(depth/'complete.tar.gz') as archive:
+                    self.assertIn('slot-cleanup-migration.json', archive.getnames())
+                self.assertFalse((depth/'pending-sessions.json').exists())
+
     # An interrupted pair is rerun once from its frozen input; completed depths skip inference and reject changed identity.
     def test_resume_after_interrupted_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,17 +440,17 @@ class RulerTests(unittest.TestCase):
                 result['prompt_sha256'] = spec['prompt_sha256']
             argv = ['ruler_eval', '--client-state', str(root), '--partition-client-state', str(root), '--data', str(data),
                     '--input-lock-sha256', lock_sha, '--output', str(root/'out'), '--depth', '512',
-                    '--tasks', 'niah_single_1', '--samples-per-task', '1']
+                    '--tasks', 'niah_single_1', '--samples-per-task', '1', '--saved-session-bytes', '1024']
             def fake_http(base, path, token=None, body=None, **kwargs):
                 assert body is not None
                 if path == '/apply-template':
                     return dict(prompt=''.join(m['content'] for m in body['messages']))
                 return dict(tokens=list(body['content']))
-            config = dict(decode_url='fixture', decode_token='')
+            config = dict(decode_url='fixture', decode_token='', proxy_url='fixture', client_credential='', slot_path=str(root))
             with patch('sys.argv', argv), patch('ruler_eval.verify_data', return_value={}), \
                  patch('ruler_eval.load_clients', return_value=(config, client, config, partition, client)), \
                  patch('ruler_eval.http', side_effect=fake_http), patch('ruler_eval.Generator') as generator, \
-                 patch('ruler_eval.run_example') as run:
+                 patch('ruler_eval.run_example') as run, patch('ruler_eval.release_session', return_value=True):
                 generator.return_value.generate.return_value = spec
                 run.side_effect = KeyboardInterrupt
                 with self.assertRaises(KeyboardInterrupt):

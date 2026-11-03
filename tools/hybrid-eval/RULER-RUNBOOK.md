@@ -90,6 +90,7 @@ for depth in 8192 32768; do
   nice -n 10 "$PY" tools/hybrid-eval/ruler_eval.py \
     --client-state "$RUN/client" --partition-client-state "$RUN/partition" --data "$DATA" \
     --input-lock-sha256 "$INPUT_SHA" --output "$RUN/pilot" --depth "$depth" \
+    --saved-session-bytes "$(( (442685280 * (depth + 130) + 8191) / 8192 ))" \
     --tasks niah_single_1 qa_1 --samples-per-task 1 --seed 261102 || break
 done
 ```
@@ -104,13 +105,16 @@ for depth in 8192 32768 65536 131072; do
   nice -n 10 "$PY" tools/hybrid-eval/ruler_eval.py \
     --client-state "$RUN/client" --partition-client-state "$RUN/partition" --data "$DATA" \
     --input-lock-sha256 "$INPUT_SHA" --output "$RUN/results" --depth "$depth" \
+    --saved-session-bytes "$(( (442685280 * (depth + 130) + 8191) / 8192 ))" \
     --samples-per-task "$samples" --seed 261102 --margin .02 --request-timeout 7200 || break
   (cd "$RUN/results/depth-$depth" && sha256sum -c complete.tar.gz.sha256) || break
   # Copy each completed depth directory's complete.tar.gz and sidecar to durable storage here.
 done
 ```
 
-A hard stop loses at most the current three-arm example; the next launch starts that example in fresh sessions. Fully committed rows are skipped. Complete depths have `complete.json`, `complete.tar.gz`, an external archive hash and per-member `SHA256SUMS`. A depth is marked complete only after all expected pairs and analysis are present; an interrupted depth has partial `specs/` and `rows/` without a completion marker. Never call an incomplete depth complete or combine subsets from changed manifests. Restarts refuse model, template, partition, seed, source, data or margin changes. A partial live session after a power loss belongs to the private service state: stop these owned services, preserve their logs, and restart them before resuming. Do not manually delete other sessions' state.
+A hard stop loses at most the current three-arm example. Before any arm starts, `pending-sessions.json` durably records fresh session IDs for all three arms. Normal completion, errors, Ctrl-C and SIGTERM release them; SIGKILL/power loss defers release to the next evaluator launch. Recovery must succeed before another example starts. The next attempt always uses new UUIDs. Each arm is independent: no saved native file is a base for another arm. Release detaches the idle decoder slot before deleting only that session's parked, resync and rollback files, preventing a later lease from saving it again. Remote-release failures leave the recovery ledger and stop execution; they do not retain a successfully detached local slot.
+
+Fully committed rows are skipped. Complete depths have `complete.json`, `complete.tar.gz`, an external archive hash and per-member `SHA256SUMS`. A depth is marked complete only after all expected pairs and analysis are present. An interrupted depth retains partial `specs/` and `rows/`. Never combine subsets from changed evaluation protocols. Restarts refuse model, template, partition, seed, source, data or margin changes, except the explicit, audited slot-lifetime repair below. A partial live session after power loss belongs to the private service state: stop these owned services, preserve their logs, and restart before resuming. Do not delete other sessions' state.
 
 `--state` must not exist at launch. After a crash or stop, use this sequence only for these three owned state directories. Moving them preserves logs and removes the old paths; all stop commands must succeed before moving anything. Then repeat the three launch commands above with identical build/model/settings (the node launch creates fresh credentials for the new clients). Keep `$RUN/results`, `$RUN/pilot`, `$DATA`, the lock and venv in place. Evaluator identity excludes state paths/credentials, so this service relaunch can resume the same depth.
 
@@ -123,6 +127,31 @@ tools/hybrid-bench/deploy-prefill-node.sh --state "$RUN/node" --stop && \
   mv "$RUN/client" "$RUN/partition" "$RUN/node" "$backup/"
 # Relaunch only after the entire sequence succeeds and the three old state paths are absent.
 ```
+
+### Recovery of the 2026-11-03 disk-full stop (17 rows)
+
+The operator already stopped all three services cleanly and removed only the leaking `ruler-*.bin` files. Keep the original `RUN` pointing to this incident's existing directory. The stop commands above are the prerequisite and have already been performed for this incident. Move the three stopped state directories, preserving logs and journals, before relaunch:
+
+```bash
+backup="$RUN/services-stopped-r36-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -m 700 "$backup" && mv "$RUN/client" "$RUN/partition" "$RUN/node" "$backup/"
+```
+
+Leave `results/`, `pilot/`, frozen `specs/`, `data/`, the input lock and venv in place. Install the reviewed R36 Python source, then repeat the three launch commands above with the original native build/model/settings: node first, batch-64 client second, batch-256 partition client third. Use the existing `NATIVE_REF` from the build record; this Python-only fix needs no native rebuild. The launchers refuse an existing `--state` directory, hence the move is required. Do not copy the old slots or SQLite journals into the new services.
+
+Resume the same 8k depth with the same 30/task denominator and seed, adding the one-time migration flag:
+
+```bash
+nice -n 10 "$PY" tools/hybrid-eval/ruler_eval.py \
+  --client-state "$RUN/client" --partition-client-state "$RUN/partition" --data "$DATA" \
+  --input-lock-sha256 "$INPUT_SHA" --output "$RUN/results" --depth 8192 \
+  --samples-per-task 30 --seed 261102 --margin .02 --request-timeout 7200 \
+  --saved-session-bytes 449710315 --resume-slot-cleanup
+```
+
+`--resume-slot-cleanup` accepts only an incomplete depth whose changed Python files have the exact accepted `b63d9019` predecessor hashes in the repair allowlist. All other manifest fields and source hashes must match. It saves `manifest-before-slot-cleanup.json` and `slot-cleanup-migration.json` with both identities and the retained row-file hashes; both audit files enter the completed archive. The 17 existing rows and their checksums/spec hashes are verified and reused byte-for-byte. No inference is repeated for them; the next inference is `niah_single_1` index 17 (example 18). A CPU regression recreates this exact 17-row boundary. Frozen specs are still rendered/tokenized for integrity checks, which is not inference.
+
+After migration, normal restarts need no migration flag. An already completed pre-R36 pilot/archive remains historical evidence; leave it intact and use a fresh pilot output directory for new pilots, rather than migrating completed bundles. A source identity refusal beyond this allowlisted repair must be investigated; do not edit hashes or create a fresh output directory that loses the 17 committed rows.
 
 On an incomplete-depth resume, existing frozen specs are re-rendered/tokenized even for saved rows to verify integrity. At late 128k this can mean hundreds of full prompt renders before new inference; budget restart time separately.
 
@@ -154,7 +183,16 @@ The table is an inference scenario at R=2500..10000 tokens/s plus 50% contingenc
 
 With n=260 at 128k, that depth is 260 cases / 780 completions, 102.24M input tokens and 4.26..17.04 inference GPU-hours. The four-depth total is 1430 cases / 4290 completions, 226.84M input tokens and **9.45..37.81 inference GPU-hours**, plus measured preparation and setup. This saves one third of 128k inference work (18.4% overall).
 
-Prompt storage assumes roughly 4 UTF-8 bytes/token and allows JSON overhead; QA/UUIDs can differ. Reserve 2 GB for immutable data/raw downloads, Python wheels and analysis, and another 2 GB for private prompts/results. Model/build storage is additional. Allow **at least 4 x a native saved-session size at the active depth plus model/build space** for transient slot/backup/export files; obtain the size from the pilot, scale using model KV geometry, and monitor high-water usage. This state-dependent part can dominate the table. The request timeout is per request, not a total time budget. A budget stop after a completed depth preserves that depth's archive; no partial 128k run invalidates completed 8k/32k/64k runs.
+Prompt storage assumes roughly 4 UTF-8 bytes/token and allows JSON overhead; QA/UUIDs can differ. Reserve 2 GB for immutable data/raw downloads, Python wheels and analysis, and another 2 GB for private prompts/results. Model/build storage is additional.
+
+The old "4 x a native saved-session size" statement was wrong for `b63d9019`: benchmark release left native slot bindings alive, so later arms parked closed sessions into permanent files. At 390 examples this grows with the number of examples. R36 instead detaches/releases each arm and removes its files before the next arm; ordinary row boundaries retain zero native files. Resync can transiently hold an export and rollback backup, at most one example's native state at a time. No cross-arm saved-session base is required.
+
+Before every uncommitted example the evaluator checks both slot volumes for **free bytes >= 2 x S + margin**, where required `--saved-session-bytes S` is an upper bound for one native saved session at that depth, including generated tokens and serialization overhead. The default `--slot-margin-bytes` is 1073741824 (1 GiB). A refusal reports free/required/S/margin bytes and starts no sessions or inference; previous committed rows stay usable. Disk admission is per volume, even if both paths share a filesystem. The check is an admission snapshot; concurrent unrelated writers can still consume its margin.
+
+For this incident the observed 8k file is 442685280 bytes. The commands above use `ceil(442685280 * (depth+130) / 8192)`, conservatively scaling the whole file, including fixed state, and allowing the 128-token output budget plus two token positions. At 8k this is S=449710315 bytes and the default floor is 1973162454 bytes. This is a model/build-specific planning bound, not a universal session-size estimator: verify it against native geometry/pilot high-water sizes at each deeper depth and increase S if needed. An underestimated S weakens admission. Do not reuse this size for another model/layout. Operational disk-budget options are recorded in the invocation/log; they do not change prompt/scoring identity.
+
+Preserved service backups consume disk until the operator archives/removes them. Moving directories on the same filesystem does not free their bytes. The incident's leaking native files have already been removed; the state move preserves the remaining logs/journals. Monitor disk usage during pilots. The request timeout is per request, not a total time budget. A budget stop after a completed depth preserves its archive; a partial 128k run does not invalidate completed lower depths.
+
 
 ## CPU qualification entry points
 

@@ -463,6 +463,38 @@ class Proxy:
                     self.verified(session["id"], False)
                 self.slot_available.notify_all()
 
+    def release_slot_files(self, sid):
+        deadline = time.monotonic() + SLOT_WAIT_SECONDS
+        with self.slot_available:
+            while True:
+                slot = self.store.get(sid)["slot"]
+                if slot is None:
+                    break
+                if slot not in self.pinned:
+                    self.pinned.add(slot)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SlotUnavailable()
+                self.slot_available.wait(min(remaining, 0.1))
+        if slot is not None:
+            idle = False
+            try:
+                self.wait_idle(slot)
+                idle = True
+                self.decode.request("POST", f"/slots/{slot}?action=erase", {})
+                self.store.set_slot(sid, None)
+            finally:
+                with self.slot_available:
+                    self.pinned.remove(slot)
+                    if not idle:
+                        self.quarantined.add(slot)
+                    self.slot_available.notify_all()
+        # Detach before unlinking, so a later lease cannot park this closed session again.
+        for suffix in (".bin", "-resync.bin", "-resync.bin.tmp", "-resync-backup.bin",
+                       "-rewrite-backup.bin", "-delta-backup.bin"):
+            (self.slot_path / (sid + suffix)).unlink(missing_ok=True)
+
     def acquire_slot(self, session):
         # Called only while the slot lease is pinned and the native slot is idle.
         rollback_pending = any((self.slot_path / (session["id"] + suffix)).exists()
@@ -993,6 +1025,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 app.store.benchmark_mode(sid, "closed")
                 ids = [session["remote_id"]] + (session.get("journal") or {}).get("retired_remote_ids", [])
                 remaining = list(dict.fromkeys(value for value in ids if value))
+                app.release_slot_files(sid)
                 for remote_id in remaining[:]:
                     path = "/v1/sessions/" + urllib.parse.quote(remote_id, safe="")
                     release_retry(lambda: app.remote(client).request("DELETE", path))

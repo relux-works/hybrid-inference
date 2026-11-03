@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Restart-safe three-treatment RULER evaluation on existing hybrid services."""
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import io
@@ -8,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
+import signal
 import sys
 import tarfile
 import time
@@ -15,10 +18,19 @@ import uuid
 
 from hybrid_eval import (Refusal, digest, http, model_identity, public_trace, read_private, require,
                          sha256, validate_identity, validate_partition)
-from hybrid_bench import mode_session, stream_chat, verify_meter
+from hybrid_bench import mode_session, release_session, stream_chat, verify_meter
 from ruler_analysis import ARMS, write_analysis
 from ruler_data import SOURCE, verify_data, verify_source
 from ruler_generate import Generator, body_for, configurations, runtime_identity, score
+
+
+# Only this accepted predecessor can opt into the slot-lifetime repair.
+SLOT_CLEANUP_PREDECESSOR = {
+    'hybrid-eval/ruler_eval.py': 'd1fa15e6bb890d76ec34337fea7ef2dbd35c449ab78a98da1174dc8506b2e35e',
+    'hybrid-eval/test_ruler.py': 'd40ff7cdd14e256a68dc48320e84fce78634eacf2b94d3aede10f551c63f9b8d',
+    'hybrid-proxy/proxy.py': '005cd787f0530629623d2f6445645ab2ab8f665fbc26984092d83a5cffe0065b',
+    'hybrid-proxy/test_benchmark.py': '645a2a94d9d9887bd7005feb0b1d450e64ac6a421bd93ac6066a40637d846807',
+}
 
 
 def atomic_json(path, value):
@@ -28,6 +40,77 @@ def atomic_json(path, value):
         output.flush()
         os.fsync(output.fileno())
     temporary.replace(path)
+
+
+def check_slot_space(configs, saved_session_bytes, margin_bytes):
+    require(saved_session_bytes > 0 and margin_bytes >= 0, 'invalid slot disk budget')
+    required = 2*saved_session_bytes + margin_bytes
+    for config in configs:
+        free = shutil.disk_usage(config['slot_path']).free
+        require(free >= required, f'slot disk floor: free={free} required={required} bytes '
+                f'(2 x saved-session={saved_session_bytes} + margin={margin_bytes}); no example started')
+
+
+def resume_manifest(root, manifest, allow_cleanup):
+    path = root/'manifest.json'
+    if not path.exists():
+        atomic_json(path, manifest)
+        return
+    previous = json.loads(path.read_text())
+    if previous == manifest:
+        return
+    changed = {name for name in previous['source_hashes'].keys() | manifest['source_hashes'].keys()
+               if previous['source_hashes'].get(name) != manifest['source_hashes'].get(name)}
+    compatible = (dict(previous, source_hashes={}) == dict(manifest, source_hashes={}) and
+                  changed and changed <= SLOT_CLEANUP_PREDECESSOR.keys() and
+                  all(previous['source_hashes'][name] == SLOT_CLEANUP_PREDECESSOR[name] for name in changed))
+    require(allow_cleanup and compatible and not (root/'complete.json').exists(),
+            'resume identity changed; only accepted b63d9019 slot cleanup can use --resume-slot-cleanup')
+    backup = root/'manifest-before-slot-cleanup.json'
+    if backup.exists():
+        require(json.loads(backup.read_text()) == previous, 'slot cleanup manifest backup differs')
+    else:
+        atomic_json(backup, previous)
+    atomic_json(root/'slot-cleanup-migration.json', dict(predecessor='b63d901932340edab431986dd1497f88ccbd4839',
+                previous_sha256=digest(previous), candidate_sha256=digest(manifest), changed_sources=sorted(changed),
+                retained_rows={p.name: sha256(p) for p in sorted((root/'rows').glob('*.json'))}))
+    atomic_json(path, manifest)
+
+
+def recover_sessions(path, config, pcfg, record):
+    if not path.exists():
+        return
+    sessions = json.loads(path.read_text())
+    require(isinstance(sessions, dict) and set(sessions) == set(ARMS), 'invalid recovery arms')
+    for sid in sessions.values():
+        require(isinstance(sid, str) and len(sid) == 38 and sid.startswith('ruler-') and
+                all(c in '0123456789abcdef' for c in sid[6:]), 'invalid recovery session')
+    released = True
+    errors = []
+    for arm, sid in sessions.items():
+        cfg = pcfg if arm == 'local_partition' else config
+        try:
+            released = release_session(cfg['proxy_url'], sid, cfg['client_credential'], cfg, record, 'mode', arm) and released
+        except (Exception, KeyboardInterrupt) as error:
+            errors.append(error)
+    if errors:
+        raise errors[0]
+    require(released, 'pending RULER sessions could not be released; no example started')
+    path.unlink()
+
+
+@contextmanager
+def example_sessions(path, config, pcfg, record):
+    sessions = {arm: 'ruler-'+uuid.uuid4().hex for arm in ARMS}
+    atomic_json(path, sessions)
+    try:
+        yield sessions
+    finally:
+        recover_sessions(path, config, pcfg, record)
+
+
+def interrupt_run(signum, frame):
+    raise KeyboardInterrupt
 
 
 def load_clients(state, partition):
@@ -44,6 +127,7 @@ def load_clients(state, partition):
     require(pcfg['prefill_url'] == config['prefill_url'], 'partition uses a different node')
     require(pcfg['decode_url'] != config['decode_url'] and pclient['proxy_url'] != client['proxy_url'], 'partition endpoints shared')
     for cfg, info in ((config, client), (pcfg, pclient)):
+        cfg['proxy_url'] = info['proxy_url']
         props = http(cfg['decode_url'], '/props', cfg['decode_token'], timeout=10)
         require(sha256(props['model_path']) == info['model_sha256'], 'live decoder model mismatch')
         require(model_identity(props['model_path'])['quantization_type'] == info['quantization_type'], 'live quantization mismatch')
@@ -52,7 +136,7 @@ def load_clients(state, partition):
     return config, client, pcfg, pclient, node
 
 
-def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record=None):
+def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record=None, sessions=None):
     results = {}
     order = list(ARMS)
     random.Random(digest([seed, spec['task'], spec['index'], spec['depth']])).shuffle(order)
@@ -68,7 +152,7 @@ def run_example(spec, config, client, pcfg, pclient, node, seed, timeout, record
         require(health['model_sha256'] == node['model_sha256'], 'live node model changed')
         body = dict(body_for(spec['input'], spec['answer_prefix']), temperature=0, seed=seed,
                     max_tokens=spec['max_tokens'])
-        sid = 'ruler-'+uuid.uuid4().hex
+        sid = sessions[arm] if sessions else 'ruler-'+uuid.uuid4().hex
         with mode_session(cfg, info, sid, releases, arm, record=event):
             returned, message, trace, _, seconds = stream_chat(info['proxy_url'], cfg['client_credential'],
                                                                body, mode, sid, timeout=timeout)
@@ -100,6 +184,9 @@ def archive_depth(root, manifest, expected):
     write_analysis(root, rows, manifest['margin'])
     files = {name: (root/name).read_bytes() for name in
              ('rows.jsonl', 'analysis.json', 'analysis.md', 'per-example.csv', 'discordant-pairs.jsonl', 'manifest.json')}
+    for name in ('manifest-before-slot-cleanup.json', 'slot-cleanup-migration.json'):
+        if (root/name).exists():
+            files[name] = (root/name).read_bytes()
     for name, value in manifest['data_provenance'].items():
         files[name] = (json.dumps(value, sort_keys=True, indent=2)+'\n').encode()
     files['SHA256SUMS'] = ''.join(hashlib.sha256(data).hexdigest()+'  '+name+'\n' for name, data in sorted(files.items())).encode()
@@ -128,10 +215,14 @@ def main():
     parser.add_argument('--seed', type=int, default=261102)
     parser.add_argument('--margin', type=float, default=.02)
     parser.add_argument('--request-timeout', type=int, default=7200)
+    parser.add_argument('--saved-session-bytes', type=int, required=True, help='upper bound at this depth, including output tokens and native overhead')
+    parser.add_argument('--slot-margin-bytes', type=int, default=1024**3)
+    parser.add_argument('--resume-slot-cleanup', action='store_true', help='audit migration from accepted b63d9019 without rerunning committed rows')
     args = parser.parse_args()
     require(512 <= args.depth <= 1048576 and 1 <= args.samples_per_task <= 1000, 'invalid run size')
     require(len(set(args.tasks)) == len(args.tasks) and 0 <= args.margin < 1, 'duplicate tasks or invalid margin')
     require(1 <= args.request_timeout <= 86400, 'invalid request timeout')
+    require(args.saved_session_bytes > 0 and args.slot_margin_bytes >= 0, 'invalid slot disk budget')
     verify_source()
     require(sha256(args.data/'inputs.lock.json') == args.input_lock_sha256, 'pinned input lock differs')
     lock = verify_data(args.data)
@@ -163,10 +254,12 @@ def main():
         run_lock.close()
         require(False, 'another evaluator owns this depth directory')
     try:
-        if (root/'manifest.json').exists():
-            require(json.loads((root/'manifest.json').read_text()) == manifest, 'resume identity changed; use a new output directory')
-        else:
-            atomic_json(root/'manifest.json', manifest)
+        resume_manifest(root, manifest, args.resume_slot_cleanup)
+        def record(event):
+            with (root/'events.jsonl').open('a') as output:
+                output.write(json.dumps(event, sort_keys=True)+'\n')
+        pending = root/'pending-sessions.json'
+        recover_sessions(pending, config, pcfg, record)
         if (root/'complete.json').exists():
             completed = json.loads((root/'complete.json').read_text())
             require(completed['manifest_sha256'] == sha256(root/'manifest.json') and
@@ -187,6 +280,9 @@ def main():
             for index in range(args.samples_per_task):
                 name = task+f'-{index:04d}.json'
                 path = root/'specs'/name
+                result_path = root/'rows'/name
+                if not result_path.exists():
+                    check_slot_space((config, pcfg), args.saved_session_bytes, args.slot_margin_bytes)
                 if path.exists():
                     spec = json.loads(path.read_text())
                     checksum = spec.pop('spec_sha256')
@@ -200,18 +296,18 @@ def main():
                     spec = generator.generate(index, args.depth, render_tokens)
                     spec['generation_seconds'] = time.perf_counter()-started
                     atomic_json(path, dict(spec, spec_sha256=digest(spec)))
-                result_path = root/'rows'/name
                 if result_path.exists():
                     saved = json.loads(result_path.read_text())
                     checksum = saved.pop('row_sha256')
                     require(checksum == digest(saved) and saved['spec_sha256'] == digest(spec), 'saved pair differs')
                     continue
-                def record(event):
-                    with (root/'events.jsonl').open('a') as output:
-                        output.write(json.dumps(event, sort_keys=True)+'\n')
-                result = run_example(spec, config, client, pcfg, pclient, node, args.seed, args.request_timeout, record)
-                result['spec_sha256'] = digest(spec)
-                atomic_json(result_path, dict(result, row_sha256=digest(result)))
+                check_slot_space((config, pcfg), args.saved_session_bytes, args.slot_margin_bytes)
+                record(dict(stage='slot_disk_admission', depth=args.depth, task=task, index=index,
+                            saved_session_bytes=args.saved_session_bytes, slot_margin_bytes=args.slot_margin_bytes))
+                with example_sessions(pending, config, pcfg, record) as sessions:
+                    result = run_example(spec, config, client, pcfg, pclient, node, args.seed, args.request_timeout, record, sessions)
+                    result['spec_sha256'] = digest(spec)
+                    atomic_json(result_path, dict(result, row_sha256=digest(result)))
                 print(f'{args.depth} {task} {index+1}/{args.samples_per_task}', flush=True)
         print(archive_depth(root, manifest, len(args.tasks)*args.samples_per_task))
         return 0
@@ -220,6 +316,7 @@ def main():
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, interrupt_run)
     try:
         sys.exit(main())
     except KeyboardInterrupt:
