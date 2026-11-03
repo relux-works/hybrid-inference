@@ -1,47 +1,72 @@
-# bf16 state KL and top-1 on one RTX PRO 6000
+# bf16 state KL and top-1 on a fresh RTX PRO 6000
 
-No GPU experiment was run on agents1. Run on one exclusive 96GB RTX PRO 6000 with the existing models, stage-2 corpus pins, prepared index and reference receipts. This compares transport dtype, not BF16 versus quantized model weights. All treatment models must be the same Q4_K_M GGUF unless a separate heterogeneous study is explicitly named.
+No GPU run or download was performed on agents1. `stage_kl_bf16.py` is an operator script for one exclusive 96 GB RTX PRO 6000 and a data volume of at least 160 GB. It rebuilds its own BF16-weight reference and serializes model/server lifetimes. All three treatment arms use the identical Q4_K_M GGUF: local, Q4-node import in f32, Q4-node import in bf16. The D reference uses BF16 **weights**; transport dtype is a separate variable.
 
-Use the exact stage-2 study from FACTS section 3: seed 42, D=20 Gutenberg documents, N=32768 context tokens, M=2048 continuation positions/document, score batch 32, BF16-weight D reference. Reuse the original `index.json`, token fixtures and `references/`; do not fetch/tokenize new books or regenerate the reference silently. There are 40960 scored positions per arm. Reference receipts, file sizes, model SHA, tokenizer layout, token hashes and score schedule are checked. If any differs, stop and locate the frozen artifacts. Original local/f32 arm receipts can be included in a report without rerunning them; new labels record candidate executable identities. The old study's imported arms can have different node weights: use the homogeneous f32 control below to isolate state dtype.
+## Historical reproduction is currently blocked
 
-Set absolute paths to the existing study, immutable candidate build and local model files. Build CUDA once using the existing offline build procedure; disable both UI asset sources. Do not replace a running service's binaries. The driver serializes node and scorer lifetimes, so the BF16 reference, Q4 node and client need not all occupy VRAM together.
+The surviving `kl-report-stage2.tar.gz` contains only CSV/Markdown/JSON reports in `report27b-seed42` and `report27b-local-seed42`. JSON contains `rows` and `settings`: document IDs, aggregate metrics, seed 42, 10000 bootstrap resamples and index digest `fcff54eac27feffe925d4895b02bf3a68bca08c719c9a218d33d771a1d51b206`. It contains **no document byte hashes or token hashes**. An aggregate index digest cannot recover them. A fresh absolute path also changes the original index's file records, so matching document/token hashes is the portable identity check; an index digest alone is insufficient.
+
+There is also **no homogeneous Q4-to-Q4 imported row**. The historical Q4-node rows are `B-Bonsai-Q4-imported` and `B-Mirai-Q4-imported`; their clients differ from Q4. The retained `/home/agent/lanes/hybrid/.temp/vast/stage-kl2.sh` confirms that mapping. Comparing either heterogeneous row against the requested homogeneous f32 arm as a reproduction test is invalid. `C-Q4-local` is available as a limited sanity check, not an imported-arm reproduction control.
+
+Model pins were recovered independently from `/home/agent/lanes/hybrid/.temp/vast/host-setup.sh` and copied into `state_bf16_model_pins.json`:
+
+| GGUF | Repository revision | Bytes | SHA256 |
+|---|---|---:|---|
+| Qwen3.8-27B-Q4_K_M.gguf | `ggml-org/Qwen3.8-27B-GGUF` at `0669b98607d47046c7c2b3f801011d54a08cfccf` | 18973870432 | `31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34` |
+| Qwen3.8-27B-BF16.gguf | same revision | 53808281952 | `5a3eedc837bcbd1365cdbf5b71e698df3122e76586ba872f07ce3ed4a9bfa97e` |
+
+Audit the saved report without downloads/builds/GPU:
 
 ```bash
-set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1
-export TMPDIR=/disk/tmp-bf16
-mkdir -p "$TMPDIR"
-export STUDY=/disk/kl-stage2/study27b
-export BUILD=/disk/hybrid-state-bf16/build
-export Q4_MODEL=/disk/models/Qwen3.8-27B-Q4_K_M.gguf
-export D_MODEL=/disk/models/Qwen3.8-27B-BF16.gguf
-export D_SHA=$(sha256sum "$D_MODEL" | cut -d' ' -f1)
-export DRIVER=tools/hybrid-bench/hetero_study.py
-export LOCK=/disk/hybrid-gpu.lock
-
-nice -n 10 python3 "$DRIVER" --lock "$LOCK" arm --study "$STUDY" \
-  --kind local --label state-Q4-local --client-model "$Q4_MODEL" \
-  --reference-model-sha256 "$D_SHA" --build-dir "$BUILD" --gpu-layers 999 --score-batch 32
-nice -n 10 python3 "$DRIVER" --lock "$LOCK" arm --study "$STUDY" \
-  --kind imported --label state-f32 --client-model "$Q4_MODEL" --node-model "$Q4_MODEL" \
-  --state-dtype f32 --reference-model-sha256 "$D_SHA" --build-dir "$BUILD" \
-  --gpu-layers 999 --score-batch 32 --chunk-tokens 4096 --ram-budget-mib 4096
-nice -n 10 python3 "$DRIVER" --lock "$LOCK" arm --study "$STUDY" \
-  --kind imported --label state-bf16 --client-model "$Q4_MODEL" --node-model "$Q4_MODEL" \
-  --state-dtype bf16 --reference-model-sha256 "$D_SHA" --build-dir "$BUILD" \
-  --gpu-layers 999 --score-batch 32 --chunk-tokens 4096 --ram-budget-mib 4096
-nice -n 10 python3 "$DRIVER" --lock "$LOCK" report --study "$STUDY" \
-  --arms state-Q4-local state-f32 state-bf16 --seed 42 --output /disk/kl-stage2/report-state-bf16
+PYTHONDONTWRITEBYTECODE=1 python3 tools/hybrid-bench/stage_kl_bf16.py \
+  --historical-archive /path/kl-report-stage2.tar.gz --audit-only
 ```
 
-No model/corpus download occurs in these commands. The existing D reference payload remains needed. For a retained original local arm, replace `state-Q4-local` in the report with its exact label and omit its arm command. A stale new arm label refuses; choose a new label instead of editing receipts.
+With the currently surviving archive this prints the missing evidence and ends `failed kl-bf16-stage: historical provenance absent; exact reproduction is blocked`, exit 1. That is the intended refusal. Reproduction mode requires an independently recovered provenance lock and a homogeneous historical imported comparator, which the current reports do not provide. Recover those inputs or explicitly choose the newly pinned study below. Do not insert invented hashes or relabel a heterogeneous comparator.
 
-Read `report.json`, `report.csv`, `report.md`, the per-document arm receipts and their native result files. Report KL against the common D reference, top-1 agreement, paired document differences and document bootstrap intervals. Native results also contain `local_to_hybrid` KL/top-1 against that client's local prefill and full-precision schedule probes. The measured client's partition-noise band KL 0.0014-0.0112 is a contextual reference, not a universal acceptance threshold. Report both bf16-minus-f32 and bf16-minus-local changes; a small difference against a large weight-quantization baseline is not proof of exactness. Preserve source/build/model/index hashes with every report.
+## Operator alternative: explicitly pin a new study
 
-For latency, use the RULER runbook's retained `seconds`, `wire_bytes`, `transfer_ms`, `import_ms` and per-chunk traces, paired against f32. On one card/loopback this measures functional import and encode costs; it does not establish Wi-Fi TTFT. Native import time includes bf16 expansion and validation.
+This is a new experiment with the historical document IDs/order and settings, **not exact stage-2 reproduction**. It needs the owner's choice of this alternative. On a fresh GPU node install the reviewed source commit in a clean separate checkout using the operator's normal source transfer; install CUDA/CMake/compiler/Python beforehand. The scripts install no tools or packages. Copy only the small surviving report archive. No old D reference is needed.
 
-Budget: existing shared D reference is 20344176640B (18.947GiB), plus model files. Q4 and BF16 model weights together are roughly 17GB and 54GB; use actual file sizes. One successful 32k document chain at chunk4096 retains at most about 2.40GB f32 or 1.77GB bf16 until scoring; default successful deltas are then removed. The conservative driver admission uses eight 514MiB response caps plus 100MiB/document and a margin: allow at least 7GiB extra free space for a new 20-document arm, above the host's required floor, even though normal retention is smaller. Allow another 2GiB for logs/rows/failed attempts. Do not use `--keep-deltas` unless budgeting about 48GB per f32 arm or 35.4GB per bf16 arm. Reference data, models and previous attempts are additional.
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+export SRC=/root/proto/src-state-bf16
+export ROOT=/root/kl-state-bf16
+export BUILD="$SRC/build-state-bf16"
+export CANDIDATE_SHA='REPLACE_WITH_REVIEWED_40_HEX_SHA'
+export OLD_REPORT=/root/kl-report-stage2.tar.gz
+mkdir -p "$ROOT"
+# Explicit first-use pinning of new Gutenberg bytes and tokens, on the GPU host only.
+python3 "$SRC/tools/hybrid-bench/stage_kl_bf16.py" \
+  --historical-archive "$OLD_REPORT" --mode new-study --bootstrap-new-lock \
+  --root "$ROOT" --build "$BUILD" --ref "$CANDIDATE_SHA" --execute
+# Preserve new-provenance-lock.json off-node before the expensive reference/arms.
+python3 "$SRC/tools/hybrid-bench/stage_kl_bf16.py" \
+  --historical-archive "$OLD_REPORT" --mode new-study \
+  --provenance-lock "$ROOT/new-provenance-lock.json" \
+  --root "$ROOT" --build "$BUILD" --ref "$CANDIDATE_SHA" --execute
+```
 
-Time is unmeasured for this arm. For planning, 20 x 32768 prefills at the published PRO 6000 M1-M3 rates (~1.1k-4.3k tok/s) is 2.5-10 minutes for one pass. Each imported scorer also computes its own local prefill, teacher-forced continuation and up to three full-prefix probes plus imported replays; process/model loading is additional. Reserve 1-2 hours for the three-arm comparison with existing references, then replace this estimate with the first document's elapsed time x20 plus 25% reserve. This is a geometry/rate estimate, not a bf16 speed result.
+Bootstrap downloads the two pinned models using immutable revision URLs, checks size and SHA256 before use, fetches exactly the 20 IDs in `gutenberg_sources.json`, and freezes each downloaded document's SHA256/size. It tokenizes the complete UTF-8 document with Q4's `/tokenize(add_special=true, parse_special=false)`, takes the first N=32768 tokens plus the next M=2048, and freezes SHA256 over their concatenated little-endian int32 IDs. There is no random document/window selection in `hetero_study.prepare`; the fixed source order and prefix rule are deterministic given bytes/tokenizer. Seed 42 is used for the statistical bootstrap. Changed or too-short documents refuse. New pins are labelled `newly-pinned-study`, never represented as recovered historical hashes.
 
-The driver owns its PIDs and stops only those children. Preserve incomplete attempt logs and process records; resume identical commands after cleanup. Keep the shared GPU lock and serialize unrelated GPU jobs too.
+The measurement phase validates the lock, source ref, GPU identity, settings and disk before work. It verifies all source/token hashes again before reference or arm execution. It builds once, niced with `-j4`, under a native build lock after `pgrep`/`uptime`. The original index/fixtures and every source/model/build hash are retained. It computes D with the BF16 model, score batch 32 and the same split-last/fresh-prefix schedule probes as the original driver. It then runs local Q4, homogeneous f32 import and homogeneous bf16 import at chunk size 4096, with successful deltas removed after scoring. A shared GPU lock serializes tokenizer, D and arm processes. No `--keep-deltas` is used.
+
+The report contains KL against D, top-1 agreement, per-document values, paired document differences and 10000-resample document bootstrap intervals, seed 42. See `report/report.json`, `.csv`, `.md`; the native per-document results also retain client local-to-import KL/top-1 and schedule probes. Compare bf16-minus-f32 and bf16-minus-local, and use the client's historical partition-noise KL band 0.0014-0.0112 as context, not a universal threshold. Top-1 agreement is against D's argmax on the same teacher-forced positions, not free-running answer identity.
+
+`reproduction.json` labels new-study mode `new-study-no-exact-reproduction`, with no f32 historical verdict. Its local-Q4 historical sanity check tests both current document-mean KL and top-1 against `C-Q4-local`'s saved 95% bootstrap intervals. A failure is retained as `passed=false`; passing cannot establish historical document identity, equivalence or imported-arm reproduction. In reproduction mode, only a recovered **homogeneous** imported comparator is allowed; both f32 means must lie inclusively within its saved KL/top-1 intervals, or the run is flagged and exits 1 after retaining all results. The supplied archive cannot satisfy this mode.
+
+## Provenance lock and recovery
+
+The version-1 lock has `historical_report_sha256` (SHA256 of the uncompressed full report JSON), `settings` exactly `{seed:42,d:20,n:32768,m:2048,score_batch:32}`, `models` with the pinned repository/revision/primary file/files list shown in `state_bf16_model_pins.json`, and `documents` with ordered `{id,url,size,sha256,token_sha256}` records. `provenance` states `kind` (`newly-pinned-study` or `recovered-stage2-lock`) and a nonempty `source`. A recovered homogeneous comparator also needs `f32_comparator` with `arm=B-Q4-Q4-imported`, `node_model_sha256` and `client_model_sha256` matching Q4. That arm must actually exist in the saved report; no such row is synthesized.
+
+Retry measurement with the identical command: receipts skip unchanged completed reference/documents/arms; changed identities refuse. Do not rerun bootstrap after a valid new lock exists. Preserve failed attempts and `.partial` model files; inspect/move only those owned partials before retrying a failed download. A changed model/hash never becomes a successful download. Scripts stop only child PIDs they created and retain tokenizer PID/exit evidence. Manifest, lock, GPU identity, process/command exit records and `outputs.json` bind the report. Copy the complete private `ROOT` (including documents, fixtures, receipts and 18.9 GiB D reference) to durable storage if independent recalculation is required; the small report alone was insufficient for this reconstruction.
+
+Terminal success is `done kl-bf16-stage seconds=...`, exit 0. Any refusal/error or failed f32 reproduction has `failed kl-bf16-stage: ...`, exit 1. A successful new-study run explicitly retains its non-reproduction label. Control-C/SIGTERM cleans up owned tokenizer/study children; SIGKILL/power loss needs inspection of owned PID records before retry. Never kill by process-name pattern.
+
+## Estimates
+
+Model download is **72,782,152,384 B (72.78 GB)** plus roughly tens of MB of Gutenberg text. At 100/50/10 MB/s the model bytes alone take 12.1/24.3/121.3 min. Reserve 20-60 min on a fast link, or 2-3 h at 10 MB/s, including verification; bandwidth is unmeasured. No additional model is downloaded.
+
+D occupies **20,344,176,640 B (18.947 GiB)**. Models plus D total 93.13 GB. Allow 6 GiB for the CUDA build, 7 GiB for transient deltas/work, 2 GiB for logs/rows/archives, and the 28 GB free floor. Admission requires approximately 136.2 GB initially free for a fresh run, on a volume of at least 160 GB. The script recomputes remaining model/reference space on resume and rechecks free space before each major step. BF16 wire does not shrink the D logits reference or native f32 slot snapshots. Do not retain successful delta chains without another roughly 48 GB/f32 arm or 35.4 GB/bf16 arm.
+
+Reference runtime was not retained in the surviving reports. Reserve **2-4 h for regenerating D**, **1-2 h for the three Q4 arms**, and **10-25 min for the first CUDA build**; with fast downloads and I/O reserve **4-8 h total**. These are unmeasured planning bounds. After the first D document and first imported document, extrapolate measured elapsed time x20 plus 25% reserve before committing the full reservation. Cleanup the candidate build only after all owned processes have stopped, preserving its record/logs; retain models, reference and provenance for replication.

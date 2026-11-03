@@ -58,4 +58,46 @@ For 390 examples/depth, measured three-arm rates imply the following one-third p
 
 Do one example first and extrapolate its observed time with 25% reserve. 64k/128k budgets are unmeasured; linear-depth projections from32k give4.3h/8.5h for390 examples before reserve, not commitments. Do not rerun local/partition to make a mismatched manifest fit.
 
-Disk uses native f32 slot backups even for bf16 wire. Before each example, the client volume must have at least `2*saved_session_bytes + 1GiB` free. The inherited conservative sizing formula above gives roughly1.90GB at8k,4.63GB at32k,15.25GB at128k; exact integer checks are authoritative. Keep the host's normal free-space floor in addition. Allow2GiB for new rows/archives/logs, plus the retained baseline and locked data; model files/builds are additional. Successful sessions are detached and their own files removed; a failed release leaves the recovery ledger and blocks the next example. Stop only the PIDs recorded by these owned launcher state directories.
+Disk uses native f32 slot backups even for bf16 wire. Before each example, the client volume must have at least `2*saved_session_bytes + 1GiB` free. The inherited conservative sizing formula above gives roughly1.97GB at8k,4.63GB at32k,15.25GB at128k; exact integer checks are authoritative. Keep the host's normal free-space floor in addition. Allow2GiB for new rows/archives/logs, plus the retained baseline and locked data; model files/builds are additional. Successful sessions are detached and their own files removed; a failed release leaves the recovery ledger and blocks the next example. Stop only the PIDs recorded by these owned launcher state directories.
+
+## Vast 58864154: stage after a completed depth
+
+Use `stage_ruler_bf16.py` on the RULER node (RTX PRO 6000, Bulgaria). It runs no remote commands from agents1. Keep `/root/proto/src-ruler` at its existing 18d3f114 source and `build-ruler` unchanged. Install the signed candidate branch in a **separate checkout**, for example `/root/proto/src-state-bf16`, using the operator's normal source-transfer procedure. No fetch, checkout, rebuild or edit occurs in the original checkout. Transfer a local git bundle if the branch has not been published. The stage requires a clean candidate checkout and the full reviewed commit SHA; it does not resolve a moving branch name.
+
+An idle scheduling window is required. The script inspects `/proc` and refuses if an evaluator from `src-ruler` is active, even if a different depth has completed. It never signals an evaluator or controller. It also holds shared locks on the selected completed depths. Do not launch the later 64k/128k process concurrently with this operator window. If an existing controller immediately starts the next depth, wait for an actual idle window; do not interrupt its running three-arm process to make room for this stage.
+
+Run with the **existing** RULER venv so Python and every package version match the frozen manifest:
+
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+export OLD=/root/proto/src-ruler
+export RUN="$OLD/.temp/ruler-r35"
+export CAND=/root/proto/src-state-bf16
+export CANDIDATE_SHA='REPLACE_WITH_REVIEWED_40_HEX_SHA'
+export PY="$RUN/venv/bin/python"
+# If the existing venv has another path, use that exact environment.
+export STAGE="$RUN/bf16-stage-8192-32768"
+export BF16_BUILD="$CAND/build-state-bf16"
+"$PY" "$CAND/tools/hybrid-eval/stage_ruler_bf16.py" \
+  --ref "$CANDIDATE_SHA" --build "$BF16_BUILD" --stage "$STAGE" --depths 8192 32768
+# The command above checks completed archives/locks/disk and changes no services.
+"$PY" "$CAND/tools/hybrid-eval/stage_ruler_bf16.py" \
+  --ref "$CANDIDATE_SHA" --build "$BF16_BUILD" --stage "$STAGE" --depths 8192 32768 --execute
+```
+
+For separate idle windows, first use `--depths 8192 --stage "$RUN/bf16-stage-8192"`; after 32k completes use `--depths 32768 --stage "$RUN/bf16-stage-32768"`. The candidate build is reused only after verifying its ref, flags and every binary/library hash. The stage requires baseline `results-r36/depth-<d>/complete.json`, archive/sidecar, private `rows/` and `specs/`. It rejects partial depths. It verifies all archive members, the outer seal and the manifest.
+
+The execute phase stops the ordinary client, partition client and node using the original launcher's recorded-PID controls, preserves their state under `STAGE/original-services`, and builds the candidate with CUDA into `build-state-bf16`. It checks `pgrep`/`uptime` and uses `nice -n 10`, `-j4` and the shared build lock. It launches three candidate services using the original model/context/batch/ports and node RAM cap; only the ordinary client's state dtype becomes bf16. Before any example at either depth, the **real evaluator** runs `--preflight-only` for **every selected depth**: source/service implementation identities are declared as the treatment; every common manifest field, corpus/package identity and frozen example must match. A mismatch exits before inference and triggers restoration. The ordinary evaluator repeats that gate when running each arm.
+
+Each bf16 result is archived under `STAGE/results/depth-<d>` and verified against the outer SHA, sidecar, internal `SHA256SUMS` and archived manifest. Whether the arm succeeds or fails, `finally` stops candidate services and relaunches originals from the original checkout/build. The original directories remain preserved; the original service paths receive fresh services/credentials. Restore checks health via launcher status and requires original commit, binary hashes, model, context, partitions and threads. `restored.json` records success. A restoration failure produces `failed`, never `done`; inspect `restore.log` before starting 64k/128k.
+
+A SIGTERM/Control-C reaches restoration. A SIGKILL, host crash or power loss cannot run `finally`. Recover explicitly using the persisted service plan:
+
+```bash
+"$PY" "$CAND/tools/hybrid-eval/stage_ruler_bf16.py" \
+  --ref "$CANDIDATE_SHA" --build "$BF16_BUILD" --stage "$STAGE" --execute --restore-only
+```
+
+The recovery command also refuses an active original evaluator and never kills by pattern. Keep `service-plan.json`, `services.log`, `build.log`, `preflight-*.log`, `arm-*.log`, `restore.log`, `restored.json` and all original/candidate service directories private. Do not restart later depths until restoration succeeds. Normal exits have a terminal `done ruler-bf16-stage seconds=...` line; any refusal/error has `failed ruler-bf16-stage: ...` and exit 1.
+
+Admission needs at least 28 GB plus 8 GiB free before staging; allow 6 GiB for the candidate build, 2 GiB for logs/archives, and the per-example slot gate (1.97 GB at 8k, 4.63 GB at 32k). Both gates are checked independently. Models, original build and frozen results are additional retained disk. Planning: new arm 33.4 min at 8k and 2.13 h at 32k from the measured three-arm rates. Reserve 45-60 min and 3-4 h, plus 10-25 min for a first CUDA build and 5-15 min for service transitions. Both depths in one window: reserve 4.5-6 h. These are estimates, not bf16 GPU measurements. After all services are restored and no candidate process remains, the operator may remove only `build-state-bf16`; retain its build record and logs first. Never remove or rebuild `build-ruler`.

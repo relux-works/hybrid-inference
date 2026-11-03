@@ -1,0 +1,29 @@
+{
+  "source": "Retained host1 operator script /home/agent/lanes/hybrid/.temp/vast/host-setup.sh; SHA256 verified again on GPU download.",
+  "models": {
+    "q4": {
+      "repo": "ggml-org/Qwen3.8-27B-GGUF",
+      "revision": "0669b98607d47046c7c2b3f801011d54a08cfccf",
+      "primary": "Qwen3.8-27B-Q4_K_M.gguf",
+      "files": [
+        {
+          "name": "Qwen3.8-27B-Q4_K_M.gguf",
+          "size": 18973870432,
+          "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34"
+        }
+      ]
+    },
+    "bf16": {
+      "repo": "ggml-org/Qwen3.8-27B-GGUF",
+      "revision": "0669b98607d47046c7c2b3f801011d54a08cfccf",
+      "primary": "Qwen3.8-27B-BF16.gguf",
+      "files": [
+        {
+          "name": "Qwen3.8-27B-BF16.gguf",
+          "size": 53808281952,
+          "sha256": "5a3eedc837bcbd1365cdbf5b71e698df3122e76586ba872f07ce3ed4a9bfa97e"
+        }
+      ]
+    }
+  }
+}

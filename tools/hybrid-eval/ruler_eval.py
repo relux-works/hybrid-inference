@@ -280,6 +280,9 @@ def run_single_arm(args, manifest, config, client, pcfg, pclient, node):
         current['declared_arm']['baseline'] = dict(implementation=baseline_manifest['declared_arm']['implementation'],
             manifest_sha256=sha256(baseline/'manifest.json'),
             rows={name: checksum for name, _, _, checksum in inputs})
+    if getattr(args, 'preflight_only', False):
+        print(json.dumps(dict(preflight='passed', examples=len(inputs), manifest=current), sort_keys=True))
+        return 0
     root = args.output/f'depth-{args.depth}'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (root/'.lock').open('a') as lock:
@@ -337,6 +340,7 @@ def main():
     parser.add_argument('--slot-margin-bytes', type=int, default=1024**3)
     parser.add_argument('--arm', choices=['all', 'offload_bf16'], default='all')
     parser.add_argument('--paired-depth', type=Path, help='read-only existing depth with committed f32 rows')
+    parser.add_argument('--preflight-only', action='store_true', help='verify the single-arm manifest and frozen inputs, then exit before output or inference')
     parser.add_argument('--resume-slot-cleanup', action='store_true', help='audit migration from accepted b63d9019 without rerunning committed rows')
     args = parser.parse_args()
     require(512 <= args.depth <= 1048576 and 1 <= args.samples_per_task <= 1000, 'invalid run size')
@@ -366,6 +370,7 @@ def main():
                              (('client', client), ('partition', pclient), ('node', node))},
                     data_provenance={'inputs.lock.json': lock, 'downloads.json': json.loads((args.data/'downloads.json').read_text())})
     require((args.arm == 'offload_bf16') == (args.paired_depth is not None), 'single arm requires --paired-depth')
+    require(not args.preflight_only or args.arm == 'offload_bf16', 'preflight-only requires a paired single arm')
     if args.arm == 'offload_bf16':
         return run_single_arm(args, manifest, config, client, pcfg, pclient, node)
     require(config.get('state_dtype', 'f32') == pcfg.get('state_dtype', 'f32') == 'f32', 'three-arm run requires f32 state')

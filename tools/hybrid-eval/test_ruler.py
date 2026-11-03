@@ -131,6 +131,22 @@ class Bf16RulerTests(unittest.TestCase):
                 run_single_arm(args, manifest, config, {}, pcfg, {}, {})
             run.assert_not_called()
 
+    # Preflight checks frozen inputs/common identity without inference, session recovery or candidate output writes.
+    def test_single_arm_preflight_is_read_only_and_refuses_manifest_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest, _, _, _ = self.baseline(root/'old')
+            args = SimpleNamespace(paired_depth=root/'old', output=root/'new', depth=8192, preflight_only=True)
+            with patch('ruler_eval.run_example') as execute, patch('ruler_eval.recover_sessions') as recover:
+                self.assertEqual(run_single_arm(args, manifest, {'state_dtype': 'bf16'}, {}, {}, {}, {}), 0)
+                bad = copy.deepcopy(manifest)
+                bad['seed'] += 1
+                with self.assertRaisesRegex(Refusal, 'outside declared arm'):
+                    run_single_arm(args, bad, {'state_dtype': 'bf16'}, {}, {}, {}, {})
+                execute.assert_not_called()
+                recover.assert_not_called()
+            self.assertFalse((root/'new').exists())
+
     # A self-rehashed disk row cannot replace an already sealed baseline observation.
     def test_sealed_baseline_rehashed_row_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
