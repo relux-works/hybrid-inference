@@ -2,6 +2,7 @@
 """Preregistered paired RULER score equivalence, CPU and standard library only."""
 import argparse
 import csv
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -20,6 +21,38 @@ ALPHA = .025
 TASKS = tuple(f'niah_{kind}_{i}' for kind in ('single', 'multikey') for i in range(1, 4)) + (
     'niah_multivalue', 'niah_multiquery', 'vt', 'cwe', 'fwe', 'qa_1', 'qa_2')
 PAIRS = (('offload', 'local'), ('local_partition', 'local'), ('bf16', 'local'), ('bf16', 'offload'))
+REGISTRATION = '2026-11-03T14:36:00Z'
+FAMILY_MODELS = {
+    'Qwen': '31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34',
+    'Glimmer': '4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e',
+}
+RUN_TIMES = {
+    'Qwen': {'f32': {
+        '8192': {'start': '2026-11-03T05:52:00Z', 'end': '2026-11-03T07:32:00Z'},
+        '32768': {'start': '2026-11-03T07:32:00Z', 'end': '2026-11-03T14:21:00Z'},
+    }},
+    'Glimmer': {'f32': {
+        '8192': {'start': '2026-11-03T13:59:00Z', 'end': '2026-11-03T15:35:00Z'},
+    }},
+}
+
+
+def registration_info(family, depth, arm='offload', run_times=None):
+    mode = 'bf16' if arm == 'bf16' else 'f32'
+    times = RUN_TIMES.get(family, {}).get(mode, {}).get(str(depth))
+    if run_times is not None:
+        times = run_times.get(family, {}).get(mode, {}).get(str(depth), times)
+    scope = 'named in registration' if family == 'Qwen' else 'not named in registration; rules applied by extension'
+    if times is None:
+        return dict(timing='unknown', start=None, end=None, scope=scope,
+                    label='unknown collection timing; '+scope+'; not confirmatory')
+    start, end, registered = [datetime.fromisoformat(t.replace('Z', '+00:00'))
+                              for t in (times['start'], times['end'], REGISTRATION)]
+    require(start.tzinfo is not None and end.tzinfo is not None and start <= end, 'invalid run timing')
+    timing = 'before' if end <= registered else 'after' if start >= registered else 'straddling'
+    label = dict(before='observed before registration', after='collection after registration',
+                 straddling='collection straddled registration; not confirmatory')[timing]
+    return dict(timing=timing, start=times['start'], end=times['end'], scope=scope, label=label+'; '+scope)
 
 
 def newcombe10(e, f, g, h, tail=ALPHA):
@@ -77,6 +110,28 @@ def invert_tost(interval, margin=MARGIN):
     return high
 
 
+def degenerate_sidecars(left, right, difference):
+    n = len(left)
+    # Zero discordance is fixed in advance; a nonzero atom is fixed by the first pair.
+    trials = n if difference == 0 else n-1
+    def exact(tail):
+        unseen = -math.expm1(math.log(tail)/trials) if trials else 1.
+        # Outside the observed point mass D=c, D remains bounded by [-1, 1].
+        return [difference-(1+difference)*unseen, difference+(1-difference)*unseen]
+    cells = paired_cells([x == 1 for x in left], [x == 1 for x in right])
+    counts = [cells[k] for k in ('both_true', 'left_only', 'right_only', 'both_false')]
+    binary = lambda tail: newcombe10(*counts, tail=tail)
+    return dict(
+        exact_unseen_departures=dict(
+            label='exact unseen discordance sidecar' if difference == 0 else 'exact unseen departures sidecar',
+            estimand='mean raw score difference', observed_constant=difference, departures=0, n=n, binomial_trials=trials,
+            interval95=exact(ALPHA), tost_p=invert_tost(exact), equivalent_unadjusted=inside(exact(ALPHA))),
+        fully_correct_newcombe=dict(label='binarised (score == 1) Newcombe sidecar',
+            estimand='fully-correct rate difference', cells=cells,
+            difference=(cells['left_only']-cells['right_only'])/n,
+            interval95=binary(ALPHA), tost_p=invert_tost(binary), equivalent_unadjusted=inside(binary(ALPHA))))
+
+
 def score_pair(left, right):
     require(len(left) == len(right) and bool(left), 'mismatched example sets')
     require(all(isinstance(x, (int, float)) and math.isfinite(x) and 0 <= x <= 1
@@ -99,7 +154,26 @@ def score_pair(left, right):
     # Do not report more tail precision than 10000 bootstrap resamples can support.
     result.update(interval95=ci, tost_p=max(inverted, 1/RESAMPLES) if limited else inverted,
                   tost_p_inverted=inverted, tost_p_resolution_limited=limited,
-                  equivalent_unadjusted=inside(ci))
+                  registered_interval_inside_margin=inside(ci))
+    degenerate = result['method'] == 'paired_percentile_bootstrap' and len(set(differences)) == 1
+    result.update(degenerate=degenerate, equivalent_unadjusted=inside(ci), claim_p=result['tost_p'],
+                  claim_basis='registered primary interval')
+    if degenerate:
+        sidecars = degenerate_sidecars(left, right, differences[0])
+        result.update(sidecars=sidecars, claim_basis='both post-review sidecars; degenerate primary cannot certify',
+                      equivalent_unadjusted=all(s['equivalent_unadjusted'] for s in sidecars.values()),
+                      claim_p=max(s['tost_p'] for s in sidecars.values()))
+    if result['method'] == 'paired_percentile_bootstrap':
+        near = not degenerate and min(abs(x-bound) for x in ci for bound in (-MARGIN, MARGIN)) <= .001
+        result.update(monte_carlo_near_margin=near,
+                      monte_carlo_note='inverted empirical percentile p is approximate and coarse even without a resolution flag')
+        if near:
+            result['monte_carlo_sensitivity'] = []
+            for seed in range(SEED-2, SEED+3):
+                draws = distribution if seed == SEED else bootstrap_distribution(differences, seed)
+                bounds = [quantile(draws, ALPHA), quantile(draws, 1-ALPHA)]
+                result['monte_carlo_sensitivity'].append(dict(seed=seed, interval95=bounds,
+                                                            interval_inside_margin=inside(bounds)))
     return result
 
 
@@ -177,7 +251,7 @@ def load_depth(path):
     return rows, manifest, dict(sorted(evidence.items()))
 
 
-def analyze_family(paths, family, depths):
+def analyze_family(paths, family, depths, run_times=None):
     require(len(depths) == len(set(depths)) == 4 and all(d > 0 for d in depths), 'declare four distinct depths')
     primary, text_rows, descriptives, sources = [], [], [], []
     seen = set()
@@ -192,6 +266,8 @@ def analyze_family(paths, family, depths):
         if model is None:
             model = identity
         require(identity == model, 'different models must use separate families')
+        if family in FAMILY_MODELS:
+            require(identity == FAMILY_MODELS[family], 'family label does not match recorded model SHA-256')
         sources.append(dict(depth=depth, sha256=hashes))
         text_rows.extend(dict(row, results={a: row['results'][a] for a in ARMS}) for row in rows)
         for task in ['ALL'] + sorted(TASKS):
@@ -204,9 +280,9 @@ def analyze_family(paths, family, depths):
                 continue
             result = score_pair([r['results'][left]['score'] for r in rows],
                                 [r['results'][right]['score'] for r in rows])
-            result.update(depth=depth, pair=left+'-'+right,
-                          registration='observed before registration' if depth in (8192, 32768) and left != 'bf16'
-                          else 'registered before data')
+            provenance = registration_info(family, depth, left, run_times)
+            result.update(depth=depth, pair=left+'-'+right, registration=provenance['label'],
+                          registration_timing=provenance)
             primary.append(result)
     require(bool(primary), 'no completed depths')
     _, secondary = analyze_text(text_rows)
@@ -214,17 +290,29 @@ def analyze_family(paths, family, depths):
         pair = left+'-'+right
         group = {r['depth']: r for r in primary if r['pair'] == pair}
         adjusted = holm([group[d]['tost_p'] if d in group else 1.0 for d in depths])
+        claim_adjusted = holm([group[d]['claim_p'] if d in group else 1.0 for d in depths])
         missing = [d for d in depths if d not in group]
-        for depth, p in zip(depths, adjusted):
+        for depth, p, claim_p in zip(depths, adjusted, claim_adjusted):
             if depth in group:
-                group[depth].update(holm_p=p, equivalent_holm=p < ALPHA and group[depth]['equivalent_unadjusted'],
-                                    provisional=bool(missing), pending_depths=missing)
+                row = group[depth]
+                accepted = claim_p < ALPHA and row['equivalent_unadjusted']
+                stability = ('equivalent; cannot reverse when pending depths arrive' if accepted else
+                             'equivalence not established; raw interval/sidecars fail, cannot reverse when pending depths arrive'
+                             if not row['equivalent_unadjusted'] else
+                             'not yet established; pending depths may reduce Holm p' if missing else
+                             'equivalence not established after complete-family Holm')
+                row.update(holm_p=p, claim_holm_p=claim_p, equivalent_holm=accepted,
+                           family_incomplete=bool(missing), pending_depths=missing,
+                           holm_p_is_upper_bound=bool(missing), decision_stability=stability,
+                           decision_can_reverse_with_pending=bool(missing) and not accepted and row['equivalent_unadjusted'])
     code = Path(__file__)
     return dict(family=family, model_sha256=model, depths=list(depths), margin=MARGIN, alpha_per_side=ALPHA,
                 analysis_sha256=hashlib.sha256(code.read_bytes()).hexdigest(), python_version=sys.version,
                 secondary_analysis_sha256=hashlib.sha256(code.with_name('ruler_analysis.py').read_bytes()).hexdigest(),
                 interval_rule='newcombe10 if all compared scores binary; paired percentile bootstrap otherwise',
-                pending_policy='p=1 for missing depths in each four-depth arm-pair family; provisional decisions',
+                registration_timestamp=REGISTRATION, family_named_in_registration=family == 'Qwen',
+                pending_policy='p=1 yields upper-bound Holm p; accepted observed decisions and raw failures cannot reverse',
+                degenerate_policy='retain primary numbers; claims require both post-review sidecars; max sidecar p enters supplementary claim Holm',
                 sources=sorted(sources, key=lambda r: r['depth']),
                 primary=sorted(primary, key=lambda r: (r['depth'], r['pair'])),
                 secondary=secondary, descriptives=descriptives)
@@ -233,15 +321,31 @@ def analyze_family(paths, family, depths):
 def markdown(result):
     lines = [f"# {result['family']}: paired RULER equivalence", '',
              'Differences and intervals are percentage points. Margin: +/-2 pp; alpha per side: 0.025.',
-             'Holm is separate for each arm pair across four depths. Pending depths enter as p=1; decisions are provisional.', '',
+             'Pending depths enter as p=1: reported Holm p-values are upper bounds. Accepted observed decisions cannot reverse when they arrive; raw failures cannot become equivalent.',
+             'A whole four-depth family claim remains incomplete while depths are missing.',
+             'Glimmer was not named in the registration; these rules are applied to it by extension.' if not result['family_named_in_registration'] else 'Qwen was named in the registration.', '',
              '| Depth | Pair | Difference | 95% interval | Method | TOST p | Holm p | Equivalent (raw / Holm) | Registration |',
              '|---:|---|---:|---|---|---:|---:|---|---|']
     for r in result['primary']:
         ci = ', '.join(f'{100*x:+.4f}' for x in r['interval95'])
-        verdict = f"{r['equivalent_unadjusted']} / {r['equivalent_holm']}"
-        if r['provisional']:
-            verdict += ' (provisional)'
-        lines.append(f"| {r['depth']} | {r['pair']} | {100*r['difference']:+.4f} | [{ci}] | {r['method']} | {r['tost_p']:.6g} | {r['holm_p']:.6g} | {verdict} | {r['registration']} |")
+        verdict = 'not certified; see sidecars' if r['degenerate'] else f"{r['equivalent_unadjusted']} / {r['equivalent_holm']}; {r['decision_stability']}"
+        method = r['method'] + (' (DEGENERATE; not claim evidence)' if r['degenerate'] else '')
+        lines.append(f"| {r['depth']} | {r['pair']} | {100*r['difference']:+.4f} | [{ci}] | {method} | {r['tost_p']:.6g} | {r['holm_p']:.6g} | {verdict} | {r['registration']} |")
+    degenerate = [r for r in result['primary'] if r['degenerate']]
+    if degenerate:
+        lines += ['', '## Sidecars for degenerate sets (post-review supplement)', '',
+                  'Claims require both sidecars. Supplementary claim Holm uses max(sidecar p) at a degenerate depth and the registered p otherwise; registered primary numbers above are unchanged.', '',
+                  '| Depth | Pair | Sidecar / estimand | 95% interval (pp) | TOST p | Combined claim Holm p (upper bound) | Equivalent from both sidecars |',
+                  '|---:|---|---|---|---:|---:|---|']
+        for r in degenerate:
+            for sidecar in r['sidecars'].values():
+                ci = ', '.join(f'{100*x:+.4f}' for x in sidecar['interval95'])
+                lines.append(f"| {r['depth']} | {r['pair']} | {sidecar['label']} / {sidecar['estimand']} | [{ci}] | {sidecar['tost_p']:.8g} | {r['claim_holm_p']:.8g} | {r['equivalent_holm']}; {r['decision_stability']} |")
+    lines += ['', '## Collection timing against 2026-11-03 14:36Z', '',
+              '| Depth / pair | Start (UTC) | End (UTC) | Timing |', '|---|---|---|---|']
+    for r in result['primary']:
+        timing = r['registration_timing']
+        lines.append(f"| {r['depth']} / {r['pair']} | {timing['start']} | {timing['end']} | {timing['timing']} |")
     lines += ['', '## Secondary: answer text (unchanged ruler_analysis.py)', '',
               '| Depth | Offload changed / n | Partition changed / n | McNemar p | Excess 95% (pp) | Text equivalent +/-2 pp |',
               '|---:|---:|---:|---:|---|---|']
@@ -255,12 +359,14 @@ def markdown(result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('rows', type=Path, nargs='+')
-    parser.add_argument('--family', required=True)
+    parser.add_argument('--family', required=True, choices=tuple(FAMILY_MODELS))
+    parser.add_argument('--run-times', type=Path, help='optional per-family, f32/bf16, depth start/end JSON map')
     parser.add_argument('--depths', type=int, nargs=4, default=[8192, 32768, 65536, 131072])
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     try:
-        result = analyze_family(args.rows, args.family, args.depths)
+        run_times = json.loads(args.run_times.read_text()) if args.run_times else None
+        result = analyze_family(args.rows, args.family, args.depths, run_times)
     except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
         print('REFUSED: '+str(error), file=sys.stderr)
         return 2

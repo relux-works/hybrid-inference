@@ -1,6 +1,7 @@
 {
   "alpha_per_side": 0.025,
-  "analysis_sha256": "b604718fb4e31014c18ceaeacb7c976d8e7cb1e5c15ead12c3ed8f71aafc2e14",
+  "analysis_sha256": "34201c392892eb1a1d84b043e67baf152183e9e0536986be31ba012a4a272e0b",
+  "degenerate_policy": "retain primary numbers; claims require both post-review sidecars; max sidecar p enters supplementary claim Holm",
   "depths": [
     8192,
     32768,
@@ -290,33 +291,84 @@
     }
   ],
   "family": "Qwen",
+  "family_named_in_registration": true,
   "interval_rule": "newcombe10 if all compared scores binary; paired percentile bootstrap otherwise",
   "margin": 0.02,
   "model_sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
-  "pending_policy": "p=1 for missing depths in each four-depth arm-pair family; provisional decisions",
+  "pending_policy": "p=1 yields upper-bound Holm p; accepted observed decisions and raw failures cannot reverse",
   "primary": [
     {
       "bootstrap_seed": 261102,
       "bootstrap_tail_resolution": 0.0001,
+      "claim_basis": "both post-review sidecars; degenerate primary cannot certify",
+      "claim_holm_p": 0.009553116948346263,
+      "claim_p": 0.0023882792370865658,
+      "decision_can_reverse_with_pending": false,
+      "decision_stability": "equivalent; cannot reverse when pending depths arrive",
+      "degenerate": true,
       "depth": 8192,
       "difference": 0.0,
       "equivalent_holm": true,
       "equivalent_unadjusted": true,
+      "family_incomplete": true,
       "holm_p": 0.0004,
+      "holm_p_is_upper_bound": true,
       "interval95": [
         0.0,
         0.0
       ],
       "method": "paired_percentile_bootstrap",
+      "monte_carlo_near_margin": false,
+      "monte_carlo_note": "inverted empirical percentile p is approximate and coarse even without a resolution flag",
       "n": 390,
       "pair": "local_partition-local",
       "pending_depths": [
         65536,
         131072
       ],
-      "provisional": true,
-      "registration": "observed before registration",
+      "registered_interval_inside_margin": true,
+      "registration": "observed before registration; named in registration",
+      "registration_timing": {
+        "end": "2026-11-03T07:32:00Z",
+        "label": "observed before registration; named in registration",
+        "scope": "named in registration",
+        "start": "2026-11-03T05:52:00Z",
+        "timing": "before"
+      },
       "resamples": 10000,
+      "sidecars": {
+        "exact_unseen_departures": {
+          "binomial_trials": 390,
+          "departures": 0,
+          "equivalent_unadjusted": true,
+          "estimand": "mean raw score difference",
+          "interval95": [
+            -0.009414072798470455,
+            0.009414072798470455
+          ],
+          "label": "exact unseen discordance sidecar",
+          "n": 390,
+          "observed_constant": 0.0,
+          "tost_p": 0.0003785903327073849
+        },
+        "fully_correct_newcombe": {
+          "cells": {
+            "both_false": 13,
+            "both_true": 377,
+            "left_only": 0,
+            "right_only": 0
+          },
+          "difference": 0.0,
+          "equivalent_unadjusted": true,
+          "estimand": "fully-correct rate difference",
+          "interval95": [
+            -0.010386756122536863,
+            0.010386756122536863
+          ],
+          "label": "binarised (score == 1) Newcombe sidecar",
+          "tost_p": 0.0023882792370865658
+        }
+      },
       "tost_p": 0.0001,
       "tost_p_inverted": 1e-15,
       "tost_p_resolution_limited": true
@@ -324,25 +376,75 @@
     {
       "bootstrap_seed": 261102,
       "bootstrap_tail_resolution": 0.0001,
+      "claim_basis": "both post-review sidecars; degenerate primary cannot certify",
+      "claim_holm_p": 0.009553116948346263,
+      "claim_p": 0.0023882792370865658,
+      "decision_can_reverse_with_pending": false,
+      "decision_stability": "equivalent; cannot reverse when pending depths arrive",
+      "degenerate": true,
       "depth": 8192,
       "difference": 0.0,
       "equivalent_holm": true,
       "equivalent_unadjusted": true,
+      "family_incomplete": true,
       "holm_p": 0.0004,
+      "holm_p_is_upper_bound": true,
       "interval95": [
         0.0,
         0.0
       ],
       "method": "paired_percentile_bootstrap",
+      "monte_carlo_near_margin": false,
+      "monte_carlo_note": "inverted empirical percentile p is approximate and coarse even without a resolution flag",
       "n": 390,
       "pair": "offload-local",
       "pending_depths": [
         65536,
         131072
       ],
-      "provisional": true,
-      "registration": "observed before registration",
+      "registered_interval_inside_margin": true,
+      "registration": "observed before registration; named in registration",
+      "registration_timing": {
+        "end": "2026-11-03T07:32:00Z",
+        "label": "observed before registration; named in registration",
+        "scope": "named in registration",
+        "start": "2026-11-03T05:52:00Z",
+        "timing": "before"
+      },
       "resamples": 10000,
+      "sidecars": {
+        "exact_unseen_departures": {
+          "binomial_trials": 390,
+          "departures": 0,
+          "equivalent_unadjusted": true,
+          "estimand": "mean raw score difference",
+          "interval95": [
+            -0.009414072798470455,
+            0.009414072798470455
+          ],
+          "label": "exact unseen discordance sidecar",
+          "n": 390,
+          "observed_constant": 0.0,
+          "tost_p": 0.0003785903327073849
+        },
+        "fully_correct_newcombe": {
+          "cells": {
+            "both_false": 13,
+            "both_true": 377,
+            "left_only": 0,
+            "right_only": 0
+          },
+          "difference": 0.0,
+          "equivalent_unadjusted": true,
+          "estimand": "fully-correct rate difference",
+          "interval95": [
+            -0.010386756122536863,
+            0.010386756122536863
+          ],
+          "label": "binarised (score == 1) Newcombe sidecar",
+          "tost_p": 0.0023882792370865658
+        }
+      },
       "tost_p": 0.0001,
       "tost_p_inverted": 1e-15,
       "tost_p_resolution_limited": true
@@ -354,11 +456,19 @@
         "left_only": 0,
         "right_only": 1
       },
+      "claim_basis": "registered primary interval",
+      "claim_holm_p": 0.021768952513075705,
+      "claim_p": 0.007256317504358568,
+      "decision_can_reverse_with_pending": false,
+      "decision_stability": "equivalent; cannot reverse when pending depths arrive",
+      "degenerate": false,
       "depth": 32768,
       "difference": -0.002564102564102564,
       "equivalent_holm": true,
       "equivalent_unadjusted": true,
+      "family_incomplete": true,
       "holm_p": 0.021768952513075705,
+      "holm_p_is_upper_bound": true,
       "interval95": [
         -0.014703570210583747,
         0.008516738607345996
@@ -370,8 +480,15 @@
         65536,
         131072
       ],
-      "provisional": true,
-      "registration": "observed before registration",
+      "registered_interval_inside_margin": true,
+      "registration": "observed before registration; named in registration",
+      "registration_timing": {
+        "end": "2026-11-03T14:21:00Z",
+        "label": "observed before registration; named in registration",
+        "scope": "named in registration",
+        "start": "2026-11-03T07:32:00Z",
+        "timing": "before"
+      },
       "tost_p": 0.007256317504358568,
       "tost_p_inverted": 0.007256317504358568,
       "tost_p_resolution_limited": false
@@ -383,11 +500,19 @@
         "left_only": 0,
         "right_only": 0
       },
+      "claim_basis": "registered primary interval",
+      "claim_holm_p": 0.009553116948346263,
+      "claim_p": 0.0025560851598389056,
+      "decision_can_reverse_with_pending": false,
+      "decision_stability": "equivalent; cannot reverse when pending depths arrive",
+      "degenerate": false,
       "depth": 32768,
       "difference": 0.0,
       "equivalent_holm": true,
       "equivalent_unadjusted": true,
+      "family_incomplete": true,
       "holm_p": 0.007668255479516717,
+      "holm_p_is_upper_bound": true,
       "interval95": [
         -0.010518524619854594,
         0.01051852461985459
@@ -399,14 +524,22 @@
         65536,
         131072
       ],
-      "provisional": true,
-      "registration": "observed before registration",
+      "registered_interval_inside_margin": true,
+      "registration": "observed before registration; named in registration",
+      "registration_timing": {
+        "end": "2026-11-03T14:21:00Z",
+        "label": "observed before registration; named in registration",
+        "scope": "named in registration",
+        "start": "2026-11-03T07:32:00Z",
+        "timing": "before"
+      },
       "tost_p": 0.0025560851598389056,
       "tost_p_inverted": 0.0025560851598389056,
       "tost_p_resolution_limited": false
     }
   ],
   "python_version": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+  "registration_timestamp": "2026-11-03T14:36:00Z",
   "secondary": [
     {
       "accuracy_pairs": {

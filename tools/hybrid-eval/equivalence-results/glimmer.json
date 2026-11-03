@@ -1,6 +1,7 @@
 {
   "alpha_per_side": 0.025,
-  "analysis_sha256": "b604718fb4e31014c18ceaeacb7c976d8e7cb1e5c15ead12c3ed8f71aafc2e14",
+  "analysis_sha256": "34201c392892eb1a1d84b043e67baf152183e9e0536986be31ba012a4a272e0b",
+  "degenerate_policy": "retain primary numbers; claims require both post-review sidecars; max sidecar p enters supplementary claim Holm",
   "depths": [
     8192,
     32768,
@@ -150,24 +151,35 @@
     }
   ],
   "family": "Glimmer",
+  "family_named_in_registration": false,
   "interval_rule": "newcombe10 if all compared scores binary; paired percentile bootstrap otherwise",
   "margin": 0.02,
   "model_sha256": "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e",
-  "pending_policy": "p=1 for missing depths in each four-depth arm-pair family; provisional decisions",
+  "pending_policy": "p=1 yields upper-bound Holm p; accepted observed decisions and raw failures cannot reverse",
   "primary": [
     {
       "bootstrap_seed": 261102,
       "bootstrap_tail_resolution": 0.0001,
+      "claim_basis": "registered primary interval",
+      "claim_holm_p": 0.4948494849484953,
+      "claim_p": 0.12371237123712382,
+      "decision_can_reverse_with_pending": false,
+      "decision_stability": "equivalence not established; raw interval/sidecars fail, cannot reverse when pending depths arrive",
+      "degenerate": false,
       "depth": 8192,
       "difference": 0.011666666666666665,
       "equivalent_holm": false,
       "equivalent_unadjusted": false,
+      "family_incomplete": true,
       "holm_p": 0.4948494849484953,
+      "holm_p_is_upper_bound": true,
       "interval95": [
         -0.0019230769230769232,
         0.026410256410256412
       ],
       "method": "paired_percentile_bootstrap",
+      "monte_carlo_near_margin": false,
+      "monte_carlo_note": "inverted empirical percentile p is approximate and coarse even without a resolution flag",
       "n": 390,
       "pair": "local_partition-local",
       "pending_depths": [
@@ -175,8 +187,15 @@
         65536,
         122880
       ],
-      "provisional": true,
-      "registration": "observed before registration",
+      "registered_interval_inside_margin": false,
+      "registration": "collection straddled registration; not confirmatory; not named in registration; rules applied by extension",
+      "registration_timing": {
+        "end": "2026-11-03T15:35:00Z",
+        "label": "collection straddled registration; not confirmatory; not named in registration; rules applied by extension",
+        "scope": "not named in registration; rules applied by extension",
+        "start": "2026-11-03T13:59:00Z",
+        "timing": "straddling"
+      },
       "resamples": 10000,
       "tost_p": 0.12371237123712382,
       "tost_p_inverted": 0.12371237123712382,
@@ -185,16 +204,26 @@
     {
       "bootstrap_seed": 261102,
       "bootstrap_tail_resolution": 0.0001,
+      "claim_basis": "registered primary interval",
+      "claim_holm_p": 0.564456445644565,
+      "claim_p": 0.14111411141114125,
+      "decision_can_reverse_with_pending": false,
+      "decision_stability": "equivalence not established; raw interval/sidecars fail, cannot reverse when pending depths arrive",
+      "degenerate": false,
       "depth": 8192,
       "difference": 0.01217948717948718,
       "equivalent_holm": false,
       "equivalent_unadjusted": false,
+      "family_incomplete": true,
       "holm_p": 0.564456445644565,
+      "holm_p_is_upper_bound": true,
       "interval95": [
         -0.0014102564102564097,
         0.026923076923076925
       ],
       "method": "paired_percentile_bootstrap",
+      "monte_carlo_near_margin": false,
+      "monte_carlo_note": "inverted empirical percentile p is approximate and coarse even without a resolution flag",
       "n": 390,
       "pair": "offload-local",
       "pending_depths": [
@@ -202,8 +231,15 @@
         65536,
         122880
       ],
-      "provisional": true,
-      "registration": "observed before registration",
+      "registered_interval_inside_margin": false,
+      "registration": "collection straddled registration; not confirmatory; not named in registration; rules applied by extension",
+      "registration_timing": {
+        "end": "2026-11-03T15:35:00Z",
+        "label": "collection straddled registration; not confirmatory; not named in registration; rules applied by extension",
+        "scope": "not named in registration; rules applied by extension",
+        "start": "2026-11-03T13:59:00Z",
+        "timing": "straddling"
+      },
       "resamples": 10000,
       "tost_p": 0.14111411141114125,
       "tost_p_inverted": 0.14111411141114125,
@@ -211,6 +247,7 @@
     }
   ],
   "python_version": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+  "registration_timestamp": "2026-11-03T14:36:00Z",
   "secondary": [
     {
       "accuracy_pairs": {

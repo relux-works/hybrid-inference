@@ -12,8 +12,8 @@ import unittest
 
 from hybrid_eval import Refusal
 from ruler_analysis import ARMS, mcnemar
-from ruler_equivalence import (TASKS, SEED, analyze_family, bootstrap_distribution, holm, inside,
-                               invert_tost, load_depth, newcombe10, score_pair, validate_rows)
+from ruler_equivalence import (FAMILY_MODELS, TASKS, SEED, analyze_family, bootstrap_distribution, holm, inside,
+                               invert_tost, load_depth, markdown, newcombe10, registration_info, score_pair, validate_rows)
 
 
 def fixture():
@@ -87,6 +87,7 @@ class EquivalenceTests(unittest.TestCase):
     # A 10 pp shift fails equivalence, even though both arms are valid binary inputs.
     def test_shifted_fixture_not_equivalent_positive_control(self):
         result = score_pair([1.]*390, [1.]*351+[0.]*39)
+        self.assertAlmostEqual(result['difference'], .1)
         self.assertFalse(result['equivalent_unadjusted'])
         self.assertEqual(result['tost_p'], 1.)
 
@@ -97,14 +98,129 @@ class EquivalenceTests(unittest.TestCase):
         self.assertAlmostEqual(result['difference'], 1/6)
         self.assertEqual(result['interval95'], [0., .5])
 
-    # Resampling whole pairs preserves identical partial scores; finite draws cannot claim p=0 precision.
+    # A point-mass bootstrap preserves raw numbers but cannot certify equivalence at n=3.
     def test_identical_partial_pairs_and_bootstrap_resolution(self):
         result = score_pair([1., .5, 0.], [1., .5, 0.])
         self.assertEqual(result['method'], 'paired_percentile_bootstrap')
         self.assertEqual(result['interval95'], [0., 0.])
         self.assertEqual(result['tost_p'], .0001)
         self.assertTrue(result['tost_p_resolution_limited'])
+        self.assertTrue(result['degenerate'])
+        self.assertFalse(result['equivalent_unadjusted'])
+        self.assertFalse(result['sidecars']['exact_unseen_departures']['equivalent_unadjusted'])
+
+    # R1: Qwen 8k sidecars bound unseen discordance and fully-correct rate with nonzero widths.
+    def test_degenerate_qwen8_sidecars_replace_point_mass_claim(self):
+        scores = [1.]*377 + [0.]*11 + [2/3]*2
+        result = score_pair(scores, scores)
+        self.assertEqual(result['interval95'], [0., 0.])
+        self.assertEqual(result['tost_p'], .0001)
+        self.assertTrue(result['degenerate'])
+        exact = result['sidecars']['exact_unseen_departures']
+        binary = result['sidecars']['fully_correct_newcombe']
+        self.assertAlmostEqual(exact['interval95'][1], .009414072798470507)
+        self.assertAlmostEqual(exact['interval95'][0], -.009414072798470507)
+        self.assertAlmostEqual(exact['tost_p'], .98**390, places=12)
+        self.assertEqual(binary['cells'], dict(both_true=377, both_false=13, left_only=0, right_only=0))
+        self.assertAlmostEqual(binary['interval95'][1], .010387, delta=.0000005)
+        self.assertAlmostEqual(binary['tost_p'], .00238828, delta=.000000005)
+        self.assertEqual(result['claim_p'], max(exact['tost_p'], binary['tost_p']))
         self.assertTrue(result['equivalent_unadjusted'])
+        self.assertLess(4*result['claim_p'], .025)
+
+    # Future constant nonzero partial differences cannot hide a 10 pp shift behind binarisation.
+    def test_future_degenerate_shift_requires_raw_score_sidecar(self):
+        for n in (1, 390):
+            result = score_pair([.6]*n, [.5]*n)
+            self.assertTrue(result['degenerate'])
+            if n == 390:
+                self.assertTrue(result['sidecars']['fully_correct_newcombe']['equivalent_unadjusted'])
+            else:
+                self.assertEqual(result['sidecars']['exact_unseen_departures']['interval95'], [-1., 1.])
+            self.assertFalse(result['sidecars']['exact_unseen_departures']['equivalent_unadjusted'])
+            self.assertFalse(result['equivalent_unadjusted'])
+
+    # R2: provenance depends on family/run timestamps, and a future Glimmer32 is never depth-labelled before.
+    def test_glimmer32_registration_uses_run_times_not_depth(self):
+        self.assertEqual(registration_info('Qwen', 8192)['timing'], 'before')
+        self.assertEqual(registration_info('Qwen', 32768)['timing'], 'before')
+        glimmer8 = registration_info('Glimmer', 8192)
+        self.assertEqual(glimmer8['timing'], 'straddling')
+        self.assertIn('not named in registration', glimmer8['label'])
+        self.assertEqual(registration_info('Glimmer', 32768)['timing'], 'unknown')
+        times = {'Glimmer': {'f32': {'32768': dict(start='2026-11-03T15:35:00Z', end='2026-11-04T02:00:00Z')}}}
+        future = registration_info('Glimmer', 32768, run_times=times)
+        self.assertEqual(future['timing'], 'after')
+        self.assertNotIn('observed before', future['label'])
+        self.assertIn('by extension', future['label'])
+        self.assertEqual(registration_info('Qwen', 8192, 'bf16')['timing'], 'unknown')
+        times['Glimmer']['f32']['32768']['end'] = '2026-11-03T13:00:00Z'
+        with self.assertRaisesRegex(Refusal, 'invalid run timing'):
+            registration_info('Glimmer', 32768, run_times=times)
+
+    # N2: bootstrap endpoints within 0.1 pp of a margin automatically report five diagnostic seeds.
+    def test_near_margin_bootstrap_reports_monte_carlo_sensitivity(self):
+        result = score_pair([.02, 0.], [0., 0.])
+        self.assertTrue(result['monte_carlo_near_margin'])
+        diagnostics = result['monte_carlo_sensitivity']
+        self.assertEqual([r['seed'] for r in diagnostics], list(range(SEED-2, SEED+3)))
+        self.assertEqual(diagnostics[2]['interval95'], result['interval95'])
+        self.assertFalse(result['equivalent_unadjusted'])
+
+    # N4: a known CLI family label is bound to its model SHA, with a valid positive control.
+    def test_family_label_requires_matching_model_identity(self):
+        rows, manifest = fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = write_fixture(root, rows, manifest)
+            with self.assertRaisesRegex(Refusal, 'family label does not match'):
+                analyze_family([path], 'Glimmer', [8192, 32768, 65536, 122880])
+            manifest['clients']['client']['model_sha256'] = FAMILY_MODELS['Glimmer']
+            write_fixture(root, rows, manifest)
+            result = analyze_family([path], 'Glimmer', [8192, 32768, 65536, 122880])
+            self.assertFalse(result['family_named_in_registration'])
+            self.assertTrue(all(r['registration_timing']['timing'] == 'straddling' for r in result['primary']))
+
+    # R3: replacing pending p=1 by lower values cannot increase the observed Holm p-values.
+    def test_pending_holm_upper_bounds_do_not_reverse_observed_decisions(self):
+        from itertools import product
+        qwen = [.00238828, .00255609, 1., 1.]
+        baseline = holm(qwen)
+        for pending in product([0., .0001, .002, .02, .2, 1.], repeat=2):
+            current = holm(qwen[:2]+list(pending))
+            self.assertTrue(all(current[i] <= baseline[i] for i in (0, 1)))
+            self.assertTrue(all(current[i] < .025 for i in (0, 1)))
+            self.assertGreaterEqual(holm([.141114]+list(pending)+[0.])[0], .141114)
+        rows, manifest = fixture()
+        for row in rows[:40]:
+            row['results']['offload']['score'] = 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_fixture(Path(tmp), rows, manifest)
+            result = analyze_family([path], 'fixture', [8192, 32768, 65536, 131072])
+            failed = next(r for r in result['primary'] if r['pair'] == 'offload-local')
+            self.assertFalse(failed['equivalent_holm'])
+            self.assertFalse(failed['decision_can_reverse_with_pending'])
+            self.assertIn('raw interval/sidecars fail', failed['decision_stability'])
+
+    # R1: primary arithmetic remains visible, but generated claims cite both nondegenerate sidecars.
+    def test_degenerate_claim_holm_and_table_do_not_certify_point_mass(self):
+        rows, manifest = fixture()
+        for row, score in zip(rows[-13:], [0.]*11+[2/3]*2):
+            for value in row['results'].values():
+                value['score'] = score
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_fixture(Path(tmp), rows, manifest)
+            result = analyze_family([path], 'fixture', [8192, 32768, 65536, 131072])
+            for row in result['primary']:
+                self.assertEqual(row['holm_p'], .0004)
+                self.assertAlmostEqual(row['claim_holm_p'], .00955312, delta=.00000002)
+                self.assertTrue(row['equivalent_holm'])
+                self.assertIn('sidecars', row['claim_basis'])
+            table = markdown(result)
+            self.assertIn('DEGENERATE; not claim evidence', table)
+            self.assertIn('not certified; see sidecars', table)
+            self.assertIn('[-0.9414, +0.9414]', table)
+            self.assertIn('[-1.0387, +1.0387]', table)
 
     # A margin touch or crossing fails the strict open interval, with a nearby inside control.
     def test_interval_crossing_margin_is_not_equivalent(self):
@@ -206,10 +322,11 @@ class EquivalenceTests(unittest.TestCase):
             self.assertEqual({r['pair'] for r in result['primary']},
                              {'offload-local', 'local_partition-local', 'bf16-local', 'bf16-offload'})
             for r in result['primary']:
-                self.assertTrue(r['provisional'])
+                self.assertTrue(r['family_incomplete'])
                 self.assertEqual(r['pending_depths'], [32768, 65536, 131072])
                 self.assertAlmostEqual(r['holm_p'], 4*r['tost_p'])
                 self.assertTrue(r['equivalent_holm'])
+                self.assertFalse(r['decision_can_reverse_with_pending'])
 
     # Different model identities cannot be pooled, and duplicate depth archives cannot inflate n.
     def test_models_and_duplicate_depths_refuse(self):
@@ -244,7 +361,7 @@ class EquivalenceTests(unittest.TestCase):
                 root.mkdir()
                 paths.append(write_fixture(root, rows, manifest))
             result = analyze_family(paths, 'fixture', depths)
-            self.assertTrue(all(not r['provisional'] for r in result['primary']))
+            self.assertTrue(all(not r['family_incomplete'] for r in result['primary']))
             for table in result['secondary']:
                 if table['task'] == 'ALL':
                     self.assertIn('mcnemar_holm_four_depths', table)
@@ -256,7 +373,7 @@ class EquivalenceTests(unittest.TestCase):
             root = Path(tmp)
             output = root/'output'
             proc = subprocess.run([sys.executable, str(Path(__file__).with_name('ruler_equivalence.py')),
-                                   str(root/'missing.jsonl'), '--family', 'fixture', '--output', str(output)],
+                                   str(root/'missing.jsonl'), '--family', 'Qwen', '--output', str(output)],
                                   capture_output=True, text=True)
             self.assertEqual(proc.returncode, 2)
             self.assertIn('manifest.json required', proc.stderr)
