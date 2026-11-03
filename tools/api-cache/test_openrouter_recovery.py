@@ -133,11 +133,12 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(body['provider']['only'],[self.candidate['endpoint']['tag']])
             self.assertFalse(body['provider']['allow_fallbacks'])
 
-    # A mismatched serving provider stops the series even when the charge itself is known.
-    def test_provider_mismatch_refuses_followup(self):
+    # A mismatched provider excludes cache evidence but cannot stop the study after a bounded charge.
+    def test_provider_mismatch_excludes_cache_and_continues(self):
         Handler.provider_override='Chutes';phase=self.phase()
-        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
-        self.assertIn('identity violation',phase.reason)
+        self.assertEqual(phase.run(),0);self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(not r['accepted'] for r in phase.rows))
+        self.assertIn('provider differs',phase.rows[0]['error'])
 
     # Full usage above the requested16 remains cache-eligible, successful availability, and permits the next POST.
     def test_over_cap_completion_is_accepted_with_flag_and_continues(self):
@@ -195,33 +196,33 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(all(r['accepted'] and r['output_guard_triggered'] and r['completion_over_cap']==1025 for r in phase.rows))
         self.assertEqual(recovery.availability(phase.rows)['rate'],1)
 
-    # Reviewer F1: a complete-usage guard must not bypass missing provider identity or allow another POST.
-    def test_named_negative_guard_completed_absent_provider_halts(self):
+    # Reviewer F1 remains excluded from cache; r15j permits the next POST after the bounded charge.
+    def test_named_negative_guard_completed_absent_provider_refuses_cache_and_continues(self):
         RecoveryHandler.output_mode='guard-no-provider';phase=self.phase()
-        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
+        self.assertEqual(phase.run(),0);self.assertEqual(len(Handler.bodies),2)
         row=phase.rows[0]
         self.assertTrue(row['output_guard_triggered']);self.assertTrue(row['usage_complete'])
         self.assertEqual(row['observed_providers'],[]);self.assertFalse(row['accepted'])
         self.assertEqual(row['completion_over_cap'],2000)
         self.assertIn('serving provider differs or is absent',row['error'])
-        self.assertIn('identity violation',phase.reason)
+        self.assertEqual(recovery.availability(phase.rows)['rate'],1)
 
     # Missing identity wins for both poppable presets; the same completed row with Phala remains accepted.
     def test_reviewer_guard_and_legacy_presets_require_observed_provider(self):
         for preset in ('output guard canceled stream','completion cap exceeded','HTTP error',None):
             with self.subTest(preset=preset):
-                row=dict(http_status=200,error=preset,output_guard_triggered=True,usage_complete=True,observed_providers=[],
+                row=dict(http_status=200,error=preset,output_guard_triggered=True,usage_complete=True,observed_models=[self.candidate['model']],observed_providers=[],
                          usage=dict(prompt_tokens=32768,completion_tokens=2000,cost=.001),completion_tokens=2000)
                 recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
                 self.assertFalse(row['accepted']);self.assertIn('serving provider differs or is absent',row['error'])
-        row.update(observed_providers=['Phala'],error='output guard canceled stream')
+        row.update(observed_models=[self.candidate['model']],observed_providers=['Phala'],error='output guard canceled stream')
         recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
         self.assertTrue(row['accepted']);self.assertEqual(row['completion_over_cap'],2000)
 
     # A parse failure replaces an obsolete output label while an actual identity refusal remains primary.
     def test_parse_failure_surfaces_usage_error_instead_of_stale_output_label(self):
         for preset in ('completion cap exceeded','output guard canceled stream'):
-            row=dict(http_status=200,error=preset,observed_providers=['Phala'],usage=None)
+            row=dict(http_status=200,error=preset,observed_models=[self.candidate['model']],observed_providers=['Phala'],usage=None)
             recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
             self.assertFalse(row['accepted']);self.assertIn('usage parsing failed',row['error'])
             row.update(error=preset,observed_providers=[])
@@ -290,10 +291,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn('model differs',phase.rows[0]['error'])
         self.assertFalse(phase.rows[0]['accepted'])
 
-    # Measured prompt depth outside tolerance remains fatal despite the relaxed output classification.
-    def test_named_negative_measured_depth_still_halts(self):
+    # Depth outside tolerance excludes cache evidence, retains its charge and allows the next call.
+    def test_measured_depth_outside_tolerance_excludes_cache_and_continues(self):
         RecoveryHandler.output_mode='wrong-depth';phase=self.phase()
-        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
+        self.assertEqual(phase.run(),0);self.assertEqual(len(Handler.bodies),2)
         self.assertIn('depth outside',phase.rows[0]['error'])
 
     # Under r15g missing identity is refused regardless of preset error, and remains an availability failure.
@@ -404,11 +405,12 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(api.Refusal,'free disk below28 GiB'):phase.call(self.session,0)
         self.assertEqual(Handler.bodies,[])
 
-    # Sustained low headroom refuses before any POST after the bounded1200s wait.
+    # Sustained low headroom skips this cell without any POST after the bounded1200s wait.
     def test_28_5_gib_headroom_refuses_before_post(self):
         phase=self.phase();now=[0]
         with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
-            with self.assertRaisesRegex(api.Refusal,'requires28.5 GiB'):phase.call(self.session,0)
+            self.assertIsNone(phase.call(self.session,0))
+            self.assertIn('requires28.5 GiB',phase.skips[-1]['reason'])
         self.assertEqual(Handler.bodies,[])
         self.assertEqual(now[0],1200)
 
@@ -432,10 +434,11 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(events[-1]['elapsed_seconds'],120);self.assertEqual(events[-1]['free_bytes'],30*1024**3)
 
     # Low headroom for the entire window stops with recorded start/end and no intent, POST or ledger change.
-    def test_named_negative_disk_headroom_never_recovers_stops(self):
+    def test_named_negative_disk_headroom_never_recovers_skips_cell(self):
         phase=self.phase();now=[0];ledger=(self.root/'ledger.json').read_bytes()
         with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
-            with self.assertRaisesRegex(api.Refusal,'1200s'):phase.call(self.session,0)
+            self.assertIsNone(phase.call(self.session,0))
+            self.assertIn('1200s',phase.skips[-1]['reason'])
         self.assertEqual(now[0],1200);self.assertEqual(Handler.bodies,[])
         self.assertFalse(list(phase.out.glob('intent-*.json')));self.assertEqual((self.root/'ledger.json').read_bytes(),ledger)
         events=[json.loads(line) for line in (self.root/'disk-waits.jsonl').read_text().splitlines()]
@@ -536,7 +539,7 @@ class RecoveryTests(unittest.TestCase):
     def test_analysis_with_and_without_alibaba_same_whole_window_rule(self):
         alibaba=json.loads(json.dumps(self.candidate));alibaba['endpoint'].update(provider_name='Alibaba',tag='alibaba')
         names={amendment.identity(c):c for c in (self.candidate,alibaba)}
-        rows=[dict(provider=n,observed_providers=[c['endpoint']['provider_name']],phase='amendment',model=c['model'],cohort='core',depth=1000000,call_index=1,accepted=True,prompt_tokens=999000,cached_tokens=0,new_tokens_estimate=1065,pause_target_seconds=8,pause_actual_seconds=8) for n,c in names.items()]
+        rows=[dict(provider=n,observed_models=[c['model']],observed_providers=[c['endpoint']['provider_name']],phase='amendment',model=c['model'],cohort='core',depth=1000000,call_index=1,accepted=True,prompt_tokens=999000,cached_tokens=0,new_tokens_estimate=1065,pause_target_seconds=8,pause_actual_seconds=8) for n,c in names.items()]
         rows.append(dict(rows[0],accepted=False,timed_out=True,error='deadline',call_index=0))
         with mock.patch.object(restart,'candidates',return_value=names),mock.patch.object(restart,'read_rows',return_value=rows):data=restart.analysis(self.root,final=True)
         comparison=data['million_token_comparison']['qwen/qwen3.8-27b']
@@ -662,7 +665,7 @@ class RecoveryTests(unittest.TestCase):
             recovery.atomic_json(directory/'terminal.json',dict(status='done',attempts=0))
             child=mock.Mock(pid=11000+len(children));child.wait.return_value=0;children.append(child)
             return child
-        with mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'settled_samples',return_value=self.samples('.000001')),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['b'*40,'']):
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]),mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'settled_samples',return_value=self.samples('.000001')),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['b'*40,'']):
             self.assertEqual(restart.supervise(self.root,resume=True),0)
         self.assertEqual(len(children),2)
         self.assertEqual(len(Handler.bodies),1)
@@ -675,34 +678,172 @@ class RecoveryTests(unittest.TestCase):
     def test_supervisor_sequences_children_and_records_terminal_custody(self):
         self.supervisor_fixture(watchdog=False)
 
-    # A watchdog stop produces failed custody and prevents launching the next paid phase.
-    def test_supervisor_watchdog_failure_prevents_amendment_launch(self):
+    # A fixed phase cutoff settles interrupted intents before the next phase is permitted.
+    def test_supervisor_watchdog_settles_then_launches_amendment(self):
         self.supervisor_fixture(watchdog=True)
 
-    def supervisor_fixture(self,watchdog):
+    # Exact0246 replay keeps its settled zero charge, rejects cache evidence and advances both indices.
+    def test_sequence_0246_unknown_model_no_usage_continues_as_availability_failure(self):
+        fixture=json.loads((api.HERE/'fixtures/unknown-model-0246.json').read_text())
+        result={k:fixture[k] for k in ('http_status','generation_id','usage','error','stream','observed_models','observed_providers','usage_complete','timed_out')}
+        phase=self.phase();Handler.cost=0
+        with mock.patch.object(recovery,'stream',return_value=result),mock.patch.object(recovery.time,'sleep'):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual([r['call_index'] for r in phase.rows],[0,1])
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+        for row in phase.rows:
+            self.assertFalse(row['accepted']);self.assertNotIn('halt_class',row)
+            self.assertEqual(row['observed_models'],['unknown'])
+            self.assertEqual(row['charge_resolution']['resolved_observed_charge_usd'],'0')
+        self.assertEqual(len(phase.budget.receipts),2)
+
+    # Missing/unknown model with valid usage is successful availability but cannot be cache-priced.
+    def test_unknown_or_absent_model_full_usage_is_excluded_from_cache_only(self):
+        for models in ([],['unknown'],[' UNKNOWN ']):
+            row=dict(http_status=200,observed_models=models,observed_providers=['Phala'],usage=dict(prompt_tokens=32768,completion_tokens=60,cost=.001))
+            recovery.classify_call(row,32768,self.candidate['model'],self.candidate['endpoint'])
+            self.assertFalse(row['accepted']);self.assertEqual(row['identity_status'],'unproven')
+            self.assertIn('model unknown or absent',row['error']);self.assertNotIn('halt_class',row)
+            self.assertEqual(recovery.availability([row])['rate'],1)
+            self.assertEqual(row['completion_over_cap'],60)
+
+    # Unknown markers and provider errors must not hide any concrete contradictory model observation.
+    def test_named_negative_known_wrong_model_alongside_unknown_still_halts(self):
+        phase=self.phase()
+        result=dict(http_status=200,observed_models=['unknown','wrong/model'],observed_providers=[],usage=None,error='output guard canceled stream')
+        with mock.patch.object(recovery,'stream',return_value=result),mock.patch.object(recovery,'settled_samples',return_value=self.samples(0)):
+            self.assertEqual(phase.run(),1)
+        self.assertEqual(len(phase.rows),1);self.assertEqual(phase.rows[0]['halt_class'],'identity')
+        self.assertIn('proven model identity violation',phase.reason)
+
+    # Excessive reported debit is persisted, halts after one request and cannot be converted to a cell skip.
+    def test_named_negative_excessive_reported_debit_halts_study(self):
+        Handler.cost=1;phase=self.phase()
+        self.assertEqual(phase.run(),1);self.assertEqual(len(Handler.bodies),1)
+        self.assertIn('reported cost exceeds reservation',phase.reason)
+        ledger=recovery.Budget.load(self.root/'ledger.json')
+        self.assertEqual(ledger.known,Decimal(1));self.assertFalse(ledger.receipts['v1/0000']['within_maximum'])
+
+    # A malformed/unavailable remote preflight never admits a POST or changes the ledger; later cells may run.
+    def test_preflight_remote_failures_skip_cell_then_next_cell_continues(self):
+        for mode in ('get','endpoint','price','spend'):
+            with self.subTest(mode=mode):
+                phase=self.phase() if not (self.root/'v1').exists() else restart.Phase(self.root,'v1',self.client,until=time.time()+5000,resume=True)
+                before=(self.root/'ledger.json').read_bytes();original=self.client.get
+                def get(path):
+                    if mode=='get':raise restart.URLError('metadata unavailable')
+                    if mode=='spend' and path=='/key':return {'data':{}}
+                    data=original(path)
+                    if '/models/' in path:
+                        if mode=='endpoint':data['data']['endpoints']=[]
+                        if mode=='price':
+                            for endpoint in data['data']['endpoints']:endpoint['pricing']['completion']='invalid'
+                    return data
+                count=len(Handler.bodies)
+                with mock.patch.object(self.client,'get',side_effect=get):self.assertIsNone(phase.call(self.session,0))
+                self.assertEqual(len(Handler.bodies),count);self.assertEqual((self.root/'ledger.json').read_bytes(),before)
+                self.assertTrue(phase.skips)
+                phase.call(dict(self.session,session_id='after-'+mode),0)
+                self.assertEqual(len(Handler.bodies),count+1);self.assertTrue(phase.rows[-1]['accepted'])
+
+    # A soft1200s timeout ends only that cell; restored headroom admits another cell without replay.
+    def test_disk_wait_expiry_does_not_halt_next_cell(self):
+        phase=self.phase()
+        with mock.patch.object(phase,'wait_for_disk',side_effect=recovery.DiskHeadroomTimeout('headroom wait expired')):
+            self.assertIsNone(phase.call(self.session,0))
+        self.assertEqual(Handler.bodies,[]);self.assertEqual(len(phase.skips),1)
+        phase.call(dict(self.session,session_id='next-cell'),0)
+        self.assertEqual(len(Handler.bodies),1)
+
+    # Evidence failure is an instrument halt after its charge is settled, even if provider usage is valid.
+    def test_named_negative_stream_evidence_failure_halts_after_settlement(self):
+        phase=self.phase();result=dict(http_status=200,observed_models=[self.candidate['model']],observed_providers=['Phala'],
+                                      usage=dict(prompt_tokens=31768,completion_tokens=2,cost=.000001),instrument_failure='stream evidence write failed')
+        with mock.patch.object(recovery,'stream',return_value=result):self.assertEqual(phase.run(),1)
+        self.assertEqual(len(phase.rows),1);self.assertFalse(phase.rows[0]['accepted'])
+        self.assertIn('instrument violation',phase.reason);self.assertIn('v1/0000',phase.budget.receipts)
+
+    # Trace disk-write faults are distinguished from provider stream failures, rather than swallowed as per-call errors.
+    def test_stream_evidence_write_fault_sets_instrument_marker(self):
+        trace=recovery.StreamTrace(self.root/'broken.jsonl',self.secret);trace.handle.close();trace.handle=mock.Mock()
+        trace.handle.write.side_effect=OSError('disk write failed')
+        with self.assertRaisesRegex(OSError,'disk write failed'):trace.record(b'data: {"model":"unknown"}\n')
+        self.assertEqual(trace.evidence_error,'stream evidence write failed')
+
+    # The registered number of failed attempts bounds a cell, and cannot prevent an independent cell from running.
+    def test_failing_cell_exhausts_registered_limit_without_halting_study(self):
+        phase=self.phase();bad=dict(self.session,session_id='failed-cell');good=dict(self.session,session_id='good-cell')
+        original=phase.call
+        def call(s,index,previous_end=None):
+            RecoveryHandler.output_mode='http-error' if s['session_id']=='failed-cell' else None
+            return original(s,index,previous_end)
+        Handler.cost=0
+        with mock.patch.object(phase,'call',side_effect=call),mock.patch.object(recovery.time,'sleep'):phase.interleave([bad,good])
+        self.assertEqual([r['call_index'] for r in phase.rows if r['session_id']=='failed-cell'],[0,1])
+        self.assertTrue(all(r['accepted'] for r in phase.rows if r['session_id']=='good-cell'))
+        self.assertEqual(len(Handler.bodies),4)
+
+    # Starting too late omits v1 explicitly and still starts amendment under its unchanged cutoff.
+    def test_late_phase_start_skips_v1_and_launches_amendment(self):
+        with mock.patch.dict(restart.PHASE_ENDS,{'v1':restart.timestamp(time.time()-1)}):
+            self.supervisor_fixture(watchdog=False,late=True)
+
+    # A child crash remains an instrument failure and prevents amendment spending, even if prior charges settled.
+    def test_named_negative_supervisor_child_crash_still_halts(self):
+        self.supervisor_fixture(watchdog=False,crash=True)
+
+    # A phase cutoff cannot hand off to amendment when interrupted-request reconciliation is still unresolved.
+    def test_named_negative_cutoff_unresolved_charge_prevents_amendment(self):
+        self.supervisor_fixture(watchdog=True,unresolved=True)
+
+    # A cutoff between recording a known wrong model and the child's fatal check must not permit phase handoff.
+    def test_named_negative_cutoff_cannot_hide_recorded_wrong_model(self):
+        self.supervisor_fixture(watchdog=True,wrong_model=True)
+
+    # Low soft headroom at startup cannot halt custody; the child owns the paid-call wait and hard-floor guard.
+    def test_supervisor_soft_headroom_startup_does_not_halt(self):
+        with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))):
+            self.supervisor_fixture(watchdog=False)
+
+    def supervisor_fixture(self,watchdog,late=False,crash=False,unresolved=False,wrong_model=False):
         recovery.atomic_json(self.root/'call34-resolution.json',dict(expected_without_call_usd='0',maximum_usd='.420'))
         children=[]
         def spawn(argv,**kwargs):
             phase=argv[argv.index('--phase')+1]
             directory=self.root/phase;directory.mkdir()
             recovery.atomic_json(directory/'terminal.json',dict(status='done',attempts=0))
+            if wrong_model:
+                recovery.atomic_json(directory/'call-0000.json',dict(session_id=self.session['session_id'],observed_models=['wrong/model'],
+                    model=self.candidate['model'],endpoint_tag=self.candidate['endpoint']['tag'],started_at=api.utc(),depth=32768,
+                    call_index=0,accepted=False,cohort='v1',sequence=0))
             child=mock.Mock(pid=10000+len(children))
-            child.wait.side_effect=[restart.subprocess.TimeoutExpired('fake-child',1),0] if watchdog else [0]
+            child.wait.side_effect=[restart.subprocess.TimeoutExpired('fake-child',1),0] if watchdog else [1 if crash else 0]
             children.append(child)
             kwargs['stdout'].write('done phase='+phase+' mock fixture\n')
             return child
-        with mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'usage_samples',return_value=self.samples(0)),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['a'*40,'']):
-            self.assertEqual(restart.supervise(self.root),1 if watchdog else 0)
-        self.assertEqual(len(children),1 if watchdog else 2)
+        original=restart.recover_interrupted
+        def recover(*args):
+            if unresolved:raise api.Refusal('unresolvable charge: fixture recovery deadline')
+            return original(*args)
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]),mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'usage_samples',return_value=self.samples(0)),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['a'*40,'']),mock.patch.object(restart,'recover_interrupted',side_effect=recover):
+            self.assertEqual(restart.supervise(self.root),1 if crash or unresolved or wrong_model else 0)
+        self.assertEqual(len(children),1 if late or crash or unresolved or wrong_model else 2)
         workflow=json.loads((self.root/'workflow.json').read_text())
-        self.assertEqual(workflow['status'],'failed' if watchdog else 'done')
-        self.assertEqual((self.root/'v1.pid').read_text().strip(),'10000')
+        self.assertEqual(workflow['status'],'failed' if crash or unresolved or wrong_model else 'done')
+        self.assertEqual((self.root/('amendment.pid' if late else 'v1.pid')).read_text().strip(),'10000')
         self.assertTrue((self.root/'SUMMARY.md').exists());self.assertTrue((self.root/'heartbeat.json').exists())
-        if watchdog:
+        if watchdog and not (unresolved or wrong_model):
             children[0].terminate.assert_called_once()
-            self.assertIn('watchdog',workflow['reason'])
-            self.assertEqual(json.loads((self.root/'v1/terminal.json').read_text())['status'],'failed')
-        else:self.assertEqual((self.root/'amendment.pid').read_text().strip(),'10001')
+            self.assertIn('both bounded',workflow['reason'])
+            self.assertEqual(json.loads((self.root/'v1/terminal.json').read_text())['status'],'done')
+        elif not (late or crash or unresolved or wrong_model):self.assertEqual((self.root/'amendment.pid').read_text().strip(),'10001')
+        if crash or unresolved:
+            self.assertFalse((self.root/'amendment.pid').exists())
+            self.assertIn('phase failed' if crash else 'unresolvable charge',workflow['reason'])
+        if wrong_model:
+            self.assertFalse((self.root/'amendment.pid').exists());self.assertIn('proven model identity violation',workflow['reason'])
+        if late:
+            self.assertFalse((self.root/'v1.pid').exists());self.assertTrue(json.loads((self.root/'v1/skipped.json').read_text()))
 
 
 if __name__=='__main__':unittest.main()

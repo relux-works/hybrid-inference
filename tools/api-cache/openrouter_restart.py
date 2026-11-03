@@ -4,6 +4,7 @@ import argparse
 from collections import deque
 from datetime import datetime,timezone
 from decimal import Decimal
+from http.client import HTTPException
 import fcntl
 import hashlib
 import heapq
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 from urllib.request import Request,build_opener,ProxyHandler
+from urllib.error import URLError
 
 import openrouter_cache as api
 import openrouter_amendment1 as amendment
@@ -24,6 +26,16 @@ import openrouter_recovery as recovery
 PHASE_ENDS={'v1':'2026-11-04T09:00:00+00:00','amendment':'2026-11-05T05:40:00+00:00'}
 WINDOW_START='2026-11-03T14:39:44.389926+00:00'
 LOCK_PATH=Path('/home/agent/lanes/hybrid/.temp/openrouter/cache-run.lock')
+
+
+class PreflightUnavailable(api.Refusal):
+    pass
+
+
+def metadata_get(client,path):
+    try:return client.get(path)
+    except (OSError,HTTPException,json.JSONDecodeError,UnicodeError) as error:
+        raise PreflightUnavailable('preflight GET unavailable: '+api.redact(str(error),client.secret)) from None
 
 
 def epoch(value):
@@ -156,11 +168,12 @@ def filter_provider_identity(rows):
         row=dict(source)
         if row.get('accepted'):
             accepted+=1
-            if not recovery.provider_observations(row):
+            if not recovery.provider_observations(row) or not recovery.model_observations(row):
                 rejected.append({k:row.get(k) for k in ('phase','sequence','provider','session_id','call_index')})
-                row.update(accepted=False,analysis_original_accepted=True,error='analysis identity refusal: serving provider absent')
+                reason='serving provider absent' if not recovery.provider_observations(row) else 'serving model unknown or absent'
+                row.update(accepted=False,analysis_original_accepted=True,error='analysis identity refusal: '+reason)
         filtered.append(row)
-    return filtered,dict(rule='Accepted research rows require observed provider; legacy serving_provider evidence is used only if observed_providers is absent.',
+    return filtered,dict(rule='Accepted research rows require observed provider and known model; legacy serving_provider evidence is used only if observed_providers is absent.',
                          original_accepted_count=accepted,rejected_count=len(rejected),rejected_rows=rejected)
 
 
@@ -217,14 +230,14 @@ def analysis(root,final=False,output=None,rows=None):
         own=[r for r in rows if r['provider']==p['provider']]
         p['cold_probe_latencies']=[dict(depth=r['depth'],call_index=r['call_index'],**amendment.miss_latency(r)) for r in own if r.get('cohort')=='probe']
     _,excluded=api.matrix(json.loads(api.SNAPSHOT.read_text()))
-    data=dict(protocol='r15d+r15e+r15f+r15g-analysis',provider_identity_filter=identity_filter,million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
+    data=dict(protocol='r15d+r15e+r15f+r15g+r15h+r15i+r15j-analysis',provider_identity_filter=identity_filter,million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
               providers=providers,million_token_comparison=comparisons,
               remote_uptime_samples=len(samples),remote_sample_times=[s['at'] for s in samples],
               smoke_used_for_cache=False,seed_calls_used_for_cache=False,
               rules='Only context/no declared cache/whole-window availability exclude. Zero hits are priced. Daily windows overlap.')
     recovery.atomic_json(output/'analysis.json',data)
     lines=['# API cache report - r15d','', 'Whole window: '+WINDOW_START+' through '+data['window_observed_through']+'. Final: '+str(final)+'.','',
-           'Identity-refused accepted rows: '+str(identity_filter['rejected_count'])+'. The r15g analysis filter refuses provider-less accepted rows from cache/price metrics and counts them as availability failures. Original raw rows and financial charges stay unchanged; rejected identities are recorded in analysis.json.','',
+           'Identity-refused accepted rows: '+str(identity_filter['rejected_count'])+'. The identity filter excludes accepted rows with absent provider or unknown/absent model from cache/price metrics. Under r15j, HTTP200 with usable complete usage is successful availability even when identity/depth is unproven; no usable usage is a failure. Earlier rows retain their recorded availability. Original raw rows and financial charges stay unchanged; rejected identities are recorded in analysis.json.','',
            'The whole Chutes smoke and every call_index0 are excluded from cache metrics. All attempted calls, including seeds and charge-resolved timeouts, count toward availability. Old full-v3 attempts join both new phases; pilot/configuration cohorts do not.','',
            'Known zero hits are priced at the measured rate. Missing usage stays unknown. Core and long-pause prices stay separate. Remote rolling daily statistics are metadata, not a substitute for whole-window own availability.','',
            'Headline1M is pooled across restarted-v1 multi-pause cadence and amendment core cadence. Per-phase1M figures are beside it; the separate long-pause substudy and probes are excluded.','',
@@ -324,6 +337,14 @@ class Phase:
         return True
 
     def call(self,s,index,previous_end=None):
+        try:return self._call(s,index,previous_end)
+        except (recovery.DiskHeadroomTimeout,PreflightUnavailable) as error:
+            self.skip(s,index,str(error))
+            self.progress(status='cell-skipped',current_call=None,next_call_time=api.utc(),next_call_reason=str(error))
+            print(api.redact(json.dumps(dict(cell_skipped=s['session_id'],index=index,reason=str(error))),self.client.secret),flush=True)
+            return None
+
+    def _call(self,s,index,previous_end=None):
         seconds=recovery.deadline_for_depth(s['depth'])
         due=time.monotonic() if previous_end is None else previous_end+s['pauses'][index]
         if not self.fits_call(s,index,seconds,due):return None
@@ -343,12 +364,18 @@ class Phase:
         while True:
             self.wait_for_disk()
             if not self.fits_call(s,index,seconds):return None
-            sample=api.sample_endpoints(self.client,self.out,self.preflights); self.preflights+=1
-            endpoint=api.live_endpoint(sample,candidate)
-            if endpoint['context_length']<s['depth'] or 'input_cache_read' not in endpoint['pricing']:
+            sample=dict(at=api.utc(),models=[metadata_get(self.client,'/models/'+model+'/endpoints') for model in ('qwen/qwen3.8-27b','z-ai/glm-5.3-flash')])
+            recovery.atomic_json(self.out/('uptime-%04d.json'%self.preflights),sample,self.client.secret);self.preflights+=1
+            try:
+                endpoint=api.live_endpoint(sample,candidate)
+                impossible=endpoint['context_length']<s['depth'] or 'input_cache_read' not in endpoint['pricing']
+                estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']),recovery.RESERVED_OUTPUT_TOKENS)
+            except (api.Refusal,KeyError,TypeError,ValueError) as error:
+                raise PreflightUnavailable('live endpoint/price metadata unavailable: '+str(error)) from None
+            if impossible:
                 self.skip(s,index,'live context/cache declaration makes this cell impossible'); return None
-            estimated=api.max_cost(endpoint,min(len(text.encode())+512,endpoint['context_length']),recovery.RESERVED_OUTPUT_TOKENS)
-            key=self.client.get('/key')['data']; live=api.money(key['usage'])
+            try:key=metadata_get(self.client,'/key')['data'];live=api.money(key['usage'])
+            except (KeyError,TypeError):raise PreflightUnavailable('live spend metadata missing; no request admitted') from None
             if live>self.budget.committed+recovery.ROUNDING:raise api.Refusal('live spend exceeds committed upper bound')
             self.budget.known=max(self.budget.known,live); self.budget.save()
             try:self.budget.reserve(live,estimated,self.cap,key.get('limit_remaining'))
@@ -399,8 +426,8 @@ class Phase:
         print(api.redact(json.dumps({k:row.get(k) for k in ('sequence','provider','cohort','depth','call_index','cached_tokens','timed_out','accepted','error')}),self.client.secret),flush=True)
         self.progress(status='between-calls',current_call=None,next_call_time=timestamp(time.time()+s['pauses'][index+1]) if index+1<len(s['pauses']) else None,next_call_reason='next registered call or new series')
         analysis(self.root)
-        if row.get('error') and any(term in row['error'] for term in ('provider differs','model differs','depth outside','evidence')):
-            raise api.Refusal('instrument/identity violation; no further spending')
+        if row.get('instrument_failure'):raise api.Refusal('instrument violation: '+row['instrument_failure'])
+        if row.get('halt_class')=='identity':raise api.Refusal('proven model identity violation; no further spending')
         return ended
 
     def interleave(self,source):
@@ -536,6 +563,16 @@ def recover_interrupted(root,phase,client):
             recovery.atomic_json(rowpath,row,client.secret)
 
 
+def check_phase_integrity(root,phase):
+    planned={s['session_id']:s['candidate'] for s in phase_sessions(phase)}
+    for path in (root/phase).glob('call-*.json'):
+        row=json.loads(path.read_text())
+        if row.get('instrument_failure'):raise api.Refusal('instrument violation: '+row['instrument_failure'])
+        candidate=planned[row['session_id']]
+        if recovery.model_observations(row)-recovery.allowed_models(candidate['model'],candidate['endpoint']):
+            raise api.Refusal('proven model identity violation at phase handoff')
+
+
 def write_summary(root,status,reason):
     ledger=recovery.Budget.load(root/'ledger.json')
     workflow=json.loads((root/'workflow.json').read_text())
@@ -563,7 +600,9 @@ def supervise(root,resume=False):
     elif resume:raise api.Refusal('resume requires existing workflow')
     lock=LOCK_PATH.open('a+')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    recovery.wait_for_disk(root,on_event=lambda event:disk_wait_event(root,event,'startup'),check_stop=lambda:check_stop(root))
+    check_stop(root)
+    # Paid admission owns the bounded soft wait; startup only checks the hard floor.
+    if api.shutil.disk_usage(root).free<recovery.MIN_FREE_BYTES:raise api.Refusal('free disk below28 GiB hard floor')
     client=recovery.Client()
     if resume:
         ledger=recovery.Budget.load(root/'ledger.json')
@@ -575,6 +614,7 @@ def supervise(root,resume=False):
         samples=recovery.settled_samples(client,ledger.known,ledger.committed-ledger.known,root/'resume-settlement.json')
         ledger.known=max(ledger.known,api.money(samples[-1]['usage_usd']));ledger.save()
         ledger.reserve(ledger.known,Decimal(0))
+        check_phase_integrity(root,'v1')
     else:
         proof=json.loads((root/'call34-resolution.json').read_text())
         expected=proof['expected_without_call_usd'];maximum=proof['maximum_usd']
@@ -612,7 +652,13 @@ def supervise(root,resume=False):
     write_summary(root,'running','sequential v1 then amendment; guarded restart launched')
     try:
         for phase in ('v1','amendment'):
-            if time.time()+600>=epoch(PHASE_ENDS[phase]):raise api.Refusal('phase start too late: '+phase)
+            if time.time()+600>=epoch(PHASE_ENDS[phase]):
+                directory=root/phase;directory.mkdir(exist_ok=True)
+                skips=[dict(session_id=s['session_id'],reason='phase start too late; unchanged cutoff',missing_call_indices=list(range(len(s['pauses'])))) for s in phase_sessions(phase)]
+                recovery.atomic_json(directory/'skipped.json',skips)
+                recovery.atomic_json(directory/'terminal.json',dict(status='done',at=api.utc(),reason='phase start too late; skipped',attempts=len(list(directory.glob('call-*.json')))))
+                print('done phase='+phase+' skipped: phase start too late',flush=True)
+                continue
             env=os.environ.copy();env['PYTHONDONTWRITEBYTECODE']='1';env['TMPDIR']=str(root/'tmp')
             with (root/(phase+'.log')).open('a' if resume else 'w') as log:
                 argv=[sys.executable,str(Path(__file__).resolve()),'--root',str(root),'--phase',phase,'--lease-fd',str(lock.fileno())]
@@ -628,11 +674,17 @@ def supervise(root,resume=False):
                     child.terminate()
                     try:child.wait(timeout=5)
                     except subprocess.TimeoutExpired:child.kill();child.wait(timeout=5)
-                    recovery.atomic_json(root/phase/'terminal.json',dict(status='failed',at=api.utc(),reason='supervisor watchdog deadline'))
-                    log.write('failed phase='+phase+' supervisor watchdog deadline\n');log.flush()
                     recover_interrupted(root,phase,client)
-                    raise api.Refusal('supervisor watchdog ended '+phase)
+                    check_phase_integrity(root,phase)
+                    terminal=root/phase/'terminal.json'
+                    if terminal.exists() and json.loads(terminal.read_text())['status']=='failed':
+                        raise api.Refusal('instrument failure at cutoff: child recorded failed terminal')
+                    recovery.atomic_json(root/phase/'terminal.json',dict(status='done',at=api.utc(),reason='phase cutoff; watchdog stopped child and settled every intent'))
+                    recovery.atomic_json(root/phase/'skipped-cutoff.json',dict(at=api.utc(),reason='fixed phase cutoff',planned=phase_sessions(phase)))
+                    log.write('done phase='+phase+' cutoff; interrupted charges settled\n');log.flush()
+                    code=0
             recover_interrupted(root,phase,client)
+            check_phase_integrity(root,phase)
             if code:raise api.Refusal('phase failed: '+phase+'; inspect terminal and charge evidence; no next phase')
         status,reason='done','both bounded phases terminated; budget/time omissions retained'
     except Exception as error:

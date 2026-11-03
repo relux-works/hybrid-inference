@@ -55,7 +55,7 @@ class Handler(BaseHTTPRequestHandler):
         if Handler.usage_cost_absent:usage.pop('cost')
         Handler.spend+=Handler.cost
         self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
-        for item in [dict(id='mock-generation',provider=Handler.provider_override or endpoint['provider_name'],choices=[dict(delta=dict(content='OK'))]),dict(usage=usage,choices=[])]:
+        for item in [dict(id='mock-generation',model=body['model'],provider=Handler.provider_override or endpoint['provider_name'],choices=[dict(delta=dict(content='OK'))]),dict(usage=usage,choices=[])]:
             self.wfile.write(b'data: '+json.dumps(item).encode()+b'\n\n')
         self.wfile.write(b'data: [DONE]\n\n')
 

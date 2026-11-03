@@ -1,0 +1,103 @@
+{
+  "protocol": "r15d",
+  "phase": "v1",
+  "sequence": 246,
+  "provider": "qwen/qwen3.8-27b / novita",
+  "model": "qwen/qwen3.8-27b",
+  "endpoint_tag": "novita",
+  "cohort": "v1",
+  "depth": 1000000,
+  "session_id": "r15d-v1-3daac815e2cee73c2d1e",
+  "call_index": 1,
+  "new_tokens_estimate": 1000,
+  "pause_target_seconds": 0,
+  "pause_actual_seconds": 68.39988755015656,
+  "started_at": "2026-11-03T22:41:44.534729+00:00",
+  "expected_spend_before_usd": "11.1690098449",
+  "maximum_cost_usd": "0.42307200",
+  "pricing": {
+    "prompt": "0.00000042",
+    "completion": "0.000003",
+    "input_cache_read": "0.000000085",
+    "discount": 0
+  },
+  "requested_output_tokens": 16,
+  "reserved_output_tokens": 1024,
+  "request_deadline_seconds": 2400,
+  "provider_request": {
+    "order": [
+      "novita"
+    ],
+    "only": [
+      "novita"
+    ],
+    "allow_fallbacks": false
+  },
+  "prompt_sha256": "b85fbd8ff57e7b17d8adf80fb250eb595bde7b26f27b092c580e1b3d8071fe22",
+  "accepted": false,
+  "http_status": 200,
+  "generation_id": "gen-1793745704-VDgInFWv6wg0Ae3CkSZm",
+  "usage": null,
+  "error": "serving model differs from pinned model",
+  "stream": [
+    {
+      "id": "gen-1793745704-VDgInFWv6wg0Ae3CkSZm",
+      "object": "chat.completion.chunk",
+      "created": 1793745704,
+      "model": "unknown",
+      "provider": "Novita",
+      "choices": [],
+      "error": {
+        "code": 400,
+        "message": "invalid request error trace_id: 27937c58c116614d4bd6dcfbbaff4708",
+        "metadata": {
+          "error_type": "invalid_request"
+        }
+      }
+    }
+  ],
+  "elapsed_seconds": 24.87607990205288,
+  "ttft_seconds": null,
+  "observed_providers": [
+    "Novita"
+  ],
+  "observed_models": [
+    "unknown"
+  ],
+  "output_guard_triggered": false,
+  "output_guard_reason": null,
+  "streamed_output_utf8_bytes": 0,
+  "usage_complete": false,
+  "allowed_model_identities": [
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.8-27b-20260814"
+  ],
+  "timed_out": false,
+  "journal": "stream-0246.jsonl",
+  "ended_at": "2026-11-03T22:42:09.413159+00:00",
+  "charge_resolution": {
+    "method": "stable cumulative usage delta",
+    "expected_usd": "11.1690098449",
+    "maximum_usd": "0.42307200",
+    "observed_delta_usd": "-7.9E-9",
+    "resolved_observed_charge_usd": "0",
+    "retained_reservation_usd": "0.42307200",
+    "rounding_tolerance_usd": "1E-8",
+    "samples": [
+      {
+        "at": "2026-11-03T22:42:24.468908+00:00",
+        "usage_usd": "11.169009837"
+      },
+      {
+        "at": "2026-11-03T22:42:39.509901+00:00",
+        "usage_usd": "11.169009837"
+      },
+      {
+        "at": "2026-11-03T22:42:54.549475+00:00",
+        "usage_usd": "11.169009837"
+      }
+    ],
+    "resolved": true
+  },
+  "usage_error": "usage parsing failed: usage missing"
+}

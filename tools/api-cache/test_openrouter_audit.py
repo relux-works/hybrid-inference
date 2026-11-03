@@ -18,6 +18,7 @@ import openrouter_audit as audit
 import openrouter_cache as api
 import openrouter_amendment1 as amendment
 import openrouter_restart as restart
+import openrouter_recovery as recovery
 from test_openrouter_amendment1 import Handler
 
 
@@ -61,7 +62,7 @@ class AuditTests(unittest.TestCase):
         self.client=audit.GetOnlyClient(self.key,'http://127.0.0.1:'+str(self.server.server_port),mock=True)
         self.candidate=next(c for c in restart.candidates().values() if c['endpoint']['provider_name']=='Phala' and c['model']=='qwen/qwen3.8-27b')
         self.row=dict(phase='v1',sequence=0,provider=amendment.identity(self.candidate),model=self.candidate['model'],endpoint_tag='phala',cohort='v1',depth=32768,session_id='fake',call_index=1,accepted=True,started_at=api.utc(),ended_at=api.utc(),generation_id='gen-1',usage={'cost':.1},cost_usd=.1,prompt_tokens=32000,cached_tokens=31000,new_tokens_estimate=1000,pause_target_seconds=0,pause_actual_seconds=.1,pricing=self.candidate['endpoint']['pricing'])
-        self.row['observed_providers']=['Phala']
+        self.row['observed_providers']=['Phala'];self.row['observed_models']=[self.row['model']]
         AuditHandler.generation_cost=.1;AuditHandler.generation_model=self.row['model'];AuditHandler.drift=False;AuditHandler.limited=False;AuditHandler.gets=0;Handler.bodies=[]
 
     def run_audit(self,rows=None):
@@ -109,6 +110,15 @@ class AuditTests(unittest.TestCase):
         row['observed_providers']=[]
         invalid,proof=restart.filter_provider_identity([row]);self.assertEqual(proof['rejected_count'],1)
         self.assertFalse(invalid[0]['accepted']);self.assertTrue(row['accepted'])
+
+    # Independent end analysis excludes planted unknown model identities while retaining explicit HTTP/usage availability.
+    def test_named_negative_analysis_unknown_model_refuses_cache_without_rewriting_raw_row(self):
+        for models in ([],['unknown']):
+            row=dict(self.row,observed_models=models,availability_success=True)
+            rows,proof=restart.filter_provider_identity([row])
+            self.assertEqual(proof['rejected_count'],1);self.assertFalse(rows[0]['accepted'])
+            self.assertEqual(recovery.availability(rows)['rate'],1)
+            self.assertTrue(row['accepted']);self.assertEqual(row['observed_models'],models)
 
     # Audit labels distinguish the live workflow's actual source from the checkout doing the audit.
     def test_audit_source_commit_comes_from_live_workflow(self):

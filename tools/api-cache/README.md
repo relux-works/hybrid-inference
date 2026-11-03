@@ -1,3 +1,9 @@
+# r15j unattended continuation
+
+[RESTART-r15j.md](RESTART-r15j.md) supersedes the earlier stop policy. Unknown/absent model, provider evidence failures and depth deviations exclude cache rows without halting the study. HTTP200 with usable complete usage remains successful availability; missing usage fails availability. Concrete wrong models, excessive/unresolved charges, hard disk floor and instrument failures still halt. Preflight failures and1200s soft disk-wait expiry skip cells without paid requests. Late phases skip explicitly; a cutoff hands off only after settled receipts and independent identity/instrument checks. Operator STOP remains authoritative.
+
+Run the CPU suite and the same signed-head --resume/nohup command documented below. Use .temp/hybrid-d-r15j-261103/tmp for CPU work and the canonical r15d/tmp for paid runtime. Runtime log, workflow.json, ledger.json and600s heartbeat.json remain in .temp/hybrid-d-r15d-261103/. New GET-only end analysis goes to .temp/hybrid-d-r15j-261103/audit-end/. SUMMARY.md in the r15j task root records the halt-path audit, signed head, restart time, independent PID verification and ledger. No source edits after launch. Caps22/45, registered pauses and both cutoffs are unchanged.
+
 # r15i disk headroom admission wait
 
 [RESTART-r15i.md](RESTART-r15i.md) registers the bounded disk wait from accepted0929c1de. Below28.5GiB, the active runner, startup and GET-only auditor recheck every60s for up to1200s before refusing. Below28GiB the guard refuses immediately. Waiting starts before an intent or paid POST; previous responses and charges are already recorded. Every wait logs start/rechecks/end with free bytes. disk-waits.jsonl and progress.json disclose paid-worker waits. Heartbeats report soft headroom without writing a sticky STOP; hard-floor observations still block future calls.

@@ -18,6 +18,10 @@ SETTLEMENT_DEADLINE_SECONDS = 1200
 DEPTH_DEADLINES = [(32768,180),(131072,300),(250000,600),(524288,1200),(1000000,2400)]
 
 
+class DiskHeadroomTimeout(api.Refusal):
+    pass
+
+
 def deadline_for_depth(depth):
     for bound,seconds in DEPTH_DEADLINES:
         if 0 < depth <= bound:
@@ -59,7 +63,7 @@ def wait_for_disk(path,on_event=None,check_stop=None):
             started=now;started_at=api.utc();event('start',free,'requires-headroom')
         elif now-started>=DISK_WAIT_SECONDS:
             event('end',free,'timeout')
-            raise api.Refusal('free disk requires28.5 GiB after1200s headroom wait')
+            raise DiskHeadroomTimeout('free disk requires28.5 GiB after1200s headroom wait')
         else:event('check',free,'requires-headroom')
         time.sleep(min(DISK_POLL_SECONDS,DISK_WAIT_SECONDS-(now-started)))
 
@@ -171,6 +175,7 @@ class StreamTrace:
         self.output_tokens=None
         self.guard_triggered=False
         self.guard_reason=None
+        self.evidence_error=None
         self.handle=path.open('w')
 
     def record(self,line):
@@ -199,8 +204,12 @@ class StreamTrace:
                         self.first=elapsed
             else:event['done']=True
         else:event['keepalive_or_other_line']=True
-        self.handle.write(api.redact(json.dumps(event),self.secret)+'\n')
-        self.handle.flush()
+        try:
+            self.handle.write(api.redact(json.dumps(event),self.secret)+'\n')
+            self.handle.flush()
+        except OSError:
+            self.evidence_error='stream evidence write failed'
+            raise
         # SSE chunks are not tokens. Bytes are an earlier, conservative stop for exposed text.
         if self.output_tokens is not None and self.output_tokens>RESERVED_OUTPUT_TOKENS:
             self.guard_reason='reported completion tokens exceed reserved output bound'
@@ -239,6 +248,7 @@ class Client(api.Client):
         self.get_timeout=30
         self.journal=None
         self.trace=None
+        self.instrument_failure=None
 
     def request(self,path,body=None):
         if not path.startswith('/') or '://' in path:
@@ -246,7 +256,10 @@ class Client(api.Client):
         headers={'Authorization':'Bearer '+self.secret,'Content-Type':'application/json'}
         raw=None if body is None else json.dumps(body).encode()
         if body is not None and self.journal is not None:
-            self.trace=StreamTrace(self.journal,self.secret)
+            try:self.trace=StreamTrace(self.journal,self.secret)
+            except OSError:
+                self.instrument_failure='stream evidence could not be opened'
+                raise
         response=self.opener.open(Request(self.base+path,data=raw,headers=headers),timeout=self.get_timeout if body is None else self.post_timeout)
         return RecordedResponse(response,self.trace) if body is not None and self.trace is not None else response
 
@@ -256,6 +269,7 @@ def stream(client,payload,endpoint,depth,journal):
     client.post_timeout=seconds
     client.journal=journal
     client.trace=None
+    client.instrument_failure=None
     try:
         result=api.stream_call(client,payload,endpoint,timeout_seconds=seconds)
         trace=client.trace
@@ -273,8 +287,9 @@ def stream(client,payload,endpoint,depth,journal):
                 result['completion_over_cap_censored']=not trace.usage_complete
             allowed=allowed_models(payload['model'],endpoint)
             result['allowed_model_identities']=sorted(allowed)
-            if trace.models-allowed:result['error']='serving model differs from pinned model'
+            if known_models(trace.models)-allowed:result['error']='serving model differs from pinned model'
             if trace.providers and trace.providers!={endpoint['provider_name']}:result['error']='serving provider differs from pinned provider'
+            if trace.evidence_error:result['instrument_failure']=trace.evidence_error
             if result.get('usage') is not None:
                 try:result.update(api.parse_usage(result['usage']))
                 except api.Refusal:pass
@@ -285,6 +300,7 @@ def stream(client,payload,endpoint,depth,journal):
         result['timed_out']=('deadline' in error or 'timed out' in error or result.get('http_status') in (408,504))
         result['request_deadline_seconds']=seconds
         result['journal']=journal.name
+        if client.instrument_failure:result['instrument_failure']=client.instrument_failure
         return result
     finally:
         if client.trace is not None:client.trace.close()
@@ -304,14 +320,21 @@ def allowed_models(model,endpoint):
 
 def classify_call(row,target,model,endpoint):
     """Accept complete usage independently of requested output length; retain real failures."""
-    row['accepted']=False
+    row.update(accepted=False,classification_protocol='r15j')
+    row['availability_success']=False
+    row.pop('halt_class',None)
     tokens=row.get('completion_tokens')
     if not row.get('completion_over_cap_censored') and isinstance(tokens,int) and tokens>REQUEST_OUTPUT_TOKENS:row['completion_over_cap']=tokens
-    observed_models=set(row.get('observed_models',[])) | {c['model'] for c in row.get('stream',[]) if c.get('model')}
+    observed_models=model_observations(row)
     observed_providers=provider_observations(row)
-    if observed_models-allowed_models(model,endpoint):row['error']='serving model differs from pinned model'
+    if row.get('error')=='serving model differs from pinned model' and not observed_models:
+        row['previous_classification']=row.pop('error')
     if observed_providers and observed_providers!={endpoint['provider_name']}:row['error']='serving provider differs or is absent'
     if not observed_providers:row['error']='serving provider differs or is absent'
+    if observed_models-allowed_models(model,endpoint):
+        row.update(error='serving model differs from pinned model',halt_class='identity')
+    if row.get('instrument_failure'):row.update(error=row['instrument_failure'],halt_class='instrument')
+    row['identity_status']='proven' if observed_models and not observed_models-allowed_models(model,endpoint) and observed_providers=={endpoint['provider_name']} else 'unproven'
     try:parsed=api.parse_usage(row.get('usage'))
     except api.Refusal as error:
         row['usage_error']='usage parsing failed: '+str(error)
@@ -319,13 +342,23 @@ def classify_call(row,target,model,endpoint):
         return
     if row.get('output_guard_triggered') and not row.get('usage_complete'):return
     row.update(parsed)
+    row['availability_success']=row.get('http_status')==200 and not row.get('halt_class') and not any(c.get('error') for c in row.get('stream',[]))
     if parsed['completion_tokens']>REQUEST_OUTPUT_TOKENS:row['completion_over_cap']=parsed['completion_tokens']
     if row.get('error') in ('completion cap exceeded','output guard canceled stream'):
         row['previous_classification']=row.pop('error')
     if row.get('error'):return
     if row.get('http_status')!=200:row['error']='successful HTTP status missing';return
+    if not observed_models:row['error']='serving model unknown or absent; identity unproven';return
     if abs(row['prompt_tokens']-target)>max(512,target*.03):row['error']='measured depth outside tolerance';return
     row['accepted']=True
+
+
+def known_models(values):
+    return {value for value in values if isinstance(value,str) and value.strip() and value.strip().lower()!='unknown'}
+
+
+def model_observations(row):
+    return known_models(list(row.get('observed_models') or [])+[c.get('model') for c in row.get('stream',[])])
 
 
 def provider_observations(row):
@@ -343,7 +376,7 @@ def rate_limited_without_generation(row):
 
 def availability(rows):
     count=len(rows)
-    success=sum(bool(r.get('accepted')) for r in rows)
+    success=sum(bool(r.get('availability_success',r.get('accepted'))) for r in rows)
     return dict(attempts=count,successes=success,errors=count-success,
                 timeouts=sum(bool(r.get('timed_out') or 'deadline' in (r.get('error') or '')) and not rate_limited_without_generation(r) for r in rows),
                 rate=success/count if count else None)
