@@ -179,6 +179,7 @@ def filter_provider_identity(rows):
 
 def analysis(root,final=False,output=None,rows=None):
     rows,identity_filter=filter_provider_identity(read_rows(root) if rows is None else rows)
+    resumed_sessions={r['session_id'] for r in rows if r.get('resumed_cell')}
     output=root if output is None else output
     providers=[]
     all_candidates=candidates()
@@ -193,6 +194,11 @@ def analysis(root,final=False,output=None,rows=None):
                 subset=[r for r in selected if r['cohort']==cohort]
                 ds=sorted({r['depth'] for r in subset})
                 phases[phase][cohort]=price_metrics(subset,c,ds) if ds else None
+                if ds:
+                    groups=dict(uninterrupted=[r for r in subset if r['session_id'] not in resumed_sessions],
+                                resumed_cells=[r for r in subset if r['session_id'] in resumed_sessions],
+                                continuation_only=[r for r in subset if r.get('resumed_cell')])
+                    phases[phase][cohort]['cadence_subsets']={label:price_metrics(group,c,sorted({r['depth'] for r in group})) if group else None for label,group in groups.items()}
         million=[r for r in own if r['depth']==1000000 and r['cohort'] not in ('probe','long') and r['phase']!='legacy-v1']
         metrics=price_metrics(million,c,[1000000])
         by_phase={phase:price_metrics([r for r in million if r['phase']==phase],c,[1000000]) for phase in ('v1','amendment')}
@@ -272,6 +278,14 @@ def analysis(root,final=False,output=None,rows=None):
     for call_id,receipt in data['permanent_reservations'].items():
         checks=receipt.get('rechecks',[])
         lines.append('| '+call_id+' | '+receipt['maximum_usd']+' | '+receipt['status']+' | '+(checks[-1]['status'] if checks else 'pending')+' |')
+    lines+=['','## Interrupted series (r15m)','','Rows after a resumed partial cell carry resumed_cell and a first-call resume_boundary. The original rows remain unchanged. Analysis separates entire interrupted cells, their continuation rows, and uninterrupted cells; no long stop gap is treated as an8s/35s TTL result. Headline pooled figures retain all admitted measurements; cadence subsets are disclosed below and in JSON.','',
+            '| Endpoint | Phase/cohort | Cadence subset | Warm accepted | Cached fraction | USD/1000 measured depth mix |','|---|---|---|---:|---:|---:|']
+    for p in providers:
+        for phase,cohorts in p['phases'].items():
+            for cohort,metrics in cohorts.items():
+                if metrics is None:continue
+                for label,value in metrics['cadence_subsets'].items():
+                    if value is not None:lines.append('| '+' | '.join([p['provider'],phase+'/'+cohort,label,str(value['accepted']),fmt(value['token_hit_rate']),fmt(value['effective_usd_per_1000_measured_depth_mix'])])+' |')
     (output/'API-CACHE-REPORT.md').write_text('\n'.join(lines))
     return data
 
@@ -293,6 +307,75 @@ def phase_sessions(phase):
             result.append(s)
     return result
 
+
+def validate_ledger(root,budget):
+    budget.check_permanent_limit()
+    stored=json.loads((root/'ledger.json').read_text())
+    if stored.get('permanent_reservation_count',len(budget.permanent_receipts()))!=len(budget.permanent_receipts()):
+        raise api.Refusal('inconsistent ledger: permanent reservation count')
+    contributions=Decimal(0);reported=Decimal(0);observed=Decimal(0)
+    for receipt in budget.receipts.values():
+        if receipt.get('within_maximum') is False:raise api.Refusal('inconsistent ledger: excessive receipt')
+        maximum=api.money(receipt.get('maximum_usd'))
+        if receipt.get('method')=='API reported cost':
+            cost=api.money(receipt['cost_usd'])
+            if cost>maximum+recovery.ROUNDING:raise api.Refusal('inconsistent ledger: cost exceeds maximum')
+            contributions+=cost;reported+=cost;observed+=cost
+        elif receipt.get('resolved') or receipt.get('permanent_reservation'):
+            if api.money(receipt['retained_reservation_usd'])!=maximum:raise api.Refusal('inconsistent ledger: reservation changed')
+            contributions+=maximum
+            observed+=api.money(receipt.get('resolved_observed_charge_usd',0))
+        else:raise api.Refusal('inconsistent ledger: unrecognized receipt')
+    if budget.reported!=reported or budget.known+recovery.SETTLEMENT_ROUNDING<observed or not budget.known<=budget.committed<=45:
+        raise api.Refusal('inconsistent ledger: cumulative totals')
+    proof=root/'call34-resolution.json'
+    if proof.exists():
+        initial=json.loads(proof.read_text())
+        contributions+=api.money(initial['expected_without_call_usd'])+api.money(initial['maximum_usd'])
+        if contributions!=budget.committed:raise api.Refusal('inconsistent ledger: committed total differs from receipts and baseline')
+    elif contributions>budget.committed:raise api.Refusal('inconsistent ledger: receipts exceed committed total')
+
+
+def resume_positions(root,name,budget,planned):
+    """Validate durable attempts and reconstruct every registered cell without changing money."""
+    validate_ledger(root,budget)
+    directory=root/name;cells={s['session_id']:s for s in planned};attempts={sid:[] for sid in cells};seen=set();sequences=[]
+    paths=sorted(directory.glob('intent-*.json'));rows={p.name:json.loads(p.read_text()) for p in directory.glob('call-*.json')}
+    for path in paths:
+        intent=json.loads(path.read_text());sequence=intent['sequence'];sid=intent['session_id'];index=intent['call_index']
+        key=name+'/%04d'%sequence;filename='call-%04d.json'%sequence
+        if path.name!='intent-%04d.json'%sequence or key not in budget.receipts or filename not in rows:
+            raise api.Refusal('inconsistent ledger: missing intent, row or receipt')
+        if sid not in cells or not isinstance(index,int) or isinstance(index,bool) or not 0<=index<len(cells[sid]['pauses']):
+            raise api.Refusal('inconsistent ledger: unregistered cell/index')
+        if (sid,index) in seen:raise api.Refusal('inconsistent ledger: duplicate cell/index')
+        row=rows[filename];s=cells[sid];receipt=budget.receipts[key]
+        for field in ('sequence','session_id','call_index','model','endpoint_tag','cohort','depth','maximum_cost_usd','prompt_sha256'):
+            if row.get(field)!=intent.get(field):raise api.Refusal('inconsistent ledger: row differs from intent')
+        if (intent['model'],intent['endpoint_tag'],intent['cohort'],intent['depth'])!=(s['candidate']['model'],s['candidate']['endpoint']['tag'],s['cohort'],s['depth']):
+            raise api.Refusal('inconsistent ledger: intent differs from registered cell')
+        if api.money(receipt['maximum_usd'])!=api.money(intent['maximum_cost_usd']):raise api.Refusal('inconsistent ledger: receipt maximum differs')
+        recorded=row.get('charge_resolution')
+        if not isinstance(recorded,dict) or any(recorded.get(field)!=receipt.get(field) for field in ('method','maximum_usd','cost_usd','resolved','permanent_reservation','retained_reservation_usd','status')):
+            raise api.Refusal('inconsistent ledger: row receipt differs')
+        if receipt.get('method')=='API reported cost' and abs(api.money(receipt['cost_usd'])-api.money(row.get('cost_usd')))>recovery.ROUNDING:
+            raise api.Refusal('inconsistent ledger: receipt cost differs from row')
+        if not row.get('ended_at'):raise api.Refusal('inconsistent ledger: response timestamp missing')
+        seen.add((sid,index));sequences.append(sequence);attempts[sid].append(row)
+    if sequences!=list(range(len(paths))) or set(rows)!={'call-%04d.json'%i for i in sequences}:
+        raise api.Refusal('inconsistent ledger: sequence gap or orphan row')
+    if {key for key in budget.receipts if key.startswith(name+'/')}!={name+'/%04d'%i for i in sequences}:
+        raise api.Refusal('inconsistent ledger: orphan receipt')
+    positions={}
+    for sid,s in cells.items():
+        own=sorted(attempts[sid],key=lambda r:r['call_index']);indices=[r['call_index'] for r in own]
+        if indices!=list(range(len(indices))):raise api.Refusal('inconsistent ledger: cell index gap')
+        positions[sid]=dict(provider=amendment.identity(s['candidate']),cohort=s['cohort'],depth=s['depth'],
+            attempted_indices=indices,next_index=len(indices),total_indices=len(s['pauses']),
+            previous_ended_at=own[-1]['ended_at'] if own else None,resumed_cell=0<len(indices)<len(s['pauses']))
+    return positions
+
+
 class Phase:
     def __init__(self,root,name,client,until=None,resume=False):
         self.root,self.name,self.client=root,name,client
@@ -300,6 +383,7 @@ class Phase:
         self.end=epoch(PHASE_ENDS[name]) if until is None else until
         self.cap=22 if name=='v1' else 45
         self.budget=recovery.Budget.load(root/'ledger.json')
+        self.resuming=resume;self.resume_started_at=api.utc()
         self.rows,self.skips=[],[]
         self.preflights=len(list(self.out.glob('uptime-*.json')))
         if resume:
@@ -309,10 +393,13 @@ class Phase:
                 self.rows.append(row)
             intents={p.name.replace('intent-','call-') for p in self.out.glob('intent-*.json')}
             if intents-{p.name for p in self.out.glob('call-*.json')}:raise api.Refusal('resume has unresolved request intent')
+        self.planned=phase_sessions(name)
+        self.positions=resume_positions(root,name,self.budget,self.planned) if resume else {}
+        if resume:
+            recovery.atomic_json(self.out/('resume-state-'+str(time.time_ns())+'.json'),dict(at=self.resume_started_at,phase=name,cells=self.positions))
             for filename in ('terminal.json','run.json'):
                 path=self.out/filename
                 if path.exists():path.replace(self.out/(filename.removesuffix('.json')+'-history-'+str(time.time_ns())+'.json'))
-        self.planned=phase_sessions(name)
         self.status,self.reason='running','collecting'
         recovery.atomic_json(self.out/'run.json',dict(phase=name,pid=os.getpid(),at=api.utc(),cutoff=timestamp(self.end),cap_usd=self.cap,planned_sessions=len(self.planned),deadlines=recovery.DEPTH_DEADLINES))
 
@@ -345,12 +432,28 @@ class Phase:
         return True
 
     def call(self,s,index,previous_end=None):
+        self.assert_next_index(s,index)
         try:return self._call(s,index,previous_end)
         except (recovery.DiskHeadroomTimeout,PreflightUnavailable) as error:
             self.skip(s,index,str(error))
             self.progress(status='cell-skipped',current_call=None,next_call_time=api.utc(),next_call_reason=str(error))
             print(api.redact(json.dumps(dict(cell_skipped=s['session_id'],index=index,reason=str(error))),self.client.secret),flush=True)
             return None
+
+    def assert_next_index(self,s,index):
+        indices=[r['call_index'] for r in self.rows if r['session_id']==s['session_id']]
+        for path in self.out.glob('intent-*.json'):
+            intent=json.loads(path.read_text())
+            if intent['session_id']==s['session_id'] and intent['call_index']==index:
+                raise api.Refusal('replayed cell/index refused: durable intent already exists')
+        if index!=(max(indices)+1 if indices else 0) or not 0<=index<len(s['pauses']):
+            raise api.Refusal('replayed or non-next cell/index refused')
+
+    def next_call(self,s):
+        own=[r for r in self.rows if r['session_id']==s['session_id']]
+        if not own:return 0,None
+        last=max(own,key=lambda r:r['call_index'])
+        return last['call_index']+1,time.monotonic()-(time.time()-epoch(last['ended_at']))
 
     def _call(self,s,index,previous_end=None):
         seconds=recovery.deadline_for_depth(s['depth'])
@@ -394,6 +497,8 @@ class Phase:
             # A dip during metadata must recover before intent/POST, then prices and spend are refreshed.
             if not self.wait_for_disk():break
         sequence=len(self.rows); call_id=self.name+'/%04d'%sequence
+        self.assert_next_index(s,index)
+        if (self.out/('intent-%04d.json'%sequence)).exists():raise api.Refusal('replayed sequence refused: durable intent exists')
         row=dict(protocol='r15d',phase=self.name,sequence=sequence,provider=amendment.identity(candidate),model=candidate['model'],
                  endpoint_tag=endpoint['tag'],cohort=s['cohort'],depth=s['depth'],session_id=s['session_id'],call_index=index,
                  new_tokens_estimate=m['new_tokens'] if index else None,pause_target_seconds=s['pauses'][index],
@@ -401,6 +506,9 @@ class Phase:
                  expected_spend_before_usd=str(self.budget.known),maximum_cost_usd=str(estimated),pricing=endpoint['pricing'],
                  requested_output_tokens=recovery.REQUEST_OUTPUT_TOKENS,reserved_output_tokens=recovery.RESERVED_OUTPUT_TOKENS,
                  request_deadline_seconds=seconds,provider_request=payload['provider'],prompt_sha256=hashlib.sha256(text.encode()).hexdigest(),accepted=False)
+        position=self.positions.get(s['session_id'],{})
+        row.update(resumed_cell=position.get('resumed_cell',False),resume_boundary=bool(position.get('resumed_cell') and index==position['next_index']))
+        if row['resumed_cell']:row.update(resume_from_index=position['next_index'],resume_previous_ended_at=position['previous_ended_at'],resume_started_at=self.resume_started_at)
         recovery.atomic_json(self.out/('intent-%04d.json'%sequence),row,self.client.secret)
         self.progress(status='in-flight',current_call={k:row[k] for k in ('sequence','provider','cohort','depth','call_index')},next_call_time=None,
                       next_call_reason='awaiting response',current_request_deadline_at=timestamp(time.time()+seconds))
@@ -465,21 +573,28 @@ class Phase:
             if self.name=='v1':self.interleave(self.planned)
             else:
                 manifest=json.loads(amendment.MANIFEST.read_text())
-                observed=analysis(self.root)
-                previous={'providers':[]}
-                for p in observed['providers']:
-                    value=p['million']['effective_usd_per_1000_by_depth']['1000000']
-                    previous['providers'].append(dict(provider=p['provider'],admission=p['eligibility'],depths=[1000000],effective_usd_per_1000_by_depth=[value]))
-                ordered,ranking=amendment.priority_order(manifest,previous)
-                recovery.atomic_json(self.out/'ranking.json',ranking)
+                if self.resuming and self.rows:
+                    ranking=json.loads((self.out/'ranking.json').read_text())
+                    by_name={amendment.identity(c):c for c in manifest['candidates']}
+                    if len(ranking)!=len(by_name) or {r['provider'] for r in ranking}!=set(by_name) or [r['priority'] for r in ranking]!=list(range(1,len(ranking)+1)):
+                        raise api.Refusal('resume ranking evidence inconsistent')
+                    ordered=[by_name[r['provider']] for r in ranking]
+                else:
+                    observed=analysis(self.root)
+                    previous={'providers':[]}
+                    for p in observed['providers']:
+                        value=p['million']['effective_usd_per_1000_by_depth']['1000000']
+                        previous['providers'].append(dict(provider=p['provider'],admission=p['eligibility'],depths=[1000000],effective_usd_per_1000_by_depth=[value]))
+                    ordered,ranking=amendment.priority_order(manifest,previous)
+                    recovery.atomic_json(self.out/'ranking.json',ranking)
                 long=[]
                 for c in ordered:
                     selected=[s for s in self.planned if amendment.identity(s['candidate'])==amendment.identity(c)]
                     for depth in reversed(manifest['depths']):
                         for cohort in ('probe','core'):
                             s=next(s for s in selected if s['depth']==depth and s['cohort']==cohort)
-                            ended=None
-                            for index in range(len(s['pauses'])):
+                            index,ended=self.next_call(s)
+                            for index in range(index,len(s['pauses'])):
                                 ended=self.call(s,index,ended)
                                 if ended is None:break
                     core=[r for r in self.rows if r['provider']==amendment.identity(c) and r['cohort']=='core']
@@ -566,6 +681,7 @@ def recover_interrupted(root,phase,client):
         if api.money(row['maximum_cost_usd'])!=api.money(intent['maximum_cost_usd']):
             raise api.Refusal('recovery reservation differs from durable intent')
         receipt=ledger.receipts.get(call_id)
+        if receipt is None and row.get('charge_resolution'):raise api.Refusal('inconsistent ledger: settled row receipt missing')
         if receipt is not None:
             if receipt.get('within_maximum') is False:raise api.Refusal('previous reported cost exceeds reservation')
         else:
@@ -631,12 +747,17 @@ def write_summary(root,status,reason):
 
 
 def supervise(root,resume=False):
-    previous=None
+    previous=None;phases=['v1','amendment']
     if (root/'workflow.json').exists():
         if not resume:raise api.Refusal('workflow already initialized; inspect existing custody before any replay')
         previous=json.loads((root/'workflow.json').read_text())
         if previous['status']!='failed':raise api.Refusal('resume requires failed terminal workflow')
-        if list((root/'amendment').glob('call-*.json')):raise api.Refusal('amendment already has data; automatic replay refused')
+        v1_terminal=root/'v1/terminal.json'
+        v1_done=v1_terminal.exists() and json.loads(v1_terminal.read_text())['status']=='done'
+        if v1_done and json.loads(v1_terminal.read_text()).get('attempts')!=len(list((root/'v1').glob('call-*.json'))):
+            raise api.Refusal('completed v1 custody differs from recorded attempts')
+        if list((root/'amendment').glob('call-*.json')) and not v1_done:raise api.Refusal('amendment resume requires completed v1')
+        if v1_done:phases=['amendment']
     elif resume:raise api.Refusal('resume requires existing workflow')
     lock=LOCK_PATH.open('a+')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -645,20 +766,18 @@ def supervise(root,resume=False):
     if api.shutil.disk_usage(root).free<recovery.MIN_FREE_BYTES:raise api.Refusal('free disk below28 GiB hard floor')
     client=recovery.Client()
     if resume:
-        recover_interrupted(root,'v1',client)
+        for phase in ('v1','amendment'):recover_interrupted(root,phase,client)
         ledger=recovery.Budget.load(root/'ledger.json')
-        # Every intent needs a settled receipt or an explicit maximum-backed exception.
-        for path in (root/'v1').glob('intent-*.json'):
-            row=json.loads(path.read_text());call_id='v1/%04d'%row['sequence']
-            if call_id not in ledger.receipts:raise api.Refusal('resume has unresolved charge')
-            if ledger.receipts[call_id].get('within_maximum') is False:raise api.Refusal('resume has excessive charge')
+        for phase in ('v1','amendment'):
+            resume_positions(root,phase,ledger,phase_sessions(phase))
+            check_phase_integrity(root,phase)
         if ledger.permanent_receipts():
             recheck_reservations(root,client,'resume');ledger=recovery.Budget.load(root/'ledger.json')
         else:
             samples=recovery.settled_samples(client,ledger.known,ledger.committed-ledger.known,root/'resume-settlement.json')
-            ledger.known=max(ledger.known,api.money(samples[-1]['usage_usd']));ledger.save()
+            observed=api.money(samples[-1]['usage_usd'])
+            if observed>ledger.known:ledger.known=observed;ledger.save()
         ledger.reserve(ledger.known,Decimal(0))
-        check_phase_integrity(root,'v1')
     else:
         proof=json.loads((root/'call34-resolution.json').read_text())
         expected=proof['expected_without_call_usd'];maximum=proof['maximum_usd']
@@ -677,7 +796,7 @@ def supervise(root,resume=False):
         if (root/'terminal.json').exists():(root/'terminal.json').replace(root/('terminal-history-'+stamp+'.json'))
     workflow=dict(pid=os.getpid(),started_at=api.utc(),status='running',resumed=resume,phase_pids={},source_commit=head,source_sha256=source_identity(),
                   phase_cutoffs=PHASE_ENDS,global_cap_usd=45,preregistration_commit='4ab91fcbb',network='HTTPS openrouter.ai only')
-    if resume:workflow['resume_registration_commit']=head
+    if resume:workflow.update(resume_registration_commit=head,resumed_phase=phases[0],prior_phase_pids=previous.get('phase_pids',{}),completed_phases=['v1'] if phases==['amendment'] else [])
     recovery.atomic_json(root/'workflow.json',workflow)
     (root/'supervisor.pid').write_text(str(os.getpid())+'\n')
     stop=threading.Event()
@@ -693,9 +812,9 @@ def supervise(root,resume=False):
             stop.wait(max(1,600-(time.monotonic()-started)))
     thread=threading.Thread(target=monitor,daemon=True);thread.start()
     status,reason='failed','supervisor interrupted'
-    write_summary(root,'running','sequential v1 then amendment; guarded restart launched')
+    write_summary(root,'running','guarded phases: '+', '.join(phases))
     try:
-        for phase in ('v1','amendment'):
+        for phase in phases:
             if time.time()+600>=epoch(PHASE_ENDS[phase]):
                 directory=root/phase;directory.mkdir(exist_ok=True)
                 skips=[dict(session_id=s['session_id'],reason='phase start too late; unchanged cutoff',missing_call_indices=list(range(len(s['pauses'])))) for s in phase_sessions(phase)]
@@ -766,7 +885,7 @@ def main():
     parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--phase',choices=('v1','amendment'))
     parser.add_argument('--lease-fd',type=int)
-    parser.add_argument('--resume',action='store_true',help='continue a failed v1 only after every prior intent has a settled receipt')
+    parser.add_argument('--resume',action='store_true',help='resume unfinished phases from receipt-checked indices; completed v1 is never replayed')
     parser.add_argument('--reclassify-output',action='store_true',help='CPU-only migration of settled historical output refusals; no requests or key read')
     args=parser.parse_args()
     root=args.root.resolve()

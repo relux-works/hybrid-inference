@@ -540,7 +540,7 @@ class RecoveryTests(unittest.TestCase):
     def test_analysis_with_and_without_alibaba_same_whole_window_rule(self):
         alibaba=json.loads(json.dumps(self.candidate));alibaba['endpoint'].update(provider_name='Alibaba',tag='alibaba')
         names={amendment.identity(c):c for c in (self.candidate,alibaba)}
-        rows=[dict(provider=n,observed_models=[c['model']],observed_providers=[c['endpoint']['provider_name']],phase='amendment',model=c['model'],cohort='core',depth=1000000,call_index=1,accepted=True,prompt_tokens=999000,cached_tokens=0,new_tokens_estimate=1065,pause_target_seconds=8,pause_actual_seconds=8) for n,c in names.items()]
+        rows=[dict(provider=n,session_id=n+'-core',observed_models=[c['model']],observed_providers=[c['endpoint']['provider_name']],phase='amendment',model=c['model'],cohort='core',depth=1000000,call_index=1,accepted=True,prompt_tokens=999000,cached_tokens=0,new_tokens_estimate=1065,pause_target_seconds=8,pause_actual_seconds=8) for n,c in names.items()]
         rows.append(dict(rows[0],accepted=False,timed_out=True,error='deadline',call_index=0))
         with mock.patch.object(restart,'candidates',return_value=names),mock.patch.object(restart,'read_rows',return_value=rows):data=restart.analysis(self.root,final=True)
         comparison=data['million_token_comparison']['qwen/qwen3.8-27b']
@@ -729,7 +729,9 @@ class RecoveryTests(unittest.TestCase):
     def test_preflight_remote_failures_skip_cell_then_next_cell_continues(self):
         for mode in ('get','endpoint','price','spend'):
             with self.subTest(mode=mode):
-                phase=self.phase() if not (self.root/'v1').exists() else restart.Phase(self.root,'v1',self.client,until=time.time()+5000,resume=True)
+                registered=[self.session]+[dict(self.session,session_id='after-'+m) for m in ('get','endpoint','price','spend')]
+                with mock.patch.object(restart,'phase_sessions',return_value=registered):
+                    phase=restart.Phase(self.root,'v1',self.client,until=time.time()+5000,resume=(self.root/'v1').exists())
                 before=(self.root/'ledger.json').read_bytes();original=self.client.get
                 def get(path):
                     if mode=='get':raise restart.URLError('metadata unavailable')

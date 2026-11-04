@@ -1,3 +1,9 @@
+# r15m amendment-only resume
+
+[RESTART-r15m.md](RESTART-r15m.md) adds receipt-checked amendment resume. The supervisor skips terminal v1, validates both phases and the unchanged ledger, then starts amendment at each cell's next unattempted index. Existing or reserved intents cannot be replayed. Original ranking, prefixes, registered pauses,45USD total cap and2026-11-05T05:40Z cutoff remain. Interrupted cells are labelled in new rows and separated in report cadence subsets.
+
+Use the same signed --resume/nohup command below. CPU TMPDIR is .temp/hybrid-d-r15m-261104/tmp; paid runtime stays .temp/hybrid-d-r15d-261103/. The task's NEXT-INDICES.json and NEXT-INDICES.csv enumerate every amendment cell; SUMMARY.md records head, restart time, verified PIDs and ledger. The GET-only end observer writes .temp/hybrid-d-r15m-261104/audit-end/. Archive only the verified old automatic hard-floor STOP before this explicitly authorized restart, with at least29.5GiB free; operator STOP and all runtime guards remain. Source stays frozen after launch.
+
 # r15k bounded settlement and permanent holds
 
 [RESTART-r15k.md](RESTART-r15k.md) fixes the0321 cumulative precision failure and supersedes the older blanket unresolved-charge stop only for failed calls without an observed generation. Three stable samples within the declared lower precision allowance and strict upper reservation bound resolve the debit. After1200s without resolution, the full maximum becomes a permanent unresolved-reserved receipt counted against both22/45USD caps; the fourth lifetime incident halts. Overshoot, known-generation uncertainty, missing evidence and proven identity/instrument failures still halt. No paid request is retried.
