@@ -230,11 +230,14 @@ def analysis(root,final=False,output=None,rows=None):
         own=[r for r in rows if r['provider']==p['provider']]
         p['cold_probe_latencies']=[dict(depth=r['depth'],call_index=r['call_index'],**amendment.miss_latency(r)) for r in own if r.get('cohort')=='probe']
     _,excluded=api.matrix(json.loads(api.SNAPSHOT.read_text()))
-    data=dict(protocol='r15d+r15e+r15f+r15g+r15h+r15i+r15j-analysis',provider_identity_filter=identity_filter,million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
+    data=dict(protocol='r15d+r15e+r15f+r15g+r15h+r15i+r15j+r15k-analysis',provider_identity_filter=identity_filter,million_aggregation='pooled restarted-v1 multi-pause cadence plus amendment core cadence; independent probe/long substudy excluded',window_start=WINDOW_START,window_observed_through=api.utc(),window_final=final,excluded_impossible_endpoints=excluded,
               providers=providers,million_token_comparison=comparisons,
               remote_uptime_samples=len(samples),remote_sample_times=[s['at'] for s in samples],
               smoke_used_for_cache=False,seed_calls_used_for_cache=False,
               rules='Only context/no declared cache/whole-window availability exclude. Zero hits are priced. Daily windows overlap.')
+    ledger_path=root/'ledger.json'
+    billing=recovery.Budget.load(ledger_path) if ledger_path.exists() else None
+    data['permanent_reservations']=billing.permanent_receipts() if billing is not None else {}
     recovery.atomic_json(output/'analysis.json',data)
     lines=['# API cache report - r15d','', 'Whole window: '+WINDOW_START+' through '+data['window_observed_through']+'. Final: '+str(final)+'.','',
            'Identity-refused accepted rows: '+str(identity_filter['rejected_count'])+'. The identity filter excludes accepted rows with absent provider or unknown/absent model from cache/price metrics. Under r15j, HTTP200 with usable complete usage is successful availability even when identity/depth is unproven; no usable usage is a failure. Earlier rows retain their recorded availability. Original raw rows and financial charges stay unchanged; rejected identities are recorded in analysis.json.','',
@@ -264,6 +267,11 @@ def analysis(root,final=False,output=None,rows=None):
     for p in providers:
         for probe in p['cold_probe_latencies']:lines.append('| '+p['provider']+' | '+str(probe['depth'])+' | '+probe['status']+' | '+fmt(probe['ttft_seconds'])+' |')
     lines+=['','Equal provider weights in these aggregates; per-provider prices retain disclosed depth/profile assumptions. The JSON contains core/long pause hit rates, measured depth mixes and differences from the logs baseline (98.1% cached, 3200 uncached tokens/call). Availability is request-sampled over the whole stated window and does not prove continuous uptime. Rolling daily observations and missing samples are retained per provider in JSON. No surface table or independent review was supplied.','']
+    lines+=['','## Permanent billing reservations (r15k)','','Never-stable failed calls without a generation id retain their full maximum permanently against both caps. They are availability failures, excluded from cache metrics; a reservation is not an observed debit. A fourth lifetime reservation halts. Handoff/end cumulative rechecks never release these holds or invent per-call cost attribution.','',
+            '| Call | Maximum USD | Status | Last recheck |','|---|---:|---|---|']
+    for call_id,receipt in data['permanent_reservations'].items():
+        checks=receipt.get('rechecks',[])
+        lines.append('| '+call_id+' | '+receipt['maximum_usd']+' | '+receipt['status']+' | '+(checks[-1]['status'] if checks else 'pending')+' |')
     (output/'API-CACHE-REPORT.md').write_text('\n'.join(lines))
     return data
 
@@ -409,18 +417,22 @@ class Phase:
         else:
             samples=[]
             try:
-                samples=recovery.settled_samples(self.client,self.budget.known,estimated,self.out/('settlement-%04d.json'%sequence))
-                row['charge_resolution']=self.budget.recovered_call(samples,estimated,call_id)
+                row['charge_resolution']=recovery.reconcile_call(self.client,self.budget,row,call_id,self.out/('settlement-%04d.json'%sequence))
             except api.Refusal as error:
                 evidence=self.out/('settlement-%04d.json'%sequence)
+                if call_id in self.budget.receipts:
+                    row['charge_resolution']=self.budget.receipts[call_id]
+                    if row['charge_resolution'].get('permanent_reservation'):row['charge_status']='unresolved-reserved'
+                    recovery.atomic_json(self.out/('call-%04d.json'%sequence),row,self.client.secret)
                 try:samples=json.loads(evidence.read_text())['samples']
                 except (OSError,ValueError,KeyError):pass
                 recovery.atomic_json(self.out/('unresolved-%04d.json'%sequence),dict(samples=samples,sample_count=len(samples),settlement_evidence=evidence.name,error=str(error),expected_usd=str(self.budget.known),maximum_usd=str(estimated)),self.client.secret)
                 raise
         target=s['depth']-(len(s['pauses'])-1-index)*m['new_tokens']
-        if recovery.rate_limited_without_generation(row):
-            row.update(accepted=False,error='HTTP 429 rate limited; charge settled',availability_failure='rate_limited')
-        else:recovery.classify_call(row,target,payload['model'],endpoint)
+        recovery.classify_call(row,target,payload['model'],endpoint)
+        if recovery.failed_without_generation(row):
+            row.update(accepted=False,availability_success=False,availability_failure='request_failed_no_generation')
+        if row['charge_resolution'].get('permanent_reservation'):row['charge_status']='unresolved-reserved'
         recovery.atomic_json(self.out/('call-%04d.json'%sequence),row,self.client.secret)
         self.csv()
         print(api.redact(json.dumps({k:row.get(k) for k in ('sequence','provider','cohort','depth','call_index','cached_tokens','timed_out','accepted','error')}),self.client.secret),flush=True)
@@ -551,16 +563,44 @@ def recover_interrupted(root,phase,client):
         call_id=phase+'/%04d'%sequence
         rowpath=directory/('call-%04d.json'%sequence)
         row=json.loads(rowpath.read_text()) if rowpath.exists() else intent
+        if api.money(row['maximum_cost_usd'])!=api.money(intent['maximum_cost_usd']):
+            raise api.Refusal('recovery reservation differs from durable intent')
         receipt=ledger.receipts.get(call_id)
         if receipt is not None:
             if receipt.get('within_maximum') is False:raise api.Refusal('previous reported cost exceeds reservation')
         else:
             # An intent may have reached the server; even a killed writer needs a bounded charge.
-            samples=recovery.settled_samples(client,ledger.known,intent['maximum_cost_usd'],directory/('settlement-watchdog-%04d.json'%sequence))
-            receipt=ledger.recovered_call(samples,intent['maximum_cost_usd'],call_id)
+            journal=directory/('stream-%04d.jsonl'%sequence)
+            if not row.get('generation_id') and journal.exists():
+                for line in journal.read_text().splitlines():
+                    event=json.loads(line).get('event',{})
+                    if event.get('id'):row['generation_id']=event['id'];break
+            receipt=recovery.reconcile_call(client,ledger,row,call_id,directory/('settlement-watchdog-%04d.json'%sequence))
         if not row.get('charge_resolution'):
-            row.update(accepted=False,timed_out=True,error=row.get('error') or 'supervisor watchdog interrupted request',ended_at=row.get('ended_at') or api.utc(),charge_resolution=receipt)
+            if rowpath.exists():
+                history=directory/'recovery-history';history.mkdir(exist_ok=True)
+                (history/(rowpath.stem+'-'+str(time.time_ns())+'.json')).write_bytes(rowpath.read_bytes())
+            row.update(accepted=False,availability_success=False,timed_out=row.get('timed_out',not rowpath.exists()),error=row.get('error') or 'supervisor watchdog interrupted request',ended_at=row.get('ended_at') or api.utc(),charge_resolution=receipt)
+            if receipt.get('permanent_reservation'):row['charge_status']='unresolved-reserved'
             recovery.atomic_json(rowpath,row,client.secret)
+
+
+def recheck_reservations(root,client,stage):
+    ledger=recovery.Budget.load(root/'ledger.json');ledger.check_permanent_limit()
+    receipts=ledger.permanent_receipts()
+    if not receipts:return
+    path=root/('reservation-recheck-'+stage+'.json')
+    evidence=dict(at=api.utc(),stage=stage,expected_usd=str(ledger.known),maximum_usd=str(ledger.committed-ledger.known),
+                  reservations=list(receipts),attribution='aggregate cumulative bound only; individual charges unknown; full holds remain')
+    try:
+        samples=recovery.settled_samples(client,ledger.known,ledger.committed-ledger.known,path)
+        evidence.update(status='stable-bounded',samples=samples)
+        ledger.known=max(ledger.known,api.money(samples[-1]['usage_usd']))
+    except recovery.SettlementTimeout:
+        evidence.update(status='still-unresolved-reserved',poll_evidence=json.loads(path.read_text()))
+    for receipt in receipts.values():receipt.setdefault('rechecks',[]).append(evidence)
+    ledger.save()
+    recovery.atomic_json(root/('reservation-recheck-result-'+stage+'.json'),evidence,client.secret)
 
 
 def check_phase_integrity(root,phase):
@@ -605,14 +645,18 @@ def supervise(root,resume=False):
     if api.shutil.disk_usage(root).free<recovery.MIN_FREE_BYTES:raise api.Refusal('free disk below28 GiB hard floor')
     client=recovery.Client()
     if resume:
+        recover_interrupted(root,'v1',client)
         ledger=recovery.Budget.load(root/'ledger.json')
-        # Prove every attempted request settled before replacing failed custody.
+        # Every intent needs a settled receipt or an explicit maximum-backed exception.
         for path in (root/'v1').glob('intent-*.json'):
             row=json.loads(path.read_text());call_id='v1/%04d'%row['sequence']
             if call_id not in ledger.receipts:raise api.Refusal('resume has unresolved charge')
             if ledger.receipts[call_id].get('within_maximum') is False:raise api.Refusal('resume has excessive charge')
-        samples=recovery.settled_samples(client,ledger.known,ledger.committed-ledger.known,root/'resume-settlement.json')
-        ledger.known=max(ledger.known,api.money(samples[-1]['usage_usd']));ledger.save()
+        if ledger.permanent_receipts():
+            recheck_reservations(root,client,'resume');ledger=recovery.Budget.load(root/'ledger.json')
+        else:
+            samples=recovery.settled_samples(client,ledger.known,ledger.committed-ledger.known,root/'resume-settlement.json')
+            ledger.known=max(ledger.known,api.money(samples[-1]['usage_usd']));ledger.save()
         ledger.reserve(ledger.known,Decimal(0))
         check_phase_integrity(root,'v1')
     else:
@@ -658,6 +702,7 @@ def supervise(root,resume=False):
                 recovery.atomic_json(directory/'skipped.json',skips)
                 recovery.atomic_json(directory/'terminal.json',dict(status='done',at=api.utc(),reason='phase start too late; skipped',attempts=len(list(directory.glob('call-*.json')))))
                 print('done phase='+phase+' skipped: phase start too late',flush=True)
+                if phase=='v1':recheck_reservations(root,client,'handoff')
                 continue
             env=os.environ.copy();env['PYTHONDONTWRITEBYTECODE']='1';env['TMPDIR']=str(root/'tmp')
             with (root/(phase+'.log')).open('a' if resume else 'w') as log:
@@ -686,11 +731,14 @@ def supervise(root,resume=False):
             recover_interrupted(root,phase,client)
             check_phase_integrity(root,phase)
             if code:raise api.Refusal('phase failed: '+phase+'; inspect terminal and charge evidence; no next phase')
+            if phase=='v1':recheck_reservations(root,client,'handoff')
         status,reason='done','both bounded phases terminated; budget/time omissions retained'
     except Exception as error:
         status,reason='failed',api.redact(str(error),client.secret)
     finally:
         stop.set();thread.join(timeout=75)
+        try:recheck_reservations(root,client,'end')
+        except Exception as error:status,reason='failed','billing recheck: '+api.redact(str(error),client.secret)
         workflow.update(status=status,reason=reason,ended_at=api.utc())
         recovery.atomic_json(root/'workflow.json',workflow)
         for phase in ('v1','amendment'):

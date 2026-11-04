@@ -2,6 +2,7 @@
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 import json
+import itertools
 from pathlib import Path
 import tempfile
 import threading
@@ -25,8 +26,8 @@ class RecoveryHandler(Handler):
             body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             Handler.bodies.append(body);Handler.spend+=Handler.cost
             mode=RecoveryHandler.output_mode
-            if mode=='http-error':
-                self.send_response(429);self.end_headers();self.wfile.write(b'{"error":"unavailable"}');return
+            if mode in ('http-error','http-error-503'):
+                self.send_response(503 if mode=='http-error-503' else 429);self.end_headers();self.wfile.write(b'{"error":"unavailable"}');return
             count=Handler.seen.get(body['session_id'],0);Handler.seen[body['session_id']]=count+1
             prompt=len(body['messages'][0]['content'][0]['text'].split())
             usage=dict(prompt_tokens=0 if mode=='wrong-depth' else prompt,completion_tokens=1025 if mode=='usage-bound' else 60 if mode=='overcap' else 2,cost=Handler.cost,
@@ -805,6 +806,173 @@ class RecoveryTests(unittest.TestCase):
         with mock.patch.object(api.shutil,'disk_usage',return_value=mock.Mock(free=int(28.4*1024**3))):
             self.supervisor_fixture(watchdog=False)
 
+    # The exact80-sample witness settles at its first stable triplet, including the10.4nanodollar shortfall.
+    def test_exact_0321_samples_resolve_zero_at_first_stable_triplet(self):
+        fixture=json.loads((api.HERE/'fixtures/settlement-0321.json').read_text())
+        values=[s['usage_usd'] for s in fixture['samples']]
+        samples,client,elapsed=self.settlement_fixture(values,fixture['expected_usd'],fixture['maximum_usd'])
+        proof=recovery.resolve_delta(samples,fixture['expected_usd'],fixture['maximum_usd'])
+        self.assertEqual(len(values),80);self.assertEqual(client.get.call_count,5);self.assertEqual(elapsed,60)
+        self.assertEqual(proof['observed_delta_usd'],'-1.04E-8')
+        self.assertEqual(proof['resolved_observed_charge_usd'],'0')
+        self.assertEqual(proof['retained_reservation_usd'],'0.12613632')
+
+    # The exact0321 counter sequence resolves the failed call and permits the next registered index.
+    def test_exact_0321_resolved_no_generation_failure_continues(self):
+        fixture=json.loads((api.HERE/'fixtures/settlement-0321.json').read_text());expected=fixture['expected_usd']
+        recovery.Budget(self.root/'ledger.json',expected,expected).save();phase=self.phase()
+        values=iter(itertools.chain([expected],[s['usage_usd'] for s in fixture['samples']],itertools.repeat(fixture['samples'][-1]['usage_usd'])))
+        original=self.client.get;now=[0]
+        def get(path):return {'data':{'usage':next(values)}} if path=='/key' else original(path)
+        failed=dict(http_status=429,error='HTTP error',generation_id=None,usage=None,observed_providers=[],observed_models=[])
+        with mock.patch.object(self.client,'get',side_effect=get),mock.patch.object(recovery,'stream',return_value=failed),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda s:now.__setitem__(0,now[0]+s)):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual([r['call_index'] for r in phase.rows],[0,1])
+        self.assertTrue(all(r['charge_resolution']['resolved_observed_charge_usd']=='0' for r in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+        self.assertFalse(phase.budget.permanent_receipts())
+
+    # A real loopback503 without a generation uses the same zero-debit continuation as a429.
+    def test_http_503_no_generation_settles_and_continues(self):
+        RecoveryHandler.output_mode='http-error-503';Handler.cost=0;phase=self.phase()
+        with mock.patch.object(recovery.time,'sleep'):self.assertEqual(phase.run(),0)
+        self.assertEqual(len(Handler.bodies),2)
+        self.assertTrue(all(r['http_status']==503 and r['charge_resolution']['resolved_observed_charge_usd']=='0' for r in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+        self.assertEqual(recovery.availability(phase.rows)['timeouts'],0)
+
+    # A timeout without a generation settles and advances, while retaining its availability and timeout errors.
+    def test_timeout_no_generation_settles_and_continues(self):
+        phase=self.phase();failed=dict(http_status=200,error='request exceeded wall-clock deadline',generation_id=None,usage=None,timed_out=True)
+        with mock.patch.object(recovery,'stream',return_value=failed),mock.patch.object(recovery.time,'sleep'):
+            self.assertEqual(phase.run(),0)
+        self.assertEqual(len(phase.rows),2)
+        self.assertTrue(all(r['charge_resolution']['resolved_observed_charge_usd']=='0' for r in phase.rows))
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+        self.assertEqual(recovery.availability(phase.rows)['timeouts'],2)
+
+    def permanent_fixture(self,calls):
+        self.session['pauses']=[0]*calls;phase=self.phase();now=[0];reads=[0];original=self.client.get
+        def get(path):
+            if path!='/key':return original(path)
+            reads[0]+=1;return {'data':{'usage':'0.000000001' if reads[0]%2 else '0'}}
+        failed=dict(http_status=503,error='HTTP error',generation_id=None,usage=None)
+        with mock.patch.object(self.client,'get',side_effect=get),mock.patch.object(recovery,'stream',return_value=failed),mock.patch.object(recovery.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(recovery.time,'sleep',side_effect=lambda s:now.__setitem__(0,now[0]+s)):
+            status=phase.run()
+        return phase,status,now[0]
+
+    # Two real1200s virtual polling windows retain both full maxima, then continue under both cumulative caps.
+    def test_never_stable_no_generation_reserves_permanently_and_continues(self):
+        phase,status,elapsed=self.permanent_fixture(2)
+        self.assertEqual(status,0);self.assertEqual(elapsed,2400);self.assertEqual(len(phase.rows),2)
+        ledger=recovery.Budget.load(self.root/'ledger.json');self.assertEqual(len(ledger.permanent_receipts()),2)
+        self.assertEqual(ledger.committed,sum(Decimal(r['maximum_cost_usd']) for r in phase.rows))
+        self.assertTrue(all(r['charge_status']=='unresolved-reserved' and not r['accepted'] for r in phase.rows))
+        self.assertTrue(all(len(r['charge_resolution']['settlement_evidence']['samples'])==80 for r in phase.rows))
+        for cap in (22,45):
+            with self.assertRaisesRegex(api.Refusal,'budget'):ledger.reserve(ledger.known,Decimal(cap)-ledger.committed+Decimal('.000001'),cap=cap)
+        self.assertEqual(recovery.availability(phase.rows)['errors'],2)
+        self.assertIn('Permanent billing reservations',(self.root/'API-CACHE-REPORT.md').read_text())
+
+    # A fourth timeout receipt is persisted with its full hold, then halts before the fifth scheduled attempt.
+    def test_named_negative_fourth_permanent_reservation_halts(self):
+        phase,status,elapsed=self.permanent_fixture(5)
+        self.assertEqual(status,1);self.assertEqual(elapsed,4800);self.assertEqual(len(phase.rows),4)
+        self.assertIn('fourth permanent reservation',phase.reason)
+        self.assertEqual(phase.rows[-1]['charge_status'],'unresolved-reserved')
+        self.assertTrue(json.loads((phase.out/'call-0003.json').read_text())['charge_resolution']['permanent_reservation'])
+        ledger=recovery.Budget.load(self.root/'ledger.json');self.assertEqual(len(ledger.permanent_receipts()),4)
+        self.assertEqual(ledger.committed,sum(Decimal(r['maximum_cost_usd']) for r in phase.rows))
+        with self.assertRaisesRegex(api.Refusal,'fourth permanent reservation'):ledger.reserve(0,0)
+
+    # A counter even1e-12 above the upper bound halts immediately; lower rounding tolerance cannot relax this bound.
+    def test_named_negative_no_generation_overshoot_never_becomes_reservation(self):
+        client=mock.Mock(secret=self.secret);client.get.return_value={'data':{'usage':'1.100000000001'}}
+        budget=recovery.Budget(self.root/'ledger.json',1,1)
+        row=dict(http_status=500,error='HTTP error',generation_id=None,usage=None,maximum_cost_usd='.1')
+        with self.assertRaisesRegex(api.Refusal,'exceeds reservation'):
+            recovery.reconcile_call(client,budget,row,'v1/0000',self.root/'overshoot.json')
+        self.assertEqual(client.get.call_count,1);self.assertEqual(budget.receipts,{})
+        self.assertEqual(budget.committed,Decimal(1))
+
+    # A known generation, including one preserved only in the stream, cannot use the no-generation timeout exception.
+    def test_named_negative_known_generation_never_stable_still_halts(self):
+        budget=recovery.Budget.load(self.root/'ledger.json')
+        for changes in (dict(generation_id='known'),dict(stream=[{'id':'journal-id'}])):
+            row=dict(http_status=504,error='HTTP error',usage=None,maximum_cost_usd='.1',**changes)
+            with mock.patch.object(recovery,'settled_samples',side_effect=recovery.SettlementTimeout('deadline')):
+                with self.assertRaisesRegex(recovery.SettlementTimeout,'deadline'):
+                    recovery.reconcile_call(self.client,budget,row,'v1/0000',self.root/'absent.json')
+            self.assertEqual(budget.receipts,{})
+
+    # Tiny lower precision error is zero; a genuinely lagging counter remains unresolved, not an invented zero charge.
+    def test_settlement_lower_rounding_boundary_and_real_lag(self):
+        self.assertEqual(recovery.resolve_delta(self.samples('.9999999'),'1','.1')['resolved_observed_charge_usd'],'0')
+        with self.assertRaisesRegex(api.Refusal,'outside reservation'):
+            recovery.resolve_delta(self.samples('.999999899999'),'1','.1')
+        self.assertEqual(recovery.ROUNDING,Decimal('.00000001'))
+
+    # Permanent holds survive stable aggregate handoff/end rechecks and idempotent reload without double billing.
+    def test_permanent_reservations_rechecked_at_handoff_and_end_without_release(self):
+        budget=recovery.Budget.load(self.root/'ledger.json')
+        evidence=dict(expected_usd='0',maximum_usd='.2',samples=[{'usage_usd':'0'}])
+        budget.permanent_call('.2','v1/0000',evidence)
+        with mock.patch.object(recovery,'settled_samples',return_value=self.samples('.05')):
+            restart.recheck_reservations(self.root,self.client,'handoff')
+            restart.recheck_reservations(self.root,self.client,'end')
+        ledger=recovery.Budget.load(self.root/'ledger.json');self.assertEqual(ledger.committed,Decimal('.2'));self.assertEqual(ledger.known,Decimal('.05'))
+        receipt=ledger.receipts['v1/0000'];self.assertEqual([r['stage'] for r in receipt['rechecks']],['handoff','end'])
+        self.assertEqual(len(ledger.permanent_receipts()),1);self.assertFalse(receipt['resolved'])
+        self.assertEqual(receipt['status'],'unresolved-reserved')
+        self.assertEqual(ledger.permanent_call('.2','v1/0000',{}),receipt)
+        self.assertEqual(ledger.committed,Decimal('.2'))
+
+    # Rechecks that remain unstable retain existing holds without creating another incident or claiming a debit.
+    def test_permanent_recheck_still_unstable_retains_hold(self):
+        budget=recovery.Budget.load(self.root/'ledger.json');evidence=dict(expected_usd='0',maximum_usd='.2',samples=[{'usage_usd':'0'}])
+        budget.permanent_call('.2','v1/0000',evidence)
+        def timeout(client,expected,maximum,path):
+            recovery.atomic_json(path,evidence);raise recovery.SettlementTimeout('deadline')
+        with mock.patch.object(recovery,'settled_samples',side_effect=timeout):restart.recheck_reservations(self.root,self.client,'end')
+        ledger=recovery.Budget.load(self.root/'ledger.json');self.assertEqual(ledger.committed,Decimal('.2'));self.assertEqual(ledger.known,0)
+        self.assertEqual(ledger.receipts['v1/0000']['rechecks'][-1]['status'],'still-unresolved-reserved')
+
+    # A reservation is never allowed to mask missing/corrupt polling evidence, even after a timeout signal.
+    def test_named_negative_missing_reservation_evidence_stops(self):
+        budget=recovery.Budget.load(self.root/'ledger.json');row=dict(http_status=503,error='HTTP error',maximum_cost_usd='.1')
+        with mock.patch.object(recovery,'settled_samples',side_effect=recovery.SettlementTimeout('deadline')):
+            with self.assertRaises(FileNotFoundError):recovery.reconcile_call(self.client,budget,row,'v1/0000',self.root/'missing.json')
+        self.assertEqual(budget.receipts,{})
+
+    # An interrupted row cannot claim absent generation when its durable SSE journal already recorded one.
+    def test_named_negative_watchdog_journal_generation_disallows_permanent_reservation(self):
+        directory=self.root/'v1';directory.mkdir()
+        row=dict(sequence=0,http_status=503,error='HTTP error',usage=None,maximum_cost_usd='.1')
+        recovery.atomic_json(directory/'intent-0000.json',row);recovery.atomic_json(directory/'call-0000.json',row)
+        (directory/'stream-0000.jsonl').write_text(json.dumps(dict(event={'id':'durable-generation'}))+'\n')
+        with mock.patch.object(recovery,'settled_samples',side_effect=recovery.SettlementTimeout('deadline')):
+            with self.assertRaisesRegex(recovery.SettlementTimeout,'deadline'):restart.recover_interrupted(self.root,'v1',self.client)
+        self.assertEqual(recovery.Budget.load(self.root/'ledger.json').receipts,{})
+
+    # A permanent recheck still stops immediately if cumulative spending exceeds the committed bound.
+    def test_named_negative_permanent_recheck_overshoot_halts(self):
+        budget=recovery.Budget.load(self.root/'ledger.json')
+        budget.permanent_call('.2','v1/0000',dict(expected_usd='0',maximum_usd='.2',samples=[{'usage_usd':'0'}]))
+        client=mock.Mock(secret=self.secret);client.get.return_value={'data':{'usage':'.200000001'}}
+        with self.assertRaisesRegex(api.Refusal,'exceeds reservation'):restart.recheck_reservations(self.root,client,'end')
+        self.assertEqual(client.get.call_count,1)
+        self.assertEqual(recovery.Budget.load(self.root/'ledger.json').committed,Decimal('.2'))
+
+    # Recovery cannot enlarge an attempted call's bound by trusting a changed response row over its intent.
+    def test_named_negative_recovery_reservation_mismatch_stops_before_get(self):
+        directory=self.root/'v1';directory.mkdir()
+        row=dict(sequence=0,http_status=503,error='HTTP error',usage=None,maximum_cost_usd='.1')
+        recovery.atomic_json(directory/'intent-0000.json',row)
+        recovery.atomic_json(directory/'call-0000.json',dict(row,maximum_cost_usd='.2'))
+        with mock.patch.object(self.client,'get') as get:
+            with self.assertRaisesRegex(api.Refusal,'differs from durable intent'):restart.recover_interrupted(self.root,'v1',self.client)
+        get.assert_not_called();self.assertEqual(recovery.Budget.load(self.root/'ledger.json').receipts,{})
+
     def supervisor_fixture(self,watchdog,late=False,crash=False,unresolved=False,wrong_model=False):
         recovery.atomic_json(self.root/'call34-resolution.json',dict(expected_without_call_usd='0',maximum_usd='.420'))
         children=[]
@@ -825,8 +993,9 @@ class RecoveryTests(unittest.TestCase):
         def recover(*args):
             if unresolved:raise api.Refusal('unresolvable charge: fixture recovery deadline')
             return original(*args)
-        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]),mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'usage_samples',return_value=self.samples(0)),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['a'*40,'']),mock.patch.object(restart,'recover_interrupted',side_effect=recover):
+        with mock.patch.object(restart,'phase_sessions',return_value=[self.session]),mock.patch.object(restart,'LOCK_PATH',self.root/'mock.lock'),mock.patch.object(recovery,'Client',return_value=self.client),mock.patch.object(recovery,'usage_samples',return_value=self.samples(0)),mock.patch.object(restart,'public_snapshot'),mock.patch.object(restart.subprocess,'Popen',side_effect=spawn),mock.patch.object(restart.subprocess,'run'),mock.patch.object(restart.subprocess,'check_output',side_effect=['a'*40,'']),mock.patch.object(restart,'recover_interrupted',side_effect=recover),mock.patch.object(restart,'recheck_reservations',wraps=restart.recheck_reservations) as rechecks:
             self.assertEqual(restart.supervise(self.root),1 if crash or unresolved or wrong_model else 0)
+        self.assertEqual([call.args[2] for call in rechecks.call_args_list],['end'] if crash or unresolved or wrong_model else ['handoff','end'])
         self.assertEqual(len(children),1 if late or crash or unresolved or wrong_model else 2)
         workflow=json.loads((self.root/'workflow.json').read_text())
         self.assertEqual(workflow['status'],'failed' if crash or unresolved or wrong_model else 'done')

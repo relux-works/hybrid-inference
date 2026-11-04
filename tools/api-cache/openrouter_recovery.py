@@ -14,11 +14,18 @@ DISK_POLL_SECONDS = 60
 REQUEST_OUTPUT_TOKENS = 16
 RESERVED_OUTPUT_TOKENS = 1024
 ROUNDING = Decimal('.00000001')
+# Cumulative API usage and the sum of streamed costs have different precision.
+SETTLEMENT_ROUNDING = Decimal('.0000001')
 SETTLEMENT_DEADLINE_SECONDS = 1200
+MAX_PERMANENT_RESERVATIONS = 3
 DEPTH_DEADLINES = [(32768,180),(131072,300),(250000,600),(524288,1200),(1000000,2400)]
 
 
 class DiskHeadroomTimeout(api.Refusal):
+    pass
+
+
+class SettlementTimeout(api.Refusal):
     pass
 
 
@@ -74,11 +81,11 @@ def resolve_delta(samples, expected, maximum):
     if len(values)<3 or len(set(values))!=1:
         raise api.Refusal('unresolvable charge: cumulative usage is missing or unstable')
     delta=values[-1]-expected
-    if delta < -ROUNDING or delta > maximum:
+    if delta < -SETTLEMENT_ROUNDING or delta > maximum:
         raise api.Refusal('unresolvable charge: cumulative delta outside reservation')
     return dict(method='stable cumulative usage delta',expected_usd=str(expected),maximum_usd=str(maximum),
                 observed_delta_usd=str(delta),resolved_observed_charge_usd=str(max(Decimal(0),delta)),
-                retained_reservation_usd=str(maximum),rounding_tolerance_usd=str(ROUNDING),samples=samples,resolved=True)
+                retained_reservation_usd=str(maximum),rounding_tolerance_usd=str(SETTLEMENT_ROUNDING),samples=samples,resolved=True)
 
 
 def usage_samples(client, count=3, pause=1):
@@ -115,7 +122,7 @@ def settled_samples(client,expected,maximum,evidence_path,timeout_seconds=SETTLE
         remaining=end-time.monotonic()
         if remaining>0:time.sleep(min(poll_seconds,remaining))
     client.get_timeout=30
-    raise api.Refusal('unresolvable charge: cumulative counter did not settle within recovery deadline')
+    raise SettlementTimeout('unresolvable charge: cumulative counter did not settle within recovery deadline')
 
 
 class Budget:
@@ -133,9 +140,18 @@ class Budget:
 
     def save(self):
         atomic_json(self.path,dict(at=api.utc(),known_observed_usd=str(self.known),
-                    committed_upper_usd=str(self.committed),restart_reported_usd=str(self.reported),global_cap_usd=45,receipts=self.receipts))
+                    committed_upper_usd=str(self.committed),restart_reported_usd=str(self.reported),global_cap_usd=45,
+                    permanent_reservation_count=len(self.permanent_receipts()),receipts=self.receipts))
+
+    def permanent_receipts(self):
+        return {key:receipt for key,receipt in self.receipts.items() if receipt.get('permanent_reservation')}
+
+    def check_permanent_limit(self):
+        if len(self.permanent_receipts())>MAX_PERMANENT_RESERVATIONS:
+            raise api.Refusal('systemic billing problem: fourth permanent reservation; no further spending')
 
     def reserve(self,live,maximum,cap=45,remaining=None):
+        self.check_permanent_limit()
         api.guard(live,self.committed,maximum,min(45,cap),remaining)
 
     def reported_call(self,cost,maximum,call_id):
@@ -159,6 +175,42 @@ class Budget:
         self.receipts[call_id]=evidence
         self.save()
         return evidence
+
+    def permanent_call(self,maximum,call_id,evidence):
+        if call_id not in self.receipts:
+            maximum=api.money(maximum)
+            if api.money(evidence['expected_usd'])!=self.known or api.money(evidence['maximum_usd'])!=maximum or not evidence['samples']:
+                raise api.Refusal('permanent reservation missing or mismatched settlement evidence')
+            if any(api.money(s['usage_usd'])>self.known+maximum for s in evidence['samples'] if 'usage_usd' in s):
+                raise api.Refusal('unresolvable charge: cumulative delta exceeds reservation')
+            self.committed+=maximum
+            self.receipts[call_id]=dict(method='permanent maximum reservation',status='unresolved-reserved',resolved=False,
+                permanent_reservation=True,expected_usd=str(self.known),maximum_usd=str(maximum),
+                retained_reservation_usd=str(maximum),observed_charge_usd=None,settlement_evidence=evidence,
+                reason='no-generation failure; cumulative usage unstable after1200s')
+            self.save()
+        self.check_permanent_limit()
+        return self.receipts[call_id]
+
+
+def failed_without_generation(row):
+    if row.get('generation_id') or any(c.get('id') for c in row.get('stream',[])):return False
+    if row.get('timed_out') or row.get('http_status')!=200 or any(c.get('error') for c in row.get('stream',[])):return True
+    if row.get('output_guard_triggered') and not row.get('usage_complete'):return True
+    try:api.parse_usage(row.get('usage'))
+    except api.Refusal:return True
+    return False
+
+
+def reconcile_call(client,budget,row,call_id,evidence_path):
+    try:
+        samples=settled_samples(client,budget.known,row['maximum_cost_usd'],evidence_path)
+        return budget.recovered_call(samples,row['maximum_cost_usd'],call_id)
+    except SettlementTimeout:
+        if not failed_without_generation(row):raise
+        # Missing/corrupt poll evidence is an instrument failure, not a reservation.
+        evidence=json.loads(evidence_path.read_text())
+        return budget.permanent_call(row['maximum_cost_usd'],call_id,evidence)
 
 
 class StreamTrace:
