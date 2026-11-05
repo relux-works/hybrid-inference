@@ -106,6 +106,30 @@ class Store:
                 json.dumps(session.get("state_imports", [])), session["id"]))
 
     @locked
+    def commit_evaluated(self, session):
+        current = self.get(session['id'], session['client'])
+        if session['tokens'][:len(current['tokens'])] != current['tokens']:
+            raise ValueError('production commit does not extend the durable journal')
+        if session['remote_id'] is None and current['remote_id'] is not None:
+            session.update(remote_id=current['remote_id'],remote_n=current['remote_n'])
+        elif session['remote_id'] == current['remote_id']:
+            session['remote_n'] = max(session['remote_n'],current['remote_n'])
+        if not 0 <= session['remote_n'] <= len(session['tokens']):
+            raise ValueError('production remote acknowledgement exceeds committed journal')
+        self.save(session)
+
+    @locked
+    def acknowledge_remote(self, sid, client, remote_id, n, digest):
+        current = self.get(sid, client)
+        if (type(n) is not int or not 0 <= n <= len(current['tokens'])
+                or digest != prefix_hash(current['tokens'][:n])):
+            raise ValueError('background node ahead of or divergent from committed journal')
+        if current['remote_id'] not in (None, remote_id):
+            raise ValueError('background acknowledgement belongs to a stale remote session')
+        with self.db:
+            self.db.execute('UPDATE sessions SET remote_id=?,remote_n=? WHERE id=?', (remote_id,n,sid))
+
+    @locked
     def benchmark_mode(self, sid, mode):
         with self.db:
             self.db.execute("UPDATE sessions SET benchmark_mode=? WHERE id=?", (mode or "default", sid))

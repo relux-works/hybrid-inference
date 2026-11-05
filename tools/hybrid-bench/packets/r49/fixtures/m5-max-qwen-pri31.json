@@ -1,0 +1,90 @@
+{
+  "schema": "hybrid-growing-rate-fixture-v1",
+  "status": "measured",
+  "priority": 31,
+  "normal_priority": true,
+  "override_used": false,
+  "target_device": "m5-max-64gb",
+  "architecture": "qwen35",
+  "model_sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
+  "depths": [
+    {
+      "depth": 16000,
+      "delta_prefill_tok_s": {
+        "512": 550.3,
+        "2000": 475.9,
+        "10000": 447.9
+      },
+      "decode_tok_s": 23.16460752006408
+    },
+    {
+      "depth": 50000,
+      "delta_prefill_tok_s": {
+        "512": 415.9,
+        "2000": 368.3,
+        "10000": 352.1
+      },
+      "decode_tok_s": 19.8925099933961
+    },
+    {
+      "depth": 100000,
+      "delta_prefill_tok_s": {
+        "512": 265.6,
+        "2000": 234.6,
+        "10000": 232.7
+      },
+      "decode_tok_s": 15.535317298539402
+    },
+    {
+      "depth": 150000,
+      "delta_prefill_tok_s": {
+        "512": 196.4,
+        "2000": 177.2,
+        "10000": 173.9
+      },
+      "decode_tok_s": 12.961619295098536
+    },
+    {
+      "depth": 200000,
+      "delta_prefill_tok_s": {
+        "512": 155.3,
+        "2000": 139.5,
+        "10000": 137.7
+      },
+      "decode_tok_s": 11.100494657120896
+    },
+    {
+      "depth": 249000,
+      "delta_prefill_tok_s": {
+        "512": 130.5,
+        "2000": 117.6,
+        "10000": 116.2
+      },
+      "decode_tok_s": 9.78203586175864
+    }
+  ],
+  "geometry": {
+    "model": "qwen27",
+    "architecture": "qwen35",
+    "native_context": 262144,
+    "full_attention_layers": 16,
+    "window_layers": 0,
+    "recurrent_layers": 48,
+    "kv_bytes_per_token": 34816,
+    "window_bytes_per_token": 0,
+    "sliding_window": 0,
+    "sliding_window_bytes": 0,
+    "recurrent_tensor_bytes": 156893184,
+    "state_bytes": 156894784,
+    "slot_fixed_bytes": 156894784
+  },
+  "provenance": {
+    "archive": "qwen27b-mac-bench-results-20261103T171250Z.tar.gz",
+    "archive_sha256": "1d0d04a372d56ef553565292d12ae10dd58357fad71d53f9f7ccd28e0d44704c",
+    "raw": "results/hybrid-bench-apple-m5-max-64g-q27b-q4km-q8kv-20261103T190306.jsonl",
+    "raw_sha256": "bbab8c3108f92da9f1d50c1a3d09207a93da5584750a416319b75a852ea72d1a",
+    "priority_sha256": "1f0fb556d787c5c7736b42bf682b15d3cfbcf585aa090223be584aea2ec139c9",
+    "routing_selector": "delta512 by conditioning level, floor step curve",
+    "limitation": "Single PRI31 kit1.6.7 ladder on M5 Max64; prototype import fit measured separately"
+  }
+}

@@ -327,3 +327,19 @@ The corrected [rehearsal policy audit](packets/r46/REHEARSAL-POLICY.md) binds re
 ## r46e explicit common-journal fidelity
 
 The [Glimmer design](packets/r46/COMMON-JOURNAL.md) declares when batch-sensitive free-running arms use a common history. `growing_session.py --pairing-contract tools/hybrid-bench/fixtures/glimmer-common-journal.json --state-probes --checkpoint-turns 10,20,30,40 ...` runs only the live hybrid history and constructs teacher-forced local/partition references at checkpoints. The declaration is bound to the exact model/layout; recurrent Qwen keeps independent equal-journal admission. Trace/checkpoint JSON records the declaration, common journal and actual teacher/free continuation IDs. Free divergence across paths is report-only; ten exact controls and teacher-forced top1>=63/64 remain required. `llama-hybrid-bench-check --test-teacher-forcing MODEL` tests real forced token evaluation on a local small CPU model and prints its result; keep logs under the task's `.temp/` root. It does not qualify native Glimmer SWA. The runbook includes the fresh-node operator commands and4-7h full-run allowance.
+
+## Proper owner-session measurement (r49)
+
+`session_measurement.py` is the explicit three-arm production entry point: local, bf16 hybrid with on-demand catch-up, and bf16 hybrid with committed-journal background catch-up. It uses authenticated HTTPS ranges and defers evidence outside timed turns. The accepted `growing_session.py` rehearsal gates remain separate. See [packets/r49/RUNBOOK.md](packets/r49/RUNBOOK.md) and [DESIGN.md](packets/r49/DESIGN.md) for the owner-export contract, priority/build/CA admission, calibration and command list.
+
+Tools and validation (Python standard library, OpenSSL, CMake/C++, Git; tc/ip/unshare only on an authorized isolated shaping runner):
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1
+python3 -m unittest discover -s tools/hybrid-proxy -p 'test_*.py' -v
+python3 -m unittest discover -s tools/hybrid-bench -p 'test_*.py' -v
+python3 tools/hybrid-bench/test_session_measurement_native.py --build-dir "$BUILD" --model "$LOCAL_SMALL_QWEN" --artifacts .temp/r49-native
+python3 tools/hybrid-bench/packets/r49/shaped_transport.py --output .temp/r49-shaped
+```
+
+Native tests require existing local small Qwen weights and never download them. The optional native command covers real TLS/imports, three arms, durable background replay and a 64-position lossy checkpoint. It is not the 40-turn owner measurement. The shaping command refuses unavailable privileges and never substitutes unshaped results. Outputs go under the chosen `.temp/` directories. Packet helper commands for `prepare_workload.py`, `probe.py`, `make_policy.py`, `estimate.py`, and `stage-node.sh` are listed in RUNBOOK.md.

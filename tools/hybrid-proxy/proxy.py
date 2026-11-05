@@ -57,13 +57,19 @@ class SlotUnavailable(HTTPError):
 
 
 class Node:
-    def __init__(self, url, token="", timeout=1.0, budget=None):
+    def __init__(self, url, token="", timeout=1.0, budget=None, parallel=None):
         self.budget = budget
+        self.parallel = None
+        if parallel is not None:
+            from parallel_transport import ParallelTransport
+            self.parallel = ParallelTransport(url, timeout=timeout, **parallel)
+        self.last_tls_bytes = dict(tls_sent_bytes=0, tls_received_bytes=0)
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
         self.last_transfer_rate = None
         self.last_transfer_seconds = 0
         self.last_bytes = 0
         self.last_prefill_ms = None
+        self.last_node_compute_ms = None
         self.last_upload_bytes = 0
 
     @timing.traced('http.open_upload_headers')
@@ -81,6 +87,8 @@ class Node:
         timing.annotate(bytes=self.last_upload_bytes)
         request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         try:
+            if self.parallel is not None:
+                return self.parallel.open(method, path, data, headers)
             return urllib.request.urlopen(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             with error:
@@ -111,6 +119,9 @@ class Node:
         if isinstance(data, dict) and 'n0' in data and isinstance(data.get('tokens'), list):
             timing.annotate(tokens=len(data['tokens']), n0=data['n0'], n1=data['n0']+len(data['tokens']),
                             transfer_id=data.get('transfer_id', ''), chunk_id=data.get('chunk_index', -1))
+        transport_before = self.parallel.stats() if self.parallel is not None else None
+        if binary and self.parallel is not None:
+            headers = dict(headers or {}, **{'X-Hybrid-Parallel': '1'})
         try:
             with self.open(method, path, data, headers) as response:
                 limit = MAX_DELTA if binary else MAX_JSON
@@ -118,19 +129,33 @@ class Node:
                     limit = min(limit, response_limit)
                 started = time.monotonic()
                 with timing.span('http.response_body_read') as span:
-                    body = response.read(limit + 1)
+                    if binary and self.parallel is not None:
+                        encoded = response.read(MAX_JSON + 1)
+                        if len(encoded) > MAX_JSON:
+                            raise ValueError('parallel manifest too large')
+                        manifest = json.loads(encoded)
+                        if type(manifest.get('bytes')) is not int or manifest['bytes'] > limit:
+                            raise ValueError('parallel payload exceeds response budget')
+                        body = self.parallel.fetch(manifest, self.token)
+                    else:
+                        body = response.read(limit + 1)
                     span['bytes'] = len(body)
                 elapsed = max(time.monotonic() - started, 1e-6)
                 self.last_transfer_rate = len(body) / elapsed if body else None
                 self.last_transfer_seconds = elapsed
                 self.last_bytes = len(body)
                 self.last_prefill_ms = getattr(response, "headers", {}).get("X-Hybrid-Prefill-Ms")
+                self.last_node_compute_ms = getattr(response, "headers", {}).get("X-Hybrid-Node-Compute-Ms")
                 if len(body) > limit:
                     raise ValueError("upstream body too large")
                 with timing.span('response.json_decode', bytes=len(body)):
                     return body if binary else (json.loads(body) if body else None)
         except http.client.HTTPException as error:
             raise OSError("upstream HTTP connection interrupted") from error
+        finally:
+            if self.parallel is not None:
+                after = self.parallel.stats()
+                self.last_tls_bytes = {k:after[k]-transport_before[k] for k in ('tls_sent_bytes','tls_received_bytes')}
 
     def download(self, path, destination, max_bytes):
         """Full snapshots have a disk budget independent of the bounded delta envelope."""
@@ -198,6 +223,7 @@ class Proxy:
         self.slot_path = Path(config["slot_path"]).resolve()
         self.slot_path.mkdir(parents=True, exist_ok=True)
         self.prefill = config["prefill_url"]
+        self.parallel_transport = config.get("parallel_transport")
         self.timeout = config.get("prefill_timeout", 0.5)
         self.snapshot_disk_reserve = config.get("snapshot_disk_reserve_bytes", 0)
         if type(self.snapshot_disk_reserve) is not int or self.snapshot_disk_reserve < 0:
@@ -264,7 +290,7 @@ class Proxy:
         return value
 
     def remote(self, client):
-        return Node(self.prefill, client["prefill_token"], self.timeout, budget=self.traffic_budget)
+        return Node(self.prefill, client["prefill_token"], self.timeout, budget=self.traffic_budget, parallel=self.parallel_transport)
 
     def reserve(self, sid, skip_busy=False):
         with self.lock:
@@ -852,6 +878,10 @@ class Proxy:
                 except OSError:
                     LOG.warning("delta recovery file retained session=%s", session["id"])
 
+    @contextmanager
+    def offload_lock(self, session):
+        yield
+
     @timing.traced('proxy.prepare_session')
     def prepare_session(self, client, body, session, tokens):
         timing.annotate(session_id=session['id'], tokens=len(tokens))
@@ -886,77 +916,79 @@ class Proxy:
         try:
             remote_started = time.monotonic()
             if decision["offload"] and len(target) > local_n:
-                # Local turns leave their durable suffix for the replay worker.
-                path = self.sync(session, client)
-                # Flush a queued shadow with a critical extend at the local boundary.
-                if session["remote_n"] > local_n:
-                    raise ValueError("server is ahead of local slot; local re-prefill required")
-                if session["remote_n"] < local_n:
-                    self.sync(session, client)
-                remote = self.remote(client)
-                transfer_id = uuid.uuid4().hex
-                starts = []
-                n0 = local_n
-                while n0 < export_end:
-                    n1 = min(n0 + self.extend_chunk_tokens, export_end) // self.export_block_size * self.export_block_size
-                    starts.append((n0, n1))
-                    n0 = n1
-                with self.delta_transfer(session, slot) as transaction:
-                    for index, (n0, n1) in enumerate(starts):
-                        chunk = dict(n0=n0, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32", status="requested", wire_bytes=0, import_ms=0)
-                        session["_bench"]["chunks"].append(chunk)
-                        delta = remote.request("POST", path + "/extend", {
-                            "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
-                            "tokens": target[n0:n1], "return_delta": True, "delta_version": 2,
-                            **({"state_dtype": self.state_dtype} if self.state_dtype != "f32" else {}),
-                            "transfer_id": transfer_id, "transfer_n0": local_n, "transfer_n1": export_end,
-                            "chunk_index": index, "chunk_count": len(starts)},
-                            headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
-                        chunk.update(status="received", wire_bytes=remote.last_bytes,
-                            transfer_ms=remote.last_transfer_seconds * 1000,
-                            server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None)
-                        meter = session["_bench"]
-                        meter["wire_bytes"] += chunk["wire_bytes"]
-                        meter["transfer_ms"] += chunk["transfer_ms"]
-                        if chunk["server_prefill_ms"] is not None:
-                            meter["server_prefill_ms"] = (meter["server_prefill_ms"] or 0) + chunk["server_prefill_ms"]
-                        if remote.last_transfer_rate:
-                            with self.lock:
-                                self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
-                        delta = self.client_delta(delta)
-                        import_started = time.monotonic()
-                        if index + 1 == len(starts):
-                            filename = session["id"] + "-delta-backup.bin"
-                            with timing.span('import.old_slot_save', tokens=local_n) as span:
-                                saved = self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": filename})
-                                span['bytes'] = saved.get('n_written', 0)
-                            transaction["backup"] = filename
-                        with timing.span('import.final_request' if index + 1 == len(starts) else 'import.stage_request',
-                                         bytes=len(delta), tokens=n1-n0, n0=n0, n1=n1, transfer_id=transfer_id, chunk_id=index):
-                            self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
-                                                {"Content-Type": "application/octet-stream",
-                                                 "X-Hybrid-Session": session["remote_id"],
-                                                 **({"X-Hybrid-State-Dtype": self.state_dtype} if self.state_dtype != "f32" else {})})
-                        chunk["import_ms"] = (time.monotonic() - import_started) * 1000
-                        meter["import_ms"] += chunk["import_ms"]
-                        actual = self.decode.request("GET", f"/slots/{slot}/info")
-                        committed = n1 if index + 1 == len(starts) else local_n
-                        if (actual["n"] != committed or actual["prefix_hash"] != prefix_hash(tokens[:committed])
-                                or actual["tokens"] != tokens[:committed]):
-                            session["_remote_applied"] = 0
-                            raise ValueError("import prefix mismatch")
-                        chunk["status"] = "imported" if index + 1 == len(starts) else "staged"
-                        if index + 1 != len(starts):
-                            continue
-                        session.update(offload=True, tokens=tokens[:n1], remote_n=n1, state_dtype=self.state_dtype)
-                        meter["lossy_import"] = self.state_dtype != "f32"
-                        entry = dict(n0=local_n, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32")
-                        session.setdefault("state_imports", []).append(entry)
-                        session["_remote_applied"] = n1 - local_n
-                        LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
-                        if "_turn" in session:
-                            session["_turn"]["checkpoints"] = []
-                        self.store.save(session)
+                with self.offload_lock(session):
+                    # Local turns leave their durable suffix for the replay worker.
+                    path = self.sync(session, client)
+                    # Flush a queued shadow with a critical extend at the local boundary.
+                    if session["remote_n"] > local_n:
+                        raise ValueError("server is ahead of local slot; local re-prefill required")
+                    if session["remote_n"] < local_n:
+                        self.sync(session, client)
+                    remote = self.remote(client)
+                    transfer_id = uuid.uuid4().hex
+                    starts = []
+                    n0 = local_n
+                    while n0 < export_end:
+                        n1 = min(n0 + self.extend_chunk_tokens, export_end) // self.export_block_size * self.export_block_size
+                        starts.append((n0, n1))
+                        n0 = n1
+                    with self.delta_transfer(session, slot) as transaction:
+                        for index, (n0, n1) in enumerate(starts):
+                            chunk = dict(n0=n0, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32", status="requested", wire_bytes=0, import_ms=0)
+                            session["_bench"]["chunks"].append(chunk)
+                            delta = remote.request("POST", path + "/extend", {
+                                "n0": n0, "prefix_hash_n0": prefix_hash(tokens[:n0]),
+                                "tokens": target[n0:n1], "return_delta": True, "delta_version": 2,
+                                **({"state_dtype": self.state_dtype} if self.state_dtype != "f32" else {}),
+                                "transfer_id": transfer_id, "transfer_n0": local_n, "transfer_n1": export_end,
+                                "chunk_index": index, "chunk_count": len(starts)},
+                                headers={"X-Hybrid-Bench": "1"} if mode else None, binary=True)
+                            chunk.update(status="received", wire_bytes=remote.last_bytes,
+                                transfer_ms=remote.last_transfer_seconds * 1000,
+                                server_prefill_ms=float(remote.last_prefill_ms) if remote.last_prefill_ms is not None else None,
+                                tls_bytes=remote.last_tls_bytes.copy())
+                            meter = session["_bench"]
+                            meter["wire_bytes"] += chunk["wire_bytes"]
+                            meter["transfer_ms"] += chunk["transfer_ms"]
+                            if chunk["server_prefill_ms"] is not None:
+                                meter["server_prefill_ms"] = (meter["server_prefill_ms"] or 0) + chunk["server_prefill_ms"]
+                            if remote.last_transfer_rate:
+                                with self.lock:
+                                    self.link_rate = 0.8 * self.link_rate + 0.2 * remote.last_transfer_rate
+                            delta = self.client_delta(delta)
+                            import_started = time.monotonic()
+                            if index + 1 == len(starts):
+                                filename = session["id"] + "-delta-backup.bin"
+                                with timing.span('import.old_slot_save', tokens=local_n) as span:
+                                    saved = self.decode.request("POST", f"/slots/{slot}?action=save", {"filename": filename})
+                                    span['bytes'] = saved.get('n_written', 0)
+                                transaction["backup"] = filename
+                            with timing.span('import.final_request' if index + 1 == len(starts) else 'import.stage_request',
+                                             bytes=len(delta), tokens=n1-n0, n0=n0, n1=n1, transfer_id=transfer_id, chunk_id=index):
+                                self.decode.request("POST", f"/slots/{slot}?action=import_delta", delta,
+                                                    {"Content-Type": "application/octet-stream",
+                                                     "X-Hybrid-Session": session["remote_id"],
+                                                     **({"X-Hybrid-State-Dtype": self.state_dtype} if self.state_dtype != "f32" else {})})
+                            chunk["import_ms"] = (time.monotonic() - import_started) * 1000
+                            meter["import_ms"] += chunk["import_ms"]
+                            actual = self.decode.request("GET", f"/slots/{slot}/info")
+                            committed = n1 if index + 1 == len(starts) else local_n
+                            if (actual["n"] != committed or actual["prefix_hash"] != prefix_hash(tokens[:committed])
+                                    or actual["tokens"] != tokens[:committed]):
+                                session["_remote_applied"] = 0
+                                raise ValueError("import prefix mismatch")
+                            chunk["status"] = "imported" if index + 1 == len(starts) else "staged"
+                            if index + 1 != len(starts):
+                                continue
+                            session.update(offload=True, tokens=tokens[:n1], remote_n=n1, state_dtype=self.state_dtype)
+                            meter["lossy_import"] = self.state_dtype != "f32"
+                            entry = dict(n0=local_n, n1=n1, state_dtype=self.state_dtype, lossy=self.state_dtype != "f32")
+                            session.setdefault("state_imports", []).append(entry)
+                            session["_remote_applied"] = n1 - local_n
+                            LOG.info("remote_applied session=%s n0=%d n1=%d kind=critical", session["id"], n0, n1)
+                            if "_turn" in session:
+                                session["_turn"]["checkpoints"] = []
+                            self.store.save(session)
         except RollbackError:
             raise
         except HTTPError as error:

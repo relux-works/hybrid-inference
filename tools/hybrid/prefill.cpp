@@ -372,6 +372,7 @@ int main(int argc, char ** argv) {
                         hybrid::encode_delta_header(header, hybrid::max_delta_body_bytes);
                     }
                     request_trace.tokens = tokens.size();
+                    const auto compute_started = std::chrono::steady_clock::now();
                     { llama_trace_span span("node.load_state", s.state.size(), n0); hybrid::load_state(ctx.get(), s.state); }
                     const auto prefill_started = std::chrono::steady_clock::now();
                     { llama_trace_span span("node.prefill", 0, tokens.size()); hybrid::prefill(ctx.get(), tokens, n0); }
@@ -383,6 +384,7 @@ int main(int argc, char ** argv) {
                     }
                     std::string state;
                     { llama_trace_span span("node.save_state", 0, all.size()); state = hybrid::save_state(ctx.get()); span.bytes = state.size(); }
+                    res.set_header("X-Hybrid-Node-Compute-Ms", std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compute_started).count()));
                     size_t old_bytes = s.state.size() + s.tokens.size() * sizeof(llama_token);
                     size_t new_bytes = state.size() + all.size() * sizeof(llama_token);
                     // Plan before deleting: an impossible admission must preserve every session.

@@ -1,0 +1,127 @@
+{
+  "schema": "hybrid-growing-rate-fixture-v1",
+  "status": "measured",
+  "priority": 31,
+  "normal_priority": true,
+  "override_used": false,
+  "architecture": "qwen35",
+  "model_sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
+  "depths": [
+    {
+      "depth": 16000,
+      "delta_prefill_tok_s": {
+        "512": 174.2,
+        "2000": 176.9,
+        "10000": 156.3
+      },
+      "decode_tok_s": 14.977311712959821,
+      "decode_samples": [
+        15.46,
+        15.19,
+        14.33
+      ],
+      "segment_prefill_tok_s": 191.5
+    },
+    {
+      "depth": 50000,
+      "delta_prefill_tok_s": {
+        "512": 121.7,
+        "2000": 116.1,
+        "10000": 106.7
+      },
+      "decode_tok_s": 13.515435524878802,
+      "decode_samples": [
+        13.85,
+        13.47,
+        13.23
+      ],
+      "segment_prefill_tok_s": 128.8
+    },
+    {
+      "depth": 100000,
+      "delta_prefill_tok_s": {
+        "512": 65.3,
+        "2000": 66.2,
+        "10000": 63.5
+      },
+      "decode_tok_s": 10.353407917234858,
+      "decode_samples": [
+        10.45,
+        10.55,
+        10.07
+      ],
+      "segment_prefill_tok_s": 81.4
+    },
+    {
+      "depth": 150000,
+      "delta_prefill_tok_s": {
+        "512": 46.2,
+        "2000": 47.1,
+        "10000": 44.4
+      },
+      "decode_tok_s": 8.984328032977537,
+      "decode_samples": [
+        9.14,
+        9.23,
+        8.61
+      ],
+      "segment_prefill_tok_s": 52.5
+    },
+    {
+      "depth": 200000,
+      "delta_prefill_tok_s": {
+        "512": 36.5,
+        "2000": 36.8,
+        "10000": 34.5
+      },
+      "decode_tok_s": 7.811929108696321,
+      "decode_samples": [
+        7.95,
+        8.03,
+        7.48
+      ],
+      "segment_prefill_tok_s": 38.2
+    },
+    {
+      "depth": 249000,
+      "delta_prefill_tok_s": {
+        "512": 28.7,
+        "2000": 29.7,
+        "10000": 27.8
+      },
+      "decode_tok_s": 6.923481680467473,
+      "decode_samples": [
+        7.03,
+        7.08,
+        6.67
+      ],
+      "segment_prefill_tok_s": 30.1
+    }
+  ],
+  "geometry": {
+    "model": "qwen27",
+    "architecture": "qwen35",
+    "native_context": 262144,
+    "full_attention_layers": 16,
+    "window_layers": 0,
+    "recurrent_layers": 48,
+    "kv_bytes_per_token": 34816,
+    "window_bytes_per_token": 0,
+    "sliding_window": 0,
+    "sliding_window_bytes": 0,
+    "recurrent_tensor_bytes": 156893184,
+    "state_bytes": 156894784,
+    "slot_fixed_bytes": 156894784
+  },
+  "provenance": {
+    "archive": "qwen27b-mac-bench-results-20261103T062853Z.tar.gz",
+    "archive_sha256": "c2e83fbd4f59a38181e48b17206783e91d6d5b6734624f46d4cede68d7bcace5",
+    "raw": "results/hybrid-bench-apple-m3-max-128g-q27b-q4km-q8kv-20261103T090007.jsonl",
+    "raw_sha256": "39c1cb3a939b5ebc3a9b06b96d7228b949581692fdb9e567c4773c378b1879a9",
+    "priority_sha256": "53990b78c384610aebea8e7fcabeaab56b8b5834514df4755fa93b83042e9b9a",
+    "decode_reduction": "sum predicted_n / sum predicted_ms; three 128-token delta calls per level",
+    "routing_selector": "delta512 by conditioning level; floor step curve, as Policy.choose",
+    "limitation": "Single PRI-31 ladder, kit engine dde879bc; not a measurement on the r46 prototype"
+  },
+  "target_device": "m3-max-128gb"
+}

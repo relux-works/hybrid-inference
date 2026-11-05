@@ -284,8 +284,9 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     std::map<std::string, checkpoint_observation> observations;
     const bool bf16_replay = fixture.value("bf16_replay", false);
     const bool common = fixture.contains("pairing");
+    const bool production_quality = fixture.value("acceptance_rule", "") == "session_quality_v1";
     if (common) {
-        require(!bf16_replay && k == 64 && fixture.value("acceptance_rule", "") == "session_append_replay_exact" &&
+        require(!bf16_replay && k == 64 && (production_quality || fixture.value("acceptance_rule", "") == "session_append_replay_exact") &&
                 fixture.contains("snapshots"), "common journal requires exact f32 checkpoint controls");
         require(fixture.at("pairing").at("mode") == "hybrid-common-journal-v1" &&
                 fixture.at("pairing").at("journal_hash") == hybrid::prefix_hash(tokens), "common journal binding mismatch");
@@ -310,6 +311,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     if (common) {
         result["pairing"] = fixture.at("pairing");
         for (const std::string name : {"L", "P"}) {
+            if (production_quality && name == "P") { continue; }
             const auto & shape = fixture.at("pairing").at("reference_batches").at(name);
             const int batch = shape.at("batch"), ubatch = shape.at("ubatch");
             require(batch >= 1 && batch <= 256 && ubatch >= 1 && ubatch <= batch, "invalid common reference batch");
@@ -364,7 +366,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
         throw std::runtime_error("snapshot checker requires LLAMA_BUILD_SERVER=ON");
 #endif
     }
-    if (fixture.contains("replay")) {
+    if (fixture.contains("replay") && !production_quality) {
         for (const std::string name : {"A", "B1", "B2", "B"}) {
             auto ctx = context(model, max_ctx, gpu, threads);
             replay_schedule(ctx.get(), tokens, fixture.at("replay").at(name));
@@ -382,7 +384,7 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
     }
     if (common) {
         require(observations.at("H").teacher == observations.at("L").teacher &&
-                observations.at("P").teacher == observations.at("L").teacher, "common teacher-forced inputs differ");
+                (production_quality || observations.at("P").teacher == observations.at("L").teacher), "common teacher-forced inputs differ");
     }
     if (fixture.contains("probes")) {
         require(fixture.at("probes").is_array() && fixture.at("probes").size() <= 16, "too many state probes");
@@ -536,7 +538,14 @@ static int check_checkpoint(const hybrid::json & fixture, llama_model * model, b
             result["status_rule"] = "session_mean_kl_zero";
             accepted = within_session_band(mean, 0, result.at("top1_agreed"), k, result.at("free_running_first_divergence"));
         }
-        if (fixture.contains("acceptance_rule")) {
+        if (production_quality) {
+            require(common && k == 64, "production quality requires a common teacher-forced reference");
+            accepted = append_tokens_agree(result.at("top1_agreed"));
+            result["quality_gate"] = accepted;
+            result["status_rule"] = "session_quality_v1";
+            result["state_transport_exact"] = fixture.value("state_dtype", std::string("f32")) == "f32";
+            result["kl_limit"] = nullptr;
+        } else if (fixture.contains("acceptance_rule")) {
             require(fixture.at("acceptance_rule") == "session_append_replay_exact" && k == 64,
                     "invalid append replay acceptance rule or width");
             const auto layout = hybrid::model_layout(model);
