@@ -12,7 +12,7 @@ from bench_common import require
 
 
 def estimate(workload,fixture,config):
-    require(workload['schema']=='hybrid-owner-workload-v1' and len(workload['turns'])==40,'selected owner window required')
+    require(workload['schema'] in ('hybrid-owner-workload-v1','hybrid-owner-workload-v2') and workload['turns'],'selected owner window required')
     policy=Policy(**config)
     arms={}
     for arm in ('local','hybrid','hybrid-background'):
@@ -42,9 +42,15 @@ def estimate(workload,fixture,config):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--workload',required=True,type=Path)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--workload',type=Path);p.add_argument('--session-set',type=Path);p.add_argument('--group',choices=('main','favourable','public'))
     p.add_argument('--fixture',required=True,type=Path);p.add_argument('--policy',required=True,type=Path)
-    a=p.parse_args();print(json.dumps(estimate(*[json.loads(x.read_text()) for x in (a.workload,a.fixture,a.policy)]),indent=2))
+    a=p.parse_args();fixture,policy=[json.loads(x.read_text()) for x in (a.fixture,a.policy)]
+    require(bool(a.workload)!=bool(a.session_set),'choose one selected workload or frozen set')
+    if a.session_set:
+        selected=json.loads(a.session_set.read_text());require(a.group in selected['sets'],'selected group required')
+        result=dict(prereg=selected['prereg'],group=a.group,sessions={row['session_digest']:estimate(row,fixture,policy) for row in selected['sets'][a.group]['sessions']})
+    else:result=estimate(json.loads(a.workload.read_text()),fixture,policy)
+    print(json.dumps(result,indent=2))
 
 
 if __name__=='__main__':main()

@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime,timezone
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,8 @@ from proxy import Node,HTTPError
 from policy import Policy
 from store import prefix_hash
 from parallel_transport import ParallelTransport
+from session_protocol import prereg_binding,validate_set,digest,finish_wait,portion_summary
+from session_admission import KitAdmission
 
 ARMS=('local','hybrid','hybrid-background')
 
@@ -74,7 +77,7 @@ def native_stream(decode,request):
     return tokens,final.get('timings',{}),first_token,first_text
 
 
-def execute_turn(app,client,sid,prompt,count,turn,seed,force_base=False):
+def execute_turn(app,client,sid,prompt,count,turn,seed,force_base=False,recorded_output=None):
     started=time.monotonic_ns()
     session=app.store.get(sid)
     before=app.decode.request('GET','/slots/0/info')['n']
@@ -83,6 +86,9 @@ def execute_turn(app,client,sid,prompt,count,turn,seed,force_base=False):
     profile=dict(client,benchmark_mode=mode)
     app.origin.value='critical';app.origin.turn=turn;app.origin.call_id=app.arm+'-'+str(turn)
     body=dict(prompt=prompt,n_predict=count,temperature=0,seed=seed,ignore_eos=True,return_tokens=True,cache_prompt=True)
+    if recorded_output is not None and count:
+        require(len(recorded_output)==count,'recorded replay count differs')
+        body.update(replay_mode='recorded-token-replay-v1',replay_tokens=recorded_output)
     try:
         session,_,request=app.prepare_session(profile,body,session,prompt)
         cold_unused_sample=0
@@ -94,6 +100,7 @@ def execute_turn(app,client,sid,prompt,count,turn,seed,force_base=False):
             require(cold_unused_sample in (0,1),'unexpected cold-prefill sample count')
             generated=[];timings=native.get('timings',{});first=first_text=None
         require(len(generated)==count,'native generation length differs from owner workload')
+        require(recorded_output is None or generated==recorded_output,'native output differs from recorded replay')
         complete=prompt+generated
         reconciliation=time.monotonic_ns()
         actual=app.decode.request('GET','/slots/0/info')
@@ -121,14 +128,16 @@ def execute_turn(app,client,sid,prompt,count,turn,seed,force_base=False):
         app.end_turn(sid)
 
 
-def snapshot(app,root,arm,turn,complete):
+def snapshot(app,root,arm,turn,complete,defer_hash=False):
     info=app.decode.request('GET','/slots/0/info')
-    require(info['tokens']==complete[:-1],'quality snapshot requires one unreconciled sampled token')
+    require(info['tokens'] in (complete,complete[:-1]),'quality snapshot does not match recorded journal')
+    extension=[0] if info['tokens']==complete else []
+    probe_tokens=complete+extension
     name=f'{arm}-{turn}.bin'
     receipt=app.decode.request('POST','/slots/0?action=save',dict(filename=name))
-    require(receipt['n_saved']==len(complete)-1,'quality snapshot token count mismatch')
+    require(receipt['n_saved']==len(probe_tokens)-1,'quality snapshot token count mismatch')
     path=root/'slots'/name
-    binding=dict(arm=arm,turn=turn,path=str(path),sha256=sha256(path),tokens=complete.copy(),model_sha256=app.model)
+    binding=dict(arm=arm,turn=turn,path=str(path),sha256=None if defer_hash else sha256(path),tokens=probe_tokens,model_sha256=app.model,recorded_journal_hash=prefix_hash(complete),probe_prefix_extension=extension)
     directory=root/'checkpoint-bindings';directory.mkdir(exist_ok=True,mode=0o700)
     private_json(directory/(arm+'-'+str(turn)+'.json'),binding)
     return binding
@@ -204,8 +213,14 @@ def summarize(events,calls):
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--client-state',type=Path,required=True);p.add_argument('--owner-export',type=Path,required=True)
-    p.add_argument('--owner-export-sha256',required=True)
+    p.add_argument('--client-state',type=Path,required=True);p.add_argument('--owner-export',type=Path)
+    p.add_argument('--owner-export-sha256')
+    p.add_argument('--session-set',type=Path);p.add_argument('--session-set-sha256');p.add_argument('--session-digest')
+    p.add_argument('--prereg-commit');p.add_argument('--arm',choices=ARMS);p.add_argument('--series-probe',type=Path)
+    p.add_argument('--refresh-series-probe',action='store_true')
+    p.add_argument('--ordinal',type=int)
+    p.add_argument('--series-id');p.add_argument('--comparison',choices=('B/A','C/A'));p.add_argument('--group',choices=('main','favourable','public'))
+    p.add_argument('--kit-root',type=Path);p.add_argument('--kit-ref')
     p.add_argument('--output',type=Path,required=True);p.add_argument('--ca-file',type=Path,required=True)
     p.add_argument('--fixture',type=Path,required=True);p.add_argument('--policy',type=Path,required=True)
     p.add_argument('--import-fit',type=Path,required=True)
@@ -217,6 +232,7 @@ def parser():
 
 def run(args):
     state,root=args.client_state.resolve(),args.output.resolve()
+    run_arm=dict(zip(ARMS,arm_names(args.state_dtype)))[args.arm]
     require(not root.exists() and root.parent.is_dir(),'new output directory required')
     config=read_private(state/'proxy-config.json');client=read_private(state/'client-info.json')
     node=json.loads((state/'node-info.json').read_text())
@@ -227,9 +243,19 @@ def run(args):
     for name in ('llama-server','llama-hybrid-bench-check'):
         require(sha256(Path(client['build_dir'])/'bin'/name)==client['binaries'][name],'client build identity changed')
     require(sha256(client['model_path'])==client['model_sha256'],'client GGUF identity changed')
-    require(args.owner_export.stat().st_size<=256*1024**2,'owner export exceeds input budget')
-    require(sha256(args.owner_export)==args.owner_export_sha256,'owner export differs from trusted delivery hash')
-    workload=select_workload(json.loads(args.owner_export.read_text()),client['model_sha256'],client['model_layout']['vocab_size'])
+    require(args.session_set is not None and args.prereg_commit and args.arm and args.kit_root and args.kit_ref and args.series_probe,
+            'preregistered session set, single arm, series probe and kit admission required')
+    prereg=prereg_binding(Path(__file__).resolve().parents[2],args.prereg_commit)
+    require(args.comparison in ('B/A','C/A') and args.group in ('main','favourable','public') and args.ordinal is not None,'series comparison/group/ordinal required')
+    require(args.session_set.stat().st_size<=512*1024**2,'session set exceeds input budget')
+    require(sha256(args.session_set)==args.session_set_sha256,'session set differs from frozen delivery hash')
+    selected=json.loads(args.session_set.read_text());rows=validate_set(selected)
+    require(selected['prereg']==prereg,'session set preregistration differs')
+    collection=selected['sets'].get(args.group,{})
+    require(collection.get('status')=='selected','selected series group incomplete')
+    workload=next((r for r in collection['sessions'] if r['session_digest']==args.session_digest),None)
+    require(workload is not None,'session missing from selected group')
+    require(workload['model_sha256']==client['model_sha256'],'session tokenizer/model identity differs')
     require(workload['final_depth']+2048<=min(client['context'],node['context'],262144),'owner workload exceeds context with margin')
     fixture=json.loads(args.fixture.read_text())
     rates=validate_fixture(fixture,client['model_sha256'],'qwen35')
@@ -257,14 +283,16 @@ def run(args):
     require(shutil.disk_usage(root.parent).free>disk_floor+15*size+2*1024**3,'disk budget for 12 checkpoint states and rollback reserve refused')
     root.mkdir(mode=0o700);(root/'slots').mkdir(mode=0o700)
     token_file=root/'decode-token';token_file.write_text(config['decode_token']);token_file.chmod(0o600)
-    trace=dict(schema='hybrid-production-session-v1',status='running',arms=list(arm_names(args.state_dtype)),state_dtype=args.state_dtype,
+    trace=dict(schema='hybrid-production-session-v2',status='running',arms=[run_arm],state_dtype=args.state_dtype,
         started_utc=datetime.now(timezone.utc).isoformat(),link_label=args.link_label,device=args.device,
         transport=dict(protocol='https-ranges-v1',streams=args.streams,ca_sha256=sha256(args.ca_file)),
-        selection_rule=SELECTION,owner_export_sha256=sha256(args.owner_export),workload=workload,
+        selection_rule='preregistered-random-owner-sessions-v1',prereg=prereg,session_set_sha256=sha256(args.session_set),
+        session_digest=args.session_digest,group=args.group,series_id=args.series_id,comparison=args.comparison,ordinal=args.ordinal,
+        admission=None,workload=workload,
         calls=[],evidence=[],quality=[],events=[],sessions={},source_head=source_head)
     def flush():
         path=root/'trace.json.tmp';path.write_text(json.dumps(trace,indent=2)+'\n');path.chmod(0o600);path.replace(root/'trace.json')
-    flush();decoder=None;app=None;saved=[]
+    flush();decoder=None;app=None;saved=[];kit=None
     raw_start=time.monotonic_ns()
     try:
         remote=Node(config['prefill_url'],next(iter(config['clients'].values()))['prefill_token'],3600,
@@ -272,59 +300,75 @@ def run(args):
         health=remote.request('GET','/v1/health')
         require(health['model_sha256']==client['model_sha256'] and args.state_dtype in health.get('state_dtypes',['f32']),
                 'node model or live-wire capability mismatch')
-        trace['link_probe']=probe(config['prefill_url'],remote.token,str(args.ca_file.resolve()),args.streams)
-        control=sorted(r['health_seconds'] for r in trace['link_probe']['samples'])[1]
-        policy['fixed']=max(policy.get('fixed',0),2*control)
-        policy['link_rate']=trace['link_probe']['bytes_per_second'];trace['policy']=policy
-        trace['control_seconds']=control
-        depth=workload['start_depth'];remote_depth=depth-1;previous_offload=False
-        decisions=[]
-        for row in workload['turns']:
-            decision=catchup_decision(Policy(**policy),len(row['input_ids']),depth,max(0,depth-remote_depth),previous_offload,control_seconds=control)
-            decisions.append(decision);previous_offload=decision['offload']
-            if decision['offload']:remote_depth=depth+len(row['input_ids'])-1
-            depth+=len(row['input_ids'])+len(row['output_ids'])
-        require(any(r['offload'] for r in decisions),'measured-link preflight predicts an empty hybrid arm')
-        trace['route_preflight']=decisions
-        for arm in arm_names(args.state_dtype):
+        trace['startup_node_tls_bytes']=remote.last_tls_bytes.copy()
+        for arm in [run_arm]:
             events=g.Events(None)
             run_config=dict(config,benchmark=True,slots=1,slot_path=str(root/'slots'),snapshot_disk_reserve_bytes=int(disk_floor),
                 decode_url='http://127.0.0.1:'+str(g.free_port()),decode_timeout=3600,prefill_timeout=3600,
-                state_dtype=args.state_dtype,policy=policy,control_seconds=control,parallel_transport=dict(ca_file=str(args.ca_file.resolve()),streams=args.streams))
+                state_dtype=args.state_dtype,policy=policy,control_seconds=0,parallel_transport=dict(ca_file=str(args.ca_file.resolve()),streams=args.streams))
             load_start=time.monotonic_ns()
-            decoder=start_process(g.decoder_command(client,run_config,int(run_config['decode_url'].rsplit(':',1)[1]),root/'slots',token_file),root,'decoder-'+arm)
+            kit=KitAdmission(args.kit_root,args.kit_ref,root)
+            decoder_args=g.decoder_command(client,run_config,int(run_config['decode_url'].rsplit(':',1)[1]),root/'slots',token_file)
+            decoder=start_process(kit.command(decoder_args),root,'decoder-'+arm)
             wait_health(run_config['decode_url'],'/health',decoder,timeout=3600,token=config['decode_token'])
             trace['sessions'][arm]=dict(decoder_load_seconds=(time.monotonic_ns()-load_start)/1e9)
+            trace['admission']=kit.cooldown(decoder)
+            if args.refresh_series_probe:
+                measured=probe(config['prefill_url'],remote.token,str(args.ca_file.resolve()),args.streams)
+                measured.update(node_url=config['prefill_url'],ca_sha256=sha256(args.ca_file),series_id=args.series_id,
+                    measured_utc=datetime.now(timezone.utc).isoformat())
+                require(not args.series_probe.exists(),'series-start probe must not overwrite prior evidence')
+                private_json(args.series_probe,measured)
+            trace['link_probe']=json.loads(args.series_probe.read_text())
+            require(trace['link_probe'].get('node_url')==config['prefill_url'] and
+                    trace['link_probe'].get('ca_sha256')==sha256(args.ca_file) and trace['link_probe'].get('series_id')==args.series_id,
+                    'series probe belongs to another node/certificate/series')
+            control=sorted(r['health_seconds'] for r in trace['link_probe']['samples'])[1]
+            policy['fixed']=max(policy.get('fixed',0),2*control)
+            policy['link_rate']=trace['link_probe']['bytes_per_second'];trace['policy']=policy
+            trace['control_seconds']=control;run_config['control_seconds']=control
             app=SessionProxy(run_config,str(root/(arm+'.sqlite')),events,background=arm in ('hybrid-background','hybrid-background-f32'));app.arm=arm
             client_profile=next(iter(config['clients'].values()))
             sid=uuid.uuid4().hex
             initial=app.store.select(client_profile['id'],[],sid);initial['slot']=0;app.store.save(initial);app.store.set_slot(sid,0)
             journal=workload['base_ids'].copy()
             rows=[];session_start=time.monotonic_ns()
-            for turn,step in enumerate([dict(input_ids=[],output_ids=[],pause_seconds=0)]+workload['turns']):
+            checkpoint_turns={max(1,math.ceil(len(workload['turns'])*fraction/4)) for fraction in (1,2,3,4)}
+            previous_end=None;pending_checkpoint=None
+            sequence=[dict(input_ids=[],output_ids=[],pause_seconds=0)]+workload['turns']
+            sequence=[dict(row,input_hash=prefix_hash(row['input_ids']),output_hash=prefix_hash(row['output_ids'])) for row in sequence]
+            for turn,step in enumerate(sequence):
                 if turn:
-                    pause_start=time.monotonic_ns();time.sleep(step['pause_seconds'])
-                    trace['sessions'][arm].setdefault('pauses',[]).append(dict(turn=turn,seconds=(time.monotonic_ns()-pause_start)/1e9))
+                    wait_start=previous_end;deadline=wait_start+int(step['pause_seconds']*1e9)
+                    evidence_start=time.monotonic_ns()
+                    if pending_checkpoint is not None:
+                        captured=snapshot(app,root,arm,turn-1,pending_checkpoint,defer_hash=True);saved.append(captured)
+                    capture_end=time.monotonic_ns()
+                    wait_receipt=finish_wait(deadline,evidence_performed=pending_checkpoint is not None)
+                    trace['evidence'].append(dict(arm=arm,turn=turn-1,start_ns=evidence_start,end_ns=capture_end,
+                        capture=pending_checkpoint is not None,within_recorded_wait=True))
+                    trace['sessions'][arm].setdefault('pauses',[]).append(dict(turn=turn,recorded_seconds=step['pause_seconds'],
+                        elapsed_seconds=(wait_receipt['ready_ns']-wait_start)/1e9,**wait_receipt))
                 prompt=journal+step['input_ids']
-                last={}
-                def publish(row,measured):
-                    last.update(row);last['timing']=measured
-                    public={k:v for k,v in last.items() if k not in ('complete','generated_ids')}
-                    public.update(arm=arm,source_turn=step.get('source_turn'),input_ids_sha256=prefix_hash(step['input_ids']))
-                    trace['calls'].append(public);rows.append(public)
-                def evidence():
-                    require(shutil.disk_usage(root).free>disk_floor+size,'checkpoint disk floor reached')
-                    journals=root/'journals';journals.mkdir(exist_ok=True,mode=0o700)
-                    private_json(journals/(arm+'-'+str(turn)+'.json'),dict(turn=turn,generated_ids=last['generated_ids'],journal_hash=last['journal_hash']))
-                    if turn in (10,20,30,40):
-                        captured=snapshot(app,root,arm,turn,last['complete']);saved.append(captured)
-                        return dict(snapshot_sha256=captured['sha256'],snapshot_bytes=Path(captured['path']).stat().st_size)
-                    return dict(snapshot=False)
-                _,_,receipt,phase=run_turn(lambda:execute_turn(app,client_profile,sid,prompt,len(step['output_ids']),turn,261105+turn,force_base=turn==0),evidence,publish)
-                trace['evidence'].append(dict(arm=arm,turn=turn,receipt=receipt,**phase))
-                journal=last['complete'];flush()
+                start_ns=time.monotonic_ns()
+                result=execute_turn(app,client_profile,sid,prompt,len(step['output_ids']),turn,261105+turn,
+                    force_base=False,recorded_output=step['output_ids'])
+                previous_end=time.monotonic_ns()
+                journal=result.pop('complete');generated=result.pop('generated_ids')
+                result.update(timing=dict(start_ns=start_ns,end_ns=previous_end,seconds=(previous_end-start_ns)/1e9),
+                    arm=arm,source_turn=step.get('source_turn'),incoming_tokens=len(step['input_ids']),
+                    input_ids_sha256=step['input_hash'],recorded_output_sha256=step['output_hash'],
+                    recorded_wait_seconds=step['pause_seconds'])
+                trace['calls'].append(result);rows.append(result)
+                pending_checkpoint=journal.copy() if turn in checkpoint_turns else None
             active_end=time.monotonic_ns()
-            app.close_background()
+            app.close_background(discard_pending=True)
+            trace['sessions'][arm]['final_background_join_seconds']=(time.monotonic_ns()-active_end)/1e9
+            if pending_checkpoint is not None:
+                saved.append(snapshot(app,root,arm,len(workload['turns']),pending_checkpoint,defer_hash=True))
+            for captured in saved:
+                captured['sha256']=sha256(captured['path'])
+                private_json(root/'checkpoint-bindings'/(captured['arm']+'-'+str(captured['turn'])+'.json'),captured)
             current=app.store.get(sid)
             if current['remote_id']:app.remote(client_profile).request('DELETE','/v1/sessions/'+current['remote_id'])
             complete_events=events.copy()
@@ -343,8 +387,11 @@ def run(args):
             trace['sessions'][arm].update(raw_window_seconds=(active_end-session_start)/1e9,
                 cold_base_seconds=rows[0]['timing']['seconds'],shutdown_seconds=(time.monotonic_ns()-active_end)/1e9,
                 summary=summarize(events.copy(),rows),background_errors=app.worker.errors if app.worker else [])
-            require(arm=='local' or trace['sessions'][arm]['summary']['offloaded_turns']>0,'live hybrid arm did not offload')
-            app.store.close();app=None;g.stop_process(decoder);decoder=None;flush()
+            trace['sessions'][arm]['portion_bins']=portion_summary(rows)
+            trace['sessions'][arm]['warm_system_seconds']=(active_end-rows[0]['timing']['end_ns'])/1e9
+            app.store.close();app=None
+            trace['admission']['completed_guard_evidence']=kit.stop(decoder)
+            decoder=None;kit=None;flush()
         # One checker context at a time, after every measured decoder has stopped.
         for item in saved:
             start=time.monotonic_ns()
@@ -362,7 +409,7 @@ def run(args):
     finally:
         if app is not None:
             try:
-                app.close_background()
+                app.close_background(discard_pending=True)
             except Exception as error:
                 trace.setdefault('cleanup_errors',[]).append(type(error).__name__)
             try:
@@ -375,10 +422,14 @@ def run(args):
             finally:
                 trace['events']+=[dict(arm=app.arm,**r) for r in app.events.copy()]
                 app.store.close()
-        if decoder is not None:g.stop_process(decoder)
+        if decoder is not None:
+            try:
+                if kit is not None:kit.abort(decoder)
+                else:g.stop_process(decoder)
+            except Exception as error:trace.setdefault('cleanup_errors',[]).append(type(error).__name__)
         trace['cold_start_semantics']='empty context; weights may be OS-cached after identity checks/calibration; no purge'
         trace['raw_run_wall_seconds']=(time.monotonic_ns()-raw_start)/1e9
-        trace['capture_timing']='post-turn snapshots and deferred checker; raw wall includes evidence; timed turns do not'
+        trace['capture_timing']='snapshots inside recorded waits; overrun refuses; hashes and checkers after timed session'
         flush()
     return 0 if trace['status']=='measured' else 3
 

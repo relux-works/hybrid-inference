@@ -87,8 +87,11 @@ class BackgroundCatchup:
             except Exception as error:
                 with self.condition:self.errors.append(type(error).__name__)
 
-    def close(self):
-        with self.condition:self.stopping=True;self.condition.notify_all()
+    def close(self,discard_pending=False):
+        with self.condition:
+            self.stopping=True
+            if discard_pending:self.pending.clear()
+            self.condition.notify_all()
         self.thread.join()
 
 
@@ -226,8 +229,8 @@ class SessionProxy(Proxy):
     def schedule(self,sid,path):
         if self.worker is not None and path=='local':self.worker.submit(sid)
 
-    def close_background(self):
-        if self.worker is not None:self.worker.close()
+    def close_background(self,discard_pending=False):
+        if self.worker is not None:self.worker.close(discard_pending=discard_pending)
         require(not self.fatal_background,'background committed-journal contract failed')
 
 

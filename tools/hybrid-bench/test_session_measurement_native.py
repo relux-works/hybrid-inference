@@ -32,6 +32,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir',required=True,type=Path);p.add_argument('--model',required=True,type=Path)
     p.add_argument('--artifacts',required=True,type=Path)
+    p.add_argument('--recorded-replay',action='store_true');p.add_argument('--mechanics-only',action='store_true')
     args=p.parse_args();build=args.build_dir.resolve();model=args.model.resolve();root=args.artifacts.resolve()
     require(not root.exists(),'new native artifact directory required');root.mkdir(parents=True,mode=0o700)
     client=dict(model_path=str(model),build_dir=str(build),backend='cpu',context=4096,**model_identity(model))
@@ -86,13 +87,13 @@ def main():
                             # Deliberate mechanics routes exercise both branches; production never uses this per-turn override.
                             app.policy=CatchupPolicy(Policy(always=turn in (0,3,4),local_rates=((0,1e9),)),app.origin,0)
                             prompt=journal+([100,101,102,103]*12 if turn else [])
-                            result=execute_turn(app,owner,sid,prompt,8 if turn else 0,turn,1+turn,force_base=turn==0)
+                            result=execute_turn(app,owner,sid,prompt,8 if turn else 0,turn,1+turn,force_base=turn==0,recorded_output=([100,101,102,103]*2 if turn else []) if args.recorded_replay else None)
                             journal=result.pop('complete');rows.append(result)
                             require(app.store.get(sid)['tokens']==journal[:-1] if turn else app.store.get(sid)['tokens']==journal,
                                     'native durable journal mismatch')
                         app.close_background()
                         require(not (app.worker and app.worker.errors),'native background worker failed')
-                        captured=snapshot(app,work,arm,4,journal) if arm=='hybrid-background' else None
+                        captured=snapshot(app,work,arm,4,journal) if arm=='hybrid-background' and not args.mechanics_only else None
                         protocol=events.copy()
                         require(arm!='local' or not protocol,'local arm made node calls')
                         require(arm=='local' or all(r['lossy_import'] for r in rows if r['path']=='offload'),'bf16 import missing lossy label')
@@ -115,8 +116,13 @@ def main():
                     except Exception as error:
                         require('teacher-forced inputs differ' in str(error),'unrelated teacher-pairing refusal')
                     else:raise AssertionError('teacher-pairing mutant survived')
+    if args.recorded_replay:
+        hashes=[[r['journal_hash'] for r in arm['calls']] for arm in report['arms']]
+        require(all(row==hashes[0] for row in hashes),'native arms do not share the recorded journal')
+        report['recorded_journals_identical']=True
+    report['mechanics_only']=args.mechanics_only
     private_json(root/'summary.json',report)
-    print(json.dumps(dict(arms=len(report['arms']),quality=report['quality'],summary=str(root/'summary.json'))))
+    print(json.dumps(dict(arms=len(report['arms']),quality=report.get('quality'),summary=str(root/'summary.json'))))
 
 
 if __name__=='__main__':main()

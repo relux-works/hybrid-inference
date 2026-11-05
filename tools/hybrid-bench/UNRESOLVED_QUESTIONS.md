@@ -20,3 +20,10 @@
 - agents1 has no effective CAP_NET_ADMIN and rejects the mapped network namespace at uid_map. The actual kernel-shaped 15/20 MB/s x 50/100/150 ms matrix is therefore unrun. Real unshaped localhost TLS mechanics are separate evidence. An authorized isolated Linux runner must execute packets/r49/shaped_transport.py; GPU/Mac timing admission remains closed until the >=80% result is verified.
 - The real M3/M5 run needs fresh selected-dtype import fits and actual supervisor RAM/disk/PRI31 admission. The M5 fixture is measured on the named M5 Max64 source archive, not borrowed from M3. Native CPU quality does not qualify CUDA/Metal or 27B.
 - node_compute_seconds and node_gpu_eval_seconds are GPU-service/evaluation wall proxies, not CUDA kernel-active seconds. Encrypted TLS byte counters exclude TCP/IP headers and retransmissions; retain supervisor physical counters separately. These are declared measurement boundaries, not inferred hardware utilization.
+
+## R49b preregistration prerequisites
+
+- Signed preregistration dfffda35763edb17b832f758f586367999ac8978 precedes owner selection and study inference. Main owner set is currently zero available sessions, not the planned five. Actual selected depths/tool waits require the ordered v2 export, trusted hash and complete-population receipt. Claude aggregate gaps 8.1/60.6 s and all-agent gaps 7.8/34.8 s do not establish tool-only durations.
+- The public CPU-tokenized reference is one constructed 68-turn session at 101711 -> 203809 using existing 0.8B weights for tokenization only; its target-27B version must be built/frozen before target inference. Its 8/60 s constructed schedule is not owner evidence.
+- The exact accepted r47 kit source/ref is requested. The adapter delegates to the existing kit interfaces and verifies their source bytes; CPU contract tests do not qualify Darwin telemetry or establish that the moving 1.6.14 candidate is the requested accepted kit.
+- The authorized tc/netem runner and real shaped throughput, chosen-node home/fast probes, target import fit/admission and review remain necessary. No GPU, Metal or owner-session performance result is claimed by r49b.

@@ -517,6 +517,27 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
+    if (data.contains("replay_tokens") || data.contains("replay_mode")) {
+        if (data.value("replay_mode", std::string()) != "recorded-token-replay-v1" ||
+                !data.contains("replay_tokens") || !data.at("replay_tokens").is_array()) {
+            throw std::runtime_error("recorded replay requires explicit mode and token array");
+        }
+        const auto & tokens = data.at("replay_tokens");
+        if (tokens.empty() || tokens.size() > 262144 || params.n_predict != (int64_t) tokens.size() ||
+                !params.return_tokens || !params.sampling.ignore_eos || !params.antiprompt.empty() ||
+                params.t_max_predict_ms > 0 || params.sampling.n_probs > 0 ||
+                !common_grammar_value(params.sampling.grammar).empty() || params.sampling.reasoning_budget_tokens >= 0) {
+            throw std::runtime_error("recorded replay requires matching length, raw tokens and no early stop");
+        }
+        for (const auto & value : tokens) {
+            if (!value.is_number_integer() || value.get<int64_t>() < 0 ||
+                    value.get<int64_t>() >= llama_vocab_n_tokens(vocab)) {
+                throw std::runtime_error("recorded replay token outside vocabulary");
+            }
+            params.replay_tokens.push_back(value.get<llama_token>());
+        }
+    }
+
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;

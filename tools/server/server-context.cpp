@@ -565,7 +565,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && (!task || task->params.replay_tokens.empty());
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1968,6 +1968,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!task.params.replay_tokens.empty() && task.type != SERVER_TASK_TYPE_COMPLETION) {
+            send_error(task, "recorded replay requires native completion", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2083,7 +2087,7 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = task.params.sampling.backend_sampling && task.params.replay_tokens.empty();
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
@@ -2270,7 +2274,7 @@ private:
             }
         }
 
-        if (llama_vocab_is_eog(vocab, result.tok)) {
+        if (llama_vocab_is_eog(vocab, result.tok) && slot.task->params.replay_tokens.empty()) {
             slot.stop           = STOP_TYPE_EOS;
             slot.has_next_token = false;
 
@@ -4972,6 +4976,9 @@ private:
 
             slot.i_batch = -1;
 
+            if (!slot.task->params.replay_tokens.empty()) {
+                id = slot.task->params.replay_tokens.at(slot.stats.n_gen);
+            }
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
