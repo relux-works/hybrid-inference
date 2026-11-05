@@ -565,7 +565,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && (!task || task->params.replay_tokens.empty());
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1968,6 +1968,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!task.params.replay_tokens.empty() && task.type != SERVER_TASK_TYPE_COMPLETION) {
+            send_error(task, "recorded replay requires native completion", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2083,7 +2087,7 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = task.params.sampling.backend_sampling && task.params.replay_tokens.empty();
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
@@ -2270,7 +2274,7 @@ private:
             }
         }
 
-        if (llama_vocab_is_eog(vocab, result.tok)) {
+        if (llama_vocab_is_eog(vocab, result.tok) && slot.task->params.replay_tokens.empty()) {
             slot.stop           = STOP_TYPE_EOS;
             slot.has_next_token = false;
 
@@ -3028,6 +3032,9 @@ private:
             return false;
         }
 
+        llama_trace_binding trace_binding(task.trace_context);
+        { llama_trace_span queued("decoder.task_queue", 0, 0, task.trace_queued_ns); }
+        llama_trace_span task_span("decoder.task_execute", task.slot_action.delta.size(), task.n_tokens());
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -3265,7 +3272,7 @@ private:
                             } else {
                                 const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
                                 const bool final = slot->hybrid_import.stage(ctx_tgt, slot->id, std::move(task.slot_action.delta), hybrid_model_hash,
-                                        task.slot_action.session_id, tokens, slot->n_ctx, llama_vocab_n_tokens(vocab));
+                                        task.slot_action.session_id, tokens, slot->n_ctx, llama_vocab_n_tokens(vocab), task.slot_action.state_dtype);
                                 if (final) {
                                     auto imported_tokens = slot->hybrid_import.imported_tokens();
                                     server_tokens imported(imported_tokens, false);
@@ -3615,6 +3622,15 @@ private:
     }
 
     void update_slots() {
+        llama_trace_context context;
+        size_t traced_tasks = 0;
+        for (const auto & slot : slots) {
+            if (slot.task && slot.is_processing()) { context = slot.task->trace_context; ++traced_tasks; }
+        }
+        if (traced_tasks != 1) { context = {}; }
+        llama_trace_binding trace_binding(context);
+        llama_trace_span iteration_span("decoder.update_slots");
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4757,14 +4773,19 @@ private:
         }
 
         bool has_output = false;
+        size_t prompt_tokens = 0;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            prompt_tokens += batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const auto decode_trace_context = llama_trace_get();
         queue_tasks.yield_to_queue([&]() {
+            llama_trace_binding binding(decode_trace_context);
+            llama_trace_span eval_span(prompt_tokens == 1 && batch.view.size() == 1 ? "decoder.single_prompt_token_eval" : "decoder.batch_eval", 0, batch.view.size());
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4948,11 +4969,16 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
+                llama_trace_span sample_span("decoder.sample", 0, 1);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                if (slot.stats.n_gen == 0) { llama_trace_span first_sample("decoder.first_sample", 0, 1); }
             }
 
             slot.i_batch = -1;
 
+            if (!slot.task->params.replay_tokens.empty()) {
+                id = slot.task->params.replay_tokens.at(slot.stats.n_gen);
+            }
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -4970,7 +4996,8 @@ private:
 
             completion_token_output result;
             result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            { llama_trace_span detokenize("decoder.detokenize", 0, 1);
+              result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok)); }
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
             if (slot.task->params.sampling.n_probs > 0) {
@@ -6852,6 +6879,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
         res->error(format_error_response("Hybrid slots require --slots and --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
         return res;
     }
+    if (info && req.get_param("trace_flush") == "1" && llama_trace_enabled()) {
+        res->ok({{"enabled", true}, {"complete", llama_trace_checkpoint()}});
+        return res;
+    }
     int id_slot;
     try {
         const auto text = req.get_param("id_slot");
@@ -6881,6 +6912,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slot_delta(const ser
         for (const auto & header : req.headers) {
             std::string name = header.first;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (name == "x-hybrid-state-dtype") {
+                task.slot_action.state_dtype = header.second;
+            }
             if (name == "x-hybrid-session") {
                 task.slot_action.session_id = header.second;
             }

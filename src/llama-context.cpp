@@ -2954,6 +2954,10 @@ public:
         }
 
         std::vector<const ggml_tensor *> const_tensors(tensors.begin(), tensors.end());
+        size_t bytes = 0;
+        for (const auto & info : winfos) { bytes += info.size; }
+        llama_trace_span span("tensor.to_host", bytes);
+        span.backend = ggml_backend_buffer_name(winfos.front().tensor->buffer);
         ggml_backend_tensor_get_n(const_tensors.data(), base_ptr, offsets.data(), sizes.data(), data_offsets.data(), winfos.size());
     }
 
@@ -3027,6 +3031,7 @@ public:
         size_t bytes = 0;
         for (const auto & rinfo : rinfos) { bytes += rinfo.size; }
         llama_io_timer timer("tensor_write", bytes);
+        timer.trace.backend = ggml_backend_buffer_name(rinfos.front().tensor->buffer);
         ggml_backend_tensor_set_n(tensors.data(), base_ptr, offsets.data(), sizes.data(), data_offsets.data(), rinfos.size());
     }
 
@@ -3090,7 +3095,9 @@ public:
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         temp_buffer.resize(size);
-        ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size);
+        { llama_trace_span span("tensor.to_host", size);
+          span.backend = ggml_backend_buffer_name(tensor->buffer);
+          ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size); }
         write(temp_buffer.data(), temp_buffer.size());
     }
 
@@ -3675,6 +3682,7 @@ size_t llama_context::state_seq_set_data_append(llama_seq_id seq_id, const uint8
         if (!iswa && (backup.empty() || state_seq_get_data(seq_id, backup.data(), backup.size(), backup_flags) != backup.size())) {
             return 0;
         }
+        backup_timer.trace.bytes = backup.size();
     }
 
     llama_io_read_host io(src, size);
@@ -3856,6 +3864,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    llama_trace_span span("recovery.save_file", 0, n_token_count);
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -3872,6 +3881,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
 
+    span.bytes = res;
     return res;
 }
 
@@ -4907,6 +4917,7 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    llama_trace_span span("decoder.prompt_or_generation_eval", 0, batch.n_tokens);
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

@@ -136,7 +136,7 @@ def check_route(trace, previous, mode, stage):
 
 
 def public_trace(trace):
-    keys = ('mode', 'path', 'depth_before', 'prompt_depth', 'depth_after', 'new_tokens', 'generated_tokens',
+    keys = ('state_dtype', 'lossy_import', 'transfer_ms', 'import_ms', 'remote_prepare_ms', 'chunks', 'mode', 'path', 'depth_before', 'prompt_depth', 'depth_after', 'new_tokens', 'generated_tokens',
             'local_evaluated', 'remote_applied', 'prefilled', 'replayed_prefix', 'rollback_n',
             'wire_bytes', 'server_prefill_ms', 'decode_ms', 'fallback_reason')
     return {key: trace[key] for key in keys if key in trace}

@@ -3,6 +3,7 @@
 #include "hash/hash.h"
 #include "hash/xxhash/xxhash.h"
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -12,6 +13,52 @@ static void require(bool ok, const char * message) {
 }
 static json header(const std::string & hash, size_t n0, size_t n1, const std::vector<llama_token> & tokens) {
     return {{"model_sha256", hash}, {"session_id", "golden"}, {"n0", n0}, {"n1", n1}, {"tokens", std::vector<llama_token>(tokens.begin() + n0, tokens.begin() + n1)}, {"prefix_hash_n1", hybrid::prefix_hash(tokens)}};
+}
+
+static void bf16_rounding_tests() {
+    // A tiny native-shaped fixture checks ties, normal finite error, signed zero, NaN, Inf, underflow and overflow.
+    std::string raw;
+    auto add = [&](uint64_t x, size_t n) { for (size_t i = 0; i < n; ++i) { raw += char(x >> (8 * i)); } };
+    add(0, 8); add(1, 4); add(1, 4); add(0, 4); add(1, 4); raw.append(16, char(0));
+    add(0, 4); add(1, 4); add(0, 8);
+    for (int i = 0; i < 2; ++i) { add(GGML_TYPE_Q8_0, 4); add(34, 8); raw.append(34, char(17)); }
+    add(1, 4); add(0, 4); add(0, 4); add(0, 4); add(2, 4);
+    std::vector<uint32_t> values = {0, 0x80000000, 0x7f800000, 0xff800000, 0x7f800001, 0xffc01234,
+        0x3f808000, 0x3f818000, 0x00800000, 1, 0x7f7fffff};
+    for (uint32_t exponent = 1; exponent < 255; ++exponent) {
+        for (uint32_t mantissa : {0u, 0x7fffu, 0x8000u, 0xffffu, 0x3f8000u, 0x7f7fffu}) {
+            values.push_back((exponent << 23) | mantissa);
+            values.push_back(0x80000000u | (exponent << 23) | mantissa);
+        }
+    }
+    std::vector<size_t> offsets;
+    for (int i = 0; i < 2; ++i) {
+        add(GGML_TYPE_F32, 4); add(values.size() * 4, 8); offsets.push_back(raw.size());
+        for (auto value : values) { add(value, 4); }
+    }
+    const auto packed = hybrid::transcode_recurrent(raw, true, true);
+    const auto back = hybrid::transcode_recurrent(packed, false, true);
+    require(raw.size() - packed.size() == values.size() * 4 && back.size() == raw.size(), "bf16 payload size");
+    double maximum = 0;
+    for (auto offset : offsets) {
+        for (size_t i = 0; i < values.size(); ++i) {
+            uint32_t actual; std::memcpy(&actual, back.data() + offset + i * 4, 4);
+            const uint32_t bits = values[i];
+            float original, rounded; std::memcpy(&original, &bits, 4); std::memcpy(&rounded, &actual, 4);
+            if (std::isnan(original)) { require(std::isnan(rounded), "bf16 NaN became non-NaN"); }
+            else if (i == 6) { require(actual == 0x3f800000, "bf16 even tie rounded up"); }
+            else if (i == 7) { require(actual == 0x3f820000, "bf16 odd tie rounded down"); }
+            else if (i == 9) { require(actual == 0, "bf16 minimum subnormal did not underflow"); }
+            else if (i == 10) { require(actual == 0x7f800000, "bf16 finite overflow not infinity"); }
+            else if (!std::isnormal(original)) { require(actual == bits, "bf16 Inf or signed zero changed"); }
+            if (std::isnormal(original) && std::isfinite(rounded)) {
+                const double relative = std::abs((double(rounded) - original) / original);
+                maximum = std::max(maximum, relative);
+                require(relative <= std::ldexp(1., -8), "bf16 relative error exceeds 2^-8");
+            }
+        }
+    }
+    std::cout << "PASS test_bf16_rne_normal_bound_nan_inf max_relative_error=" << maximum << '\n';
 }
 
 static void wire_size_tests() {
@@ -73,6 +120,7 @@ static void codec_tests(size_t max_ctx) {
     require(hybrid::layout_fingerprint(layout) == fingerprint, "layout fingerprint unstable");
     std::cout << "PASS layout fingerprint structural mutation controls\n";
     wire_size_tests();
+    bf16_rounding_tests();
     const std::string hash(64, 'a');
     auto h = header(hash, 0, 1, {1});
     // The writer admits the inclusive body cap and rejects one byte more before allocating a body.
@@ -94,6 +142,9 @@ static void codec_tests(size_t max_ctx) {
         require(one_more_rejected, "one-more reserved chunk accepted");
         std::cout << "PASS reserved chunk boundary: kv=" << geometry.first << " tokens=" << chunk << '\n';
     }
+    // Frozen pre-bf16 envelope fields and order protect the default wire, independent of the decoder.
+    const std::string legacy_header = R"({"model_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_id":"golden","n0":0,"n1":1,"tokens":[1],"prefix_hash_n1":"67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450","magic":"HYBD","version":2,"transfer_id":"golden","transfer_n0":0,"transfer_n1":1,"chunk_index":0,"chunk_count":1,"fixed_state":true,"body_format":"llama-native-chunks-v3","kv_type":"q8_0","state_dtype":"f32","sections":[{"name":"llama_seq_state","offset":0,"bytes":3}]})";
+    require(hybrid::encode_delta_header(h, 3) == legacy_header, "f32 legacy header bytes changed");
     auto wire = hybrid::encode_delta(h, "abc");
     require(hybrid::read_delta(wire, hash, 0).state == "abc", "codec positive control");
     // A borrowed decode references the owning envelope; the copying API retains its independent state.

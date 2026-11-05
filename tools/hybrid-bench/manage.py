@@ -128,6 +128,7 @@ def parser():
     p.add_argument('--bench-link', action='store_true', help='enable authenticated node download probe')
     p.add_argument('--extend-chunk-tokens', type=int)
     p.add_argument('--hetero-quant', action='store_true')
+    p.add_argument('--state-dtype', choices=['f32', 'bf16'], default='f32')
     p.add_argument('--node-info')
     p.add_argument('--node-sha256')
     p.add_argument('--prefill-url', default='http://127.0.0.1:8091')
@@ -202,6 +203,7 @@ def main():
             except (OSError, ValueError):
                 raise Refusal('prefill node unreachable or unhealthy at configured URL') from None
             require(health['model_sha256'] == expected, 'live node model sha256 mismatch')
+            require(args.state_dtype in health.get('state_dtypes', ['f32']), 'node does not support requested state dtype')
             validate_identity(digest, identity, health['model_sha256'], health, args.hetero_quant)
             # An authenticated read detects a missing/wrong token before any build or local state.
             try:
@@ -266,7 +268,7 @@ def main():
                 config['export_block_size'] = block
             if plan.get('window_state_bytes'):
                 config['delta_geometry']['window_bytes'] = plan['window_state_bytes']
-            config.update(hetero_quant=args.hetero_quant, node_model_sha256=expected,
+            config.update(state_dtype=args.state_dtype, hetero_quant=args.hetero_quant, node_model_sha256=expected,
                           layout_fingerprint=identity['layout_fingerprint'],
                           node_layout_fingerprint=(node or {}).get('layout_fingerprint'))
             if args.extend_chunk_tokens is not None:

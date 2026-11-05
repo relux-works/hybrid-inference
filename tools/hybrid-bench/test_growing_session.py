@@ -3,6 +3,7 @@ import copy
 from array import array
 import json
 import io
+import importlib.util
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -12,12 +13,474 @@ from unittest import mock
 import growing_session as growing
 from bench_common import Refusal
 from policy import Policy
+from growing_fixture import validate_fixture, from_archive
 from proxy import HTTPError
 from store import prefix_hash
 import test_proxy
 
 
 class ScenarioTests(unittest.TestCase):
+    # Common pairing is explicit and hash/layout bound; recurrent Qwen cannot opt out of journal equality.
+    def test_common_journal_declaration_admission(self):
+        path = Path(growing.__file__).parent / 'fixtures/glimmer-common-journal.json'
+        declaration = json.loads(path.read_text())
+        client = dict(model_sha256=declaration['model_sha256'], model_layout=dict(
+            architecture='muse-glimmer', sliding_window=2048, layers=[dict(recurrent=False)]))
+        self.assertEqual(growing.pairing_contract(None, client, {10}, True)['mode'], 'independent-equal-journals')
+        self.assertEqual(growing.pairing_contract(declaration, client, {10}, True)['mode'], growing.COMMON_JOURNAL)
+        with self.assertRaisesRegex(Refusal, 'requires checkpoints and state probes'):
+            growing.pairing_contract(declaration, client, set(), True)
+        with self.assertRaisesRegex(Refusal, 'requires checkpoints and state probes'):
+            growing.pairing_contract(declaration, client, {10}, False)
+        for changed in (dict(client, model_sha256='0'*64), dict(client, model_layout=dict(
+                architecture='qwen35', layers=[dict(recurrent=True)]))):
+            with self.assertRaisesRegex(Refusal, 'matching nonrecurrent SWA model'):
+                growing.pairing_contract(declaration, changed, {10}, True)
+
+    # The unchanged Qwen pairing gate accepts identical journals and refuses a same-length divergent journal.
+    def test_qwen_divergent_journal_still_refuses(self):
+        reference = dict(journal_hash=prefix_hash([1,2,3]))
+        same = dict(reference)
+        growing.require_paired_journal(same, reference)
+        self.assertTrue(same['paired_journal_equal'])
+        divergent = dict(journal_hash=prefix_hash([1,2,9]))
+        with self.assertRaisesRegex(Refusal, '^paired journal hashes differ$'):
+            growing.require_paired_journal(divergent, reference)
+        self.assertFalse(divergent['paired_journal_equal'])
+
+    # Identical teacher inputs can pass while independent free token journals diverge; raw scoring is tested separately.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_common_journal_divergent_free_history_is_report_only(self, raw):
+        row = self.append_gate_row()
+        row['state_component'] = 'window'
+        row['probes']['CHAIN_WINDOW'] = row['probes'].pop('CHAIN_RECURRENT')
+        row['gate_controls']['CHAIN_WINDOW-H'] = row['gate_controls'].pop('CHAIN_RECURRENT-H')
+        for name in ('CHAIN_ATTENTION', 'CHAIN_WINDOW'):
+            state = row['probes'][name]['roundtrips'][0]
+            state['window_equal'] = state.pop('recurrent_equal')
+        row.update(pairing=dict(mode=growing.COMMON_JOURNAL,journal_hash=prefix_hash([1,2,3])),
+                   raw_logits=dict(vocab=4),free_running_first_divergence=0,exact=False,top1_agreed=63,
+                   mean_kl_nats=.01,max_abs_logit_diff=1,local_partition_mean_kl_nats=.02,
+                   local_partition_p95_kl_nats=.04,kl_to_partition_ratio=.5,kl_to_partition_ratio_status='finite')
+        row['partition'].update(free_running_first_divergence=2,mean_kl_nats=.02,p95_kl_nats=.04)
+        row['continuations'] = {name:dict(teacher_tokens=[0]*64,free_tokens=[0]*64) for name in ('H','L','P')}
+        row['continuations']['H']['free_tokens'][0] = 1
+        row['continuations']['P']['free_tokens'][2] = 2
+        self.assertNotEqual(prefix_hash(row['continuations']['H']['free_tokens']), prefix_hash(row['continuations']['L']['free_tokens']))
+        growing.validate_checkpoint(row, False, 1000)
+        self.assertEqual(row['free_running_first_divergence'], 0)
+        self.assertEqual(len(row['gate_controls']), 10)
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(dict(row, top1_agreed=62), False, 1000)
+        broken_window = copy.deepcopy(row)
+        broken_window['probes']['CHAIN_WINDOW']['H']['exact'] = False
+        with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+            growing.validate_checkpoint(broken_window, False, 1000)
+        changed = copy.deepcopy(row)
+        changed['continuations']['H']['teacher_tokens'][0] = 1
+        with self.assertRaisesRegex(Refusal, 'teacher-forced inputs differ: H'):
+            growing.validate_checkpoint(changed, False, 1000)
+        changed = copy.deepcopy(row)
+        changed['free_running_first_divergence'] = -1
+        with self.assertRaisesRegex(Refusal, 'free divergence contradicts tokens'):
+            growing.validate_checkpoint(changed, False, 1000)
+    @staticmethod
+    def packet_module(name):
+        path = Path(growing.__file__).parent / 'packets/r46' / (name + '.py')
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # The failed GPU packet must refuse on its real geometry; the sourced replacement must exercise both routes.
+    def test_qwen_rehearsal_old_16mb_policy_refuses(self):
+        plan = growing.depth_plan(100000, 40, 1, 10875, 4506, 340, 14, 196608)
+        old = Policy(local_rates=[[0,100]], server_rate=1767, link_rate=16000000, fixed=.110,
+                     import_fixed=1.618657356721653, import_per_token=.0004953084013066794,
+                     kv_bytes=34816, state_bytes=156893184)
+        self.assertEqual(growing.route_preflight(old, plan, 2, 3, False)['counts'],
+                         dict(policy_local=37, policy_offload=0))
+        with self.assertRaisesRegex(Refusal, "degenerate connected policy mix.*'policy_offload': 0"):
+            growing.route_preflight(old, plan, 2, 3)
+        module = self.packet_module('rehearsal_policy')
+        policy, report = module.prepare('qwen', dict(kv_bytes=34816, state_bytes=156893184))
+        self.assertEqual(report['f32']['counts'], dict(policy_local=30, policy_offload=7))
+        self.assertEqual(report['bf16_independent_policy']['counts'], dict(policy_local=28, policy_offload=9))
+        self.assertEqual(report['bf16_chain_turn_imports'], [7,13,17,31,32,33,40])
+        self.assertEqual(report['bf16_chain_imports_at_checkpoints'], {'10':2,'20':4,'30':4,'40':8})
+        self.assertEqual(growing.route_preflight(Policy(**policy), plan, 2, 3)['counts'], report['f32']['counts'])
+        self.assertEqual((plan['final_depth'], min(r['input_tokens'] for r in plan['sequence']),
+                          max(r['input_tokens'] for r in plan['sequence'])), (143439,6,2329))
+
+    # Glimmer's old real-window policy is already mixed; a low-link negative prevents vacuous rehearsal admission.
+    def test_glimmer_rehearsal_low_link_refuses_and_old_policy_is_mixed(self):
+        plan = growing.depth_plan(76000, 40, 1, 10875, 4506, 340, 32, 131072)
+        old = Policy(local_rates=[[0,100]], server_rate=2823, link_rate=16000000, fixed=.110,
+                     import_fixed=1.618657356721653, import_per_token=.0004953084013066794,
+                     kv_bytes=7072, state_bytes=43514896)
+        self.assertEqual(growing.route_preflight(old, plan, 20, 3)['counts'], dict(policy_local=26, policy_offload=11))
+        policy, report = self.packet_module('rehearsal_policy').prepare(
+            'glimmer', dict(kv_bytes=7072, state_bytes=0, window_bytes=43514896))
+        self.assertEqual(report['f32']['counts'], dict(policy_local=26, policy_offload=11))
+        self.assertEqual(report['f32']['offload_turns'], [3,5,6,7,13,16,17,31,32,33,40])
+        low = dict(policy, link_rate=2000000)
+        self.assertEqual(growing.route_preflight(Policy(**low), plan, 20, 3, False)['counts'],
+                         dict(policy_local=37, policy_offload=0))
+        with self.assertRaisesRegex(Refusal, "degenerate connected policy mix.*'policy_offload': 0"):
+            growing.route_preflight(Policy(**low), plan, 20, 3)
+
+    # Labels cannot alias a transport, and the bf16 policy changes only tensor wire bytes while preserving metadata.
+    def test_bf16_arm_labels_and_policy_bytes(self):
+        layout=dict(architecture='qwen35',layers=[dict(recurrent=True)]*18,
+                    recurrent_layout=dict(state=128,inner=2048,conv=4,groups=16))
+        policy=dict(state_bytes=20201472+1600,kv_bytes=6528,local_rates=((0,100),),import_fixed=1.5)
+        before=copy.deepcopy(policy);bf16=growing.bf16_policy(layout,policy)
+        self.assertEqual(policy,before)
+        self.assertEqual(bf16,dict(before,state_bytes=10100736+1600))
+        self.assertEqual(growing.arm_names(set(),True),['hybrid','local','hybrid-bf16'])
+        self.assertEqual(growing.arm_names(set()),['hybrid','local'])
+        self.assertEqual(growing.arm_names({10}),['hybrid','local','local_partition'])
+        with self.assertRaisesRegex(Refusal,'common-journal rehearsal'):growing.arm_names({10},True)
+        with self.assertRaisesRegex(Refusal,'requires Qwen35'):growing.bf16_policy(dict(layout,architecture='muse-glimmer'),policy)
+        module=self.packet_module('mac_timing')
+        command=module.command(Path('state'),Path('out'),Path('policy'),Path('fixture'),100000,'5G',Path('bf16'))
+        self.assertIn('--include-bf16',command)
+        self.assertEqual(command[command.index('--bf16-policy')+1],'bf16')
+
+    # The paired calibration fits both dtypes under one shared cap; fixed metadata stays full width.
+    def test_bf16_calibration_shared_budget(self):
+        from traffic import TrafficBudget
+        module=self.packet_module('calibrate_import')
+        self.assertEqual(module.PAIRED_SIZES,[512,1024,2048,512,1024,2048])
+        module.validate_plan('qwen35',2_000_000_000,module.PAIRED_SIZES)
+        budget=TrafficBudget(2_000_000_000,dict(kv_bytes=34816,state_bytes=156894784,recurrent_tensor_bytes=156893184))
+        for dtype in ('f32','bf16'):
+            for n in module.PAIRED_SIZES:
+                data=dict(tokens=[100]*n,return_delta=True,state_dtype=dtype)
+                with budget.reserve('/extend',data,11*n,'POST') as receipt:
+                    receipt['actual']=34848*n+156894784-(78446592 if dtype=='bf16' else 0)+4096
+        self.assertLess(budget.status()['charged_bytes'],2_000_000_000)
+        self.assertEqual(budget.status()['requests'],12)
+        self.assertEqual(budget.status()['outstanding_bytes'],0)
+
+    # The rehearsal transforms actual captured delta steps only, leaves f32 inputs untouched and requires imports.
+    def test_bf16_common_journal_treatment(self):
+        module=self.packet_module('replay_bf16')
+        source=dict(acceptance_rule='session_append_replay_exact',probes=[dict(name='CHAIN',steps=[dict(delta='x',sha256='0'*64),dict(decode=[dict(n0=1,n1=2)])])])
+        before=copy.deepcopy(source);converted=module.treatment(source)
+        self.assertEqual(source,before)
+        self.assertTrue(converted['bf16_replay'])
+        self.assertEqual(converted['probes'][-1]['name'],'BF16_CHAIN')
+        self.assertEqual(converted['probes'][-1]['steps'][0]['reencode_state_dtype'],'bf16')
+        with self.assertRaisesRegex(Refusal,'source must be f32'):module.treatment(dict(source,state_dtype='bf16'))
+        with self.assertRaisesRegex(Refusal,'recorded imports'):module.treatment(dict(source,probes=[dict(name='CHAIN',steps=[])]))
+
+    # Base-only rounding cannot qualify repeated imports; other arms, local turns and later turns do not count.
+    def test_bf16_rehearsal_base_only_chain_refuses(self):
+        module = self.packet_module('replay_bf16')
+        calls = [dict(arm='hybrid',stage='start',path='offload',turn=0),
+                 dict(arm='hybrid',stage='turn',path='local',turn=1),
+                 dict(arm='local',stage='turn',path='offload',turn=7),
+                 dict(arm='hybrid',stage='turn',path='offload',turn=31)]
+        with self.assertRaisesRegex(Refusal, 'turn imports beyond the base'):
+            module.replay_coverage(dict(calls=calls), [10,20,30])
+        calls.append(dict(arm='hybrid',stage='turn',path='offload',turn=7))
+        self.assertEqual(module.replay_coverage(dict(calls=calls), [10,20,30,40]),
+                         dict(turn_imports=[7,31],final_imports_at_checkpoints={'10':2,'20':2,'30':2,'40':3}))
+
+    # The same source/binary binding accepts an unchanged fit and rejects changed bytes or missing binaries.
+    def test_fit_reuse_requires_source_and_binary_identity(self):
+        module = self.packet_module('mac_timing')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root/'bin').mkdir(); binary=root/'bin/llama-server'; binary.write_bytes(b'old')
+            client = dict(build_dir=str(root), binaries={'llama-server': 'unused'}, model_sha256='a'*64, build_record={'fixture': True})
+            fit = module.import_identity(client)
+            module.require_fit_identity(fit, client)
+            bad = copy.deepcopy(fit); bad['import_path_sha256']['src/llama-io.cpp']='0'*64
+            with self.assertRaisesRegex(Refusal, 'source/binary identity mismatch'):
+                module.require_fit_identity(bad, client)
+            binary.write_bytes(b'changed')
+            with self.assertRaisesRegex(Refusal, 'source/binary identity mismatch'):
+                module.require_fit_identity(fit, client)
+            binary.unlink()
+            with self.assertRaisesRegex(Refusal, 'missing import binary'):
+                module.require_fit_identity(fit, client)
+
+    # Metered traffic is reserved before open; rejected or interrupted exchanges cannot dispatch/reclaim credit.
+    def test_calibration_budget_refuses_before_dispatch(self):
+        from traffic import TrafficBudget, TrafficBudgetExceeded
+        data = dict(n0=0, tokens=[1,2], return_delta=True)
+        out = len(json.dumps(data).encode())
+        limit = TrafficBudget.cleanup_headroom + 8*1024**2 + TrafficBudget.allowance + out
+        budget = TrafficBudget(limit, dict(kv_bytes=16, state_bytes=100))
+        node = growing.Node('http://unused', budget=budget)
+        response = mock.MagicMock(); response.__enter__.return_value=response; response.read.return_value=b'{}'; response.headers={}
+        with mock.patch.object(node, 'open', return_value=response) as opened:
+            self.assertEqual(node.request('POST','/extend',data,binary=True), b'{}')
+            with self.assertRaisesRegex(TrafficBudgetExceeded, 'before dispatch'):
+                node.request('POST','/extend',data,binary=True)
+            opened.assert_called_once()
+        with mock.patch.object(node,'open') as opened:
+            with self.assertRaisesRegex(TrafficBudgetExceeded,'snapshot download forbidden before dispatch'):
+                node.download('/snapshot',Path('unused.bin'),10**9)
+            opened.assert_not_called()
+        state=budget.status()
+        self.assertLessEqual(state['charged_bytes'],limit)
+        self.assertEqual(state['outstanding_bytes'],0)
+        interrupted=TrafficBudget(limit,dict(kv_bytes=16,state_bytes=100))
+        with self.assertRaises(OSError), interrupted.reserve('/extend',data,out,'POST'):
+            raise OSError('transport interrupted')
+        with self.assertRaisesRegex(TrafficBudgetExceeded, 'before dispatch'):
+            with interrupted.reserve('/extend',data,out,'POST'): pass
+        self.assertEqual(interrupted.status()['charged_bytes'],limit-TrafficBudget.cleanup_headroom)
+
+    # The caps apply independently of requested repetition/size flags; local warmup does not waive either cap.
+    def test_calibration_plan_caps(self):
+        module = self.packet_module('calibrate_import')
+        self.assertEqual(module.validate_plan('qwen35',2_000_000_000,module.SIZES),2_000_000_000)
+        self.assertEqual(module.validate_plan('muse-glimmer',3_000_000_000,module.SIZES),3_000_000_000)
+        for architecture,budget,sizes in [('qwen35',2_000_000_001,module.SIZES),('muse-glimmer',3_000_000_001,module.SIZES),
+                                         ('qwen35',0,module.SIZES),('qwen35',2_000_000_000,module.SIZES*2)]:
+            with self.assertRaises(Refusal): module.validate_plan(architecture,budget,sizes)
+
+    # An injected 100ns hash delay moves that leaf and TTFT once, while transfer and the explicit residual stay fixed.
+    def test_nested_leaf_delay_reconciles_once(self):
+        import timing
+        def run(delay):
+            timing.start(); clock=[0]
+            with mock.patch.object(timing.time,'monotonic_ns',side_effect=lambda:clock[0]):
+                with timing.span('bench.call',call_id='control'):
+                    with timing.span('request'):
+                        with timing.span('checksum.sha256'): clock[0]+=delay
+                        with timing.span('transfer'): clock[0]+=20
+                    clock[0]+=5
+            rows=timing.rows(); result=timing.account(rows,0,clock[0],'control'); timing.stop()
+            return rows,result
+        original,base=run(1); rows,delayed=run(101)
+        self.assertEqual(delayed['ttft_ns']-base['ttft_ns'],100)
+        self.assertEqual(delayed['leaf_union_ns']-base['leaf_union_ns'],100)
+        self.assertEqual(delayed['residual_ns'],5)
+        self.assertEqual(next(r['duration_ns'] for r in rows if r['name']=='transfer'),20)
+        self.assertEqual(len(delayed['leaf_ids']),2)
+        bad=copy.deepcopy(rows); child=next(r for r in bad if r['name']=='transfer'); child['end_ns']+=1000; child['duration_ns']+=1000
+        with self.assertRaisesRegex(ValueError,'outside parent'): timing.account(bad,0,126,'control')
+        with self.assertRaisesRegex(ValueError,'duplicate'): timing.account(rows+[rows[0]],0,126,'control')
+        remote=copy.deepcopy(rows[0]); remote['clock_domain']='remote'; remote['id']='remote'
+        self.assertEqual(timing.account(rows+[remote],0,126,'control')['leaf_union_ns'],delayed['leaf_union_ns'])
+
+    # A bounded span collector reports loss instead of claiming a complete trace.
+    def test_span_overflow_is_not_success(self):
+        import timing
+        timing.start(1)
+        with timing.span('first'): pass
+        with timing.span('second'): pass
+        with self.assertRaisesRegex(ValueError,'overflow'): timing.rows()
+        timing.stop()
+
+    # Offline extracts retain held-token/reconciliation fields and reject loss, bad nesting or changed accounting.
+    def test_timing_extract_preserves_fields_and_refuses_incomplete(self):
+        import timing
+        module=self.packet_module('extract_timing')
+        bounds=dict(stream_start_ns=10,first_nonempty_delta_ns=30)
+        account=timing.account([],10,30,'call','domain')
+        call=dict(arm='hybrid',turn=1,stage='turn',ttft_seconds=20e-9,local_tail_seconds=.4,
+                  reconciliation_seconds=.7,import_seconds=3,import_stage_seconds=1,
+                  import_final_save_apply_seconds=2,timing_accounting=account,
+                  meter=dict(local_prompt_ms=17,timing_boundaries=bounds,timing_call_id='call',timing_clock_domain='domain'))
+        trace=dict(instrumentation=dict(spans=[]),calls=[call])
+        result=module.extract(trace,[])['calls'][0]
+        self.assertEqual(result['local_tail_seconds'],.4)
+        self.assertEqual(result['reconciliation_seconds'],.7)
+        self.assertEqual(result['meter']['local_prompt_ms'],17)
+        self.assertEqual(result['import_stage_seconds']+result['import_final_save_apply_seconds'],result['import_seconds'])
+        changed=copy.deepcopy(trace);changed['calls'][0]['timing_accounting']['residual_ns']+=1
+        with self.assertRaisesRegex(ValueError,'accounting mismatch'):module.extract(changed,[])
+        row=dict(kind='span',clock_domain='native',id='1',parent_domain='native',parent_id='',
+                 start_ns=1,end_ns=3,duration_ns=2,bytes=10,tokens=1)
+        module.validate_native([row])
+        bad=dict(row,parent_id='missing')
+        with self.assertRaisesRegex(ValueError,'missing parent'):module.validate_native([bad])
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'native.jsonl'
+            marker=dict(kind='trace_checkpoint',dropped=0,writer_ok=True,records=1)
+            path.write_text(json.dumps(row)+'\n'+json.dumps(marker)+'\n')
+            self.assertEqual(module.native_rows(path),[row])
+            for records in ([row],[row,dict(marker,dropped=1)],[row,dict(marker,records=2)]):
+                path.write_text('\n'.join(map(json.dumps,records)))
+                with self.assertRaises(ValueError):module.native_rows(path)
+            path.write_text(json.dumps(row)+'\n{')
+            with self.assertRaises(ValueError):module.native_rows(path)
+
+    # Seven requested links, fixed base staging and bf16's tensor-byte reduction are independent table invariants.
+    def test_link_table_and_wire_only_projection(self):
+        module=self.packet_module('estimate')
+        profiles=module.table()
+        self.assertEqual(len(profiles),5)
+        for profile in profiles:
+            self.assertEqual([r['link_MB_s'] for r in profile['rows']],[2,3,5,10,20,30,50])
+            for row in profile['rows']:
+                self.assertTrue(row['base_offloads'])
+                self.assertAlmostEqual(row['hybrid_total_ttft_s'],row['hybrid_base_ttft_s']+row['hybrid_turn_ttft_s'])
+                self.assertLessEqual(len(row['policy_offloads']),37)
+        f32=module.estimate('qwen',2e6); bf16=module.estimate('qwen',2e6,recurrent_dtype='bf16')
+        self.assertEqual(f32['down_body_estimate_bytes']-bf16['down_body_estimate_bytes'],78_446_592)
+        self.assertTrue(bf16['wire_projection_only'])
+        minimum=module.threshold('qwen')*1e6
+        self.assertFalse(module.estimate('qwen',minimum*.999999)['policy_offloads'])
+        self.assertTrue(module.estimate('qwen',minimum*1.000001)['policy_offloads'])
+
+    # Ten attention chunks at 100k carry one fixed recurrent state, not ten copies; headers remain an allowance.
+    def test_packet_traffic_counts_final_state_once(self):
+        path = Path(growing.__file__).parent / 'packets/r46/estimate.py'
+        spec = importlib.util.spec_from_file_location('r46_estimate', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.delta_wire_estimate(100000, dict(kv_bytes=34816, state_bytes=157000000)), 3641840960)
+        run = module.estimate('qwen', 5.19e6)
+        self.assertEqual(run['policy_offloads'], [])
+        self.assertLess(run['down_body_estimate_bytes'], 3.65e9)
+
+    # A measured positive control is accepted; placeholders, wrong models, background and incomplete rates refuse.
+    def test_pri31_fixture_admission(self):
+        fixture = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-qwen-pri31.json').read_text())
+        rates = validate_fixture(fixture, fixture['model_sha256'], 'qwen35')
+        self.assertIn([100000, 65.3], rates)
+        self.assertEqual(len(rates), 7)
+        for fields in (dict(status='placeholder'), dict(priority=4), dict(override_used=True),
+                       dict(normal_priority=False), dict(depths=[])):
+            with self.subTest(fields=fields), self.assertRaises(Refusal):
+                validate_fixture(dict(fixture, **fields), fixture['model_sha256'], 'qwen35')
+        with self.assertRaisesRegex(Refusal, 'model mismatch'):
+            validate_fixture(fixture, '0' * 64, 'qwen35')
+        bad = copy.deepcopy(fixture)
+        del bad['depths'][0]['delta_prefill_tok_s']['2000']
+        with self.assertRaisesRegex(Refusal, 'incomplete'):
+            validate_fixture(bad, fixture['model_sha256'], 'qwen35')
+
+    # Archive pinning happens before tar parsing; a wrong file cannot be relabeled as a new rate source.
+    def test_fixture_archive_checksum_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wrong.tar.gz'
+            path.write_bytes(b'not a tar archive')
+            with self.assertRaisesRegex(Refusal, 'archive checksum mismatch'):
+                from_archive(path, '0' * 64)
+
+    # The Mac payload fixes two arms through none, preserves seed/outage, and requires a physical link label.
+    def test_mac_packet_command_and_placeholder_refusal(self):
+        path = Path(growing.__file__).parent / 'packets/r46/mac_timing.py'
+        spec = importlib.util.spec_from_file_location('mac_timing', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        command = module.command(Path('state'), Path('run'), Path('policy'), Path('fixture'), 76000, '5G')
+        for flag, value in (('--checkpoint-turns', 'none'), ('--depth', '76000'), ('--seed', '1'), ('--turns', '40'),
+                            ('--disconnect-turn', '2'), ('--disconnect-turns', '3'), ('--rate-fixture', 'fixture')):
+            self.assertEqual(command[command.index(flag) + 1], value)
+        placeholder = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-glimmer-pri31.pending.json').read_text())
+        client = dict(model_sha256='0' * 64, model_layout=dict(architecture='muse-glimmer'))
+        with self.assertRaisesRegex(Refusal, 'measured PRI-31 fixture required'):
+            module.admission(client, {}, {}, placeholder, {}, 'unused')
+        fixture = json.loads((Path(growing.__file__).parent / 'fixtures/m3-max-qwen-pri31.json').read_text())
+        client = dict(model_sha256=fixture['model_sha256'], model_layout=dict(architecture='qwen35'), backend='metal', context=196608)
+        node = dict(backend='cuda', context=196608)
+        fit = dict(model_sha256=fixture['model_sha256'], source_head='head')
+        with mock.patch.object(module, 'require_fit_identity') as proof:
+            self.assertEqual(module.admission(client, node, {}, fixture, fit, 'head')[1], 100000)
+            proof.assert_called_once_with(fit, client)
+        for bad_client, bad_node, bad_fit in ((dict(client, context=262144), node, fit),
+                                             (client, dict(node, backend='cpu'), fit),
+                                             (client, node, dict(fit, source_head='stale'))):
+            with mock.patch.object(module, 'require_fit_identity'), self.assertRaises(Refusal):
+                module.admission(bad_client, bad_node, {}, fixture, bad_fit, 'head')
+
+    # Timing mode refuses capture options before reading metadata or creating artifacts.
+    def test_timing_mode_refuses_capture_options(self):
+        self.assertEqual(growing.checkpoint_turns('none', 40), set())
+        for option in ('--state-probes', '--keep-checkpoint-states'):
+            args = growing.parser().parse_args(['--client-state', 'absent', '--output', 'absent',
+                '--link-label', 'CPU', '--checkpoint-turns', 'none', option])
+            with mock.patch.object(growing, 'read_private') as read:
+                with self.assertRaisesRegex(Refusal, 'timing-only mode forbids'):
+                    growing.run(args)
+                read.assert_not_called()
+
+    # Timing observes an all-local production policy; the identical plan remains invalid for fidelity qualification.
+    def test_timing_all_local_preserves_fidelity_route_gate(self):
+        plan = growing.depth_plan(100000, 40, 1, 10875, 4506, 340, 14)
+        policy = Policy(local_rates=((0, 2000),), fixed=100)
+        result = growing.route_preflight(policy, plan, 2, 3, require_mix=False)
+        self.assertEqual(result['counts'], dict(policy_local=37, policy_offload=0))
+        with self.assertRaisesRegex(Refusal, 'degenerate connected policy mix'):
+            growing.route_preflight(policy, plan, 2, 3)
+
+    # The real request wrapper returns the import envelope without invoking snapshot download when capture is disabled.
+    def test_timing_node_request_has_no_snapshot(self):
+        events = growing.Events(None)
+        node = growing.MeasuredNode('http://unused', 'private-fixture', 1, events=events, session='h', source='critical')
+        node.last_bytes = 7
+        with mock.patch.object(growing.Node, 'request', return_value=b'envelope'), mock.patch.object(node, 'download') as download:
+            result = node.request('POST', '/v1/sessions/h/extend', dict(n0=0, tokens=[1], return_delta=True, prefix_hash_n0='0' * 64))
+        self.assertEqual(result, b'envelope')
+        download.assert_not_called()
+        self.assertFalse(any('node_snapshot' in r or 'node_delta' in r for r in events.copy()))
+
+    # Seed 1 fits Glimmer at 76k with framing up to 32 and a 2048-token margin; 80k must refuse.
+    def test_glimmer_native_depth_margin(self):
+        plan = growing.depth_plan(76000, 40, 1, 10875, 4506, 340, 32, 131072)
+        self.assertEqual(len(plan['sequence']), 40)
+        self.assertLessEqual(plan['final_depth'] + 2048, 131072)
+        with self.assertRaisesRegex(Refusal, 'no turns truncated'):
+            growing.depth_plan(80000, 40, 1, 10875, 4506, 340, 16, 131072)
+
+    # SWA keeps ten controls; changed window bytes and 62/64 cannot pass a forged summary.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_window_gate_replaces_recurrent_without_weakening(self, raw):
+        row = self.append_gate_row()
+        row['state_component'] = 'window'
+        row['probes']['CHAIN_WINDOW'] = row['probes'].pop('CHAIN_RECURRENT')
+        row['gate_controls']['CHAIN_WINDOW-H'] = row['gate_controls'].pop('CHAIN_RECURRENT-H')
+        for name in ('CHAIN_ATTENTION', 'CHAIN_WINDOW'):
+            state = row['probes'][name]['roundtrips'][0]
+            state['window_equal'] = state.pop('recurrent_equal')
+        growing.validate_checkpoint(row, False, 1000)
+        self.assertEqual(len(growing.append_replay_controls(row)), 10)
+        for name in ('CHAIN_ATTENTION', 'CHAIN_WINDOW'):
+            bad = copy.deepcopy(row)
+            bad['probes'][name]['roundtrips'][0]['window_equal'] = False
+            with self.assertRaisesRegex(Refusal, 'contradicts controls'):
+                growing.validate_checkpoint(bad, False, 1000)
+        bad = dict(row, exact=False, top1_agreed=62)
+        with self.assertRaisesRegex(Refusal, 'verdict'):
+            growing.validate_checkpoint(bad, False, 1000)
+
+    # Invalid selections fail before private metadata reads, process launch or output writes.
+    def test_checkpoint_turns_invalid_is_atomic(self):
+        for value in ('', '0', '-1', '41', '20,20', '40,20', '20,', 'x', '1.5', ' 20', '２０'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'absent'
+                args = growing.parser().parse_args(['--client-state', 'absent', '--output', str(output),
+                    '--link-label', 'CPU', '--checkpoint-turns', value])
+                with mock.patch.object(growing, 'read_private') as read, mock.patch.object(growing, 'start_process') as start:
+                    with self.assertRaisesRegex(Refusal, 'invalid checkpoint turns'):
+                        growing.run(args)
+                    read.assert_not_called()
+                    start.assert_not_called()
+                self.assertFalse(output.exists())
+        self.assertEqual(growing.checkpoint_turns('20,40', 40), {20, 40})
+        self.assertEqual(growing.checkpoint_turns('7', 40), {7})
+
+    # The default orchestration emits identical plan bytes to r43 for all permitted run lengths.
+    # Live trace timestamps, UUIDs and the driver source hash are intentionally outside this control.
+    def test_checkpoint_turns_default_run_byte_identical(self):
+        args = growing.parser().parse_args(['--client-state', 'unused', '--output', 'unused', '--link-label', 'CPU'])
+        self.assertIsNone(args.checkpoint_turns)
+        for turns in range(1, 1001):
+            legacy = set(range(10, turns + 1, 10)) | {turns}
+            current = growing.checkpoint_turns(args.checkpoint_turns, turns)
+            def run_plan(selected):
+                return json.dumps([(arm, turn, turn in selected) for arm in ('hybrid', 'local', 'local_partition')
+                    for turn in range(1, turns + 1)], separators=(',', ':')).encode()
+            self.assertEqual(run_plan(current), run_plan(legacy))
+
     # Probe plans preserve local prefix KV through append imports; missing or overlapping node evidence refuses.
     def test_state_probe_plans_require_live_boundaries(self):
         source = dict(tokens=list(range(12)), replay={name: [dict(n0=0, n1=12, logits=True)] for name in ('A', 'B')})
@@ -27,6 +490,10 @@ class ScenarioTests(unittest.TestCase):
         trace = dict(calls=[dict(arm='hybrid', turn=1, session_id='h', meter=dict(chunks=[dict(status='imported', n1=9)]))],
                      events=[event(0, 4), event(4, 7, True), event(7, 9)])
         plans = {r['name']: r['steps'] for r in growing.state_probe_plans(source, trace, 1)}
+        window = {r['name']: r['steps'] for r in growing.state_probe_plans(dict(source, state_component='window'), trace, 1)}
+        self.assertIn('CHAIN_WINDOW', window)
+        self.assertNotIn('CHAIN_RECURRENT', window)
+        self.assertEqual(window['CHAIN_WINDOW'][-2]['replace'], 'window')
         self.assertEqual(plans['NODE'][0], dict(snapshot='snapshot', sha256='s'))
         self.assertEqual([next(iter(s)) for s in plans['CHAIN']], ['delta', 'decode', 'delta', 'decode'])
         self.assertEqual(plans['CHAIN'][1]['decode'], [dict(n0=4, n1=7, logits=True)])
@@ -251,6 +718,19 @@ class ScenarioTests(unittest.TestCase):
         hybrid = growing.turn_record('hybrid', dict(turn=1), meter, .1, .2, 'hash', events, 'hybrid')
         self.assertEqual((local['catchup_tokens'], local['catchup_seconds'], local['catchup_upload_bytes']), (0, 0, 0))
         self.assertEqual((hybrid['catchup_tokens'], hybrid['catchup_seconds'], hybrid['catchup_upload_bytes']), (5, 2, 20))
+
+    # A lossy-origin snapshot cannot pass the exact gate, even when its measured distributions agree.
+    @mock.patch.object(growing, 'validate_raw_positions')
+    def test_bf16_import_never_exact(self, raw):
+        row = dict(depth=1000, k=64, exact=True, top1_agreed=64, mean_kl_nats=0,
+                   max_abs_logit_diff=0, free_running_first_divergence=-1, status='passed', exit_code=0)
+        growing.validate_checkpoint(row, False, 1000)
+        for status, code, exact in (('passed', 0, True), ('passed', 0, False), ('lossy', 5, True)):
+            with self.assertRaises(Refusal):
+                growing.validate_checkpoint(dict(row, state_dtype='bf16', lossy_import=True,
+                                                 status=status, exit_code=code, exact=exact), False, 1000)
+        growing.validate_checkpoint(dict(row, state_dtype='bf16', lossy_import=True,
+                                         status='lossy', exit_code=5, exact=False), False, 1000)
 
     # Tiny KL and unchanged top-1 cannot satisfy exactness; malformed or weakened checker verdicts refuse.
     @mock.patch.object(growing, "validate_raw_positions")
@@ -494,6 +974,167 @@ class ProtocolTests(unittest.TestCase):
             f.prefill.app.db.execute('DELETE FROM sessions')
         _, meter = self.call(durable['tokens'] + [34, 35], sid)
         self.assertEqual(meter['path'], 'offload')
+
+
+
+
+class RecheckTests(unittest.TestCase):
+    # Common recheck reconstructs one live hybrid snapshot and its journal; divergent free histories are never substituted.
+    def test_common_journal_recheck_uses_hybrid_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            path = run / 'trace.json'
+            trace = json.loads(path.read_text())
+            trace['pairing'] = dict(mode=growing.COMMON_JOURNAL,reference_batches=dict(
+                L=dict(batch=256,ubatch=256),P=dict(batch=64,ubatch=32)))
+            trace['calls'] = [r for r in trace['calls'] if r['arm']=='hybrid']
+            source = json.loads((run/'check-1/input.json').read_text())
+            saved = [dict(tokens=source['tokens'],path=source['snapshots'][0],sha256=source['snapshot_sha256'][0])]
+            expected = growing.checkpoint_source(trace['client'],saved,trace,1)
+            (run/'check-1/input.json').write_text(json.dumps(expected,indent=2)+'\n')
+            path.write_text(json.dumps(trace,indent=2)+'\n')
+            _, bound, _, verified = growing.verify_recheck(path,1)
+            self.assertEqual(bound['tokens'],list(range(12)))
+            self.assertEqual(bound['pairing']['journal_hash'],prefix_hash(list(range(12))))
+            self.assertEqual(len(bound['snapshots']),1)
+            self.assertIn(str(run/'slots/hybrid-checkpoint-1.bin'), verified)
+    @staticmethod
+    def fixture(root):
+        run = root / 'run'
+        (run / 'slots').mkdir(parents=True)
+        (run / 'check-1').mkdir()
+        tokens = list(range(12))
+        saved = []
+        for arm in ('hybrid', 'local', 'local_partition'):
+            path = run / 'slots' / (arm + '-checkpoint-1.bin')
+            path.write_bytes(arm.encode())
+            saved.append(dict(path=str(path), sha256=growing.sha256(path), tokens=tokens))
+        node, delta = run / 'node.snapshot', run / 'node.delta'
+        node.write_bytes(b'node snapshot')
+        delta.write_bytes(b'node delta')
+        calls = [dict(arm='hybrid', turn=0, depth_before=0, depth_after=8, session_id='h',
+                      meter=dict(prompt_depth=4, chunks=[dict(n0=0, n1=3, status='imported')])),
+                 dict(arm='hybrid', turn=1, depth_before=8, depth_after=12, session_id='h',
+                      meter=dict(prompt_depth=10, chunks=[dict(n0=8, n1=9, status='imported')]), journal_hash=prefix_hash(tokens))]
+        calls += [dict(calls[-1], arm=arm) for arm in ('local', 'local_partition')]
+        events = [dict(session='h', status='ok', n0=a, n1=b, catchup=catchup,
+                       node_snapshot=dict(path=str(node), sha256=growing.sha256(node)),
+                       node_delta=dict(path=str(delta), sha256=growing.sha256(delta)))
+                  for a, b, catchup in ((0, 3, False), (3, 8, True), (8, 9, False))]
+        trace = dict(schema='hybrid-growing-session-v3', status='aborted', turns=1, calls=calls, events=events,
+                     client=dict(context=4096, model_sha256='model', backend='cpu'), node=dict(backend='cpu'),
+                     heterogeneous=False, engine=dict(checker=dict(batch=256, ubatch=256, threads=2, threads_batch=2)))
+        growing.private_json(run / 'trace.json', trace)
+        growing.private_json(run / 'check-1/input.json', growing.checkpoint_source(trace['client'], saved, trace, 1))
+        return run
+
+    # Reconstruction binds fixture bytes, journal, replay and every referenced state hash before any checker/output side effect.
+    def test_recheck_preserved_input_positive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            before = {p: p.read_bytes() for p in run.rglob('*') if p.is_file()}
+            trace, source, fixture, verified = growing.verify_recheck(run / 'trace.json', 1)
+            self.assertEqual(source['tokens'], list(range(12)))
+            self.assertEqual(len(verified), 5)
+            self.assertEqual(before, {p: p.read_bytes() for p in run.rglob('*') if p.is_file()})
+
+    # Only files referenced by this checkpoint are inputs; an unused intermediate capture is not required.
+    def test_recheck_unused_intermediate_snapshot_is_not_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            path = run / 'trace.json'
+            trace = json.loads(path.read_text())
+            trace['events'][0]['node_snapshot'] = dict(path=str(run / 'unused-missing.snapshot'), sha256='0' * 64)
+            path.write_text(json.dumps(trace))
+            _, _, _, verified = growing.verify_recheck(path, 1)
+            self.assertNotIn(str(run / 'unused-missing.snapshot'), verified)
+
+    # A running trace is not a stable preserved checkpoint source.
+    def test_recheck_running_trace_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.fixture(Path(directory))
+            path = run / 'trace.json'
+            trace = json.loads(path.read_text())
+            trace['status'] = 'running'
+            path.write_text(json.dumps(trace))
+            with self.assertRaisesRegex(Refusal, 'finished or aborted'):
+                growing.verify_recheck(path, 1)
+
+    # Missing snapshots cannot trigger computation or create an output; the positive fixture above uses the same verifier.
+    def test_recheck_missing_snapshot_refuses(self):
+        self.refusal('node.snapshot', None, 'missing preserved input')
+
+    # A one-byte state change refuses at its original fixture hash, before checker launch and output creation.
+    def test_recheck_modified_state_refuses(self):
+        self.refusal('slots/hybrid-checkpoint-1.bin', b'changed', 'preserved input checksum mismatch')
+
+    # The trace also anchors deltas; changing a delta cannot be hidden by otherwise valid saved states.
+    def test_recheck_modified_delta_refuses(self):
+        self.refusal('node.delta', b'changed', 'preserved input checksum mismatch')
+
+    # Even valid JSON with changed serialization is not the preserved input emitted by the driver.
+    def test_recheck_modified_input_refuses(self):
+        self.refusal('check-1/input.json', b'{}', 'invalid preserved checkpoint input')
+
+    # GPU command construction uses the original driver's 999 layers; this does not execute a GPU backend.
+    def test_recheck_command_preserves_gpu_layers(self):
+        for backend, expected in (('cpu', 0), ('metal', 999), ('cuda', 999)):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = self.fixture(root)
+                trace_path, fixture = run / 'trace.json', run / 'check-1/input.json'
+                trace, source = json.loads(trace_path.read_text()), json.loads(fixture.read_text())
+                model, checker = root / 'model', root / 'checker'
+                model.write_bytes(b'model')
+                checker.write_bytes(b'checker')
+                checker.chmod(0o700)
+                trace['client']['backend'] = source['backend'] = backend
+                trace['heterogeneous'] = source['heterogeneous'] = backend != 'cpu'
+                trace['client']['model_sha256'] = source['model_sha256'] = growing.sha256(model)
+                trace_path.write_text(json.dumps(trace))
+                fixture.write_text(json.dumps(source, indent=2) + '\n')
+                args = SimpleNamespace(trace=str(trace_path), turn=1, checker=str(checker), model=str(model), output=str(root / 'recheck'))
+                process = SimpleNamespace(pid=123, returncode=2, poll=lambda: 2, wait=lambda: 2)
+                with mock.patch.object(growing, 'model_identity', return_value=dict(model_layout=dict(vocab_size=1))), \
+                     mock.patch.object(growing, 'start_process', return_value=process) as start:
+                    with self.assertRaisesRegex(Refusal, 'checker produced no metrics'):
+                        growing.recheck(args)
+                self.assertEqual(start.call_args.args[0][-1], expected)
+                record = json.loads((root / 'recheck/recheck.json').read_text())
+                self.assertEqual((record['gpu_layers'], record['checker_exit_code'], record['status']), (expected, 2, 'refused'))
+
+    # Output under the original run and existing output both refuse before reading inputs or launching the checker.
+    def test_recheck_output_preserves_original_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.fixture(root)
+            existing = root / 'existing'
+            existing.mkdir()
+            for output in (run / 'new', existing):
+                args = SimpleNamespace(trace=str(run / 'trace.json'), turn=1, output=str(output))
+                with mock.patch.object(growing, 'verify_recheck') as verify:
+                    with self.assertRaisesRegex(Refusal, 'new directory outside'):
+                        growing.recheck(args)
+                    verify.assert_not_called()
+
+    def refusal(self, path, content, reason):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.fixture(root)
+            if content is None:
+                (run / path).unlink()
+            else:
+                (run / path).write_bytes(content)
+            before = {p: p.read_bytes() for p in run.rglob('*') if p.is_file()}
+            args = growing.recheck_parser().parse_args(['--trace', str(run / 'trace.json'), '--turn', '1',
+                '--checker', 'unused', '--model', 'unused', '--output', str(root / 'recheck')])
+            with mock.patch.object(growing, 'start_process') as start:
+                with self.assertRaises((Refusal, KeyError)) as caught:
+                    growing.recheck(args)
+                self.assertIn(reason, str(caught.exception))
+                start.assert_not_called()
+            self.assertFalse((root / 'recheck').exists())
+            self.assertEqual(before, {p: p.read_bytes() for p in run.rglob('*') if p.is_file()})
 
 
 if __name__ == '__main__':

@@ -41,6 +41,30 @@ class BenchmarkProxyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'delta body/header bound'):
                     Proxy(config, str(Path(directory) / 'over.sqlite'))
 
+    # An envelope must match the configured dtype before import; each dtype has a matching positive control.
+    def test_state_dtype_mismatch_and_controls(self):
+        import json
+        import struct
+        app = self.fixture.app
+        def envelope(dtype):
+            text = json.dumps(dict(version=2, state_dtype=dtype)).encode()
+            return struct.pack('<I', len(text)) + text + bytes(48)
+        for dtype, other in (('f32', 'bf16'), ('bf16', 'f32')):
+            app.state_dtype = dtype
+            self.assertEqual(app.client_delta(envelope(dtype)), envelope(dtype))
+            with self.assertRaisesRegex(ValueError, 'state dtype mismatch'):
+                app.client_delta(envelope(other))
+
+    # State import origin survives the session database and appears in per-chunk trace records.
+    def test_state_dtype_persisted_and_traced(self):
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        sid, _ = fixture.chat([1, 2, 3])
+        session = fixture.app.store.get(sid)
+        self.assertEqual(session['state_dtype'], 'f32')
+        self.assertEqual(session['state_imports'][-1]['state_dtype'], 'f32')
+        self.assertFalse(session['state_imports'][-1]['lossy'])
+
     # Benchmark headers have no authority unless the operator enables them; invalid modes also refuse.
     def test_switch_requires_opt_in(self):
         fixture = self.fixture
@@ -203,6 +227,70 @@ class BenchmarkProxyTests(unittest.TestCase):
         self.assertEqual(error.exception.status, 409)
         self.assertEqual(fixture.decode.app.imports, imports)
         self.assertEqual(fixture.app.store.get(sid)['tokens'], before['tokens'])
+
+    # Six three-arm rows use tiny real slot files; closed occupants must never be parked by the next arm.
+    def test_ruler_slot_files_bounded_after_committed_rows(self):
+        import uuid
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        fixture.app.slots = 1
+        root = fixture.app.slot_path
+        foreign = root / 'unrelated.bin'
+        foreign.write_bytes(b'keep')
+        for index in range(6):
+            for arm in ('local', 'offload', 'local'):
+                sid = 'ruler-' + uuid.uuid4().hex
+                fixture.client.request('POST', '/v1/chat/completions',
+                    dict(messages=[], _tokens=[index, len(arm), 123]),
+                    {'X-Hybrid-Session': sid, 'X-Hybrid-Bench-Mode': arm})
+                fixture.client.request('DELETE', '/v1/sessions/' + sid)
+            (root / f'row-{index}.json').write_text(json.dumps(dict(index=index, committed=True)))
+            slots = list(root.glob('ruler-*.bin'))
+            self.assertEqual((len(slots), sum(path.stat().st_size for path in slots)), (0, 0),
+                             'committed RULER rows leaked native slot files')
+        self.assertEqual(foreign.read_bytes(), b'keep')
+
+    # Release removes only the named session's parked/export/backup files; a foreign credential cannot remove them.
+    def test_release_removes_owned_slot_files_and_detaches(self):
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        sid, _ = fixture.chat([1, 2, 3])
+        suffixes = ('.bin', '-resync.bin', '-resync.bin.tmp', '-resync-backup.bin',
+                    '-rewrite-backup.bin', '-delta-backup.bin')
+        for suffix in suffixes:
+            (fixture.app.slot_path / (sid + suffix)).write_bytes(b'owned')
+        other, _ = fixture.chat([9, 8, 7])
+        parked = fixture.app.slot_path / (other + '.bin')
+        parked.write_bytes(b'foreign')
+        foreign = Node(fixture.client.url, 'fixture-b')
+        with self.assertRaises(HTTPError) as error:
+            foreign.request('DELETE', '/v1/sessions/' + sid)
+        self.assertEqual(error.exception.status, 404)
+        self.assertTrue(all((fixture.app.slot_path / (sid + suffix)).exists() for suffix in suffixes))
+        fixture.client.request('DELETE', '/v1/sessions/' + sid)
+        self.assertIsNone(fixture.app.store.get(sid)['slot'])
+        self.assertTrue(all(not (fixture.app.slot_path / (sid + suffix)).exists() for suffix in suffixes))
+        self.assertEqual(parked.read_bytes(), b'foreign')
+        fixture.client.request('DELETE', '/v1/sessions/' + sid)
+
+
+    # A filesystem cleanup refusal is visible and retryable; the detached session cannot be parked into new files.
+    def test_release_unlink_failure_refuses_and_retry_cleans(self):
+        fixture = self.fixture
+        fixture.app.benchmark = True
+        sid, _ = fixture.chat([1, 2, 3])
+        slot_file = fixture.app.slot_path / (sid + '.bin')
+        slot_file.write_bytes(b'owned')
+        with mock.patch('pathlib.Path.unlink', side_effect=OSError('fixture unlink refusal')):
+            with self.assertRaises(HTTPError) as raised:
+                fixture.client.request('DELETE', '/v1/sessions/' + sid)
+            self.assertEqual(raised.exception.status, 503)
+            self.assertIn('fixture unlink refusal', json.loads(raised.exception.body)['message'])
+        self.assertIsNone(fixture.app.store.get(sid)['slot'])
+        self.assertTrue(slot_file.exists())
+        fixture.client.request('DELETE', '/v1/sessions/' + sid)
+        self.assertFalse(slot_file.exists())
+
 
 class ChunkAndLifecycleTests(unittest.TestCase):
     setUp = BenchmarkProxyTests.setUp
@@ -506,6 +594,8 @@ class ChunkAndLifecycleTests(unittest.TestCase):
                         self.assertEqual(sleep.call_count, 2 if fault == 'permanent' else 0)
                 self.assertEqual(len(calls), expected_attempts)
                 self.assertEqual(fixture.app.store.get(sid)['benchmark_mode'], 'closed')
+                self.assertIsNone(fixture.app.store.get(sid)['slot'])
+                self.assertEqual(list(fixture.app.slot_path.glob(sid + '*.bin')), [])
                 if fault != 'transient':
                     remote.request('DELETE', '/v1/sessions/' + session['remote_id'])
 

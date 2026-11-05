@@ -114,37 +114,58 @@ def verify_meter(trace, previous, mode):
 
 
 def stream_chat(url, token, body, mode, sid, timeout=300):
+    import timing
+    with timing.span('bench.request_json_encode') as encoded_span:
+        encoded = json.dumps(dict(body, stream=True)).encode()
+        encoded_span['bytes'] = len(encoded)
     headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'X-Hybrid-Bench-Mode': mode}
     if sid:
         headers['X-Hybrid-Session'] = sid
-    request = urllib.request.Request(url + '/v1/chat/completions', json.dumps(dict(body, stream=True)).encode(), headers)
-    started = time.perf_counter()
-    first = None
+    headers.update(timing.headers())
+    request = urllib.request.Request(url + '/v1/chat/completions', encoded, headers)
+    first_ns = None
+    boundaries = {}
     message = dict(role='assistant', content='')
     trace = None
     done = False
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        sid = response.headers['X-Hybrid-Session']
-        for line in response:
-            if not line.startswith(b'data: '):
-                continue
-            if line.strip() == b'data: [DONE]':
-                done = True
-                continue
-            chunk = json.loads(line[6:])
-            if 'hybrid_bench' in chunk:
-                trace = chunk['hybrid_bench']
-            for choice in chunk.get('choices', []):
-                delta = choice.get('delta', {})
-                for key in ('content', 'reasoning_content'):
-                    if delta.get(key):
-                        if first is None:
-                            first = time.perf_counter() - started
-                        message[key] = message.get(key, '') + delta[key]
-                require(not delta.get('tool_calls'), 'unexpected generated tool call in synthetic text fixture')
-    total = time.perf_counter() - started
+    with timing.span('bench.stream') as stream_span:
+        started_ns = time.monotonic_ns()
+        boundaries['stream_start_ns'] = started_ns
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            boundaries['headers_received_ns'] = time.monotonic_ns()
+            sid = response.headers['X-Hybrid-Session']
+            observed_body = False
+            for line in response:
+                if not observed_body:
+                    boundaries['first_response_body_read_ns'] = time.monotonic_ns()
+                    observed_body = True
+                    timing.point('bench.first_response_body_read', bytes=len(line))
+                if not line.startswith(b'data: '):
+                    continue
+                if line.strip() == b'data: [DONE]':
+                    done = True
+                    continue
+                chunk = json.loads(line[6:])
+                if 'hybrid_bench' in chunk:
+                    trace = chunk['hybrid_bench']
+                for choice in chunk.get('choices', []):
+                    delta = choice.get('delta', {})
+                    for key in ('content', 'reasoning_content'):
+                        if delta.get(key):
+                            if first_ns is None:
+                                first_ns = time.monotonic_ns()
+                                boundaries['first_nonempty_delta_ns'] = first_ns
+                                timing.point('bench.first_nonempty_delta')
+                            message[key] = message.get(key, '') + delta[key]
+                    require(not delta.get('tool_calls'), 'unexpected generated tool call in synthetic text fixture')
+        ended_ns = time.monotonic_ns()
+        boundaries['stream_end_ns'] = ended_ns
     require(done and trace is not None, 'stream aborted or missing committed benchmark trace')
-    return sid, message, trace, first, total
+    if timing.enabled():
+        trace['timing_boundaries'] = boundaries
+        trace['timing_call_id'] = stream_span['call_id']
+        trace['timing_clock_domain'] = stream_span['clock_domain']
+    return sid, message, trace, None if first_ns is None else (first_ns-started_ns)/1e9, (ended_ns-started_ns)/1e9
 
 
 def link_probe(config):
@@ -219,7 +240,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
                 prefix = hashlib.sha256(b''.join(struct.pack('<i', t) for t in tokens[:n0])).hexdigest()
                 try:
                     data = http(base, '/v1/sessions/' + remote + '/extend', token,
-                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2,
+                        dict(n0=n0, prefix_hash_n0=prefix, tokens=tokens[n0:n1], return_delta=True, delta_version=2, state_dtype=config.get('state_dtype', 'f32'),
                              transfer_id=transfer_id, transfer_n0=transfer_n0, transfer_n1=endpoint,
                              chunk_index=index, chunk_count=chunk_count),
                         timeout=args.request_timeout or 120, binary=True)
@@ -251,7 +272,7 @@ def equivalence(config, client, tokens, args, scratch, boundaries=None, cross_ba
         stem = scratch / ('check-' + str(len(tokens)))
         token_path, result_path = [Path(str(stem) + suffix) for suffix in ('.json', '.result.json')]
         private_json(token_path, dict(tokens=tokens, model_sha256=config['model_sha256'], k=args.check_tokens,
-                                     deltas=paths, max_ctx=client['context'],
+                                     deltas=paths, max_ctx=client['context'], state_dtype=config.get('state_dtype', 'f32'),
                                      local_tail_start=n0,
                                      noise_chunks=args.noise_chunks, backend=client['backend'], uncalibrated=cross_backend or config.get('hetero_quant', False)))
         binary = Path(client['build_dir']) / 'bin/llama-hybrid-bench-check'
@@ -345,6 +366,8 @@ def validate_checker_result(result):
 
 def classify_equivalence(result, cross_backend, backend='cpu'):
     require(result['backend'] == backend, 'checker backend label/device mismatch')
+    if result.get('state_dtype', 'f32') != 'f32' or result.get('lossy_import'):
+        return ('lossy', 5)
     if cross_backend:
         return ('uncalibrated', 5)
     return ('passed', 0) if result['same_partition_within_floor'] and result['same_partition_agreed'] == result['k'] and (backend != 'cpu' or result['numerical_within_bounds']) else ('failed', 3)
@@ -626,7 +649,7 @@ def main():
         aborted += len(release_errors)
         if not interrupted:
             code = 2
-    rows.append(dict(stage='summary', status='interrupted' if interrupted else 'aborted' if aborted else 'failed' if code == 3 else 'uncalibrated' if code == 5 else 'partial' if code else 'passed',
+    rows.append(dict(stage='summary', status='interrupted' if interrupted else 'aborted' if aborted else 'failed' if code == 3 else 'lossy' if code == 5 and config.get('state_dtype', 'f32') != 'f32' else 'uncalibrated' if code == 5 else 'partial' if code else 'passed',
                      skipped=skipped, aborted=aborted, checks=checks, exit_code=code,
                      release_failed=bool(release_errors),
                      checker_exit_codes=[r['checker_exit_code'] for r in rows if r.get('stage') == 'checker']))

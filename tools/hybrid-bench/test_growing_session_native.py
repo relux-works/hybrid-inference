@@ -252,19 +252,161 @@ def multi_chunk_prestage(build, model, root, config):
     private_json(output / 'cleanup.json', removed)
 
 
+def recheck_controls(build, model, root, run):
+    result_path = run / 'check-10/result.json'
+    original_bytes = result_path.read_bytes()
+    original = json.loads(original_bytes)
+    # Bound scratch use: preserve original raw-file hashes, then remove only this CPU fixture's old logits.
+    raw_hashes = {}
+    for name, entry in original['raw_logits']['files'].items():
+        raw_hashes[name] = sha256(entry['path'])
+        require(raw_hashes[name] == entry['sha256'], 'original raw logit hash mismatch')
+        Path(entry['path']).unlink()
+    before = {str(p): sha256(p) for p in run.rglob('*') if p.is_file()}
+    source = json.loads((run / 'check-10/input.json').read_text())
+    snapshot = Path(source['probes'][0]['steps'][0]['snapshot'])
+    state = Path(source['snapshots'][0])
+    commands = []
+    for name in ('test_recheck_missing_snapshot_refuses', 'test_recheck_modified_state_refuses', 'test_recheck_cpu_result_byte_identical'):
+        output = root / name
+        command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), 'recheck',
+                   '--trace', str(run / 'trace.json'), '--turn', '10', '--checker', str(build / 'bin/llama-hybrid-bench-check'),
+                   '--model', str(model), '--output', str(output)]
+        missing = name == 'test_recheck_missing_snapshot_refuses'
+        changed = name == 'test_recheck_modified_state_refuses'
+        moved = snapshot.with_suffix('.held')
+        byte = None
+        try:
+            if missing:
+                snapshot.rename(moved)
+            if changed:
+                with state.open('r+b') as target:
+                    byte = target.read(1)
+                    target.seek(0)
+                    target.write(bytes([byte[0] ^ 1]))
+            with (root / (name + '.log')).open('wb') as log:
+                process = subprocess.Popen(command, stdout=log, stderr=log)
+                (root / (name + '.pid')).write_text(str(process.pid) + '\n')
+                try:
+                    code = process.wait()
+                finally:
+                    stop_process(process)
+        finally:
+            if missing:
+                moved.rename(snapshot)
+            if byte is not None:
+                with state.open('r+b') as target:
+                    target.write(byte)
+        commands.append(dict(name=name, command=command, pid=process.pid, exit_code=code))
+        private_json(root / (name + '.command.json'), commands[-1])
+        if missing or changed:
+            reason = 'missing preserved input' if missing else 'preserved input checksum mismatch'
+            require(code == 2 and reason in (root / (name + '.log')).read_text() and not output.exists(), name + ': unrelated refusal')
+        else:
+            # Only output paths change; all result bytes after that substitution and every raw logit byte identity must match.
+            expected = original_bytes.replace(str(result_path).encode(), str(output / 'result.json').encode())
+            require(code == original['exit_code'] and (output / 'result.json').read_bytes() == expected,
+                    'CPU recheck result differs beyond output paths')
+            reproduced = json.loads((output / 'result.json').read_text())
+            require({k: sha256(v['path']) for k, v in reproduced['raw_logits']['files'].items()} == raw_hashes,
+                    'CPU recheck raw logits differ')
+            private_json(output / 'comparison.json', dict(result_bytes_equal_after_output_path_substitution=True,
+                original_result_sha256=sha256(result_path), raw_logits_byte_identical=True, raw_sha256=raw_hashes))
+        require(before == {str(p): sha256(p) for p in run.rglob('*') if p.is_file()}, 'recheck changed the original run')
+        print('PASS ' + name + ': exit ' + str(code), flush=True)
+    # The binary fixtures are task-owned; keep hashes/logs after the comparison to restore the host disk margin.
+    removed = []
+    for directory in (run, output):
+        for path in directory.rglob('*'):
+            if path.is_file() and path.suffix in ('.bin', '.node_snapshot', '.node_delta', '.f32'):
+                removed.append(dict(path=str(path), bytes=path.stat().st_size, sha256=sha256(path)))
+                path.unlink()
+    private_json(root / 'recheck-cleanup.json', removed)
+
+
+def timing_local_control(state, root, config):
+    policy = root / 'timing-local-policy.json'
+    private_json(policy, dict(config['policy'], local_rates=[[0, 2000]]))
+    output = root / 'timing-all-local'
+    command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
+        '--output', str(output), '--depth', '128', '--turns', '3', '--disconnect-turn', '2', '--disconnect-turns', '1',
+        '--max-new', '48', '--max-output', '16', '--pause-cap', '0', '--seed', '281', '--checkpoint-turns', 'none',
+        '--policy', str(policy), '--link-label', 'CPU all-local timing control']
+    with (root / 'timing-all-local-01.log').open('wb') as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log)
+        (root / 'timing-all-local.pid').write_text(str(process.pid) + '\n')
+        try:
+            code = process.wait()
+        finally:
+            stop_process(process)
+    private_json(root / 'timing-all-local-command.json', dict(command=command, pid=process.pid, exit_code=code))
+    trace = json.loads((output / 'trace.json').read_text())
+    # A policy-local production run completes both paired arms without weakening the separate fidelity route gate.
+    require(code == 0 and trace['status'] == 'measured' and len([r for r in trace['calls'] if r['stage'] == 'turn']) == 6 and
+            trace['route_counts']['connected_policy_offload'] == 0 and trace['route_counts']['connected_policy_local'] == 2,
+            'all-local timing incorrectly refused or forced offload')
+    require(trace['capture'] == dict(enabled=False, node_snapshots=0, node_deltas=0, checker_runs=0) and
+            not (output / 'node-states').exists(), 'all-local timing captured measurement state')
+    print('PASS all-local timing: measured without forced turn offload', flush=True)
+
+
+def bounded_calibration_controls(build, model, root, state, config, packet):
+    controls=root/'bounded-calibration';controls.mkdir(mode=0o700)
+    calibration_state=controls/'metadata';calibration_state.mkdir(mode=0o700)
+    for name in ('client-info.json','node-info.json'):
+        private_json(calibration_state/name,json.loads((state/name).read_text()))
+    with native_server(build/'bin/llama-server',model,controls/'decoder',checkpoints=0) as (decoder,slots):
+        configured=dict(config,decode_url=decoder.url,slot_path=str(slots),slots=3)
+        private_json(calibration_state/'proxy-config.json',configured)
+        commands=[]
+        for name,budget,expected in [('refused',1,2),('one-pass',2_000_000_000,0)]:
+            output=controls/name
+            command=[sys.executable,str(Path(__file__).parent/'packets/r46/calibrate_import.py'),
+                     '--client-state',str(calibration_state),'--output',str(output),'--r44-packet',str(packet),
+                     '--with-bf16','--budget-bytes',str(budget),'--depth','128','--sizes','32','64','96','128','160','1200']
+            with (controls/(name+'.log')).open('wb') as log:
+                process=subprocess.Popen(command,stdout=log,stderr=log)
+                (controls/(name+'.pid')).write_text(str(process.pid)+'\n');code=process.wait()
+            commands.append(dict(command=command,pid=process.pid,exit_code=code))
+            (controls/'commands.json').write_text(json.dumps(commands,indent=2)+'\n')
+            require(code==expected,name+': unexpected calibration exit')
+            result=json.loads((output/'calibration.json').read_text());traffic=result['traffic']
+            require(traffic['charged_bytes']<=budget and traffic['outstanding_bytes']==0,'calibration exceeded cap')
+            if expected:
+                # A one-byte cap prevents every WAN dispatch and publishes no fit; local warmup may still run.
+                require(result['status']=='refused' and traffic['requests']==0 and traffic['refused_before_dispatch']>0
+                        and not (output/'import-fit.json').exists(),'budget refusal was bypassed')
+            else:
+                # Six real imports span >1000 tokens and bind the resulting fit to current source/binaries.
+                require(result['status']=='passed' and result['repetitions']==1 and len(result['points'])==6
+                        and (output/'import-fit.json').exists() and (output/'bf16-import-fit.json').exists()
+                        and set(result['profiles'])=={'f32','bf16'},'bounded calibration incomplete')
+    print('PASS bounded calibration: zero-dispatch refusal and one six-point real import pass',flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build-dir', required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--artifacts', required=True)
+    p.add_argument('--bf16-replay-only',action='store_true',help='one retained checkpoint and real common-journal bf16 replay')
+    p.add_argument('--recheck-only', action='store_true', help='one preserved checkpoint and offline recheck controls')
+    p.add_argument('--timing-spans', action='store_true')
+    p.add_argument('--include-bf16',action='store_true')
+    p.add_argument('--calibration-only', action='store_true')
+    p.add_argument('--r44-packet', type=Path)
+    p.add_argument('--timing-only', action='store_true', help='real two-arm run, no node captures or checker')
     p.add_argument('--controls-only', action='store_true')
     p.add_argument('--multi-chunk-only', action='store_true')
     p.add_argument('--state-probes', action='store_true')
     p.add_argument('--start', choices=('both', 'cold', 'pre-staged'), default='both')
     args = p.parse_args()
+    if args.bf16_replay_only:
+        args.recheck_only=True
+        args.state_probes=True
     build, root, model = Path(args.build_dir).resolve(), Path(args.artifacts).resolve(), Path(args.model).resolve()
     require(root.is_dir(), 'artifacts directory must exist')
-    if not args.multi_chunk_only:
+    if not args.multi_chunk_only and not args.recheck_only and not args.timing_only and not args.calibration_only:
         checkpoint_controls(build, model, root)
     if args.controls_only:
         return
@@ -286,17 +428,33 @@ def main():
         private_json(state / 'client-info.json', client)
         private_json(state / 'proxy-config.json', config)
         private_json(state / 'node-info.json', dict(model_sha256=digest, backend='cpu', context=4096, bench_link=True, **identity))
-        multi_chunk_prestage(build, model, root, config)
+        if args.calibration_only:
+            require(args.r44_packet is not None, '--r44-packet required for calibration control')
+            bounded_calibration_controls(build,model,root,state,config,args.r44_packet)
+            require(node.request('GET','/v1/sessions')==[],'calibration leaked remote sessions')
+            return
+        if not args.recheck_only and not args.timing_only and not args.calibration_only:
+            multi_chunk_prestage(build, model, root, config)
         if args.multi_chunk_only:
             return
-        preflight_controls(state, root, config)
+        if not args.recheck_only and not args.timing_only and not args.calibration_only:
+            preflight_controls(state, root, config)
         commands = []
-        for start in (('cold', 'pre-staged') if args.start == 'both' else (args.start,)):
+        starts = ('pre-staged',) if args.recheck_only else (('cold', 'pre-staged') if args.start == 'both' else (args.start,))
+        for start in starts:
             output = root / start
             command = [sys.executable, str(Path(__file__).with_name('growing_session.py')), '--client-state', str(state),
                 '--output', str(output), '--depth', '128', '--turns', '12', '--disconnect-turn', '4',
                 '--disconnect-turns', '2', '--max-new', '48', '--max-output', '128', '--pause-cap', '1.1', '--seed', '281',
                 '--start', start, '--link-label', 'CPU loopback; sampled output capped128/input48 seed281; synthetic policy']
+            if args.recheck_only:
+                command += ['--checkpoint-turns', '10', '--keep-checkpoint-states']
+            if args.timing_only:
+                command += ['--checkpoint-turns', 'none']
+            if args.timing_spans:
+                command += ['--timing-spans']
+            if args.include_bf16:
+                command += ['--include-bf16']
             if args.state_probes:
                 command.append('--state-probes')
             with (root / (start + '.log')).open('wb') as log:
@@ -308,6 +466,38 @@ def main():
             require(code in (0, 3), start + ': experiment aborted; inspect the retained trace and log')
             trace = json.loads((output / 'trace.json').read_text())
             calls = [r for r in trace['calls'] if r['stage'] == 'turn']
+            if args.timing_only:
+                # Real imports, outage and both routes run; all measurement captures and the checker stay absent.
+                require(code == 0 and trace['status'] == 'measured' and len(calls) == (36 if args.include_bf16 else 24) and
+                        trace['arms'] == (['hybrid','local','hybrid-bf16'] if args.include_bf16 else ['hybrid','local']) and trace['checkpoints'] == [] and
+                        trace['capture'] == dict(enabled=False, node_snapshots=0, node_deltas=0, checker_runs=0),
+                        'timing mode captured state or ran the checker')
+                require(not (output / 'node-states').exists() and not list(output.glob('check-*')),
+                        'timing mode wrote capture artifacts')
+                require(not any('snapshot' in e.get('path', '') for e in trace['events']),
+                        'timing mode requested a node snapshot')
+                require(trace['route_counts']['connected_policy_local'] and trace['route_counts']['connected_policy_offload'],
+                        'timing mode did not exercise both routes')
+                require(any(r.get('resync') for r in calls), 'timing mode did not recover after outage')
+                require(node.request('GET', '/v1/sessions') == [], 'timing mode leaked remote sessions')
+                if args.include_bf16:
+                    bf16=[r for r in calls if r['arm']=='hybrid-bf16']
+                    require(len(bf16)==12 and any(r['lossy_import'] for r in bf16),'bf16 timing arm missing imports')
+                    require(all(r['state_dtype']=='bf16' and r['transport_profile']['recurrent_transport']=='bf16' for r in bf16),
+                            'bf16 timing arm mislabeled')
+                    require(all(not r['lossy_import'] for r in calls if r['arm'] in ('hybrid','local')),'baseline became lossy')
+                if args.timing_spans:
+                    sys.path.insert(0,str(Path(__file__).parent/'packets/r46'))
+                    from extract_timing import native_rows, extract
+                    files=list(root.glob('native-*.jsonl'))+list(output.glob('native-*.jsonl'))
+                    require(len(files)==2,'expected complete node/client native traces')
+                    # The checkpoint is outside all measured parents; an unfinished flush parent must fail here.
+                    extracted=extract(trace,[row for path in files for row in native_rows(path)])
+                    private_json(output/'timing-extract.json',extracted)
+                    require(all(c['accounting'].get('residual_ns',0)>=0 for c in extracted['calls']),
+                            'negative timing residual')
+                print('PASS timing-only: '+('three' if args.include_bf16 else 'two')+' arms, real imports/outage, zero captures/checker',flush=True)
+                continue
             # Three live sessions preserve their journals through both routes and the actual relay outage.
             require(len(calls) == 36 and trace['status'] in ('passed', 'failed'), 'incomplete three-arm session')
             hybrid = [r for r in calls if r['arm'] == 'hybrid']
@@ -316,9 +506,11 @@ def main():
             require(trace['route_counts']['background_catchup_events'], 'background replay path missing')
             require(all(r['path'] == 'local' for r in hybrid if 4 <= r['turn'] < 6), 'offload during outage')
             require(any(r.get('resync', {}).get('tokens', 0) > 0 for r in hybrid), 'no recovered journal catch-up')
-            require([r['turn'] for r in trace['checkpoints']] == [10, 12], 'checkpoint missing')
+            require([r['turn'] for r in trace['checkpoints']] == ([10] if args.recheck_only else [10, 12]), 'checkpoint missing')
             require(all(r['k'] == 64 for r in trace['checkpoints']), 'wrong checkpoint width')
             require(node.request('GET', '/v1/sessions') == [], 'remote sessions leaked')
+            if args.recheck_only and not args.bf16_replay_only:
+                recheck_controls(build, model, root, output)
             for arm in ('local', 'local_partition'):
                 local = [r for r in calls if r['arm'] == arm]
                 require(all(r['journal_hash'] == l['journal_hash'] for r, l in zip(hybrid, local)), 'paired journals differ')
@@ -327,6 +519,22 @@ def main():
             require(trace['depth_plan']['final_depth'] == trace['final_depth']['hybrid'] and
                     len(trace['workload']) == 12, 'depth plan or sequence changed')
             print('OBSERVED ' + start + ': ' + trace['status'] + '; driver exit ' + str(code), flush=True)
+        if args.bf16_replay_only:
+            command=[sys.executable,str(Path(__file__).parent/'packets/r46/replay_bf16.py'),
+                     '--trace',str(root/'pre-staged/trace.json'),'--checker',str(build/'bin/llama-hybrid-bench-check'),
+                     '--model',str(model),'--output',str(root/'bf16-replay'),'--turns','10']
+            with (root/'bf16-replay.log').open('wb') as log:
+                process=subprocess.Popen(command,stdout=log,stderr=log)
+                (root/'bf16-replay.pid').write_text(str(process.pid)+'\n');code=process.wait()
+            private_json(root/'bf16-replay-exit.json',dict(pid=process.pid,exit_code=code))
+            require(code==5,'bf16 replay must exit lossy/5')
+            summary=json.loads((root/'bf16-replay/summary.json').read_text())
+            require(summary['exact'] is False and summary['quality_gate']==all(
+                c['local_to_bf16']['top1_agreed']>=63 for c in summary['checkpoints']),
+                'bf16 replay gate contradicts measurements')
+            print('PASS bf16 common-journal replay: real repeated imports, f32/local reference logits retained, lossy/5',flush=True)
+        if args.timing_only:
+            timing_local_control(state, root, config)
         require(sha256(model) == digest, 'model file changed')
     require(all(r['exit_code'] == 0 for r in commands), 'append replay/component/token criterion is not qualified')
     print('PASS all native growing-session checks; CPU only, no downloads', flush=True)

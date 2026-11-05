@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--artifacts', required=True, help='new private directory')
     parser.add_argument('--depths', nargs='+', type=int, default=[2048])
     parser.add_argument('--tasks', choices=TASK_TYPES, nargs='+', default=list(TASK_TYPES))
+    parser.add_argument('--ruler-checks', action='store_true', help='RULER generator fixtures with real tokenizer and three-arm smoke')
     args = parser.parse_args()
     root = Path(args.artifacts).resolve()
     root.mkdir(mode=0o700)
@@ -50,14 +51,16 @@ def main():
     private_json(root / 'proxy-config.json', config)
     binaries = {name: sha256(path) for name, path in [('node', args.node_binary), ('decode', args.decode_binary)]}
     info = dict(identity, context=context, batch=256, ubatch=256, threads=2, threads_batch=2, binaries=binaries)
-    private_json(root / 'client-info.json', dict(info, batch=64, ubatch=64, proxy_url=f'http://127.0.0.1:{proxy_port}', model_path=str(model)))
+    client_info = dict(info, batch=64, ubatch=64, proxy_url=f'http://127.0.0.1:{proxy_port}', model_path=str(model))
+    private_json(root / 'client-info.json', client_info)
     private_json(root / 'node-info.json', info)
     partition_root = root / 'partition'
     partition_root.mkdir(mode=0o700)
     (partition_root / 'slots').mkdir(mode=0o700)
     partition_config = dict(config, decode_url=f'http://127.0.0.1:{partition_decode_port}', slot_path=str(partition_root / 'slots'))
     private_json(partition_root / 'proxy-config.json', partition_config)
-    private_json(partition_root / 'client-info.json', dict(info, proxy_url=f'http://127.0.0.1:{partition_proxy_port}', model_path=str(model)))
+    partition_info = dict(info, proxy_url=f'http://127.0.0.1:{partition_proxy_port}', model_path=str(model))
+    private_json(partition_root / 'client-info.json', partition_info)
     node_command = ['nice', '-n', '10', args.node_binary, model, root / 'node-tokens.json', node_port, context,
                     '--max-ctx', context, '--ram-budget-mib', 512, '--max-request-mib', 1]
     decode_command = ['nice', '-n', '10', args.decode_binary, '-m', model, '--host', '127.0.0.1', '--port', decode_port,
@@ -134,6 +137,9 @@ def main():
                     require(result['vs_local']['prompt_identical'], 'paired prompt differs')
                 if mode in ('hybrid', 'offload'):
                     require(result['turns'][0]['remote_applied'] > 0, 'ingest stayed local')
+        if args.ruler_checks:
+            from test_ruler import native_checks
+            native_checks(root, config, client_info, partition_config, partition_info, info)
         health = http(config['prefill_url'], '/v1/health')
         require(health['sessions'] == health['ram_bytes'] == 0, 'remote session leaked')
         private_json(root / 'result.json', dict(status='passed', tasks=len(tasks), health=health,

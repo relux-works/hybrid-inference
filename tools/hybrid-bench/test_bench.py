@@ -24,6 +24,17 @@ from hybrid_bench import classify_equivalence, PROVENANCE, bundle, quantile_samp
 from policy import extend_chunk_limit
 
 
+class Bf16GateTests(unittest.TestCase):
+    # Numerical identity does not override a lossy import origin; f32 keeps its exact positive control.
+    def test_bf16_import_never_passes_exact_gate(self):
+        from hybrid_bench import classify_equivalence
+        row = dict(backend='cpu', same_partition_within_floor=True, same_partition_agreed=64, k=64,
+                   numerical_within_bounds=True)
+        self.assertEqual(classify_equivalence(row, False), ('passed', 0))
+        self.assertEqual(classify_equivalence(dict(row, state_dtype='bf16'), False), ('lossy', 5))
+        self.assertEqual(classify_equivalence(dict(row, lossy_import=True), False), ('lossy', 5))
+
+
 class BenchmarkTests(unittest.TestCase):
     # Client partitions are bounded before preflight or state writes; the native node's fixed partition cannot be mislabeled.
     def test_client_partition_bounds(self):
@@ -510,6 +521,88 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(selected, source / 'build')
             self.assertEqual(compile.call_args.args[:2], (source, source / 'build'))
             self.assertTrue((root / 'build.lock').exists())
+
+    # Real packet argv drives the real stamp/hash code from a node-only record through client build and reuse.
+    # Only git identity and compiler execution are fixtures; this does not qualify native CUDA binaries.
+    def test_rehearsal_client_build_records_missing_targets(self):
+        wrapper = Path(manage.__file__).parent / 'packets/r46/setup-rehearsal-client.sh'
+        targets = ['llama-server', 'llama-hybrid-bench-check', 'llama-hybrid-score']
+        for kind, context in (('qwen', 196608), ('glimmer', 131072)):
+            with self.subTest(model=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'tools/hybrid-bench').mkdir(parents=True)
+                (root / 'tools/hybrid-bench/packets').mkdir()
+                (root / 'tools/hybrid-bench/packets/r46').symlink_to(wrapper.parent, target_is_directory=True)
+                (root / 'node').mkdir()
+                (root / 'client').mkdir()
+                (root / 'commands').mkdir()
+                launcher = root / 'tools/hybrid-bench/setup-client.sh'
+                launcher.write_text("#!/bin/sh\nexec python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' \"$@\"\n")
+                launcher.chmod(0o700)
+                git = root / 'commands/git'
+                git.write_text('#!/bin/sh\nprintf "%s\\n" ' + 'a' * 40 + '\n')
+                git.chmod(0o700)
+                env = dict(os.environ, MODEL='fixture.gguf', MODEL_SHA256='b' * 64, R46_HEAD='a' * 40,
+                           NODE_ROOT=str(root / 'node'), CLIENT_ROOT=str(root / 'client'), BUILD=str(root / 'build'),
+                           BF16_NODE_STATE=str(root / 'node/qwen-bf16-node'))
+                env['PATH'] = str(root / 'commands') + os.pathsep + env['PATH']
+                runbook = wrapper.parent / ('REHEARSAL-QWEN-BF16.md' if kind == 'qwen' else 'REHEARSAL-GLIMMER.md')
+                commands = [line for line in runbook.read_text().splitlines() if line.startswith('bash ') and 'setup-rehearsal-client.sh' in line]
+                self.assertEqual(len(commands), 1)
+                stages = [line for line in runbook.read_text().splitlines() if line.startswith('bash ') and '-node.sh ' in line]
+                self.assertEqual(len(stages), 1)
+                self.assertIn('--build-lock "$NODE_ROOT/build.lock"', stages[0])
+                self.assertIn('--build-dir "$BUILD"', stages[0])
+                command = subprocess.run(['bash', '-c', commands[0]], cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(command.returncode, 0, command.stderr)
+                args = manage.parser().parse_args(['client', *json.loads((root / 'client/setup-01.log').read_text())])
+                self.assertFalse(args.skip_build)
+                self.assertTrue(args.offline and args.cuda)
+                self.assertEqual((args.ctx, args.ref, args.build_lock), (context, 'a' * 40, str(root / 'node/build.lock')))
+                binaries = root / 'build/bin'
+
+                def configure(argv):
+                    binaries.mkdir(parents=True, exist_ok=True)
+
+                def compile_process(argv):
+                    for name in argv[argv.index('--target') + 1:]:
+                        (binaries / name).write_bytes(('built-' + name).encode())
+                    return SimpleNamespace(pid=123, returncode=0, poll=lambda: 0)
+
+                def git_output(argv):
+                    return '' if 'status' in argv else 'a' * 40
+
+                with mock.patch.object(manage, 'output', side_effect=git_output), \
+                     mock.patch.object(manage, 'run', side_effect=configure), \
+                     mock.patch.object(manage.subprocess, 'Popen', side_effect=compile_process):
+                    manage.build(args, ['llama-hybrid-prefill'], dict(os='Linux'))
+                    stamp = root / 'build/hybrid-bench-build.json'
+                    node_stamp = stamp.read_bytes()
+                    args.skip_build = True
+                    with self.assertRaises(FileNotFoundError):
+                        manage.build(args, targets, dict(os='Linux'))
+                    for name in targets:
+                        (binaries / name).write_bytes(b'manual-unrecorded-build')
+                    with self.assertRaisesRegex(common.Refusal, 'binary hash mismatch: llama-server'):
+                        manage.build(args, targets, dict(os='Linux'))
+                    self.assertEqual(stamp.read_bytes(), node_stamp)
+                    args.skip_build = False
+                    _, record = manage.build(args, targets, dict(os='Linux'))
+                    self.assertTrue(set(targets) <= record['binaries'].keys())
+                    args.skip_build = True
+                    self.assertEqual(manage.build(args, targets, dict(os='Linux'))[1], record)
+                    (binaries / 'llama-server').write_bytes(b'changed-after-build')
+                    with self.assertRaisesRegex(common.Refusal, 'binary hash mismatch: llama-server'):
+                        manage.build(args, targets, dict(os='Linux'))
+
+    # Rehearsal client builds preserve the 25 GiB admission floor before configure or compilation.
+    def test_rehearsal_client_build_disk_floor(self):
+        with mock.patch.object(manage.shutil, 'disk_usage', return_value=SimpleNamespace(free=common.FLOOR - 1)), \
+             mock.patch.object(manage, 'run') as configure, mock.patch.object(manage.subprocess, 'Popen') as compile:
+            with self.assertRaisesRegex(common.Refusal, '25 GiB build admission floor'):
+                manage.compile_targets(common.ROOT, Path('unused-build'), 'a' * 40, [], ['llama-server'])
+            configure.assert_not_called()
+            compile.assert_not_called()
 
     # Derived budgets and lower operator caps reach the node; the download endpoint still requires opt-in.
     def test_node_limit_command(self):

@@ -23,12 +23,14 @@ import urllib.request
 import uuid
 
 from bench_common import (Refusal, http, private_json, read_private, require, sha256,
-                          start_process, validate_identity, wait_health)
+                          start_process, validate_identity, wait_health, model_identity)
 from hybrid_bench import PROVENANCE, link_probe, sanitized_info, stream_chat, verify_meter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hybrid-proxy'))
 from proxy import Handler, Node, Proxy
 from policy import Policy
+import timing
+from growing_fixture import validate_fixture
 from store import prefix_hash
 
 QUANTILES = [.10, .25, .50, .75, .90, .99]
@@ -39,6 +41,51 @@ PAUSE = [.2, 3.8, 7.8, 17.9, 34.8, 340]
 SYSTEM = 'Read synthetic tool results. Reply with decimal digits only.'
 NATIVE_CONTEXT = 262144
 DEPTH_MARGIN = 2048
+COMMON_JOURNAL = 'hybrid-common-journal-v1'
+
+
+def pairing_contract(declaration, client, checkpoints, probes, partition_batch=64, partition_ubatch=32):
+    if declaration is None:
+        return dict(mode='independent-equal-journals')
+    layout = client['model_layout']
+    require(declaration.get('schema') == 'hybrid-pairing-contract-v1' and declaration.get('mode') == COMMON_JOURNAL and
+            declaration.get('free_running_batch_invariant') is False, 'invalid declared pairing contract')
+    require(declaration['model_sha256'] == client['model_sha256'] and
+            declaration['architecture'] == layout['architecture'] and
+            declaration['sliding_window'] == layout.get('sliding_window') and layout.get('sliding_window', 0) > 0 and
+            declaration['recurrent_layers'] == 0 and not any(r['recurrent'] for r in layout['layers']),
+            'common-journal declaration requires matching nonrecurrent SWA model; Qwen equality contract unchanged')
+    require(checkpoints and probes, 'common-journal fidelity requires checkpoints and state probes')
+    require(1 <= partition_ubatch <= partition_batch <= 256, 'invalid common-journal partition')
+    return dict(mode=COMMON_JOURNAL, declaration=declaration,
+                reference_batches=dict(L=dict(batch=256, ubatch=256), P=dict(batch=partition_batch, ubatch=partition_ubatch)))
+
+
+def common_journal(trace):
+    return trace.get('pairing', {}).get('mode') == COMMON_JOURNAL
+
+
+def require_paired_journal(row, reference):
+    row['paired_journal_equal'] = row['journal_hash'] == reference['journal_hash']
+    require(row['paired_journal_equal'], 'paired journal hashes differ')
+
+
+def validate_common_pairing(row):
+    pairing = row['pairing']
+    require(pairing['mode'] == COMMON_JOURNAL and len(pairing['journal_hash']) == 64,
+            'invalid common-journal result binding')
+    continuations = row['continuations']
+    teacher = continuations['L']['teacher_tokens']
+    require(len(teacher) == 64 and all(type(t) is int and 0 <= t < row['raw_logits']['vocab'] for t in teacher),
+            'invalid common-journal teacher tokens')
+    for name in ('H', 'L', 'P'):
+        require(continuations[name]['teacher_tokens'] == teacher, 'common-journal teacher-forced inputs differ: ' + name)
+        free = continuations[name]['free_tokens']
+        require(len(free) == 64 and all(type(t) is int and 0 <= t < row['raw_logits']['vocab'] for t in free),
+                'invalid common-journal free tokens')
+    for name, metrics in (('H', row), ('P', row['partition'])):
+        first = next((i for i, (a, b) in enumerate(zip(continuations['L']['free_tokens'], continuations[name]['free_tokens'])) if a != b), -1)
+        require(metrics['free_running_first_divergence'] == first, 'common-journal free divergence contradicts tokens')
 
 
 def sample(points, u):
@@ -168,17 +215,20 @@ class MeasuredNode(Node):
         self.session = session
         self.source = source
 
+    @timing.traced('node.protocol_with_optional_evidence')
     def request(self, method, path, data=None, headers=None, binary=False):
         started = time.monotonic()
-        encoded = json.dumps(data).encode() if isinstance(data, (dict, list)) else data or b''
-        row = dict(kind='protocol', session=self.session, source=self.source, method=method, path=path, upload_body_bytes=len(encoded),
+        timing.annotate(session_id=self.session or '', origin=self.source)
+        row = dict(kind='protocol', session=self.session, source=self.source, method=method, path=path, upload_body_bytes=0,
                    response_body_bytes=0, status='failed')
+        if timing.enabled():
+            row['timing_context'] = {k: timing.context().get(k) for k in ('id', 'parent_id', 'clock_domain', 'call_id', 'origin')}
         if isinstance(data, dict) and path.endswith('/extend'):
             row.update(n0=data['n0'], n1=data['n0'] + len(data['tokens']),
                        catchup=not data.get('return_delta', False), prefix_hash_n0=data['prefix_hash_n0'])
         try:
             result = super().request(method, path, data, headers, binary)
-            row.update(status='ok', response_body_bytes=self.last_bytes)
+            row.update(status='ok', response_body_bytes=self.last_bytes, upload_body_bytes=self.last_upload_bytes)
             if row.get('catchup'):
                 require(self.last_prefill_ms is not None, 'node catch-up evaluation timing missing')
                 row['node_prefill_seconds'] = float(self.last_prefill_ms) / 1000
@@ -196,10 +246,13 @@ class MeasuredNode(Node):
                         header = source.read(12)
                     require(len(header) == 12 and int.from_bytes(header[8:12], 'little') == row['n1'],
                             'node snapshot moved past the captured import boundary')
-                    delta.write_bytes(result)
+                    with timing.span('evidence.delta_write', bytes=len(result)):
+                        delta.write_bytes(result)
                     for key, target in (('node_snapshot', snapshot), ('node_delta', delta)):
-                        target.chmod(0o600)
-                        row[key] = dict(path=str(target), sha256=sha256(target))
+                        with timing.span('evidence.chmod_header_check'):
+                            target.chmod(0o600)
+                        with timing.span('evidence.' + key + '_sha256', bytes=target.stat().st_size):
+                            row[key] = dict(path=str(target), sha256=sha256(target))
                 except BaseException:
                     snapshot.unlink(missing_ok=True)
                     delta.unlink(missing_ok=True)
@@ -213,7 +266,9 @@ class MeasuredNode(Node):
             row['seconds'] = time.monotonic() - started
             self.events.add(**row)
 
+    @timing.traced('evidence.snapshot_download')
     def download(self, path, destination, max_bytes):
+        timing.annotate(session_id=self.session or '', origin=self.source)
         started = time.monotonic()
         row = dict(kind='protocol', session=self.session, source=self.source, method='GET', path=path,
                    upload_body_bytes=0, status='failed')
@@ -252,7 +307,8 @@ class MeasuredProxy(Proxy):
 
     def remote(self, client):
         return MeasuredNode(self.prefill, client['prefill_token'], self.timeout, events=self.events,
-                            session=getattr(self.current, 'session', None), source=getattr(self.current, 'origin', 'background'))
+                            session=getattr(self.current, 'session', None), source=getattr(self.current, 'origin', 'background'),
+                            budget=self.traffic_budget)
 
     def sync(self, session, client, recreate=True):
         self.current.session = session['id']
@@ -321,7 +377,7 @@ def proxy_server(app):
             client = next(c for c in app.clients.values() if c['id'] == session['client'])
             for sid in set(value for value in ids if value):
                 try:
-                    Node(app.cleanup_prefill, client['prefill_token'], app.timeout).request('DELETE', '/v1/sessions/' + sid)
+                    Node(app.cleanup_prefill, client['prefill_token'], app.timeout, budget=app.traffic_budget).request('DELETE', '/v1/sessions/' + sid)
                 except Exception as error:
                     if getattr(error, 'status', None) != 404:
                         remaining.append(sid)
@@ -351,7 +407,7 @@ def base_messages(app, depth):
     return body['messages']
 
 
-def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1):
+def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1, require_mix=True):
     previous = True  # the base is explicitly offloaded
     rows = []
     for step in plan['sequence']:
@@ -362,8 +418,8 @@ def route_preflight(policy, plan, disconnect_turn=0, disconnect_turns=1):
         previous = choice['offload'] and not outage
     counts = dict(policy_local=sum(not r['offload'] and not r['outage'] for r in rows),
                   policy_offload=sum(r['offload'] and not r['outage'] for r in rows))
-    require(all(counts.values()), 'route preflight refuses degenerate connected policy mix before any arm: ' + str(counts))
-    return dict(rows=rows, counts=counts, link_model='constant configured link; live EMA can change routes')
+    require(not require_mix or all(counts.values()), 'route preflight refuses degenerate connected policy mix before any arm: ' + str(counts))
+    return dict(rows=rows, counts=counts, require_mix=require_mix, link_model='constant configured link; live EMA can change routes')
 
 
 def session_catchup(events, sid):
@@ -457,23 +513,39 @@ def replay_schedules(trace, turn, depth):
     return schedules
 
 
-def checkpoint(app, client, root, turn, heterogeneous, trace):
-    saved = [app.saved[(arm, turn)] for arm in ('hybrid', 'local', 'local_partition')]
-    hybrid, local, partition = saved
-    require(hybrid['tokens'] == local['tokens'] == partition['tokens'], 'checkpoint journal mismatch between arms')
+def checkpoint_source(client, saved, trace, turn, probes=True):
+    local = saved[0] if common_journal(trace) else saved[1]
+    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'], acceptance_rule='session_append_replay_exact',
+        model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=trace['heterogeneous'],
+        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
+        replay=replay_schedules(trace, turn, len(local['tokens'])))
+    if common_journal(trace):
+        source['pairing'] = dict(trace['pairing'], journal_hash=prefix_hash(local['tokens']))
+    if client.get('model_layout', {}).get('sliding_window'):
+        source['state_component'] = 'window'
+    if probes:
+        source['probes'] = state_probe_plans(source, trace, turn)
+    return source
+
+
+def checkpoint(app, client, root, turn, heterogeneous, trace, keep_states=False):
+    arms = ('hybrid',) if common_journal(trace) else ('hybrid', 'local', 'local_partition')
+    saved = [app.saved[(arm, turn)] for arm in arms]
+    hybrid, local = saved[0], saved[0] if common_journal(trace) else saved[1]
+    require(all(item['tokens'] == local['tokens'] for item in saved), 'checkpoint journal mismatch between arms')
     scratch = root / ('check-' + str(turn))
     scratch.mkdir(mode=0o700)
     fixture = scratch / 'input.json'
     result = scratch / 'result.json'
-    source = dict(tokens=local['tokens'], k=64, max_ctx=client['context'], acceptance_rule='session_append_replay_exact',
-        model_sha256=client['model_sha256'], backend=client['backend'], heterogeneous=heterogeneous,
-        snapshots=[r['path'] for r in saved], snapshot_sha256=[r['sha256'] for r in saved],
-        replay=replay_schedules(dict(trace, events=app.events.copy()), turn, len(local['tokens'])))
-    if app.events.state_dir is not None:
-        source['probes'] = state_probe_plans(source, dict(trace, events=app.events.copy()), turn)
+    captured = dict(trace, events=app.events.copy())
+    source = checkpoint_source(client, saved, captured, turn, app.events.state_dir is not None)
+    if app.state_dtype != 'f32':
+        source['state_dtype'] = app.state_dtype
     private_json(fixture, source)
     command = [Path(client['build_dir']) / 'bin/llama-hybrid-bench-check', client['model_path'], fixture,
                hybrid['path'], result, 0 if client['backend'] == 'cpu' else 999]
+    trace.setdefault('checkpoint_inputs', []).append(dict(turn=turn, input_sha256=sha256(fixture),
+        snapshot_sha256=source['snapshot_sha256'], gpu_layers=command[-1]))
     process = start_process(command, scratch, 'checker')
     try:
         process.wait()
@@ -483,11 +555,14 @@ def checkpoint(app, client, root, turn, heterogeneous, trace):
     row = json.loads(result.read_text())
     require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
     require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
+    if common_journal(trace):
+        require(row.get('pairing') == source['pairing'], 'checkpoint common-journal binding changed')
     validate_checkpoint(row, heterogeneous, len(local['tokens']))
     row.update(turn=turn, checker_exit_code=process.returncode, fidelity_flag=fidelity_flags(row),
                snapshot_sha256=[r['sha256'] for r in saved], journal_hash=prefix_hash(local['tokens']))
-    for item in saved:
-        Path(item['path']).unlink()
+    if not keep_states:
+        for item in saved:
+            Path(item['path']).unlink()
     return row
 
 
@@ -526,7 +601,7 @@ def state_probe_plans(source, trace, turn):
     plans = [('NODE', [snapshot, tail]), ('RESTORE', restore + [compare, tail]),
              ('BSTATE', [decode('B', 0, last), compare, tail]),
              ('NODE_RANGE', [snapshot, dict(roundtrip='range'), tail]), ('CHAIN', chain + [tail])]
-    for component in ('attention', 'recurrent'):
+    for component in ('attention', source.get('state_component', 'recurrent')):
         plans.append(('CHAIN_' + component.upper(), chain + [dict(snapshot, replace=component), tail]))
     for mode in ('native', 'range'):
         plans.append(('OWN_' + mode.upper(), [decode('A', 0, depth - 1), dict(roundtrip=mode), decode('A', depth - 1, depth)]))
@@ -547,7 +622,7 @@ def validate_raw_positions(row, depth):
             left, right = name.split('-')
             pairs[name] = (left, right)
     for name, probe in row.get('probes', {}).items():
-        for reference in ('A', 'B', 'H'):
+        for reference in ('A', 'B', 'H', 'L'):
             if reference in probe:
                 pairs[name + ':' + reference] = (reference, name)
     handles = {}
@@ -598,16 +673,18 @@ def validate_raw_positions(row, depth):
         require(math.isclose(measured['mean_kl_nats'], math.fsum(values) / 64, rel_tol=1e-8, abs_tol=1e-12) and
                 math.isclose(measured['p95_kl_nats'], sorted(values)[60], rel_tol=1e-8, abs_tol=1e-12) and
                 measured['top1_agreed'] == sum(p['top1_agreed'] for p in positions) and
-                measured['exact'] == all(p['exact'] for p in positions) and
+                measured.get('logits_exact', measured['exact']) == all(p['exact'] for p in positions) and
                 measured['max_abs_logit_diff'] == max(p['max_abs_logit_diff'] for p in positions),
                 'checkpoint summary contradicts raw logits')
 
 
 def append_replay_controls(row):
     controls = {}
+    component = row.get('state_component', 'recurrent')
+    require(component in ('recurrent', 'window'), 'invalid state component')
     pairs = [('NODE', 'B'), ('RESTORE', 'B'), ('BSTATE', 'B'), ('NODE_RANGE', 'B'),
              ('OWN_NATIVE', 'A'), ('OWN_RANGE', 'A'), ('CHAIN', 'H'),
-             ('CHAIN_ATTENTION', 'B'), ('CHAIN_RECURRENT', 'H')]
+             ('CHAIN_ATTENTION', 'B'), ('CHAIN_' + component.upper(), 'H')]
     require(set(name for name, _ in pairs) <= row.get('probes', {}).keys() and
             'A-L' in row.get('factorial', {}), 'missing append replay controls')
 
@@ -624,12 +701,14 @@ def append_replay_controls(row):
             for state in states:
                 if name in ('RESTORE', 'BSTATE'):
                     equal = equal and state.get('bytes_equal', state.get('snapshot_bytes_equal')) is True
-                elif name in ('CHAIN_ATTENTION', 'CHAIN_RECURRENT'):
-                    equal = equal and state['recurrent_equal'] is True
+                elif name in ('CHAIN_ATTENTION', 'CHAIN_' + component.upper()):
+                    equal = equal and state[component + '_equal'] is True
                 else:
                     equal = equal and state['bytes_equal'] is True
         controls[name + '-' + reference] = equal
     controls['A-L'] = exact(row['factorial']['A-L'])
+    if row.get('state_dtype', 'f32') != 'f32':
+        controls['state_transport_exact'] = False
     return controls
 
 
@@ -646,6 +725,8 @@ def fidelity_flags(row):
 
 
 def validate_checkpoint(row, heterogeneous, depth):
+    if 'pairing' in row:
+        validate_common_pairing(row)
     require(row['depth'] == depth and row['k'] == 64 and type(row['exact']) is bool and
             type(row['top1_agreed']) is int and 0 <= row['top1_agreed'] <= 64 and
             math.isfinite(row['mean_kl_nats']) and row['mean_kl_nats'] >= 0 and
@@ -673,7 +754,9 @@ def validate_checkpoint(row, heterogeneous, depth):
         controls = append_replay_controls(row)
         require(row['gate_controls'] == controls and row['kl_limit'] is None, 'checkpoint replay gate contradicts controls')
         accepted = all(controls.values()) and row['top1_agreed'] >= 63
-    status, code = ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
+    lossy = row.get('state_dtype', 'f32') != 'f32'
+    require(not lossy or (row.get('lossy_import') is True and row['exact'] is False), 'bf16 import cannot be exact')
+    status, code = ('lossy', 5) if lossy else ('heterogeneous', 5) if heterogeneous else ('passed', 0) if accepted else ('failed', 3)
     require((row['status'], row['exit_code']) == (status, code), 'checkpoint verdict contradicts acceptance rule')
 
 
@@ -689,12 +772,50 @@ def turn_record(arm, step, meter, ttft, total, journal_hash, events, session_id)
         local_prefill_seconds=(meter['local_prompt_ms'] or 0) / 1000 if meter['path'] == 'local' else 0,
         local_tail_seconds=(meter['local_prompt_ms'] or 0) / 1000 if meter['path'] == 'offload' else 0,
         reconciliation_seconds=meter['reconciliation_ms'] / 1000,
+        import_stage_seconds=sum(c['import_ms'] for c in meter.get('chunks', []) if c['status'] == 'staged')/1000 if 'chunks' in meter else None,
+        import_final_save_apply_seconds=sum(c['import_ms'] for c in meter.get('chunks', []) if c['status'] == 'imported')/1000 if 'chunks' in meter else None,
         catchup_tokens=sum(r['n1'] - r['n0'] for r in catchup), catchup_seconds=sum(r['seconds'] for r in catchup),
         catchup_node_seconds=sum(r.get('node_prefill_seconds', 0) for r in catchup),
         catchup_upload_bytes=sum(r['upload_body_bytes'] for r in catchup),
         decode_tokens_per_second=(meter['generated_tokens'] - 1) * 1000 / meter['decode_ms']
             if meter.get('decode_ms') and meter['generated_tokens'] > 1 else None,
-        meter=meter)
+        state_dtype=meter.get('state_dtype','f32'),lossy_import=meter.get('lossy_import',False),
+        requested_state_dtype=meter.get('state_dtype','f32'),
+        negotiated_state_dtype=meter.get('state_dtype','f32') if meter['path']=='offload' else None,meter=meter)
+
+
+def checkpoint_turns(value, turns):
+    if value is None:
+        return set(range(10, turns + 1, 10)) | {turns}
+    if value == 'none':
+        return set()
+    parts = value.split(',')
+    require(all(part.isascii() and part.isdecimal() for part in parts), 'invalid checkpoint turns: use comma-separated integers')
+    selected = [int(part) for part in parts]
+    require(selected and selected == sorted(set(selected)) and all(1 <= turn <= turns for turn in selected),
+            'invalid checkpoint turns: require increasing unique turns within 1..turns')
+    return set(selected)
+
+
+def recurrent_tensor_bytes(layout):
+    require(layout.get('architecture') == 'qwen35', 'bf16 arm requires Qwen35')
+    r=layout['recurrent_layout']; count=sum(layer['recurrent'] for layer in layout['layers'])
+    size=count*4*(r['state']*r['inner']+(r['conv']-1)*(r['inner']+2*r['groups']*r['state']))
+    require(type(size) is int and size > 0 and size % 2 == 0, 'invalid recurrent tensor bytes')
+    return size
+
+
+def bf16_policy(layout, policy):
+    result=dict(policy); saving=recurrent_tensor_bytes(layout)//2
+    require(result['state_bytes'] >= 2*saving, 'policy omits recurrent state bytes')
+    result['state_bytes']-=saving
+    return result
+
+
+def arm_names(checkpoints, include_bf16=False):
+    require(not include_bf16 or not checkpoints, 'bf16 timing arm requires no checkpoints; use common-journal rehearsal')
+    return (['hybrid','local','local_partition'] if checkpoints else
+            ['hybrid','local','hybrid-bf16'] if include_bf16 else ['hybrid','local'])
 
 
 def parser():
@@ -708,6 +829,9 @@ def parser():
     p.add_argument('--partition-ubatch', type=int, default=32)
     p.add_argument('--state-probes', action='store_true', help='capture private live node states and isolate serialization/import factors')
     p.add_argument('--turns', type=int, default=40)
+    p.add_argument('--keep-checkpoint-states', action='store_true', help='retain saved states for checkpoint-only rechecks')
+    p.add_argument('--pairing-contract', help='explicit model-bound common-journal fidelity declaration; default requires equal independent journals')
+    p.add_argument('--checkpoint-turns', help='none for capture-free hybrid/local timing; otherwise increasing turns, default every 10 and final')
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--start', choices=['cold', 'pre-staged'], default='pre-staged')
     p.add_argument('--disconnect-turn', type=int, default=20, help='one-based, zero disables')
@@ -716,6 +840,10 @@ def parser():
     p.add_argument('--max-output', type=int, default=4506)
     p.add_argument('--pause-cap', type=float, default=340, help='zero for CPU smoke; changes the workload')
     p.add_argument('--policy', help='JSON Policy fields from calibration, never per-turn routing overrides')
+    p.add_argument('--include-bf16', action='store_true', help='third Qwen timing arm; native state remains f32')
+    p.add_argument('--bf16-policy', help='bf16 import fit and wire-byte policy, otherwise f32 import costs are a planning assumption')
+    p.add_argument('--timing-spans', action='store_true', help='buffer nested monotonic spans; serialize after the stream')
+    p.add_argument('--rate-fixture', help='measured PRI-31 step-40 fixture; overrides only local policy rates')
     p.add_argument('--link-label', required=True, help='physical link description, no credentials or addresses')
     p.add_argument('--request-timeout', type=int, default=3600)
     p.add_argument('--disk-floor-gb', type=float, default=28)
@@ -724,6 +852,13 @@ def parser():
 
 def run(args):
     require((args.depth == 'deep' or 64 <= args.depth <= NATIVE_CONTEXT) and 1 <= args.turns <= 1000, 'invalid depth or turn count')
+    if args.timing_spans:
+        timing.start()
+    checkpoints = checkpoint_turns(args.checkpoint_turns, args.turns)
+    arms=arm_names(checkpoints,args.include_bf16)
+    require(not args.bf16_policy or args.include_bf16, '--bf16-policy requires --include-bf16')
+    require(bool(checkpoints) or not (args.state_probes or args.keep_checkpoint_states),
+            'timing-only mode forbids state probes and checkpoint retention')
     require(1 <= args.partition_ubatch <= args.partition_batch <= 4096, 'invalid partition batch/ubatch')
     require(0 <= args.disconnect_turn <= args.turns and args.disconnect_turns >= 1 and
             (not args.disconnect_turn or args.disconnect_turn + args.disconnect_turns <= args.turns),
@@ -738,29 +873,61 @@ def run(args):
     require(not config.get('hetero_quant'), 'growing-session requires identical model files')
     validate_identity(client['model_sha256'], client, node['model_sha256'], node)
     require(sha256(client['model_path']) == client['model_sha256'], 'client model file changed')
-    for binary in ('llama-server', 'llama-hybrid-bench-check'):
+    for binary in (('llama-server', 'llama-hybrid-bench-check') if checkpoints else ('llama-server',)):
         require(sha256(Path(client['build_dir']) / 'bin' / binary) == client['binaries'][binary], 'client binary changed: ' + binary)
     require(not root.exists() and root.parent.is_dir(), 'output must be a new directory in an existing parent')
-    capacity = min(client['context'], node['context'], NATIVE_CONTEXT)
-    require(max(client['context'], node['context']) <= NATIVE_CONTEXT, 'native 262144 context only; no YaRN')
-    require(args.depth != 'deep' or capacity == NATIVE_CONTEXT, 'deep arm needs native 262144 context on both roles')
+    layout = client['model_layout']
+    declaration = json.loads(Path(args.pairing_contract).read_text()) if args.pairing_contract else None
+    pairing = pairing_contract(declaration, client, checkpoints, args.state_probes, args.partition_batch, args.partition_ubatch)
+    if declaration is not None:
+        pairing['declaration_sha256'] = sha256(args.pairing_contract)
+        arms = ['hybrid']
+    require(config.get('state_dtype','f32')=='f32', 'hybrid/local require f32 client configuration; use --include-bf16')
+    if args.include_bf16:
+        recurrent_tensor_bytes(layout)
+    rate_fixture = json.loads(Path(args.rate_fixture).read_text()) if args.rate_fixture else None
+    if rate_fixture is not None:
+        validate_fixture(rate_fixture, client['model_sha256'], layout['architecture'])
+    require(layout['architecture'] != 'muse-glimmer' or client['backend'] != 'metal' or rate_fixture is not None,
+            'Glimmer Mac requires a measured PRI-31 fixture')
+    native_context = 131072 if layout['architecture'] == 'muse-glimmer' else NATIVE_CONTEXT
+    if layout['architecture'] == 'muse-glimmer':
+        require(layout.get('sliding_window') == 2048 and not any(r['recurrent'] for r in layout['layers']),
+                'Glimmer requires window 2048 without recurrent state')
+    capacity = min(client['context'], node['context'], native_context)
+    require(max(client['context'], node['context']) <= native_context, 'native context only; no YaRN')
+    require(args.depth != 'deep' or capacity == native_context, 'deep arm needs full native context on both roles')
     require(args.partition_batch != client.get('batch', 256) and args.partition_ubatch != client.get('ubatch', 256),
             'partition baseline needs different batch and ubatch')
-    checkpoints = set(range(10, args.turns + 1, 10)) | {args.turns}
     geometry = config.get('delta_geometry', dict(kv_bytes=34816, state_bytes=157000000))
-    size = geometry['state_bytes'] + (geometry['kv_bytes'] + 32) * client['context']
+    size = geometry['state_bytes'] + geometry.get('window_bytes', 0) + (geometry['kv_bytes'] + 32) * client['context']
     floor = args.disk_floor_gb * 1e9
     raw_bytes = len(checkpoints) * 16 * 64 * client['model_layout']['vocab_size'] * 4
-    require(shutil.disk_usage(root.parent).free > floor + (2 * len(checkpoints) + 6) * size + raw_bytes,
+    require(shutil.disk_usage(root.parent).free > floor + ((3 if args.keep_checkpoint_states else 2) * len(checkpoints) + 6) * size + raw_bytes,
             'insufficient disk for checkpoint and base snapshots above the floor')
     root.mkdir(mode=0o700)
     (root / 'slots').mkdir(mode=0o700)
-    state_dir = root / 'node-states'
+    state_dir = root / 'node-states' if checkpoints else None
     if state_dir is not None:
         state_dir.mkdir(mode=0o700)
     events = Events(state_dir)
     trace = dict(schema='hybrid-growing-session-v3', status='running', seed=args.seed, start=args.start,
         depth=args.depth, turns=args.turns, workload=[], calls=[], checkpoints=[],
+        measurement_mode='fidelity' if checkpoints else 'timing-only',
+        capture=dict(enabled=bool(checkpoints), node_snapshots=0, node_deltas=0, checker_runs=0),
+        arms=arms,
+        arm_definitions=dict(hybrid=dict(route='policy', recurrent_transport='f32' if geometry['state_bytes'] else None,
+                                        window_transport='q8_0' if geometry.get('window_bytes') else None,
+                                        attention_transport='q8_0'),
+                             local=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None),
+                             local_partition=dict(route='local', recurrent_transport=None, window_transport=None, attention_transport=None),
+                             **({'hybrid-bf16':dict(route='policy',recurrent_transport='bf16',attention_transport='q8_0',
+                                                   window_transport=None,lossy=True,protocol_version=2)} if args.include_bf16 else {})),
+        reserved_arms={} if args.include_bf16 else {'hybrid-bf16': dict(available=False, route='policy', recurrent_transport='bf16',
+                                         attention_transport='q8_0', window_transport=None,
+                                         prerequisite='dev-a r38 protocol capability and independent qualification')},
+        instrumentation=dict(version=2, enabled=args.timing_spans, clock='monotonic_ns',
+                             native_trace='LLAMA_HYBRID_TRACE async JSONL, separate clock domain', spans=[]),
         provenance=dict(**PROVENANCE, depth_bins=DEPTH_BINS, pause_seconds=PAUSE,
                         sampling='linear below p50, log-linear above; bounded at last published quantile',
                         table_sha256=sha256(Path(__file__).with_name('fixtures') / 'growing-provenance.json'),
@@ -770,9 +937,18 @@ def run(args):
         disconnect=dict(turn=args.disconnect_turn, turns=args.disconnect_turns),
         driver=dict(source_sha256=sha256(__file__), proxy_sha256=sha256(Path(__file__).parents[1] / 'hybrid-proxy/proxy.py')),
         started_utc=datetime.now(timezone.utc).isoformat())
+    trace['pairing'] = pairing
+    if common_journal(trace):
+        trace['client']['model_layout'] = layout
+        trace['reference_arms'] = dict(local='teacher-forced replay at checkpoints', local_partition='teacher-forced partition replay at checkpoints')
 
     def flush():
         trace['events'] = events.copy()
+        if args.timing_spans:
+            trace['instrumentation']['spans'] = timing.rows()
+        trace['capture'].update(node_snapshots=sum('node_snapshot' in r for r in trace['events']),
+                                node_deltas=sum('node_delta' in r for r in trace['events']),
+                                checker_runs=len(trace.get('checkpoint_inputs', [])))
         temp = root / 'trace.json.tmp'
         with temp.open('w') as target:
             json.dump(trace, target, indent=2, allow_nan=False)
@@ -791,9 +967,15 @@ def run(args):
                       prefill_timeout=args.request_timeout, decode_timeout=args.request_timeout)
         if args.policy:
             config['policy'] = json.loads(Path(args.policy).read_text())
+        if rate_fixture is not None:
+            config['policy'] = dict(config.get('policy', {}), local_rates=validate_fixture(
+                rate_fixture, client['model_sha256'], layout['architecture']))
+            trace['rate_fixture'] = dict(sha256=sha256(args.rate_fixture), **rate_fixture)
         token_file = root / 'decode-token'
         token_file.write_text(config['decode_token'])
         token_file.chmod(0o600)
+        if args.timing_spans:
+            os.environ['LLAMA_HYBRID_TRACE'] = str(root / 'native-%p.jsonl')
         decoder = start_process(decoder_command(client, config, urllib.parse.urlsplit(config['decode_url']).port,
                                                 root / 'slots', token_file), root, 'decode')
         wait_health(config['decode_url'], '/health', decoder, timeout=args.request_timeout, token=config['decode_token'])
@@ -810,6 +992,10 @@ def run(args):
             try:
                 health = wait_health(bridge_url, '/v1/health', process, timeout=30)
                 require(health['model_sha256'] == client['model_sha256'], 'live node model changed')
+                require(not args.include_bf16 or 'bf16' in health.get('state_dtypes',[]), 'node lacks bf16 capability')
+                trace['transport_capabilities']=dict(node_state_dtypes=health.get('state_dtypes',['f32']),
+                    delta_version=health.get('delta_version'))
+                require(not args.timing_spans or health.get('native_trace_enabled') is True, 'node native trace not enabled')
                 return process
             except BaseException:
                 stop_process(process)
@@ -828,7 +1014,22 @@ def run(args):
         trace.update(depth=args.depth, depth_plan={k: v for k, v in plan.items() if k != 'sequence'},
                      workload=plan['sequence'], local_partition=dict(batch=args.partition_batch, ubatch=args.partition_ubatch))
         trace['policy'] = app.policy_config
-        trace['route_preflight'] = route_preflight(Policy(**app.policy_config), plan, args.disconnect_turn, args.disconnect_turns)
+        original_policy=dict(app.policy_config)
+        compressed_policy=bf16_policy(layout,original_policy) if args.include_bf16 else None
+        if args.bf16_policy:
+            supplied=json.loads(Path(args.bf16_policy).read_text())
+            for key,value in compressed_policy.items():
+                if key not in ('import_fixed','import_per_token'):
+                    require(json.loads(json.dumps(supplied.get(key,value)))==json.loads(json.dumps(value)),
+                            'bf16 policy differs beyond wire bytes/import fit: '+key)
+            compressed_policy.update(supplied)
+        trace['arm_policies']={'hybrid':original_policy,'local':original_policy}
+        if args.include_bf16:
+            trace['arm_policies']['hybrid-bf16']=compressed_policy
+            trace['bf16_policy_source']=(dict(path=args.bf16_policy,sha256=sha256(args.bf16_policy)) if args.bf16_policy else
+                dict(placeholder=True,reason='f32 import costs assumed; Mac payload requires its own bf16 fit'))
+        trace['route_preflight'] = route_preflight(Policy(**app.policy_config), plan, args.disconnect_turn, args.disconnect_turns,
+                                                 require_mix=bool(checkpoints))
         trace['engine'] = dict(extend_chunk_tokens=app.extend_chunk_tokens, delta_geometry=geometry,
             node=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
             checker=dict(batch=256, ubatch=256, threads=2, threads_batch=2),
@@ -836,17 +1037,32 @@ def run(args):
         trace['engine']['cpu_affinity'] = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
         flush()
         trace['heterogeneous'] = client['backend'] != node['backend']
+        trace['state_dtype'] = app.state_dtype
         credential = config['client_credential']
         with proxy_server(app) as proxy_url:
             previous = {}
             cursors = {}
             def call(arm, sid, messages, step, initial=False):
+                with timing.span('bench.call', call_id=arm + '-' + str(step['turn']), session_id=sid,
+                                 tokens=step.get('input_tokens', 0), origin='critical'):
+                    result = call_inner(arm, sid, messages, step, initial)
+                    timing.point('bench.post_call_verification_end')
+                if args.timing_spans:
+                    row = trace['calls'][-1]
+                    bounds = row['meter']['timing_boundaries']
+                    row['timing_accounting'] = timing.account(timing.rows(), bounds['stream_start_ns'],
+                        bounds.get('first_nonempty_delta_ns'), row['meter']['timing_call_id'])
+                flush()
+                return result
+
+            def call_inner(arm, sid, messages, step, initial=False):
                 require(shutil.disk_usage(root).free > floor + size, 'disk guard reached before call')
                 before = cursors.get(arm, len(events.copy()))
                 app.phase = dict(arm=arm, turn=step['turn'])
                 body = dict(messages=messages, max_tokens=step['output_tokens'], temperature=0,
                             seed=step['seed'], ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False))
-                mode = 'offload' if initial and arm == 'hybrid' else 'local' if arm == 'local_partition' else arm
+                mode = ('offload' if initial and arm in ('hybrid','hybrid-bf16') else
+                        'hybrid' if arm=='hybrid-bf16' else 'local' if arm == 'local_partition' else arm)
                 sid, message, meter, first, total = stream_chat(proxy_url, credential, body, mode, sid, args.request_timeout)
                 verify_meter(meter, previous.get(arm, 0), mode)
                 previous[arm] = meter['depth_after']
@@ -859,6 +1075,7 @@ def run(args):
                 row = turn_record(arm, step, meter, first, total, prefix_hash(current['tokens']), captured[before:], sid)
                 cursors[arm] = len(captured)
                 row['stage'] = 'start' if initial else 'turn'
+                row['transport_profile'] = trace['arm_definitions'][arm]
                 row['at_seconds'] = time.monotonic() - events.started
                 row['ttft_other_seconds'] = None if first is None else first - sum(row[k] for k in
                     ('server_prefill_seconds', 'transfer_seconds', 'import_seconds', 'local_prefill_seconds', 'local_tail_seconds'))
@@ -867,8 +1084,9 @@ def run(args):
                 trace['calls'].append(row)
                 if arm != 'hybrid':
                     reference = next(r for r in trace['calls'] if r['arm'] == 'hybrid' and r['turn'] == step['turn'])
-                    require(row['journal_hash'] == reference['journal_hash'], 'paired journal hashes differ')
-                flush()
+                    row['paired_journal_equal']=row['journal_hash']==reference['journal_hash']
+                    if arm != 'hybrid-bf16':
+                        require_paired_journal(row, reference)
                 return sid, messages + [message]
 
             initial = dict(turn=0, output_tokens=1, seed=args.seed)
@@ -883,9 +1101,15 @@ def run(args):
                            bytes=(app.slot_path / filename).stat().st_size, seconds=time.monotonic() - started)
 
             if args.start == 'pre-staged':
-                for arm in ('hybrid', 'local'):
+                for arm in (('hybrid',) if common_journal(trace) else ('hybrid', 'local')):
                     stage_base(arm)
-            for arm in ('hybrid', 'local', 'local_partition'):
+            for arm in trace['arms']:
+                if arm=='hybrid-bf16':
+                    app.state_dtype='bf16'
+                    app.policy=MeasuredPolicy(Policy(**compressed_policy),app.current)
+                    app.link_rate=compressed_policy['link_rate']
+                    if args.start=='pre-staged':
+                        stage_base(arm)
                 if arm == 'local_partition':
                     stop_process(decoder)
                     alternate = dict(client, batch=args.partition_batch, ubatch=args.partition_ubatch)
@@ -913,22 +1137,22 @@ def run(args):
                     require(previous[arm] + step['input_tokens'] + step['output_tokens'] + plan['framing_tokens'] + DEPTH_MARGIN <=
                             capacity, 'growing context exhausted; no clamping')
                     turn = step['turn']
-                    if arm == 'hybrid' and turn == args.disconnect_turn:
-                        events.add(kind='disconnect', turn=turn, pid=bridge.pid)
+                    if arm in ('hybrid','hybrid-bf16') and turn == args.disconnect_turn:
+                        events.add(kind='disconnect', arm=arm, turn=turn, pid=bridge.pid)
                         stop_process(bridge)
                         bridge = None
                         flush()
-                    if arm == 'hybrid' and args.disconnect_turn and turn == args.disconnect_turn + args.disconnect_turns:
+                    if arm in ('hybrid','hybrid-bf16') and args.disconnect_turn and turn == args.disconnect_turn + args.disconnect_turns:
                         reconnect_events = len(events.copy())
                         started = time.monotonic()
                         bridge = connect()
-                        events.add(kind='reconnect', turn=turn, pid=bridge.pid, seconds=time.monotonic() - started)
+                        events.add(kind='reconnect', arm=arm, turn=turn, pid=bridge.pid, seconds=time.monotonic() - started)
                     time.sleep(step['pause_seconds'])
                     sid, messages = call(arm, sid, messages + [dict(role='user', content=' x' * step['input_tokens'])], step)
                     row = trace['calls'][-1]
                     require(row['new_tokens'] == step['input_tokens'] + plan['framing_tokens'],
                             'actual template growth differs from sampled plan; no clamping')
-                    if arm == 'hybrid' and args.disconnect_turn <= turn < args.disconnect_turn + args.disconnect_turns and args.disconnect_turn:
+                    if arm in ('hybrid','hybrid-bf16') and args.disconnect_turn <= turn < args.disconnect_turn + args.disconnect_turns and args.disconnect_turn:
                         require(row['path'] == 'local', 'offload accepted during disconnection')
                     if reconnect_events is not None and row['path'] == 'offload':
                         recovered = events.copy()[reconnect_events:]
@@ -939,8 +1163,8 @@ def run(args):
                             catchup_seconds=sum(r['seconds'] for r in catchup),
                             upload_body_bytes=sum(r['upload_body_bytes'] for r in catchup))
                         reconnect_events = None
-                    if arm == 'local_partition' and turn in checkpoints:
-                        result = checkpoint(app, client, root, turn, trace['heterogeneous'], trace)
+                    if (arm == 'hybrid' if common_journal(trace) else arm == 'local_partition') and turn in checkpoints:
+                        result = checkpoint(app, client, root, turn, trace['heterogeneous'], trace, args.keep_checkpoint_states)
                         trace['checkpoints'].append(result)
                         flush()
                 events.add(kind='window', arm=arm, seconds=time.monotonic() - start)
@@ -953,12 +1177,14 @@ def run(args):
             counts = route_counts(trace['calls'], events.copy(), trace['disconnect'])
             trace['route_counts'] = counts
             trace['final_depth'] = previous
-            require(counts['connected_policy_local'] and counts['connected_policy_offload'], 'scenario did not exercise both connected policy routes')
-            require(counts['connected_local_catchup_turns'], 'no connected policy-local prompt catch-up')
-            require(not args.disconnect_turn or any(r.get('resync') for r in trace['calls']),
-                    'no verified offload after reconnection')
-            trace['status'] = ('failed' if any(r['status'] == 'failed' for r in trace['checkpoints']) else
-                               'heterogeneous' if trace['heterogeneous'] else 'passed')
+            if checkpoints:
+                require(counts['connected_policy_local'] and counts['connected_policy_offload'], 'scenario did not exercise both connected policy routes')
+                require(counts['connected_local_catchup_turns'], 'no connected policy-local prompt catch-up')
+                require(not args.disconnect_turn or any(r.get('resync') for r in trace['calls']),
+                        'no verified offload after reconnection')
+            trace['status'] = ('measured' if not checkpoints else
+                               'failed' if any(r['status'] == 'failed' for r in trace['checkpoints']) else
+                               'lossy' if app.state_dtype != 'f32' else 'heterogeneous' if trace['heterogeneous'] else 'passed')
     except BaseException as error:
         trace.update(status='aborted', error_type=type(error).__name__,
                      reason=str(error) if isinstance(error, Refusal) else 'runtime failure; inspect private logs')
@@ -966,11 +1192,147 @@ def run(args):
     finally:
         if bridge is not None:
             stop_process(bridge)
+        if decoder is not None and app is not None and args.timing_spans:
+            try:
+                trace['native_client_checkpoint'] = http(config['decode_url'], '/slots/0/info?trace_flush=1', config['decode_token'])
+            except Exception as error:
+                trace['native_client_checkpoint'] = dict(complete=False, error_type=type(error).__name__)
         if decoder is not None:
             stop_process(decoder)
+        if args.timing_spans and app is not None:
+            try:
+                remote = Node(upstream, next(iter(config['clients'].values()))['prefill_token'], args.request_timeout)
+                trace['native_node_checkpoint'] = remote.request('POST', '/v1/bench/trace-flush')
+            except Exception as error:
+                trace['native_node_checkpoint'] = dict(complete=False, error_type=type(error).__name__)
+            if not trace['native_node_checkpoint'].get('complete') or not trace.get('native_client_checkpoint', {}).get('complete'):
+                trace.update(status='aborted', reason='node trace checkpoint incomplete')
         trace['ended_utc'] = datetime.now(timezone.utc).isoformat()
         flush()
+    require(not args.timing_spans or (trace.get('native_node_checkpoint', {}).get('complete') and trace.get('native_client_checkpoint', {}).get('complete')), 'native trace checkpoint incomplete')
     return trace
+
+
+def recheck_parser():
+    p = argparse.ArgumentParser(description='Recheck a preserved checkpoint without contacting the node or changing the run')
+    p.add_argument('--trace', required=True)
+    p.add_argument('--turn', required=True, type=int)
+    p.add_argument('--checker', required=True)
+    p.add_argument('--model', required=True)
+    p.add_argument('--output', required=True)
+    return p
+
+
+def verify_recheck(trace_path, turn):
+    trace = json.loads(trace_path.read_text())
+    require(trace['schema'] == 'hybrid-growing-session-v3' and
+            trace['status'] in ('passed', 'failed', 'heterogeneous', 'aborted'), 'recheck needs a finished or aborted trace')
+    require(1 <= turn <= trace['turns'], 'invalid recheck turn')
+    fixture = trace_path.parent / ('check-' + str(turn)) / 'input.json'
+    require(fixture.is_file(), 'missing preserved checkpoint input: ' + str(fixture))
+    require(fixture.stat().st_size <= 64 * 1024 * 1024, 'checkpoint input exceeds limit')
+    source = read_private(fixture)
+    require(isinstance(source, dict) and all(key in source for key in
+            ('tokens', 'snapshots', 'snapshot_sha256', 'probes')), 'invalid preserved checkpoint input')
+    arms = ('hybrid',) if common_journal(trace) else ('hybrid', 'local', 'local_partition')
+    require(len(source['snapshots']) == len(source['snapshot_sha256']) == len(arms), 'checkpoint preserved state count mismatch')
+    tokens = source['tokens']
+    journal_hash = prefix_hash(tokens)
+    saved = []
+    for arm, path, digest in zip(arms, source['snapshots'], source['snapshot_sha256']):
+        rows = [r for r in trace['calls'] if r['arm'] == arm and r['turn'] == turn]
+        require(len(rows) == 1 and rows[0]['journal_hash'] == journal_hash and
+                rows[0]['depth_after'] == len(tokens), 'preserved checkpoint journal mismatch: ' + arm)
+        require(Path(path) == trace_path.parent / 'slots' / (arm + '-checkpoint-' + str(turn) + '.bin'),
+                'preserved checkpoint state path mismatch: ' + arm)
+        saved.append(dict(path=path, sha256=digest, tokens=tokens))
+    heterogeneous = trace['client']['backend'] != trace['node']['backend']
+    require(trace['heterogeneous'] == heterogeneous, 'trace backend relationship mismatch')
+    require(trace['engine']['checker'] == dict(batch=256, ubatch=256, threads=2, threads_batch=2),
+            'unsupported preserved checker parameters')
+    expected = checkpoint_source(trace['client'], saved, trace, turn)
+    # R44 has no separate input-file digest: bind its exact serialization to the trace and original state manifest.
+    encoded = (json.dumps(expected, indent=2) + '\n').encode()
+    require(fixture.read_bytes() == encoded, 'preserved checkpoint input differs from trace reconstruction')
+    verified = {}
+
+    def verify(path, digest):
+        path = Path(path)
+        require(path.is_file(), 'missing preserved input: ' + str(path))
+        key = str(path)
+        if key not in verified:
+            actual = sha256(path)
+            require(actual == digest, 'preserved input checksum mismatch: ' + key)
+            verified[key] = actual
+        require(verified[key] == digest, 'conflicting preserved input hashes: ' + key)
+
+    for item in saved:
+        verify(item['path'], item['sha256'])
+    for probe in source['probes']:
+        for step in probe['steps']:
+            for key in ('snapshot', 'compare_snapshot', 'delta'):
+                if key in step:
+                    verify(step[key], step['sha256'])
+    manifest = [r for r in trace.get('checkpoint_inputs', []) if r['turn'] == turn]
+    if manifest:
+        require(len(manifest) == 1 and manifest[0]['input_sha256'] == sha256(fixture) and
+                manifest[0]['snapshot_sha256'] == source['snapshot_sha256'] and
+                manifest[0]['gpu_layers'] == (0 if source['backend'] == 'cpu' else 999), 'checkpoint input checksum mismatch')
+    return trace, source, fixture, verified
+
+
+def recheck(args):
+    trace_path, root = Path(args.trace).resolve(), Path(args.output).resolve()
+    require(not root.exists() and root.parent.is_dir() and not root.is_relative_to(trace_path.parent),
+            'recheck output must be a new directory outside the original run')
+    trace, source, fixture, verified = verify_recheck(trace_path, args.turn)
+    checker, model = Path(args.checker).resolve(), Path(args.model).resolve()
+    require(checker.is_file() and os.access(checker, os.X_OK), 'recheck checker is not executable')
+    require(model.is_file() and sha256(model) == source['model_sha256'], 'preserved checkpoint model checksum mismatch')
+    vocab = model_identity(model)['model_layout']['vocab_size']
+    require(shutil.disk_usage(root.parent).free > 28e9 + 16 * 64 * vocab * 4,
+            'insufficient disk for recheck logits above floor')
+    gpu_layers = 0 if source['backend'] == 'cpu' else 999
+    root.mkdir(mode=0o700)
+    (root / 'input.json').write_bytes(fixture.read_bytes())
+    (root / 'input.json').chmod(0o600)
+    (root / 'trace.json').write_bytes(trace_path.read_bytes())
+    (root / 'trace.json').chmod(0o600)
+    command = [checker, model, root / 'input.json', source['snapshots'][0], root / 'result.json', gpu_layers]
+    record = dict(schema='hybrid-checkpoint-recheck-v1', turn=args.turn, status='running',
+        trace_path=str(trace_path), trace_sha256=sha256(root / 'trace.json'), input_path=str(fixture), input_sha256=sha256(fixture),
+        input_binding=('recorded input SHA256 plus trace reconstruction' if trace.get('checkpoint_inputs') else
+                       'trace reconstruction plus original fixture state hashes; r44 has no independent input-file digest'),
+        preserved_inputs=verified, model_sha256=source['model_sha256'], checker_sha256=sha256(checker),
+        driver_sha256=sha256(__file__), gpu_layers=gpu_layers, command=[str(v) for v in command],
+        started_utc=datetime.now(timezone.utc).isoformat())
+    private_json(root / 'invocation.json', record)
+    process = None
+    try:
+        process = start_process(command, root, 'checker')
+        record['pid'] = process.pid
+        record['checker_exit_code'] = process.wait()
+        require((root / 'result.json').is_file(), 'checkpoint checker produced no metrics; inspect its log')
+        row = json.loads((root / 'result.json').read_text())
+        if common_journal(trace):
+            require(row.get('pairing') == source['pairing'], 'recheck common-journal binding changed')
+        require(process.returncode == row['exit_code'] and process.returncode in (0, 3, 5), 'checkpoint checker failed')
+        require(row.get('status_rule') == 'session_append_replay_exact', 'checkpoint replay gate missing')
+        validate_checkpoint(row, trace['heterogeneous'], len(source['tokens']))
+        record.update(status=row['status'], fidelity_flag=fidelity_flags(row), result_sha256=sha256(root / 'result.json'))
+        return process.returncode
+    except (KeyboardInterrupt, SystemExit):
+        record.update(status='interrupted')
+        raise
+    except (Refusal, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        record.update(status='refused', reason=str(error))
+        raise
+    finally:
+        if process is not None:
+            stop_process(process)
+            record['checker_exit_code'] = process.returncode
+        record['ended_utc'] = datetime.now(timezone.utc).isoformat()
+        private_json(root / 'recheck.json', record)
 
 
 def replay_from_trace(argv):
@@ -1006,6 +1368,12 @@ def replay_from_trace(argv):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'recheck':
+        try:
+            return recheck(recheck_parser().parse_args(sys.argv[2:]))
+        except (Refusal, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+            print('refused: ' + (str(error) if isinstance(error, Refusal) else type(error).__name__), file=sys.stderr)
+            return 2
     if len(sys.argv) > 1 and sys.argv[1] == 'replay':
         return replay_from_trace(sys.argv[2:])
     if len(sys.argv) == 4 and sys.argv[1] == 'relay':
@@ -1015,7 +1383,7 @@ def main():
     try:
         trace = run(args)
         print(json.dumps(dict(status=trace['status'], trace=str(Path(args.output) / 'trace.json'))))
-        return {'heterogeneous': 5, 'failed': 3, 'passed': 0}[trace['status']]
+        return {'lossy': 5, 'heterogeneous': 5, 'failed': 3, 'passed': 0, 'measured': 0}[trace['status']]
     except (Refusal, OSError, ValueError, KeyError) as error:
         print('refused: ' + (str(error) if isinstance(error, Refusal) else type(error).__name__), file=sys.stderr)
         return 2
