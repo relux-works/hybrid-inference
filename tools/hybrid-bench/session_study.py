@@ -34,8 +34,8 @@ def freeze_receipt(frozen,artifact_sha256,study_id):
 
 
 def read_events(event=None):
-    argv=['a2a','--as',SENDER,'read',ROOM,'--topic',TOPIC,'--json']
-    argv+=['--event',event] if event else ['--last','1000']
+    argv=['a2a','--as',SENDER,'read',ROOM,'--json']
+    argv+=['--event',event] if event else ['--topic',TOPIC,'--last','1000']
     output=subprocess.check_output(argv,text=True)
     return [json.loads(line) for line in output.splitlines() if line.strip()]
 

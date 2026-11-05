@@ -18,16 +18,16 @@ Task logs: /home/agent/Werkstatt/hybrid-b/llama.cpp/.temp/hybrid-b-r49c-261105.
 
 | Check | Result |
 |---|---|
-| Full bench suite | bench-06.log,205 tests, exit0,7 optional native skips |
+| Full bench suite | bench-07.log,206 tests, exit0,7 optional native skips |
 | Full proxy suite | proxy-01.log,141 tests, exit0; source unchanged |
-| Twelve narrowing mutants | each exit1 at named contract test; harness exit0; COVERAGE.md and mutants JSON contain test/bound table |
+| Thirteen narrowing mutants | each exit1 at named contract test; harness exit0; COVERAGE.md and mutants JSON contain test/bound table |
 | Native source/test reuse | eight source/test hashes match r49b receipt, including server replay files, runtime, admission and native fixture scripts; prior native green reused only for unchanged contracts |
 | Build/validation |13 Python files AST/compile/ASCII checked; entry-point help/import, shell syntax, whitespace, immutable registrations and verbatim power note checked; no native build needed or attempted |
 | Budget | budget_wall.py output byte-matches BUDGET.json; input fixture/public hashes retained |
 | Actual Darwin full loop | not run; mandatory first public target rehearsal |
 | Actual shaped / independent real-path throughput | not run; owner choice/qualified runner required |
 
-First study fixtures hit FileExistsError on deliberate test rewrites, then exposed the same issue in product progress/hash updates; corrected separate runs pass. One later test invocation used the wrong working-directory path and did not add/run its intended new class; corrected unchanged-controls-02 exits0 and the full suite includes both new tests. A temporary import-order failure and missing fixture plan key are retained in study-03/06 logs; corrected study-07/bench runs pass. Initial a2a readiness treated JSONL as one JSON document and failed; corrected JSONL parsing succeeds. The first standalone help check exposed an inherited missing proxy import path in build_public_session.py (masked by in-process tests); its explicit bootstrap and a fresh-interpreter regression fix it. Corrected help checks pass. No such failed attempt is counted as a green control.
+First study fixtures hit FileExistsError on deliberate test rewrites, then exposed the same issue in product progress/hash updates; corrected separate runs pass. One later test invocation used the wrong working-directory path and did not add/run its intended new class; corrected unchanged-controls-02 exits0 and the full suite includes both new tests. A temporary import-order failure and missing fixture plan key are retained in study-03/06 logs; corrected study-07/bench runs pass. Initial a2a readiness treated JSONL as one JSON document and failed; corrected JSONL parsing succeeds. The first standalone help check exposed an inherited missing proxy import path in build_public_session.py (masked by in-process tests); its explicit bootstrap and a fresh-interpreter regression fix it. Corrected help checks pass. Live orchestrator readback then exposed a2a's mutual exclusion of --event with --topic/--last, also used by freeze verification. The read helper now selects event-only or topic-history arguments, with an argument-level regression and actual live event readback. The initial source/report is superseded by the signed correction. No such failed attempt is counted as a green control.
 
 Shared-disk admission briefly stopped two mutant attempts at the28.5GiB work threshold; source restoration was verified before proceeding. Three own r49b synthetic JSON fixture files were gzip-compressed byte-exactly (hash-verified, receipts retained), saving69,376,747 bytes. No measured evidence was deleted. No build tree was created. df admission/observed samples and compression receipt remain in the task artifacts. The absolute28GiB reserve was not intentionally spent.
 

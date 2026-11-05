@@ -350,3 +350,13 @@ class PublicationRecoveryTests(unittest.TestCase):
                 output.unlink();private_json(output.with_suffix('.body.json'),{'different':'inventory'})
                 with self.assertRaisesRegex(Refusal,'no inventory reroll'):module.main()
             self.assertFalse(output.exists())
+
+
+class A2ASelectorTests(unittest.TestCase):
+    # Event lookup and topic history are mutually exclusive a2a selectors; actual freeze verification uses the event-only command.
+    def test_a2a_event_read_never_combines_topic_or_last(self):
+        with mock.patch.object(s.subprocess,'check_output',return_value='{"type":"message"}\n') as run:
+            self.assertEqual(s.read_events('$event'),[{'type':'message'}])
+            command=run.call_args.args[0];self.assertIn('--event',command);self.assertNotIn('--topic',command);self.assertNotIn('--last',command)
+            s.read_events();command=run.call_args.args[0]
+            self.assertIn('--topic',command);self.assertIn('--last',command);self.assertNotIn('--event',command)

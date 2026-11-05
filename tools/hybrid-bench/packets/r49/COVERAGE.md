@@ -1,10 +1,10 @@
 # R7az source coverage and execution bounds
 
-The review supplies surface rows R1-R8. Every changed source contract has a passing CPU control and a killed narrowing mutant below. Native/GPU/Metal execution is not implied by these controls. All previous reviewer tests retain their names; the full bench205 (7 optional native skips) and proxy141 suites pass.
+The review supplies surface rows R1-R8. Every changed source contract has a passing CPU control and a killed narrowing mutant below. Native/GPU/Metal execution is not implied by these controls. All previous reviewer tests retain their names; the full bench206 (7 optional native skips) and proxy141 suites pass.
 
 | Surface | CPU controls / retained evidence | Narrowing mutant | Bound |
 |---|---|---|---|
-| R1 selection/prereg integrity | test_select_entrypoint_cannot_skip_publication; test_published_freeze_requires_live_event_matching_inventory; test_exclusion_message_and_api_availability_are_retained; immutable signed doc checks | publication-content | actual a2a event content/routing required; tests inject isolated event data, no owner population published |
+| R1 selection/prereg integrity | test_select_entrypoint_cannot_skip_publication; test_published_freeze_requires_live_event_matching_inventory; test_exclusion_message_and_api_availability_are_retained; immutable signed doc checks | publication-content; a2a-mixed-selectors | actual a2a event content/routing required; tests inject isolated event data, no owner population published |
 | R2 identical work/native replay | test_recorded_output_mismatch_never_commits; unchanged r49b native-replay-03 and native-paired-02 source/test identities verified | replay-output-equality | Python commit boundary and replay request verified; native C++ unchanged, no fresh native build |
 | R3 waits/background | test_checkpoint_nearest_wait_tie_and_final_only; test_capture_budget_and_actual_wait_both_bound_save; test_wait_lateness_measured_after_sleep; retained journal/background tests | wait-placement; save-budget | fixed wait selection and two independent bounds; target save latency awaits public run |
 | R4 order/link/cost/admission | test_cooldown_delegates_to_real_kit_interfaces; test_four_arm_scheduler_loop_and_no_reroll_on_post_failure; existing accounting/bin tests | cooldown-shortened | adapter calls actual kit contract; test uses fakes, Darwin priority/memory execution remains open |
@@ -15,11 +15,11 @@ The review supplies surface rows R1-R8. Every changed source contract has a pass
 
 ## Mutation controls
 
-Each unmutated positive is green. All twelve plants exit1 at the named test; none survives. The progress-exclusive mutant fails on the related FileExistsError inside the valid four-arm scheduler, reproducing the original progress-write failure. Other plants fail named assertions. An earlier harness attempt found two progress call sites rather than one and stopped before planting that mutant; two later admission checks stopped below28.5GiB and left source restored. Corrected successful controls are recorded separately.
+Each unmutated positive is green. All thirteen plants exit1 at the named test; none survives. The progress-exclusive mutant fails on the related FileExistsError inside the valid four-arm scheduler, reproducing the original progress-write failure. Other plants fail named assertions. An earlier harness attempt found two progress call sites rather than one and stopped before planting that mutant; two later admission checks stopped below28.5GiB and left source restored. Corrected successful controls are recorded separately.
 
 | Mutant | Narrows the contract to | Named failing test | Exit |
 |---|---|---|---|
-| publication-content | accepts a changed inventory behind a real event | test_session_study.StudyTests.test_published_freeze_requires_live_event_matching_inventory | 1 |
+| publication-content; a2a-mixed-selectors | accepts a changed inventory behind a real event | test_session_study.StudyTests.test_published_freeze_requires_live_event_matching_inventory | 1 |
 | wait-placement | chooses midpoint without an eligible following wait | test_session_study.StudyTests.test_checkpoint_nearest_wait_tie_and_final_only | 1 |
 | save-budget | bounds the save only by the wait, dropping the declared budget | test_session_study.FullSeriesAdapterTests.test_capture_budget_and_actual_wait_both_bound_save | 1 |
 | descriptive-pairs | retains counts but drops public/favourable pairs | test_session_study.EntryPointTests.test_analyze_entrypoint_preserves_n1_n3_estimates | 1 |
@@ -32,6 +32,8 @@ Each unmutated positive is green. All twelve plants exit1 at the named test; non
 | public-api-base-dropped | drops the API replay base while keeping native tokens | test_session_study.UnchangedContractTests.test_public_api_format_keeps_base_and_recorded_messages | 1 |
 
 | standalone-import | requires an inherited in-process proxy import path, so the runbook command fails | test_session_study.StandaloneEntryTests.test_runbook_entrypoints_import_in_clean_process | 1 |
+
+| a2a-mixed-selectors | Combines event lookup with topic history, which the real CLI refuses | test_session_study.A2ASelectorTests.test_a2a_event_read_never_combines_topic_or_last | 1 |
 
 ## Declared limits and scope
 
