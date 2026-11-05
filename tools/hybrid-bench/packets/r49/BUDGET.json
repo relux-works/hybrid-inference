@@ -1,0 +1,254 @@
+{
+  "schema": "hybrid-e2e-wall-budget-v1",
+  "fixture_sha256": "b55d5d19c542b4d5812aa18b5589847694933cc9b29ded1461a67254a40211d7",
+  "public_sha256": "7c42962e0d5b8185e07084a788a89dc041df964285191f61e07ea4a8eede85ab",
+  "session_count": 1,
+  "turns": 68,
+  "depths": [
+    101711,
+    203809
+  ],
+  "checkpoint_turns": [
+    29,
+    68
+  ],
+  "checker_components": [
+    {
+      "turn": 29,
+      "depth": 146142,
+      "scaled_seconds": 1419.1701110525848,
+      "raw_seconds": 1900.6719214634754
+    },
+    {
+      "turn": 68,
+      "depth": 203809,
+      "scaled_seconds": 2533.3795532680942,
+      "raw_seconds": 3409.603009807738
+    }
+  ],
+  "cold_scale": 0.7384097596120988,
+  "setup_hours": [
+    0.5,
+    1
+  ],
+  "rows": [
+    {
+      "link_MB_s": 3.75,
+      "arms": {
+        "local": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 0.0,
+          "wall_hours": 1.1018711172368203,
+          "unscaled_fill_wall_hours": 1.1741257684320423,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 2.19980157954812,
+          "unscaled_fill_wall_hours": 2.6492021382296014,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid-background": {
+          "warm_hours": 0.764690279068371,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 2.1915791900618693,
+          "unscaled_fill_wall_hours": 2.640979748743351,
+          "offloads": 1,
+          "envelope_GB": 0.277491264
+        }
+      },
+      "public_four_arms_hours": 7.072341592528074,
+      "main_CA_ten_arms_hours": 16.70586083071567,
+      "optional_BA_ten_arms_hours": 16.746972778146922,
+      "qualification_hours_per_block": 0.2386092942222222
+    },
+    {
+      "link_MB_s": 6,
+      "arms": {
+        "local": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 0.0,
+          "wall_hours": 1.1018711172368203,
+          "unscaled_fill_wall_hours": 1.1741257684320423,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 2.19980157954812,
+          "unscaled_fill_wall_hours": 2.6492021382296014,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid-background": {
+          "warm_hours": 0.6826406406552076,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 2.109529551648706,
+          "unscaled_fill_wall_hours": 2.5589301103301874,
+          "offloads": 20,
+          "envelope_GB": 3.571197184
+        }
+      },
+      "public_four_arms_hours": 6.811334983448244,
+      "main_CA_ten_arms_hours": 16.20613415331652,
+      "optional_BA_ten_arms_hours": 16.65749429281359,
+      "qualification_hours_per_block": 0.14913080888888888
+    },
+    {
+      "link_MB_s": 18.75,
+      "arms": {
+        "local": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 0.0,
+          "wall_hours": 1.1018711172368203,
+          "unscaled_fill_wall_hours": 1.1741257684320423,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid": {
+          "warm_hours": 0.4604997709668609,
+          "cold_hours": 0.090661679496096,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.7740919127742565,
+          "unscaled_fill_wall_hours": 2.151237820260516,
+          "offloads": 58,
+          "envelope_GB": 7.982574208
+        },
+        "hybrid-background": {
+          "warm_hours": 0.4594109808321502,
+          "cold_hours": 0.090661679496096,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.773003122639546,
+          "unscaled_fill_wall_hours": 2.1501490301258053,
+          "offloads": 58,
+          "envelope_GB": 7.982574208
+        }
+      },
+      "public_four_arms_hours": 5.846280987576332,
+      "main_CA_ten_arms_hours": 14.422093058226274,
+      "optional_BA_ten_arms_hours": 14.427537008899828,
+      "qualification_hours_per_block": 0.047721858844444444
+    },
+    {
+      "link_MB_s": 27.875,
+      "arms": {
+        "local": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 0.0,
+          "wall_hours": 1.1018711172368203,
+          "unscaled_fill_wall_hours": 1.1741257684320423,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid": {
+          "warm_hours": 0.41244834534164676,
+          "cold_hours": 0.0700098713450951,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.7053886789980415,
+          "unscaled_fill_wall_hours": 2.082534586484301,
+          "offloads": 62,
+          "envelope_GB": 8.364536704
+        },
+        "hybrid-background": {
+          "warm_hours": 0.4119058810450803,
+          "cold_hours": 0.0700098713450951,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.7048462147014751,
+          "unscaled_fill_wall_hours": 2.0819921221877347,
+          "offloads": 62,
+          "envelope_GB": 8.364536704
+        }
+      },
+      "public_four_arms_hours": 5.678176938277791,
+      "main_CA_ten_arms_hours": 14.065686564743793,
+      "optional_BA_ten_arms_hours": 14.068398886226625,
+      "qualification_hours_per_block": 0.03209990505231689
+    },
+    {
+      "link_MB_s": 50,
+      "arms": {
+        "local": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 0.0,
+          "wall_hours": 1.1018711172368203,
+          "unscaled_fill_wall_hours": 1.1741257684320423,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid": {
+          "warm_hours": 0.36878567446635485,
+          "cold_hours": 0.051232285509167905,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.6429484222868225,
+          "unscaled_fill_wall_hours": 2.020094329773082,
+          "offloads": 63,
+          "envelope_GB": 8.453986752
+        },
+        "hybrid-background": {
+          "warm_hours": 0.3683684380640455,
+          "cold_hours": 0.051232285509167905,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.642531185884513,
+          "unscaled_fill_wall_hours": 2.0196770933707726,
+          "offloads": 63,
+          "envelope_GB": 8.453986752
+        }
+      },
+      "public_four_arms_hours": 5.52501323677831,
+      "main_CA_ten_arms_hours": 13.739907212673334,
+      "optional_BA_ten_arms_hours": 13.741993394684881,
+      "qualification_hours_per_block": 0.017895697066666664
+    },
+    {
+      "link_MB_s": 100,
+      "arms": {
+        "local": {
+          "warm_hours": 0.7729126685546218,
+          "cold_hours": 0.20395844868219867,
+          "checker_hours": 0.0,
+          "wall_hours": 1.1018711172368203,
+          "unscaled_fill_wall_hours": 1.1741257684320423,
+          "offloads": 0,
+          "envelope_GB": 0.0
+        },
+        "hybrid": {
+          "warm_hours": 0.3406457677230717,
+          "cold_hours": 0.03940346731308947,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.602979697347461,
+          "unscaled_fill_wall_hours": 1.9801256048337206,
+          "offloads": 65,
+          "envelope_GB": 8.62547104
+        },
+        "hybrid-background": {
+          "warm_hours": 0.34042505213510454,
+          "cold_hours": 0.03940346731308947,
+          "checker_hours": 1.0979304623112998,
+          "wall_hours": 1.6027589817594938,
+          "unscaled_fill_wall_hours": 1.9799048892457534,
+          "offloads": 65,
+          "envelope_GB": 8.62547104
+        }
+      },
+      "public_four_arms_hours": 5.427376610647262,
+      "main_CA_ten_arms_hours": 13.532098343514905,
+      "optional_BA_ten_arms_hours": 13.53320192145474,
+      "qualification_hours_per_block": 0.008947848533333332
+    }
+  ],
+  "extra_decode_hours_per_arm_512_tokens_at_recorded_depths": 0.9956562070746525,
+  "limits": "Public 0.8B token counts used for planning only; target retokenization and owner sample unknown. Background estimate assumes hidden catch-up; rates/surrogate/fit are prior measurements, not current calibration. 512-token sensitivity is decode cost only at the recorded depths (optimistic as it omits added-context slowdown); it is not a selected session or a context-valid alternate. Actual 200k checker during public rehearsal controls the budget decision. Original unscaled local fills retained per arm; slower actual checker can exceed both brackets."
+}

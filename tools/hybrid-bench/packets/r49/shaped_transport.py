@@ -62,7 +62,7 @@ def main():
                 row=dict(rate_MB_s=rate,rtt_ms=rtt,payload_MB_s=throughput,capacity_fraction=throughput/rate,
                     passed=throughput>=.8*rate,probe=result,qdisc=json.loads(command(['tc','-s','-j','qdisc','show','dev','lo'])))
                 rows.append(row)
-                (a.output/'RESULTS.json').write_text(json.dumps(dict(rows=rows,all_passed=all(r['passed'] for r in rows)),indent=2)+'\n')
+                (a.output/'RESULTS.json').write_text(json.dumps(dict(source_head=command(['git','-C',str(ROOT),'rev-parse','HEAD']).strip(),rows=rows,all_passed=all(r['passed'] for r in rows)),indent=2)+'\n')
                 print(json.dumps({k:row[k] for k in ('rate_MB_s','rtt_ms','payload_MB_s','capacity_fraction','passed')}),flush=True)
     finally:
         subprocess.run(['tc','qdisc','del','dev','lo','root'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

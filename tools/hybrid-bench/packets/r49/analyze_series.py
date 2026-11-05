@@ -8,15 +8,16 @@ ROOT=Path(__file__).resolve().parents[4]
 sys.path.insert(0,str(ROOT/'tools/hybrid-bench'))
 from bench_common import require,sha256
 from session_protocol import paired_analysis,portion_summary
+from session_study import descriptive_pairs,verify_series_transport
 
 
-def analyze(plan,attempts,gpu_price_per_hour=None,traffic_price_per_GB=None):
+def analyze(plan,attempts,gpu_price_per_hour=None,traffic_price_per_GB=None,series_qualified=None):
     require(len(attempts)==len(plan['attempts']),'every planned attempt including failures must be retained')
     seen=set();flow=[];rows={};bins={}
     for expected,attempt in zip(plan['attempts'],attempts):
         require(attempt['index']==expected['index'] and attempt['index'] not in seen,'attempt order/duplicate differs from preregistration')
         seen.add(attempt['index']);trace=attempt.get('trace')
-        qualified=bool(trace and trace.get('status')=='measured')
+        qualified=bool(trace and trace.get('status')=='measured' and (not plan.get('amendment') or series_qualified is True))
         if trace:
             require(trace['prereg']==plan['prereg'] and trace['session_set_sha256']==plan['session_set_sha256'] and
                 trace['series_id']==plan['series_id'] and trace['session_digest']==expected['session_digest'] and
@@ -49,27 +50,32 @@ def analyze(plan,attempts,gpu_price_per_hour=None,traffic_price_per_GB=None):
                 require(ba[label]['count']==bb[label]['count'],'paired portion counts differ')
                 bucket['local_seconds']+=ba[label]['timed_seconds'];bucket['hybrid_seconds']+=bb[label]['timed_seconds'];bucket['count']+=ba[label]['count']
             pairs.append(dict(session_digest=sid,local_seconds=a[0],hybrid_seconds=b[0],qualified=a[1] and b[1]))
-        comparisons[comparison]=paired_analysis(pairs) if len(pairs)==5 else dict(qualified=False,success=False,available_pairs=len(pairs))
+        comparisons[comparison]=descriptive_pairs(pairs)
+        if len(pairs)==5 and plan.get('group','main')=='main':comparisons[comparison].update(paired_analysis(pairs),descriptive_only=False)
         for bucket in groups.values():
             bucket['fractional_reduction']=1-bucket['hybrid_seconds']/bucket['local_seconds'] if bucket['local_seconds'] else None
         paired_bins[comparison]=groups
         thresholds[comparison]=next((label for label,bucket in groups.items() if bucket['count'] and bucket['fractional_reduction']>0),None)
     return dict(schema='hybrid-e2e-analysis-v1',prereg=plan['prereg'],session_set_sha256=plan['session_set_sha256'],
-        flow=flow,comparisons=comparisons,portion_bins=bins,paired_bin_gains=paired_bins,smallest_tested_bin_with_gain=thresholds,
+        amendment=plan.get('amendment'),series_qualified=series_qualified,flow=flow,comparisons=comparisons,portion_bins=bins,paired_bin_gains=paired_bins,smallest_tested_bin_with_gain=thresholds,
         pricing=dict(gpu_price_per_hour=gpu_price_per_hour,traffic_price_per_GB=traffic_price_per_GB),
         cost_boundary='Native synchronized service wall seconds, not kernel time. TLS TCP payload, not physical billed traffic. Rental wall cost requires the actual rental receipt.')
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--plan',required=True,type=Path)
-    p.add_argument('--attempts',required=True,type=Path);p.add_argument('--gpu-price-per-hour',type=float)
+    p.add_argument('--attempts',required=True,type=Path);p.add_argument('--series-receipt',type=Path);p.add_argument('--gpu-price-per-hour',type=float)
     p.add_argument('--traffic-price-per-GB',type=float);a=p.parse_args()
     attempts=json.loads(a.attempts.read_text())
     for row in attempts:
         if row.get('trace_path'):
             path=Path(row['trace_path']);require(sha256(path)==row['trace_sha256'],'attempt trace hash differs')
             row['trace']=json.loads(path.read_text())
-    print(json.dumps(analyze(json.loads(a.plan.read_text()),attempts,a.gpu_price_per_hour,a.traffic_price_per_GB),indent=2))
+    plan=json.loads(a.plan.read_text());qualified=None
+    if plan.get('amendment'):
+        receipt=a.series_receipt or a.plan.parent/'SERIES.json'
+        qualified=verify_series_transport(receipt,a.plan) if receipt.exists() else False
+    print(json.dumps(analyze(plan,attempts,a.gpu_price_per_hour,a.traffic_price_per_GB,qualified),indent=2))
 
 
 if __name__=='__main__':main()

@@ -8,9 +8,11 @@ from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[4]
 sys.path.insert(0,str(ROOT/'tools/hybrid-bench'))
+sys.path.insert(0,str(ROOT/'tools/hybrid-proxy'))
 from bench_common import read_private,private_json,require,sha256
 from proxy import Node
 from session_protocol import recorded_session,digest,prereg_binding,distribution
+from session_study import amendment_binding
 
 
 def build(source,tokenize,model,prereg):
@@ -47,7 +49,7 @@ def build(source,tokenize,model,prereg):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for key in ('source','client-state','output'):p.add_argument('--'+key,required=True,type=Path)
-    p.add_argument('--source-sha256',required=True);p.add_argument('--prereg-commit',required=True)
+    p.add_argument('--amendment-commit',required=True);p.add_argument('--source-sha256',required=True);p.add_argument('--prereg-commit',required=True)
     a=p.parse_args();require(not a.output.exists(),'public session must be frozen, never overwritten')
     require(sha256(a.source)==a.source_sha256,'public source artifact hash differs')
     client=read_private(a.client_state/'client-info.json');config=read_private(a.client_state/'proxy-config.json')
@@ -55,6 +57,7 @@ def main():
     def tokenize(text):return node.request('POST','/tokenize',dict(content=text,add_special=False))['tokens']
     with gzip.open(a.source,'rt') as stream:source=json.load(stream)
     result=build(source,tokenize,client['model_sha256'],prereg_binding(ROOT,a.prereg_commit))
+    result['amendment']=amendment_binding(ROOT,a.amendment_commit)
     result['tokenizer_receipt']=dict(model_sha256=client['model_sha256'],source_sha256=a.source_sha256,
         source_head=client['commit'],backend=client['backend'],tokenization_only=True)
     private_json(a.output,result)

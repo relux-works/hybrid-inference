@@ -23,6 +23,7 @@ from store import prefix_hash
 from parallel_transport import ParallelTransport
 from session_protocol import prereg_binding,validate_set,digest,finish_wait,portion_summary
 from session_admission import KitAdmission
+from session_study import amendment_binding,validate_run_plan,verify_qualification,replace_private_json,validate_capture
 
 ARMS=('local','hybrid','hybrid-background')
 
@@ -186,7 +187,7 @@ def check_quality(client,root,saved,dtype):
     Path(saved['path']).unlink()
     return dict(arm=saved['arm'],turn=saved['turn'],gate=accepted,top1_agreed=row['top1_agreed'],
         mean_kl_nats=row['mean_kl_nats'],free_running_first_divergence=row['free_running_first_divergence'],
-        checker_exit_code=code,state_dtype=dtype,exact=row['exact'],result=str(result),input_sha256=sha256(fixture))
+        checker_exit_code=code,state_dtype=dtype,exact=row['exact'],result=str(result),result_sha256=sha256(result),input_sha256=sha256(fixture))
 
 
 def summarize(events,calls):
@@ -216,7 +217,9 @@ def parser():
     p.add_argument('--client-state',type=Path,required=True);p.add_argument('--owner-export',type=Path)
     p.add_argument('--owner-export-sha256')
     p.add_argument('--session-set',type=Path);p.add_argument('--session-set-sha256');p.add_argument('--session-digest')
-    p.add_argument('--prereg-commit');p.add_argument('--arm',choices=ARMS);p.add_argument('--series-probe',type=Path)
+    p.add_argument('--prereg-commit');p.add_argument('--amendment-commit')
+    p.add_argument('--series-plan',type=Path);p.add_argument('--series-plan-sha256')
+    p.add_argument('--arm',choices=ARMS);p.add_argument('--series-probe',type=Path)
     p.add_argument('--refresh-series-probe',action='store_true')
     p.add_argument('--ordinal',type=int)
     p.add_argument('--series-id');p.add_argument('--comparison',choices=('B/A','C/A'));p.add_argument('--group',choices=('main','favourable','public'))
@@ -250,7 +253,17 @@ def run(args):
     require(args.session_set.stat().st_size<=512*1024**2,'session set exceeds input budget')
     require(sha256(args.session_set)==args.session_set_sha256,'session set differs from frozen delivery hash')
     selected=json.loads(args.session_set.read_text());rows=validate_set(selected)
-    require(selected['prereg']==prereg,'session set preregistration differs')
+    amendment=amendment_binding(Path(__file__).resolve().parents[2],args.amendment_commit)
+    require(selected['prereg']==prereg and selected.get('amendment')==amendment,'session set registration differs')
+    require(args.series_plan and sha256(args.series_plan)==args.series_plan_sha256,'verified series plan required')
+    plan=json.loads(args.series_plan.read_text())
+    require(plan['prereg']==prereg and plan['amendment']==amendment,'series registration differs')
+    checkpoints=validate_run_plan(plan,selected,args,source_head,client['model_sha256'])
+    qualification=json.loads((args.series_plan.parent/('qualification-'+args.comparison[0]+'-pre.json')).read_text())
+    require(qualification['series_id']==args.series_id and qualification['source_head']==source_head and
+        qualification['block']==args.comparison[0] and qualification['side']=='pre' and
+        qualification['node_url']==config['prefill_url'] and qualification['ca_sha256']==sha256(args.ca_file),'pre-block qualification identity differs')
+    verify_qualification(qualification,plan['qualification_method'],plan['link_series'],args.link_label)
     collection=selected['sets'].get(args.group,{})
     require(collection.get('status')=='selected','selected series group incomplete')
     workload=next((r for r in collection['sessions'] if r['session_digest']==args.session_digest),None)
@@ -280,12 +293,13 @@ def run(args):
     geometry=config['delta_geometry']
     size=geometry['state_bytes']+(geometry['kv_bytes']+32)*client['context']+1024**2
     disk_floor=40*1024**3 if client['backend']=='metal' else 28.5*1024**3
-    require(shutil.disk_usage(root.parent).free>disk_floor+15*size+2*1024**3,'disk budget for 12 checkpoint states and rollback reserve refused')
+    require(shutil.disk_usage(root.parent).free>disk_floor+(len(checkpoints['turns'])+3)*size+2*1024**3,'disk budget for checkpoint states and rollback reserve refused')
     root.mkdir(mode=0o700);(root/'slots').mkdir(mode=0o700)
     token_file=root/'decode-token';token_file.write_text(config['decode_token']);token_file.chmod(0o600)
     trace=dict(schema='hybrid-production-session-v2',status='running',arms=[run_arm],state_dtype=args.state_dtype,
         started_utc=datetime.now(timezone.utc).isoformat(),link_label=args.link_label,device=args.device,
         transport=dict(protocol='https-ranges-v1',streams=args.streams,ca_sha256=sha256(args.ca_file)),
+        amendment=amendment,series_plan_sha256=args.series_plan_sha256,checkpoint_plan=checkpoints,
         selection_rule='preregistered-random-owner-sessions-v1',prereg=prereg,session_set_sha256=sha256(args.session_set),
         session_digest=args.session_digest,group=args.group,series_id=args.series_id,comparison=args.comparison,ordinal=args.ordinal,
         admission=None,workload=workload,
@@ -333,7 +347,7 @@ def run(args):
             initial=app.store.select(client_profile['id'],[],sid);initial['slot']=0;app.store.save(initial);app.store.set_slot(sid,0)
             journal=workload['base_ids'].copy()
             rows=[];session_start=time.monotonic_ns()
-            checkpoint_turns={max(1,math.ceil(len(workload['turns'])*fraction/4)) for fraction in (1,2,3,4)}
+            checkpoint_turns=set(checkpoints['turns'])
             previous_end=None;pending_checkpoint=None
             sequence=[dict(input_ids=[],output_ids=[],pause_seconds=0)]+workload['turns']
             sequence=[dict(row,input_hash=prefix_hash(row['input_ids']),output_hash=prefix_hash(row['output_ids'])) for row in sequence]
@@ -344,6 +358,8 @@ def run(args):
                     if pending_checkpoint is not None:
                         captured=snapshot(app,root,arm,turn-1,pending_checkpoint,defer_hash=True);saved.append(captured)
                     capture_end=time.monotonic_ns()
+                    if pending_checkpoint is not None:
+                        validate_capture(evidence_start,capture_end,deadline,checkpoints['capture_budget_seconds'])
                     wait_receipt=finish_wait(deadline,evidence_performed=pending_checkpoint is not None)
                     trace['evidence'].append(dict(arm=arm,turn=turn-1,start_ns=evidence_start,end_ns=capture_end,
                         capture=pending_checkpoint is not None,within_recorded_wait=True))
@@ -365,10 +381,12 @@ def run(args):
             app.close_background(discard_pending=True)
             trace['sessions'][arm]['final_background_join_seconds']=(time.monotonic_ns()-active_end)/1e9
             if pending_checkpoint is not None:
+                final_capture_start=time.monotonic_ns()
                 saved.append(snapshot(app,root,arm,len(workload['turns']),pending_checkpoint,defer_hash=True))
+                trace['evidence'].append(dict(arm=arm,turn=len(workload['turns']),start_ns=final_capture_start,end_ns=time.monotonic_ns(),capture=True,after_session=True))
             for captured in saved:
                 captured['sha256']=sha256(captured['path'])
-                private_json(root/'checkpoint-bindings'/(captured['arm']+'-'+str(captured['turn'])+'.json'),captured)
+                replace_private_json(root/'checkpoint-bindings'/(captured['arm']+'-'+str(captured['turn'])+'.json'),captured)
             current=app.store.get(sid)
             if current['remote_id']:app.remote(client_profile).request('DELETE','/v1/sessions/'+current['remote_id'])
             complete_events=events.copy()

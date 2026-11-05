@@ -76,6 +76,7 @@ def recorded_session(session,model,vocab,observations=None):
             return dict(schema='hybrid-owner-workload-v2',protocol=PROTOCOL,model_sha256=model,
                 session_digest=identity,source_session=session['id'],base_ids=base,turns=window,
                 start_depth=start,final_depth=final,source_turns=[r['source_turn'] for r in window],
+                has_request_messages=all('request_messages' in r for r in window),
                 wait_distribution=distribution([r['pause_seconds'] for r in window]))
     return None
 
@@ -99,7 +100,7 @@ def freeze_export(export,export_sha256,model,vocab,prereg):
             eligible.append(row)
             observed_waits += [r['pause_seconds'] for r in row['turns']]
         except (Refusal,ValueError,KeyError,TypeError) as error:
-            excluded.append(dict(index=index,reason=type(error).__name__))
+            excluded.append(dict(index=index,reason=type(error).__name__,message=str(error)))
     return dict(schema='hybrid-e2e-frozen-population-v1',prereg=prereg,owner_export_sha256=export_sha256,
         source_log_sha256=export['source_log_sha256'],population=population,eligible=eligible,excluded=excluded,
         eligible_count=len(eligible),observed_count=len(export['sessions']),
@@ -141,11 +142,13 @@ def validate_set(selected):
     return all_rows
 
 
-def schedule(selected,group,link_series):
+def schedule(selected,group,link_series,comparison='both'):
     validate_set(selected);require(link_series in ('home','fast'),'declared home/fast series required')
     collection=selected['sets'][group];require(collection['status']=='selected','session collection incomplete')
     pairs=[('B/A','hybrid'),('C/A','hybrid-background')]
     if link_series=='fast':pairs.reverse()
+    require(comparison in ('both','B/A','C/A'),'unknown comparison')
+    pairs=[p for p in pairs if comparison=='both' or p[0]==comparison]
     return [dict(index=i,comparison=comparison,arm=arm,session_digest=row['session_digest'],group=group,link_series=link_series)
         for i,(comparison,row,arm) in enumerate((c,r,a) for c,h in pairs for r in collection['sessions'] for a in ('local',h))]
 
@@ -155,7 +158,8 @@ def finish_wait(deadline_ns,clock=time.monotonic_ns,sleep=time.sleep,evidence_pe
     require(not evidence_performed or now<=deadline_ns,'evidence overran recorded tool wait; timing contaminated')
     requested=max(0,(deadline_ns-now)/1e9)
     if requested:sleep(requested)
-    return dict(remaining_sleep_seconds=requested,deadline_ns=deadline_ns,ready_ns=clock(),dispatch_lateness_seconds=max(0,(now-deadline_ns)/1e9))
+    ready=clock()
+    return dict(remaining_sleep_seconds=requested,deadline_ns=deadline_ns,ready_ns=ready,dispatch_lateness_seconds=max(0,(ready-deadline_ns)/1e9))
 
 
 def bin_label(tokens):
