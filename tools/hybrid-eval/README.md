@@ -18,6 +18,23 @@ The analysis uses only the standard library and writes `equivalence.json` and a 
 
 The CLI binds `--family Qwen` or `--family Glimmer` to its known model hash. Collection timing comes from explicit family/depth maps; add witnessed future start/end metadata with `--run-times timings.json` using the format in the report. Missing timing stays unknown. Glimmer was not named in the registration and uses the rules by extension. Degenerate bootstrap primaries remain visible, but claims require both labelled sidecars. Pending-as-1 Holm values are upper bounds: pending arrivals cannot reverse an accepted observed decision or rescue a raw margin failure. Near-margin bootstrap endpoints automatically get five-seed Monte Carlo diagnostics.
 
+`ruler_bf16_adapter.py` separately admits the reviewed Qwen state-bf16 archives at 8k/32k, whose fourth arm is named `offload_bf16`. It verifies the supplied compressed hashes, every internal member hash, the pinned implementation, complete row identities/checksums and all three unchanged f32 baseline arms before mapping only that fourth arm to `bf16`. It writes `rows.jsonl`, the unchanged original `manifest.json`, and `provenance.json` into an absent `--output` directory with an existing parent. Every original/derived row-hash pair is retained. Refusals exit 2 and do not create the output directory. This is an input adapter, with no statistical changes.
+
+```sh
+mkdir -p .temp/ruler-bf16
+python3 tools/hybrid-eval/ruler_bf16_adapter.py \
+    --bf16-archive /path/to/bf16-8192-complete.tar.gz --bf16-sha256 EXPECTED_SHA256 \
+    --baseline-archive /path/to/depth-8192-complete.tar.gz --baseline-sha256 EXPECTED_SHA256 \
+    --output .temp/ruler-bf16/depth-8192
+export RULER_BF16_TEST_INPUTS="$PWD/.temp/hybrid-d-r16f-261106/inputs"
+PYTHONPATH=tools/hybrid-eval python3 -m unittest -v \
+    test_ruler_equivalence test_eval \
+    test_ruler.RulerTests.test_known_paired_table_and_intervals \
+    test_ruler.RulerTests.test_complete_archive_and_member_hashes test_ruler_bf16_adapter
+```
+
+The adapter tests require local copies of the four pinned real archives, not a network connection; no test is skipped for missing inputs. The report's bf16 regeneration section gives their full hashes, staging commands and the exact adapter/statistical commands. Outputs are `equivalence-results/qwen-bf16.json` and `bf16-input-provenance.json`; existing f32/Glimmer snapshots are independent. At bf16 8k the collection label is unknown because stage setup time is unrecorded. At 32k the supplied timing map is a conservative enclosing window derived from the serial 8k calls and whole-stage end, not invented per-depth timestamps. The absent, never-measured 64k/128k depths enter both bf16 families at p=1.
+
 Python 3.10+ standard library only. This is an offline synthetic quality experiment for the hybrid prototype, not an upstream submission. No datasets, model downloads, packages or native builds are performed by the evaluator or its tests. Reuse the existing [node/client launchers](../hybrid-bench/README.md) and their private state. Run from the repository root.
 
 ## Tasks and depths
@@ -137,6 +154,7 @@ For a different node quantization, add **`--hetero-quant` to both client setups*
 | Tool / command | Purpose | Artifacts |
 |---|---|---|
 | `python3 tools/hybrid-eval/hybrid_eval.py --help` | Evaluator options | Help only |
+| `python3 tools/hybrid-eval/ruler_bf16_adapter.py --help` | Verified bf16 archive admission and arm mapping | Derived rows, original manifest and hash-link provenance under `--output`; exact example above |
 | Evaluator command above | Synthetic quality run | `hybrid-eval-LABEL-TIME.jsonl`, `.md`, `.tar.gz`, `.tar.gz.sha256` under `--output` |
 | `python3 -m unittest discover -s tools/hybrid-eval -p test_eval.py -v` | Seeded oracle, scoring, fitting, routing and archive controls | Redirect output to `.temp/<run>/unit-01.log` |
 | Native test below | Real CPU node, two decoders/proxies, all modes plus repeat/partition controls, tokenizer and routing claims | Private native logs, commands, PID records, JSON metadata, result bundle and cleanup record under `--artifacts` |
