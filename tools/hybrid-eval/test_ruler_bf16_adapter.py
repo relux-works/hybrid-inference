@@ -40,11 +40,11 @@ class Bf16AdapterTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
 
-    def run_cli(self, depth=8192, bf16=None, baseline=None, expected=None):
+    def run_cli(self, depth=8192, bf16=None, baseline=None, expected=None, output_name='adapted'):
         bf_name, base_name = f'bf16-{depth}-complete.tar.gz', f'depth-{depth}-complete.tar.gz'
         bf_path, bf_sha = bf16 or (self.root/bf_name, HASHES[bf_name])
         base_path, base_sha = baseline or (self.root/base_name, HASHES[base_name])
-        output = self.work/'adapted'
+        output = self.work/output_name
         proc = subprocess.run([sys.executable, str(self.adapter), '--bf16-archive', str(bf_path),
                                '--bf16-sha256', bf_sha, '--baseline-archive', str(base_path),
                                '--baseline-sha256', base_sha, '--output', str(output)], capture_output=True, text=True)
@@ -136,7 +136,14 @@ class Bf16AdapterTests(unittest.TestCase):
             with self.subTest(arm=arm):
                 def mutate(m, rows):
                     rows[0]['results'][arm]['answer'] += ' changed'
-                self.run_cli(bf16=self.changed(mutate), expected='frozen baseline arms differ')
+                self.run_cli(bf16=self.changed(mutate), expected='frozen baseline arms differ',
+                             output_name='adapted-'+arm)
+
+    # A resealed change to frozen generation metadata refuses before any output is created.
+    def test_frozen_baseline_metadata_mismatch_refuses(self):
+        def mutate(m, rows):
+            rows[0]['max_tokens'] += 1
+        self.run_cli(bf16=self.changed(mutate), expected='frozen baseline metadata differ')
 
     # Source row checksums are mandatory on both sides; a repaired archive checksum cannot conceal a bad row hash.
     def test_row_hash_failure_refuses(self):

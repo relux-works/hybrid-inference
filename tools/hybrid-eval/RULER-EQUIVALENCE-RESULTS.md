@@ -219,7 +219,7 @@ Per-arm scores and secondary text statistics reproduce the accepted evaluator an
 | 131072 | 32/390, 8.21 [5.87, 11.35] | 27/390, 6.92 [4.80, 9.89] | 13 / 8 | 0.38331 | +1.2821 [-2.6891, +5.2105] | False |
 <!-- END QWEN DETAIL TABLES -->
 
-At 128k, three fwe paired-score differences are nonzero; the sorted first two training pairs (cwe) have zero differences. The frozen range guard counts three departures among the remaining 388 pairs, giving the [-2.2429,+2.2429] pp sidecar. The binary score==1 sidecar passes alone, but both sidecars are required. None of the bootstrap intervals triggers the near-margin sensitivity diagnostic, so no extra-seed result is generated. Finite bootstrap p resolution remains 1/10000.
+At 128k, the three nonzero paired-score differences, identical for offload-local and partition-local, are fwe index 12 (+1/3; local 2/3 versus the other arm 1), qa_2 index 13 (+1; local 0 versus the other arm 1), and qa_2 index 14 (-1; local 1 versus the other arm 0); the first two sorted training pairs are cwe indices 0 and 1, both with zero difference. The frozen range guard counts three departures among the remaining 388 pairs, giving the [-2.2429,+2.2429] pp sidecar. The binary score==1 sidecar passes alone, but both sidecars are required. None of the bootstrap intervals triggers the near-margin sensitivity diagnostic, so no extra-seed result is generated. Finite bootstrap p resolution remains 1/10000.
 
 All 56 Qwen ALL/per-task secondary tables match the archived analyses exactly after excluding their single-depth Bonferroni adjustment field; the frozen secondary analyser now emits its four-depth Holm field. All 52 per-task score triplets and text counts are preserved in qwen.json. The 128k cross-check is 95.81/95.90/95.90%, changed answers 32/390 and 27/390, discordant counts 13 and 8, text McNemar p=0.38331, matching the supplied archive and FACTS. Historical Glimmer descriptive numbers and its incomplete family remain unchanged. These data establish bounded RULER task-score claims at 8k/32k/64k under the accepted policy; they do not establish identical answer text, general quality equivalence outside RULER, a confirmatory 128k claim, or a complete bf16 family.
 
@@ -285,9 +285,9 @@ Claims require both sidecars. Supplementary claim Holm uses max(sidecar p) at a 
 
 <!-- END BF16 TABLES -->
 
-### Adapter validation and review coverage
+### Adapter validation and review coverage (r16f)
 
-The full CPU suite has 72 tests: the unchanged 48 plus 24 new adapter tests. Real 8k and 32k inputs are positive controls, not synthetic substitutes; tests require four staged archives via RULER_BF16_TEST_INPUTS and do not download. Every named negative checks the intended exit 2, a clear refusal, no traceback and no created output. The existing-output negative instead verifies preservation of its sentinel. All original input bytes are preserved.
+At r16f, the full CPU suite had 72 tests: the unchanged 48 plus 24 new adapter tests. Real 8k and 32k inputs are positive controls, not synthetic substitutes; tests require four staged archives via RULER_BF16_TEST_INPUTS and do not download. Every named negative checks the intended exit 2, a clear refusal, no traceback and no created output. The existing-output negative instead verifies preservation of its sentinel. All original input bytes are preserved.
 
 | Check | Count / real exit | Evidence under .temp/hybrid-d-r16f-261106/ |
 |---|---|---|
@@ -302,6 +302,19 @@ The full CPU suite has 72 tests: the unchanged 48 plus 24 new adapter tests. Rea
 | Skip baseline-arm equality | A valid resealed row must not replace any frozen baseline result | test_baseline_mismatch_refuses | 1; intended assertion failure |
 
 Both requested mutants are killed; no survivors. These finite controls establish the named mapping/baseline properties, not exhaustive malformed-input coverage. Source changes are confined to tools/hybrid-eval. Scope/security/design/tests/general self-review found no remaining blocker. No surface table was supplied; no surface-table coverage is claimed. No out-of-contract requested row remains: bf16 at 64k/128k is explicitly absent under task clause 3, and 8k timing is unknown under clause 4. Native/CUDA tests and builds are inapplicable to this stdlib-only input adapter and were not run. No network, GPU or supervisor changes occurred; no push or landing is claimed. Temporary adapted row copies are deleted after evidence/regeneration checks; row-hash receipts remain committed.
+
+### r16g: attribution correction and bounded review notes
+
+Muse r7ap4 independently reproduced every statistical value. The corrected 128k attribution above names fwe index 12 (+1/3), qa_2 index 13 (+1) and qa_2 index 14 (-1), identical for both arm pairs. The r16e handoff body and its supporting live table copy are corrected too; the r16f handoff has no such attribution. Historical before/candidate byte snapshots retain the earlier signed-head evidence. No generated JSON, statistical value, statistical code or adapter source changes.
+
+N2 adds test_frozen_baseline_metadata_mismatch_refuses: a resealed max_tokens change must produce exit 2, the specific metadata refusal, no traceback and no output. N3 gives each baseline-arm subtest its own output path. The full suite is now 73 tests (48 unchanged plus 25 adapter tests), exit 0, with both existing real-input positive controls retained. Evidence is under .temp/hybrid-d-r16g-261106/ (tests-full-01.log and signed-head tests-full-head-01.log).
+
+| Mutant rerun | Property narrowed | Named failing test | Real exit / evidence |
+|---|---|---|---|
+| Map f32 offload instead of bf16 | Correct transported-arm identity, beyond equal scores | test_real_8k_archive_admitted_with_exact_mapping_and_provenance | 1; intended assertion failure |
+| Skip baseline-arm equality | Each frozen baseline arm must match independently | test_baseline_mismatch_refuses | 1; all three subtests admit unexpectedly (0 vs 2), with no output-already-exists artifact |
+
+Both mutants are killed; no survivors. The repair changes only report prose and the adapter test file. Native builds are inapplicable and were not run. The live FACTS copy is outside this worktree; its matching attribution correction is included in the coordinator handoff.
 
 ## Historical r16e validation and review coverage
 
